@@ -1,7 +1,7 @@
 <div align="center">
   <img src="./logo.png" alt="GraDOOM" width="560" />
 
-  **⚡ GPU-native Doom reinforcement learning ⚡**
+  **🔥 Rip and Tear Until It Is Done—at GPU speed. 🔥**
 </div>
 
 GraDOOM is a Python library for reinforcement-learning researchers and engineers who need to train Doom policies at high throughput. It runs batched deathmatch simulation, rendering, rewards, and resets in PyTorch on the same device as the learner, then targets zero-shot evaluation in comparable ViZDoom environments.
