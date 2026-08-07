@@ -15,6 +15,13 @@ SCENARIO = Path("/Users/tsilva/repos/tsilva/ViZDoom-turbo/scenarios/deathmatch.w
 DOOM2 = Path("/Users/tsilva/roms/vizdoom/doom2.wad")
 
 
+@pytest.fixture(scope="module")
+def pinned_deathmatch_scenario():
+    if not SCENARIO.is_file() or not DOOM2.is_file():
+        pytest.skip("operator WADs absent")
+    return compile_deathmatch_scenario(SCENARIO, DOOM2)
+
+
 def test_native_transparent_sprites_reveal_fifth_farther_actor(square_scenario) -> None:
     atlas = np.zeros((2, 3, 3), dtype=np.uint8)
     atlas[0] = 10
@@ -63,9 +70,57 @@ def test_native_transparent_sprites_reveal_fifth_farther_actor(square_scenario) 
     assert rendered[0, 103, 160].item() == 20
 
 
+def test_native_teleport_fog_uses_reference_animation_and_lifetime(square_scenario) -> None:
+    atlas = np.stack(
+        [np.full((3, 3), 10 + frame, dtype=np.uint8) for frame in range(12)]
+    )
+    scenario = replace(
+        square_scenario,
+        raw_sprite_atlas=atlas,
+        raw_sprite_opaque=np.ones_like(atlas, dtype=np.bool_),
+        raw_sprite_widths=np.full(12, 3, dtype=np.int32),
+        raw_sprite_heights=np.full(12, 3, dtype=np.int32),
+        raw_sprite_left_offsets=np.ones(12, dtype=np.int32),
+        raw_sprite_top_offsets=np.full(12, 42, dtype=np.int32),
+        raw_teleport_fog_sprite_ids=np.arange(12, dtype=np.int32),
+    )
+    engine = TorchDeathmatchEngine(scenario, 1, device=torch.device("cpu"))
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([123]))
+    engine.x.zero_()
+    engine.y.zero_()
+    engine.z.zero_()
+    engine.view_z.fill_(41)
+    engine.angle.zero_()
+    engine.player_dead.fill_(True)
+    engine.item_available.zero_()
+    engine.teleport_fog_x[:, 0] = 64
+    engine.teleport_fog_y[:, 0] = 0
+    engine.teleport_fog_z[:, 0] = 0
+    blank = torch.zeros((1, 208, 320), dtype=torch.uint8)
+    wall_distance = torch.full((1, 320), torch.inf)
+    scene_depth = torch.full_like(blank, torch.inf, dtype=torch.float32)
+
+    def center_pixel(tics: int) -> int:
+        engine.teleport_fog_tics[:, 0] = tics
+        rendered = engine._native_render_sprites(
+            blank,
+            wall_distance,
+            engine.view_z,
+            scene_depth,
+        )
+        return int(rendered[0, 103, 160])
+
+    assert center_pixel(71) == 10
+    assert center_pixel(67) == 10
+    assert center_pixel(66) == 11
+    assert center_pixel(60) == 12
+    assert center_pixel(1) == 21
+    assert center_pixel(0) == 0
+
+
 @pytest.mark.skipif(not SCENARIO.is_file() or not DOOM2.is_file(), reason="operator WADs absent")
-def test_player_floor_uses_full_box_across_pit_steps() -> None:
-    scenario = compile_deathmatch_scenario(SCENARIO, DOOM2)
+def test_player_floor_uses_full_box_across_pit_steps(pinned_deathmatch_scenario) -> None:
+    scenario = pinned_deathmatch_scenario
     engine = TorchDeathmatchEngine(scenario, 1, device=torch.device("cpu"))
     engine.x.fill_(569.3977813720703)
     engine.y.fill_(515.9373168945312)
@@ -84,8 +139,104 @@ def test_player_floor_uses_full_box_across_pit_steps() -> None:
 
 
 @pytest.mark.skipif(not SCENARIO.is_file() or not DOOM2.is_file(), reason="operator WADs absent")
-def test_native_renderer_preserves_rgb_hud_and_enemy_animation() -> None:
-    scenario = compile_deathmatch_scenario(SCENARIO, DOOM2)
+def test_awakened_zombieman_matches_reference_discrete_chase_steps(
+    pinned_deathmatch_scenario,
+) -> None:
+    scenario = pinned_deathmatch_scenario
+    engine = TorchDeathmatchEngine(
+        scenario,
+        1,
+        device=torch.device("cpu"),
+        frame_skip=1,
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([123]))
+    engine.x.fill_(835.9440307617188)
+    engine.y.fill_(391.3482971191406)
+    engine.z.zero_()
+    engine.view_z.fill_(41)
+    engine.view_height.fill_(41)
+    engine.angle.fill_(math.radians(102.16735842222519))
+    engine.episode_time.fill_(136)
+    engine.weapon_raise_cooldown.zero_()
+    engine.selected_weapon.fill_(1)
+    engine.selected_weapon_variant.zero_()
+    engine.enemy_alive.zero_()
+    engine.enemy_death_tics.zero_()
+    engine.drop_type.fill_(-1)
+    engine.teleport_fog_tics.zero_()
+    engine.next_spawn_check.fill_(100_000)
+    engine.enemy_x[0, 0] = 731.1809539794922
+    engine.enemy_y[0, 0] = 953.5846099853516
+    engine._enemy_x_fixed[0, 0] = round(float(engine.enemy_x[0, 0]) * 65536)
+    engine._enemy_y_fixed[0, 0] = round(float(engine.enemy_y[0, 0]) * 65536)
+    engine.enemy_angle[0, 0] = math.radians(181.40625004223693)
+    engine.enemy_type[0, 0] = 0
+    engine.enemy_health[0, 0] = 20
+    engine.enemy_alive[0, 0] = True
+    engine.enemy_target_slot[0, 0] = -2
+    engine.enemy_move_cooldown[0, 0] = 8
+    engine.enemy_cooldown[0, 0] = 18
+
+    attack = torch.zeros((1, 20), dtype=torch.bool)
+    attack[:, 0] = True
+    noop = torch.zeros_like(attack)
+    samples: dict[int, tuple[float, float, float]] = {}
+    for tick in range(41):
+        if int(engine.episode_time[0]) in (145, 149, 153, 157, 176):
+            samples[int(engine.episode_time[0])] = (
+                float(engine.enemy_x[0, 0]),
+                float(engine.enemy_y[0, 0]),
+                float(torch.rad2deg(engine.enemy_angle[0, 0])),
+            )
+        if tick < 40:
+            engine.step(attack if tick == 0 else noop)
+
+    expected = {
+        145: (736.8378143310547, 947.9277496337891, -135.0),
+        149: (742.4946746826172, 942.2708892822266, -90.0),
+        153: (748.1515350341797, 936.6140289306641, -45.0),
+        157: (753.8083953857422, 930.9571685791016, -45.0),
+        176: (776.4358367919922, 908.3297271728516, -45.0),
+    }
+    for episode_time, reference in expected.items():
+        assert samples[episode_time] == pytest.approx(reference, abs=5e-5)
+
+
+@pytest.mark.skipif(not SCENARIO.is_file() or not DOOM2.is_file(), reason="operator WADs absent")
+def test_ground_monster_refuses_center_pit_dropoff(pinned_deathmatch_scenario) -> None:
+    scenario = pinned_deathmatch_scenario
+    engine = TorchDeathmatchEngine(scenario, 1, device=torch.device("cpu"))
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([123]))
+    engine.x.fill_(1000)
+    engine.y.fill_(1000)
+    engine.enemy_alive.zero_()
+    engine.enemy_x[0, 0] = 617
+    engine.enemy_y[0, 0] = 512
+    engine.enemy_z[0, 0] = 0
+    engine._enemy_x_fixed[0, 0] = 617 * 65536
+    engine._enemy_y_fixed[0, 0] = 512 * 65536
+    engine.enemy_type[0, 0] = 0
+    engine.enemy_health[0, 0] = 20
+    engine.enemy_alive[0, 0] = True
+    requested = torch.zeros_like(engine.enemy_alive)
+    requested[0, 0] = True
+    west = torch.full_like(engine.enemy_type, 4)
+
+    moved = engine._try_enemy_chase_step(
+        requested,
+        west,
+        engine.enemy_type.clamp_min(0),
+    )
+
+    assert not moved[0, 0]
+    assert engine.enemy_x[0, 0].item() == 617
+
+
+@pytest.mark.skipif(not SCENARIO.is_file() or not DOOM2.is_file(), reason="operator WADs absent")
+def test_native_renderer_preserves_rgb_hud_and_enemy_animation(
+    pinned_deathmatch_scenario,
+) -> None:
+    scenario = pinned_deathmatch_scenario
     engine = TorchDeathmatchEngine(scenario, 1, device=torch.device("cpu"))
     engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([123]))
 
@@ -242,6 +393,12 @@ def test_native_renderer_preserves_rgb_hud_and_enemy_animation() -> None:
     first_walk_frame = engine._native_enemy_sprite_ids()[:, 0].clone()
     engine.enemy_animation_tics[:, 0] = 8
     second_walk_frame = engine._native_enemy_sprite_ids()[:, 0].clone()
+    engine.enemy_target_slot[:, 0] = -2
+    engine.enemy_animation_tics[:, 0] = 0
+    first_idle_frame = engine._native_enemy_sprite_ids()[:, 0].clone()
+    engine.enemy_animation_tics[:, 0] = 10
+    second_idle_frame = engine._native_enemy_sprite_ids()[:, 0].clone()
+    engine.enemy_target_slot[:, 0] = -1
     engine.enemy_attack_phase[:, 0] = 1
     engine.enemy_cooldown[:, 0] = 10
     attack_frame = engine._native_enemy_sprite_ids()[:, 0].clone()
@@ -253,6 +410,7 @@ def test_native_renderer_preserves_rgb_hud_and_enemy_animation() -> None:
     recovery_frame = engine._native_enemy_sprite_ids()[:, 0].clone()
 
     assert not torch.equal(first_walk_frame, second_walk_frame)
+    assert not torch.equal(first_idle_frame, second_idle_frame)
     assert not torch.equal(second_walk_frame, attack_frame)
     assert not torch.equal(muzzle_frame, recovery_frame)
 
@@ -275,8 +433,8 @@ def test_native_renderer_preserves_rgb_hud_and_enemy_animation() -> None:
 
 
 @pytest.mark.skipif(not SCENARIO.is_file() or not DOOM2.is_file(), reason="operator WADs absent")
-def test_native_pit_depth_occludes_map_items() -> None:
-    scenario = compile_deathmatch_scenario(SCENARIO, DOOM2)
+def test_native_pit_depth_occludes_map_items(pinned_deathmatch_scenario) -> None:
+    scenario = pinned_deathmatch_scenario
     engine = TorchDeathmatchEngine(scenario, 1, device=torch.device("cpu"))
     engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([2024]))
     engine.x.fill_(471.74908447265625)
@@ -317,8 +475,8 @@ def test_native_pit_depth_occludes_map_items() -> None:
 
 
 @pytest.mark.skipif(not SCENARIO.is_file() or not DOOM2.is_file(), reason="operator WADs absent")
-def test_native_renderer_includes_voodoo_dolls() -> None:
-    scenario = compile_deathmatch_scenario(SCENARIO, DOOM2)
+def test_native_renderer_includes_voodoo_dolls(pinned_deathmatch_scenario) -> None:
+    scenario = pinned_deathmatch_scenario
     engine = TorchDeathmatchEngine(scenario, 1, device=torch.device("cpu"))
     engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([123]))
     engine.x.fill_(835.9440307617188)

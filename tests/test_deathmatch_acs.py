@@ -29,6 +29,12 @@ def _finish_pending_attack(engine: TorchDeathmatchEngine) -> torch.Tensor:
     return reward
 
 
+def test_certified_enemy_actor_radii_match_reference(square_scenario) -> None:
+    engine = _engine(square_scenario)
+
+    assert engine._enemy_radius.tolist() == [20.0, 20.0, 16.0, 20.0, 30.0, 24.0]
+
+
 def test_reset_uses_acs_teleport_and_delayed_spawn(square_scenario) -> None:
     engine = _engine(square_scenario)
     assert not torch.any(engine.enemy_alive)
@@ -82,6 +88,92 @@ def test_spawn_check_attempts_each_acs_actor_class(square_scenario) -> None:
         torch.sort(engine.enemy_type[0, engine.enemy_alive[0]]).values,
         torch.arange(6),
     )
+    assert torch.all(engine.enemy_target_slot[engine.enemy_alive] == -2)
+    spawned_type = engine.enemy_type[engine.enemy_alive]
+    assert torch.equal(
+        engine.enemy_move_cooldown[engine.enemy_alive],
+        engine._enemy_look_interval[spawned_type] - 2,
+    )
+    fog_alive = engine.teleport_fog_tics > 0
+    assert torch.sum(fog_alive, dim=1).tolist() == [6, 6]
+    assert torch.all(engine.teleport_fog_tics[fog_alive] == 71)
+    assert torch.equal(engine.teleport_fog_x[:, :6], engine.enemy_x[:, :6])
+    assert torch.equal(engine.teleport_fog_y[:, :6], engine.enemy_y[:, :6])
+    assert torch.equal(engine.teleport_fog_z[:, :6], engine.enemy_z[:, :6])
+
+    for _ in range(70):
+        engine._collect_drops()
+    assert torch.all(engine.teleport_fog_tics[fog_alive] == 1)
+    engine._collect_drops()
+    assert not torch.any(engine.teleport_fog_tics)
+
+
+def test_unaware_monster_waits_for_front_facing_sight_check(
+    square_scenario,
+) -> None:
+    engine = _engine(square_scenario)
+    engine.x.fill_(-100)
+    engine.y.zero_()
+    engine.enemy_alive.zero_()
+    engine.enemy_x[:, 0] = 0
+    engine.enemy_y[:, 0] = 0
+    engine.enemy_z[:, 0] = 0
+    engine.enemy_angle[:, 0] = 0
+    engine.enemy_type[:, 0] = 0
+    engine.enemy_health[:, 0] = 20
+    engine.enemy_alive[:, 0] = True
+    engine.enemy_target_slot[:, 0] = -2
+    engine.enemy_move_cooldown[:, 0] = 0
+    engine.enemy_cooldown[:, 0] = 999
+
+    engine._enemy_tick()
+
+    assert engine.enemy_target_slot[:, 0].tolist() == [-2, -2]
+    assert engine.enemy_x[:, 0].tolist() == [0.0, 0.0]
+    assert engine.enemy_move_cooldown[:, 0].tolist() == [9, 9]
+
+    engine.enemy_angle[:, 0] = math.pi
+    for _ in range(9):
+        engine._enemy_tick()
+    assert engine.enemy_target_slot[:, 0].tolist() == [-2, -2]
+    engine._enemy_tick()
+
+    assert engine.enemy_target_slot[:, 0].tolist() == [-1, -1]
+    # Fresh actors begin with DI_EAST. Doom avoids immediately reversing
+    # direction, so a player directly behind them causes one eastward step.
+    assert torch.all(engine.enemy_x[:, 0] > 0)
+
+
+def test_player_weapon_noise_wakes_monster_outside_field_of_view(
+    square_scenario,
+) -> None:
+    engine = _engine(square_scenario)
+    engine.x.fill_(-100)
+    engine.y.zero_()
+    engine.enemy_alive.zero_()
+    engine.enemy_x[:, 0] = 0
+    engine.enemy_y[:, 0] = 0
+    engine.enemy_z[:, 0] = 0
+    engine.enemy_angle[:, 0] = 0
+    engine.enemy_type[:, 0] = 0
+    engine.enemy_health[:, 0] = 20
+    engine.enemy_alive[:, 0] = True
+    engine.enemy_target_slot[:, 0] = -2
+    engine.enemy_move_cooldown[:, 0] = 0
+    engine.enemy_cooldown[:, 0] = 999
+
+    engine._execute_player_attack(
+        torch.zeros(2, dtype=torch.int64),
+        torch.ones(2, dtype=torch.bool),
+        torch.ones(2, dtype=torch.bool),
+    )
+    assert engine.enemy_heard_player[:, 0].tolist() == [True, True]
+
+    engine._enemy_tick()
+
+    assert engine.enemy_target_slot[:, 0].tolist() == [-1, -1]
+    assert engine.enemy_heard_player[:, 0].tolist() == [False, False]
+    assert torch.all(engine.enemy_x[:, 0] > 0)
 
 
 def test_kill_reward_comes_from_spawned_actor_class(square_scenario) -> None:
@@ -291,6 +383,270 @@ def test_enemy_projectile_hits_monsters_without_player_kill_credit(
     # an infighting kill never belongs to the controlled player's counters.
     assert engine.enemy_health[:, 0].tolist() == [500.0, 500.0]
     assert engine.killcount.tolist() == [0, 0]
+
+
+def test_monster_damage_switches_targets_until_retaliation_threshold_expires(
+    square_scenario,
+) -> None:
+    engine = _engine(square_scenario)
+    engine.enemy_alive.zero_()
+    engine.enemy_type[:, :3] = torch.tensor([0, 1, 4])
+    engine.enemy_health[:, :3] = 150
+    engine.enemy_alive[:, :3] = True
+    engine._enemy_pain_chance.zero_()
+
+    first_hit = torch.zeros(
+        (engine.num_envs, engine.enemy_slots, engine.enemy_slots)
+    )
+    first_hit[:, 0, 2] = 1
+    engine._apply_enemy_damage(
+        torch.sum(first_hit, dim=1),
+        pain_override=torch.zeros_like(engine.enemy_alive),
+        credit_player=False,
+        attacker_is_player=False,
+        monster_damage_by_source=first_hit,
+    )
+
+    assert engine.enemy_target_slot[:, 2].tolist() == [0, 0]
+    assert engine.enemy_target_threshold[:, 2].tolist() == [100, 100]
+
+    competing_hit = torch.zeros_like(first_hit)
+    competing_hit[:, 1, 2] = 1
+    engine._apply_enemy_damage(
+        torch.sum(competing_hit, dim=1),
+        pain_override=torch.zeros_like(engine.enemy_alive),
+        credit_player=False,
+        attacker_is_player=False,
+        monster_damage_by_source=competing_hit,
+    )
+    assert engine.enemy_target_slot[:, 2].tolist() == [0, 0]
+    assert engine.enemy_target_threshold[:, 2].tolist() == [100, 100]
+
+    engine.enemy_target_threshold[:, 2].zero_()
+    engine._apply_enemy_damage(
+        torch.sum(competing_hit, dim=1),
+        pain_override=torch.zeros_like(engine.enemy_alive),
+        credit_player=False,
+        attacker_is_player=False,
+        monster_damage_by_source=competing_hit,
+    )
+    assert engine.enemy_target_slot[:, 2].tolist() == [1, 1]
+    assert engine.enemy_target_threshold[:, 2].tolist() == [100, 100]
+
+    player_hit = torch.zeros_like(engine.enemy_health)
+    player_hit[:, 2] = 1
+    engine._apply_enemy_damage(
+        player_hit,
+        pain_override=torch.zeros_like(engine.enemy_alive),
+    )
+    assert engine.enemy_target_slot[:, 2].tolist() == [1, 1]
+    engine.enemy_target_threshold[:, 2].zero_()
+    engine._apply_enemy_damage(
+        player_hit,
+        pain_override=torch.zeros_like(engine.enemy_alive),
+    )
+    assert engine.enemy_target_slot[:, 2].tolist() == [-1, -1]
+    assert engine.enemy_target_threshold[:, 2].tolist() == [100, 100]
+
+
+def test_retaliating_monster_pursues_its_attacker_instead_of_player(
+    square_scenario,
+) -> None:
+    engine = _engine(square_scenario)
+    engine.x.fill_(-200)
+    engine.y.zero_()
+    engine.enemy_alive.zero_()
+    engine.enemy_x[:, 0] = 100
+    engine.enemy_y[:, 0] = 0
+    engine.enemy_z[:, 0] = 0
+    engine.enemy_type[:, 0] = 4
+    engine.enemy_health[:, 0] = 150
+    engine.enemy_alive[:, 0] = True
+    engine.enemy_pain_tics[:, 0] = 10
+    engine.enemy_x[:, 1] = 0
+    engine.enemy_y[:, 1] = 0
+    engine.enemy_z[:, 1] = 0
+    engine.enemy_type[:, 1] = 0
+    engine.enemy_health[:, 1] = 20
+    engine.enemy_alive[:, 1] = True
+    engine.enemy_target_slot[:, 1] = 0
+    engine.enemy_target_threshold[:, 1] = 100
+    engine.enemy_cooldown[:, 1] = 999
+    engine.enemy_move_cooldown[:, 1] = 0
+
+    engine._enemy_tick()
+
+    assert torch.all(engine.enemy_x[:, 1] > 0)
+    assert engine.enemy_target_slot[:, 1].tolist() == [0, 0]
+    assert engine.enemy_target_threshold[:, 1].tolist() == [99, 99]
+
+
+def test_monster_chase_uses_doom_discrete_direction_and_gradual_turn(
+    square_scenario,
+) -> None:
+    engine = _engine(square_scenario)
+    engine.x.fill_(100)
+    engine.y.fill_(-100)
+    engine.enemy_alive.zero_()
+    engine.enemy_x[:, 0] = 0
+    engine.enemy_y[:, 0] = 0
+    engine.enemy_z[:, 0] = 0
+    engine.enemy_angle[:, 0] = math.radians(181.40625)
+    engine.enemy_type[:, 0] = 0
+    engine.enemy_health[:, 0] = 20
+    engine.enemy_alive[:, 0] = True
+    engine.enemy_target_slot[:, 0] = -1
+    engine.enemy_move_direction[:, 0] = 0
+    engine.enemy_move_count[:, 0] = 0
+    engine.enemy_move_cooldown[:, 0] = 0
+    engine.enemy_cooldown[:, 0] = 999
+
+    engine._enemy_tick()
+
+    expected_step = 8 * 46341 / 65536
+    assert torch.allclose(
+        engine.enemy_x[:, 0],
+        torch.full((2,), expected_step),
+    )
+    assert torch.allclose(
+        engine.enemy_y[:, 0],
+        torch.full((2,), -expected_step),
+    )
+    assert engine.enemy_move_direction[:, 0].tolist() == [7, 7]
+    assert torch.allclose(
+        torch.rad2deg(engine.enemy_angle[:, 0]),
+        torch.full((2,), -135.0),
+        atol=1e-4,
+    )
+
+
+def test_monster_hitscan_damages_and_angers_intervening_monster(
+    square_scenario,
+) -> None:
+    engine = _engine(square_scenario)
+    engine.x.fill_(200)
+    engine.y.fill_(100)
+    engine.enemy_alive.zero_()
+    engine.enemy_x[:, 0] = 0
+    engine.enemy_y[:, 0] = 0
+    engine.enemy_z[:, 0] = 0
+    engine.enemy_type[:, 0] = 4
+    engine.enemy_health[:, 0] = 150
+    engine.enemy_alive[:, 0] = True
+    engine.enemy_pain_tics[:, 0] = 10
+    engine.enemy_x[:, 1] = 100
+    engine.enemy_y[:, 1] = 0
+    engine.enemy_z[:, 1] = 0
+    engine.enemy_type[:, 1] = 0
+    engine.enemy_health[:, 1] = 20
+    engine.enemy_alive[:, 1] = True
+    engine.enemy_target_slot[:, 1] = 0
+    engine.enemy_target_threshold[:, 1] = 100
+    engine.enemy_attack_phase[:, 1] = 1
+    engine.enemy_cooldown[:, 1] = 1
+    engine._enemy_pain_chance.zero_()
+
+    engine._enemy_tick()
+
+    assert torch.all(engine.enemy_health[:, 0] < 150)
+    assert engine.health.tolist() == [100.0, 100.0]
+    assert engine.enemy_target_slot[:, 0].tolist() == [1, 1]
+    assert engine.enemy_target_threshold[:, 0].tolist() == [100, 100]
+
+
+def test_monster_melee_damages_target_monster_instead_of_player(
+    square_scenario,
+) -> None:
+    engine = _engine(square_scenario)
+    engine.x.fill_(200)
+    engine.y.fill_(100)
+    engine.enemy_alive.zero_()
+    engine.enemy_x[:, 0] = 0
+    engine.enemy_y[:, 0] = 0
+    engine.enemy_z[:, 0] = 0
+    engine.enemy_type[:, 0] = 0
+    engine.enemy_health[:, 0] = 100
+    engine.enemy_alive[:, 0] = True
+    engine.enemy_pain_tics[:, 0] = 10
+    engine.enemy_x[:, 1] = 32
+    engine.enemy_y[:, 1] = 0
+    engine.enemy_z[:, 1] = 0
+    engine.enemy_type[:, 1] = 4
+    engine.enemy_health[:, 1] = 150
+    engine.enemy_alive[:, 1] = True
+    engine.enemy_target_slot[:, 1] = 0
+    engine.enemy_target_threshold[:, 1] = 100
+    engine.enemy_attack_phase[:, 1] = 1
+    engine.enemy_cooldown[:, 1] = 1
+    engine._enemy_pain_chance.zero_()
+
+    engine._enemy_tick()
+
+    assert torch.all(engine.enemy_health[:, 0] < 100)
+    assert engine.health.tolist() == [100.0, 100.0]
+    assert engine.enemy_target_slot[:, 0].tolist() == [1, 1]
+
+
+def test_hell_knight_aims_baron_ball_at_monster_target(square_scenario) -> None:
+    engine = _engine(square_scenario)
+    engine.x.fill_(200)
+    engine.y.fill_(100)
+    engine.enemy_alive.zero_()
+    engine.enemy_x[:, 0] = 0
+    engine.enemy_y[:, 0] = 0
+    engine.enemy_z[:, 0] = 0
+    engine.enemy_type[:, 0] = 4
+    engine.enemy_health[:, 0] = 150
+    engine.enemy_alive[:, 0] = True
+    engine.enemy_pain_tics[:, 0] = 100
+    engine.enemy_x[:, 1] = 100
+    engine.enemy_y[:, 1] = 0
+    engine.enemy_z[:, 1] = 0
+    engine.enemy_type[:, 1] = 5
+    engine.enemy_health[:, 1] = 500
+    engine.enemy_alive[:, 1] = True
+    engine.enemy_target_slot[:, 1] = 0
+    engine.enemy_target_threshold[:, 1] = 100
+    engine.enemy_attack_phase[:, 1] = 1
+    engine.enemy_cooldown[:, 1] = 1
+    engine._enemy_pain_chance.zero_()
+
+    engine._enemy_tick()
+
+    assert torch.all(engine.enemy_projectile_velocity_x[:, 1] < 0)
+    assert torch.all(engine.enemy_projectile_velocity_y[:, 1] == 0)
+    assert engine.health.tolist() == [100.0, 100.0]
+    for _ in range(8):
+        engine._enemy_projectile_tick(torch.ones(2, dtype=torch.bool))
+
+    assert torch.all(engine.enemy_health[:, 0] < 150)
+    assert engine.enemy_target_slot[:, 0].tolist() == [1, 1]
+    assert engine.enemy_target_threshold[:, 0].tolist() == [100, 100]
+
+
+def test_monster_reacquires_player_after_infighting_target_dies(
+    square_scenario,
+) -> None:
+    engine = _engine(square_scenario)
+    engine.x.fill_(200)
+    engine.y.zero_()
+    engine.enemy_alive.zero_()
+    engine.enemy_x[:, 1] = 100
+    engine.enemy_y[:, 1] = 0
+    engine.enemy_z[:, 1] = 0
+    engine.enemy_type[:, 1] = 0
+    engine.enemy_health[:, 1] = 20
+    engine.enemy_alive[:, 1] = True
+    engine.enemy_target_slot[:, 1] = 0
+    engine.enemy_target_threshold[:, 1] = 50
+    engine.enemy_cooldown[:, 1] = 999
+    engine.enemy_move_cooldown[:, 1] = 0
+
+    engine._enemy_tick()
+
+    assert engine.enemy_target_slot[:, 1].tolist() == [-1, -1]
+    assert engine.enemy_target_threshold[:, 1].tolist() == [0, 0]
+    assert torch.all(engine.enemy_x[:, 1] > 100)
 
 
 def test_enemy_projectile_only_passes_corpse_after_no_block_frame(
@@ -853,21 +1209,28 @@ def test_player_cannot_move_through_solid_monster(square_scenario) -> None:
     assert engine.momentum_x.tolist() == [0.0, 0.0]
 
 
-def test_monster_chase_stops_at_combined_actor_radii(square_scenario) -> None:
+def test_monster_chase_step_does_not_penetrate_player_radius(square_scenario) -> None:
     engine = _engine(square_scenario)
     engine.x.zero_()
     engine.y.zero_()
-    engine.enemy_x[:, 0] = 50
+    engine.enemy_x[:, 0] = 42
     engine.enemy_y[:, 0] = 0
     engine.enemy_type[:, 0] = 0
     engine.enemy_health[:, 0] = 20
     engine.enemy_alive[:, 0] = True
-    engine.enemy_cooldown[:, 0] = 999
+    engine._enemy_x_fixed[:, 0] = 42 * 65536
+    requested = torch.zeros_like(engine.enemy_alive)
+    requested[:, 0] = True
+    direction = torch.full_like(engine.enemy_type, 4)
 
-    for _ in range(10):
-        engine._enemy_tick()
+    moved = engine._try_enemy_chase_step(
+        requested,
+        direction,
+        engine.enemy_type.clamp_min(0),
+    )
 
-    assert torch.allclose(engine.enemy_x[:, 0], torch.full((2,), 36.0))
+    assert not torch.any(moved[:, 0])
+    assert engine.enemy_x[:, 0].tolist() == [42.0, 42.0]
 
 
 def test_monster_wall_collision_uses_actor_specific_radius(square_scenario) -> None:
@@ -899,13 +1262,21 @@ def test_moving_monsters_treat_other_monsters_as_solid(square_scenario) -> None:
     engine.enemy_type[:, :2] = 0
     engine.enemy_health[:, :2] = 20
     engine.enemy_alive[:, :2] = True
-    engine.enemy_cooldown[:, :2] = 999
-    engine.enemy_move_cooldown[:, :2] = 0
+    engine._enemy_x_fixed[:, 0] = 100 * 65536
+    engine._enemy_x_fixed[:, 1] = 60 * 65536
+    requested = torch.zeros_like(engine.enemy_alive)
+    requested[:, 0] = True
+    direction = torch.full_like(engine.enemy_type, 4)
 
-    engine._enemy_tick()
+    moved = engine._try_enemy_chase_step(
+        requested,
+        direction,
+        engine.enemy_type.clamp_min(0),
+    )
 
+    assert not torch.any(moved[:, 0])
     assert engine.enemy_x[:, 0].tolist() == [100.0, 100.0]
-    assert engine.enemy_x[:, 1].tolist() == [52.0, 52.0]
+    assert engine.enemy_x[:, 1].tolist() == [60.0, 60.0]
 
 
 def test_solid_corpses_retain_actor_specific_collision_radius(square_scenario) -> None:
@@ -1034,6 +1405,7 @@ def test_monster_attacks_instead_of_moving_on_chase_tic(square_scenario) -> None
     assert engine.enemy_x[:, 0].tolist() == [100.0, 100.0]
     assert engine.health.tolist() == [100.0, 100.0]
     assert engine.enemy_attack_phase[:, 0].tolist() == [1, 1]
+    assert engine.enemy_just_attacked[:, 0].tolist() == [True, True]
     assert engine.enemy_cooldown[:, 0].tolist() == [10, 10]
     for _ in range(9):
         engine._enemy_tick()
@@ -1045,6 +1417,36 @@ def test_monster_attacks_instead_of_moving_on_chase_tic(square_scenario) -> None
     assert torch.all(engine.health < 100)
     assert engine.enemy_attack_phase[:, 0].tolist() == [2, 2]
     assert engine.enemy_cooldown[:, 0].tolist() == [16, 16]
+
+
+def test_monster_forces_new_chase_direction_after_ranged_attack(
+    square_scenario,
+) -> None:
+    engine = _engine(square_scenario)
+    engine.x.zero_()
+    engine.y.zero_()
+    engine.enemy_x[:, 0] = 100
+    engine.enemy_y[:, 0] = 0
+    engine._enemy_x_fixed[:, 0] = 100 * 65536
+    engine._enemy_y_fixed[:, 0] = 0
+    engine.enemy_type[:, 0] = 0
+    engine.enemy_health[:, 0] = 20
+    engine.enemy_alive[:, 0] = True
+    engine.enemy_attack_phase[:, 0] = 0
+    engine.enemy_just_attacked[:, 0] = True
+    engine.enemy_cooldown[:, 0] = 0
+    engine.enemy_move_cooldown[:, 0] = 0
+    engine.enemy_move_direction[:, 0] = 8
+    engine.enemy_move_count[:, 0] = 15
+
+    engine._enemy_tick()
+
+    assert engine.enemy_x[:, 0].tolist() == [92.0, 92.0]
+    assert engine.enemy_y[:, 0].tolist() == [0.0, 0.0]
+    assert engine.enemy_move_direction[:, 0].tolist() == [4, 4]
+    assert torch.all(engine.enemy_move_count[:, 0] <= 15)
+    assert engine.enemy_attack_phase[:, 0].tolist() == [0, 0]
+    assert engine.enemy_just_attacked[:, 0].tolist() == [False, False]
 
 
 def test_monster_faces_target_at_prefire_and_hitscan_action(square_scenario) -> None:
@@ -1152,7 +1554,7 @@ def test_monster_hitscan_uses_independent_reference_pellets(square_scenario) -> 
         + (engine.y[:, None] - engine.enemy_y) ** 2
     ).clamp_min(1e-4)
 
-    damage, _actual_player_damage = engine._enemy_hitscan_damage(
+    damage, _actual_player_damage, _enemy_damage = engine._enemy_hitscan_damage(
         engine.enemy_type.clamp_min(0),
         fires,
         distance,
@@ -1216,7 +1618,7 @@ def test_monster_spread_pellet_traces_its_own_blocking_linedef(
             torch.full_like(engine.z[:, None], 56.0),
         )
         assert torch.all(visible[:, 0])
-        damage, _actual_player_damage = engine._enemy_hitscan_damage(
+        damage, _actual_player_damage, _enemy_damage = engine._enemy_hitscan_damage(
             engine.enemy_type.clamp_min(0),
             fires,
             distance,

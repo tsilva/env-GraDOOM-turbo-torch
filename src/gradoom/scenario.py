@@ -126,6 +126,7 @@ DEATHMATCH_PROJECTILE_EXPLOSION_DURATIONS = (
     (4, 4, 4, 4, 4),
     (6, 6, 6),
 )
+DEATHMATCH_TELEPORT_FOG_FRAMES = tuple(f"TFOG{frame}0" for frame in "ABABCDEFGHIJ")
 DEATHMATCH_HUD_PATCHES = (
     "STBAR",
     "STARMS",
@@ -259,6 +260,7 @@ class CompiledScenario:
     enemy_pain_sprite_ids: np.ndarray | None = None
     raw_projectile_flight_sprite_ids: np.ndarray | None = None
     raw_projectile_explosion_sprite_ids: np.ndarray | None = None
+    raw_teleport_fog_sprite_ids: np.ndarray | None = None
     projectile_explosion_frame_counts: np.ndarray | None = None
     projectile_explosion_frame_durations: np.ndarray | None = None
     projectile_explosion_total_tics: np.ndarray | None = None
@@ -515,6 +517,10 @@ def compile_deathmatch_scenario(
             )
     projectile_explosion_total_tics = projectile_explosion_frame_durations.sum(
         axis=1, dtype=np.int32
+    )
+    raw_teleport_fog_sprite_ids = np.asarray(
+        [request_raw_sprite(name) for name in DEATHMATCH_TELEPORT_FOG_FRAMES],
+        dtype=np.int32,
     )
     raw_static_sprite_ids = np.asarray(
         [request_raw_sprite(name) for name in DEATHMATCH_SPRITE_FRAMES[6:]],
@@ -814,6 +820,7 @@ def compile_deathmatch_scenario(
         enemy_pain_sprite_ids=enemy_pain_sprite_ids,
         raw_projectile_flight_sprite_ids=raw_projectile_flight_sprite_ids,
         raw_projectile_explosion_sprite_ids=raw_projectile_explosion_sprite_ids,
+        raw_teleport_fog_sprite_ids=raw_teleport_fog_sprite_ids,
         projectile_explosion_frame_counts=projectile_explosion_frame_counts,
         projectile_explosion_frame_durations=projectile_explosion_frame_durations,
         projectile_explosion_total_tics=projectile_explosion_total_tics,

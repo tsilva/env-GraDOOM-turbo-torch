@@ -130,6 +130,8 @@ def test_pinned_deathmatch_compiles_external_doom2_data() -> None:
     assert scenario.raw_projectile_flight_sprite_ids.shape == (3, 2, 8)
     assert scenario.raw_projectile_explosion_sprite_ids is not None
     assert scenario.raw_projectile_explosion_sprite_ids.shape == (3, 5)
+    assert scenario.raw_teleport_fog_sprite_ids is not None
+    assert scenario.raw_teleport_fog_sprite_ids.shape == (12,)
     assert scenario.projectile_explosion_frame_counts is not None
     assert scenario.projectile_explosion_frame_counts.tolist() == [3, 5, 3]
     assert scenario.projectile_explosion_frame_durations is not None
