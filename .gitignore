@@ -1,0 +1,15 @@
+__pycache__/
+*.egg-info/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+build/
+dist/
+*.wad
+*.pk3
+*.lmp
+*.grd
+_vizdoom.ini
+.dstack.cuda-correctness.yml
+benchmark-results/
