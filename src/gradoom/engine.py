@@ -44,6 +44,9 @@ _PLAYER_FRICTION_FIXED = 0xE800
 _PLAYER_AIR_CONTROL_FIXED = 0x0100
 _PLAYER_AIR_FRICTION_FIXED = _FIXED_UNIT
 _PLAYER_TURN_DEGREES = 3.515625
+_PLAYER_MOVE_BOB_FIXED = _FIXED_UNIT // 4
+_PLAYER_MAX_BOB_FIXED = 16 * _FIXED_UNIT
+_PLAYER_VIEW_BOB_PERIOD_TICS = 20
 _WEAPON_LOWER_TICS = 16
 _WEAPON_RAISE_TICS = 16
 _WEAPON_SPAWN_RAISE_TICS = 14
@@ -805,6 +808,7 @@ class TorchDeathmatchEngine:
         self._y_fixed = torch.zeros(n, device=device, dtype=torch.int64)
         self._momentum_x_fixed = torch.zeros(n, device=device, dtype=torch.int64)
         self._momentum_y_fixed = torch.zeros(n, device=device, dtype=torch.int64)
+        self._player_bob_fixed = torch.zeros(n, device=device, dtype=torch.int64)
         self.velocity_z = torch.zeros(n, device=device)
         self.health = torch.full((n,), 100.0, device=device)
         self.armor = torch.zeros(n, device=device)
@@ -1083,6 +1087,7 @@ class TorchDeathmatchEngine:
             tensor.masked_fill_(mask, 0)
         self._momentum_x_fixed.masked_fill_(mask, 0)
         self._momentum_y_fixed.masked_fill_(mask, 0)
+        self._player_bob_fixed.masked_fill_(mask, 0)
         self.health.masked_fill_(mask, 100)
         self.killcount.masked_fill_(mask, 0)
         self.episode_time.masked_fill_(mask, 1)
@@ -1729,10 +1734,13 @@ class TorchDeathmatchEngine:
     ) -> torch.Tensor:
         direction_x = target_x - origin_x
         direction_y = target_y - origin_y
-        start_x = self.map.walls[:, 0]
-        start_y = self.map.walls[:, 1]
-        segment_x = self.map.walls[:, 2] - start_x
-        segment_y = self.map.walls[:, 3] - start_y
+        # Two-sided linedefs in the certified map are open portals whose
+        # vertical openings contain all supported attack origins and targets.
+        # Only one-sided blocking lines stop sight and hitscan traversal.
+        start_x = self.map.blocking_walls[:, 0]
+        start_y = self.map.blocking_walls[:, 1]
+        segment_x = self.map.blocking_walls[:, 2] - start_x
+        segment_y = self.map.blocking_walls[:, 3] - start_y
         offset_x = start_x - origin_x[..., None]
         offset_y = start_y - origin_y[..., None]
         denominator = direction_x[..., None] * segment_y - direction_y[..., None] * segment_x
@@ -1982,6 +1990,19 @@ class TorchDeathmatchEngine:
             (forward_move_fixed * sine_fixed >> 16)
             + (side_move_fixed * -cosine_fixed >> 16)
         )
+        # P_CalcHeight observes the thrust-adjusted actor velocity before the
+        # actor thinker moves and applies friction.  Preserve that fixed-point
+        # magnitude for both camera and psprite bobbing.
+        motion_squared_fixed = (
+            self._momentum_x_fixed * self._momentum_x_fixed
+            + self._momentum_y_fixed * self._momentum_y_fixed
+        ) >> 16
+        self._player_bob_fixed.copy_(
+            ((motion_squared_fixed * _PLAYER_MOVE_BOB_FIXED) >> 16).clamp(
+                0,
+                _PLAYER_MAX_BOB_FIXED,
+            )
+        )
         (
             doom_position_x_fixed,
             doom_position_y_fixed,
@@ -2058,8 +2079,23 @@ class TorchDeathmatchEngine:
             next_delta_view_height + 0.25,
             next_delta_view_height,
         )
+        bob_angle = torch.div(
+            self.episode_time.to(torch.int64) * _FINE_ANGLES,
+            _PLAYER_VIEW_BOB_PERIOD_TICS,
+            rounding_mode="trunc",
+        ) & (_FINE_ANGLES - 1)
+        view_bob_fixed = (
+            (self._player_bob_fixed >> 1) * self._fine_sine_fixed[bob_angle]
+        ) >> 16
+        next_view_z = (
+            self.z
+            + next_view_height
+            + view_bob_fixed.to(torch.float32) / _FIXED_UNIT
+        )
+        next_view_z = torch.minimum(next_view_z, self.player_ceiling_z - 4.0)
+        next_view_z = torch.maximum(next_view_z, self.player_floor_z + 4.0)
         self.view_height.copy_(torch.where(active, next_view_height, self.view_height))
-        self.view_z.copy_(torch.where(active, self.z + next_view_height, self.view_z))
+        self.view_z.copy_(torch.where(active, next_view_z, self.view_z))
 
         floor = self.player_floor_z
         proposed_z = self.z + self.velocity_z
@@ -4943,17 +4979,21 @@ class TorchDeathmatchEngine:
             & (self.weapon_raise_cooldown <= 0)
             & (self.pending_weapon < 0)
         )
-        motion_bob = torch.clamp(
-            (self.momentum_x * self.momentum_x + self.momentum_y * self.momentum_y) * 0.25,
-            0,
-            16,
-        )
-        bob_phase = self.episode_time.to(torch.float32) * (2.0 * math.pi / 64.0)
-        bob_x = torch.round(motion_bob * torch.cos(bob_phase)).to(torch.int64)
-        bob_y = torch.round(
-            motion_bob
-            * torch.sin(torch.remainder(bob_phase, math.pi))
-            * self.native_vertical_aspect
+        bob_angle = (self.episode_time.to(torch.int64) * 128) & (_FINE_ANGLES - 1)
+        bob_x_fixed = (
+            self._player_bob_fixed
+            * self._fine_sine_fixed[(bob_angle + _FINE_ANGLES // 4) & (_FINE_ANGLES - 1)]
+        ) >> 16
+        bob_y_fixed = (
+            self._player_bob_fixed
+            * self._fine_sine_fixed[bob_angle & (_FINE_ANGLES // 2 - 1)]
+        ) >> 16
+        # The software renderer converts the fixed psprite origin to screen
+        # coordinates by dropping fractional bits.  Flooring matters for both
+        # the negative horizontal swing and the positive vertical swing.
+        bob_x = torch.floor(bob_x_fixed.to(torch.float32) / _FIXED_UNIT).to(torch.int64)
+        bob_y = torch.floor(
+            bob_y_fixed.to(torch.float32) / _FIXED_UNIT * self.native_vertical_aspect
         ).to(torch.int64)
         bob_x = torch.where(ready, bob_x, torch.zeros_like(bob_x))
         bob_y = torch.where(ready, bob_y, torch.zeros_like(bob_y))

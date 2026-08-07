@@ -474,6 +474,58 @@ def test_forward_trace_matches_vizdoom_fixed_point_oracle(square_scenario) -> No
     assert torch.equal(engine.momentum_y, torch.full((2,), 1.8876495361328125))
 
 
+def test_movement_camera_bob_matches_vizdoom_fixed_point_oracle(square_scenario) -> None:
+    engine = TorchDeathmatchEngine(
+        square_scenario,
+        1,
+        device=torch.device("cpu"),
+        frame_skip=1,
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([123]))
+    engine.x.fill_(835.9440307617188)
+    engine.y.fill_(391.3482971191406)
+    engine.z.zero_()
+    engine.view_z.fill_(41)
+    engine.angle.fill_(torch.deg2rad(torch.tensor(102.16735842222519)))
+    engine.momentum_x.zero_()
+    engine.momentum_y.zero_()
+    engine.reaction_time.fill_(7)
+    buttons = torch.zeros((1, 20), dtype=torch.bool)
+    buttons[:, 6] = True
+    view_z_trace = []
+
+    for _ in range(24):
+        engine.step(buttons)
+        view_z_trace.append(float(engine.view_z[0]))
+
+    assert view_z_trace == [
+        41.0,
+        41.0,
+        41.0,
+        41.0,
+        41.0,
+        41.0,
+        41.0,
+        41.04481506347656,
+        41.08551025390625,
+        41.0,
+        40.71632385253906,
+        40.22947692871094,
+        39.60401916503906,
+        38.95379638671875,
+        38.42231750488281,
+        38.15003967285156,
+        38.247222900390625,
+        38.76953125,
+        39.713623046875,
+        41.0,
+        42.49800109863281,
+        44.03582763671875,
+        45.41265869140625,
+        46.44627380371094,
+    ]
+
+
 def test_wall_contact_uses_reference_slide_residual(square_scenario) -> None:
     engine = _engine(square_scenario)
     engine.x.zero_()
@@ -755,6 +807,51 @@ def test_blocking_linedef_occludes_hitscan_and_monster_attacks(square_scenario) 
 
     assert engine.enemy_health[:, 0].tolist() == [20.0, 20.0]
     assert engine.health.tolist() == [100.0, 100.0]
+
+
+def test_two_sided_portal_does_not_occlude_hitscan_or_monster_sight(square_scenario) -> None:
+    portal = np.asarray([(0, -256, 0, 256)], dtype=np.float32)
+    walls = np.concatenate((square_scenario.wall_segments, portal), axis=0)
+    scenario = replace(
+        square_scenario,
+        wall_segments=walls,
+        wall_texture_ids=np.zeros(5, dtype=np.int32),
+        wall_texture_offsets=np.zeros((5, 2), dtype=np.float32),
+        wall_side_texture_ids=np.concatenate(
+            (
+                np.zeros((5, 1, 1), dtype=np.int32),
+                np.full((5, 1, 1), -1, dtype=np.int32),
+            ),
+            axis=1,
+        ).repeat(3, axis=2),
+        wall_side_texture_offsets=np.zeros((5, 2, 2), dtype=np.float32),
+        wall_sectors=np.zeros((5, 2), dtype=np.int32),
+        sector_edge_mask=np.ones((1, 5), dtype=np.bool_),
+    )
+    engine = _engine(scenario)
+    engine.x.fill_(-64)
+    engine.y.zero_()
+    engine.angle.zero_()
+    engine.enemy_x[:, 0] = 64
+    engine.enemy_y[:, 0] = 0
+    engine.enemy_type[:, 0] = 0
+    engine.enemy_health[:, 0] = 20
+    engine.enemy_alive[:, 0] = True
+    engine.enemy_cooldown[:, 0] = 0
+    buttons = torch.zeros((2, 20), dtype=torch.bool)
+    buttons[:, 0] = True
+
+    engine._player_attack(buttons)
+    _finish_pending_attack(engine)
+
+    assert torch.all(engine.enemy_health[:, 0] < 20)
+    engine.enemy_health[:, 0] = 20
+    engine.enemy_alive[:, 0] = True
+    engine.enemy_pain_tics[:, 0] = 0
+    engine.enemy_attack_phase[:, 0] = 1
+    engine.enemy_cooldown[:, 0] = 1
+    engine._enemy_tick()
+    assert torch.all(engine.health < 100)
 
 
 def test_reference_monster_damage_distributions(square_scenario) -> None:
