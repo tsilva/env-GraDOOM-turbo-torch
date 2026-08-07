@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import pytest
@@ -22,10 +23,33 @@ def test_native_renderer_preserves_rgb_hud_and_enemy_animation() -> None:
 
     assert initial.shape == (1, 240, 320, 3)
     assert initial.dtype == torch.uint8
-    assert torch.any(initial[:, 200:232] != 0)
-    assert torch.all(initial[:, 232:] == 0)
+    assert torch.any(initial[:, 208:] != 0)
     assert not torch.equal(initial[..., 0], initial[..., 1])
 
+    engine.episode_time.fill_(21)
+    hud = engine._native_render_hud()[0]
+    face_index = 14
+    face_width = int(engine.map.hud_patch_widths[face_index].item())
+    face_height = int(engine.map.hud_patch_heights[face_index].item())
+    face = engine.map.hud_patch_atlas[face_index, :face_height, :face_width]
+    opaque = engine.map.hud_patch_opaque[face_index, :face_height, :face_width]
+    assert torch.equal(hud[2 : 2 + face_height, 148 : 148 + face_width][opaque], face[opaque])
+
+    engine.x.fill_(668.9710083007812)
+    engine.y.fill_(393.1371307373047)
+    engine.z.zero_()
+    engine.angle.fill_(math.radians(145.95336917460742))
+    engine.episode_time.fill_(56)
+    flat_frame, surface_depth = engine._native_render_flats(
+        engine._current_sector(), engine.z + 41.0
+    )
+    pit_frame = engine._native_render_portal_walls(
+        flat_frame.clone(), engine.z + 41.0, surface_depth
+    )
+    assert torch.isinf(surface_depth[0, 131, 160])
+    assert pit_frame[0, 131, 160] != flat_frame[0, 131, 160]
+
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([123]))
     engine.enemy_type[:, 0] = 0
     engine.enemy_alive[:, 0] = True
     engine.enemy_x[:, 0] = engine.x + 64

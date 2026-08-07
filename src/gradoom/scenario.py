@@ -80,8 +80,12 @@ DEATHMATCH_HUD_PATCHES = (
     "STARMS",
     *(f"STTNUM{digit}" for digit in range(10)),
     "STTPRCNT",
-    *(f"STFST{pain}0" for pain in range(5)),
+    *(f"STFST{pain}{straight}" for pain in range(5) for straight in range(3)),
     *(f"STYSNUM{digit}" for digit in range(10)),
+)
+DEATHMATCH_TEXTURE_ANIMATIONS = (
+    ("BFALL1", "BFALL2", "BFALL3", "BFALL4"),
+    ("BLOOD1", "BLOOD2", "BLOOD3"),
 )
 
 
@@ -145,6 +149,10 @@ class CompiledScenario:
     hud_patch_opaque: np.ndarray | None = None
     hud_patch_widths: np.ndarray | None = None
     hud_patch_heights: np.ndarray | None = None
+    hud_patch_left_offsets: np.ndarray | None = None
+    hud_patch_top_offsets: np.ndarray | None = None
+    texture_animation_ids: np.ndarray | None = None
+    texture_animation_counts: np.ndarray | None = None
 
     @property
     def bounds(self) -> tuple[float, float, float, float]:
@@ -265,20 +273,22 @@ def compile_deathmatch_scenario(
     )
     if any(not name for name in (*sector_floor_texture_names, *sector_ceiling_texture_names)):
         raise ValueError("every deathmatch sector must declare floor and ceiling textures")
-    texture_names = tuple(
-        sorted(
-            {name for name in wall_texture_names if name}
-            | {
-                name
-                for sides_for_line in wall_side_texture_names
-                for textures_for_side in sides_for_line
-                for name in textures_for_side
-                if name
-            }
-            | set(sector_floor_texture_names)
-            | set(sector_ceiling_texture_names)
-        )
+    referenced_texture_names = (
+        {name for name in wall_texture_names if name}
+        | {
+            name
+            for sides_for_line in wall_side_texture_names
+            for textures_for_side in sides_for_line
+            for name in textures_for_side
+            if name
+        }
+        | set(sector_floor_texture_names)
+        | set(sector_ceiling_texture_names)
     )
+    for animation in DEATHMATCH_TEXTURE_ANIMATIONS:
+        if referenced_texture_names.intersection(animation):
+            referenced_texture_names.update(animation)
+    texture_names = tuple(sorted(referenced_texture_names))
     texture_atlas, texture_widths, texture_heights = compile_grayscale_atlas(game, texture_names)
     texture_index_atlas, _, _ = compile_indexed_atlas(game, texture_names)
     (
@@ -305,13 +315,13 @@ def compile_deathmatch_scenario(
     for enemy_type, prefix in enumerate(DEATHMATCH_ENEMY_PREFIXES):
         for frame_index, frame in enumerate(("A", "B", "C", "D")):
             for rotation in range(1, 9):
-                enemy_walk_sprite_ids[enemy_type, frame_index, rotation - 1] = (
-                    request_raw_sprite(f"{prefix}{frame}{rotation}")
+                enemy_walk_sprite_ids[enemy_type, frame_index, rotation - 1] = request_raw_sprite(
+                    f"{prefix}{frame}{rotation}"
                 )
         for frame_index, frame in enumerate(DEATHMATCH_ENEMY_ATTACK_FRAMES[enemy_type]):
             for rotation in range(1, 9):
-                enemy_attack_sprite_ids[enemy_type, frame_index, rotation - 1] = (
-                    request_raw_sprite(f"{prefix}{frame}{rotation}")
+                enemy_attack_sprite_ids[enemy_type, frame_index, rotation - 1] = request_raw_sprite(
+                    f"{prefix}{frame}{rotation}"
                 )
     max_death_frames = max(len(frames) for frames in DEATHMATCH_ENEMY_DEATH_FRAMES)
     enemy_death_sprite_ids = np.empty((6, max_death_frames), dtype=np.int32)
@@ -339,8 +349,8 @@ def compile_deathmatch_scenario(
         raw_sprite_left_offsets,
         raw_sprite_top_offsets,
     ) = compile_indexed_sprite_atlas(game, tuple(raw_sprite_requests))
-    _, native_weapon_screen_values, native_weapon_screen_alpha = (
-        compile_indexed_weapon_overlays(game, DEATHMATCH_WEAPON_FRAMES)
+    _, native_weapon_screen_values, native_weapon_screen_alpha = compile_indexed_weapon_overlays(
+        game, DEATHMATCH_WEAPON_FRAMES
     )
     (
         hud_patch_names,
@@ -348,10 +358,24 @@ def compile_deathmatch_scenario(
         hud_patch_opaque,
         hud_patch_widths,
         hud_patch_heights,
-        _hud_left_offsets,
-        _hud_top_offsets,
+        hud_patch_left_offsets,
+        hud_patch_top_offsets,
     ) = compile_indexed_patch_atlas(game, DEATHMATCH_HUD_PATCHES)
     texture_ids_by_name = {name: index for index, name in enumerate(texture_names)}
+    max_animation_frames = max(len(animation) for animation in DEATHMATCH_TEXTURE_ANIMATIONS)
+    texture_animation_ids = np.repeat(
+        np.arange(len(texture_names), dtype=np.int32)[:, None],
+        max_animation_frames,
+        axis=1,
+    )
+    texture_animation_counts = np.ones(len(texture_names), dtype=np.int32)
+    for animation in DEATHMATCH_TEXTURE_ANIMATIONS:
+        if not set(animation).issubset(texture_ids_by_name):
+            continue
+        frame_ids = [texture_ids_by_name[name] for name in animation]
+        for texture_id in frame_ids:
+            texture_animation_ids[texture_id, : len(frame_ids)] = frame_ids
+            texture_animation_counts[texture_id] = len(frame_ids)
     wall_texture_ids = np.full(len(linedefs), -1, dtype=np.int32)
     for index, name in enumerate(wall_texture_names):
         if name:
@@ -399,10 +423,7 @@ def compile_deathmatch_scenario(
         raise ValueError("deathmatch scenario contains no player starts")
     items = [thing for thing in things if int(thing.get("type", -1)) != 1]
     item_spawns = np.asarray(
-        [
-            (float(thing["x"]), float(thing["y"]), float(thing.get("height", 0)))
-            for thing in items
-        ],
+        [(float(thing["x"]), float(thing["y"]), float(thing.get("height", 0))) for thing in items],
         dtype=np.float32,
     ).reshape(-1, 3)
     item_types = np.asarray([int(thing["type"]) for thing in items], dtype=np.int32)
@@ -471,4 +492,8 @@ def compile_deathmatch_scenario(
         hud_patch_opaque=hud_patch_opaque,
         hud_patch_widths=hud_patch_widths,
         hud_patch_heights=hud_patch_heights,
+        hud_patch_left_offsets=hud_patch_left_offsets,
+        hud_patch_top_offsets=hud_patch_top_offsets,
+        texture_animation_ids=texture_animation_ids,
+        texture_animation_counts=texture_animation_counts,
     )

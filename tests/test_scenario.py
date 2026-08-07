@@ -28,17 +28,36 @@ def test_pinned_deathmatch_compiles_external_doom2_data() -> None:
     assert (scenario.wall_sectors[scenario.blocking_wall_indices, 1] < 0).all()
     assert scenario.texture_names == (
         "BFALL1",
+        "BFALL2",
+        "BFALL3",
+        "BFALL4",
         "BIGBRIK1",
         "BLOOD1",
+        "BLOOD2",
+        "BLOOD3",
         "BRICK12",
         "CEIL3_3",
         "CEIL4_1",
         "COMPBLUE",
         "FLAT5_3",
     )
-    assert scenario.texture_atlas.shape == (8, 128, 64)
-    assert scenario.texture_widths.tolist() == [64] * 8
-    assert scenario.texture_heights.tolist() == [128, 128, 64, 128, 64, 64, 128, 64]
+    assert scenario.texture_atlas.shape == (13, 128, 64)
+    assert scenario.texture_widths.tolist() == [64] * 13
+    assert scenario.texture_heights.tolist() == [
+        128,
+        128,
+        128,
+        128,
+        128,
+        64,
+        64,
+        64,
+        128,
+        64,
+        64,
+        128,
+        64,
+    ]
     assert (scenario.wall_texture_ids[scenario.blocking_wall_indices] >= 0).all()
     assert scenario.sector_edge_mask.shape == (14, 215)
     assert scenario.sector_floor_texture_ids.shape == (14,)
@@ -65,6 +84,10 @@ def test_pinned_deathmatch_compiles_external_doom2_data() -> None:
     assert scenario.weapon_screen_alpha.any(axis=(1, 2)).all()
     assert scenario.texture_index_atlas is not None
     assert scenario.texture_index_atlas.shape == scenario.texture_atlas.shape
+    assert scenario.texture_animation_ids is not None
+    assert scenario.texture_animation_counts is not None
+    assert scenario.texture_animation_counts[:4].tolist() == [4, 4, 4, 4]
+    assert scenario.texture_animation_counts[5:8].tolist() == [3, 3, 3]
     assert scenario.colormap is not None
     assert scenario.colormap.shape == (34, 256)
     assert scenario.raw_sprite_atlas is not None
@@ -82,12 +105,16 @@ def test_pinned_deathmatch_compiles_external_doom2_data() -> None:
     assert scenario.raw_static_sprite_ids is not None
     assert scenario.raw_static_sprite_ids.shape == (20,)
     assert scenario.native_weapon_screen_values is not None
-    assert scenario.native_weapon_screen_values.shape == (8, 200, 320)
+    assert scenario.native_weapon_screen_values.shape == (8, 208, 320)
     assert scenario.native_weapon_screen_alpha is not None
     assert scenario.native_weapon_screen_alpha.any(axis=(1, 2)).all()
     assert scenario.hud_patch_names[0:2] == ("STBAR", "STARMS")
     assert scenario.hud_patch_atlas is not None
-    assert scenario.hud_patch_atlas.shape == (28, 32, 320)
+    assert scenario.hud_patch_atlas.shape == (38, 32, 320)
+    assert scenario.hud_patch_left_offsets is not None
+    assert scenario.hud_patch_top_offsets is not None
+    assert scenario.hud_patch_left_offsets[14] == -5
+    assert scenario.hud_patch_top_offsets[14] == -2
     assert scenario.sector_heights.shape == (14, 2)
     assert scenario.player_starts.shape == (3, 3)
     assert scenario.item_spawns.shape == (192, 3)
@@ -106,4 +133,4 @@ def test_pinned_deathmatch_compiles_external_freedoom2_data() -> None:
     assert scenario.weapon_screen_values.shape == (8, 84, 84)
     assert scenario.weapon_screen_alpha.any(axis=(1, 2)).all()
     assert scenario.native_weapon_screen_values is not None
-    assert scenario.native_weapon_screen_values.shape == (8, 200, 320)
+    assert scenario.native_weapon_screen_values.shape == (8, 208, 320)

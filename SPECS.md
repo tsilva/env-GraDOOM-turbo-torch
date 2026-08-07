@@ -17,6 +17,7 @@ GraDOOM is a GPU-native Doom reinforcement-learning environment whose primary ou
 - GraDOOM must preserve Doom gameplay mechanics sufficiently for policies trained in GraDOOM to remain performant without fine-tuning in comparable ViZDoom environments.
 - Deterministic gameplay mechanics must match the reference environment unless an explicitly documented deviation passes transfer acceptance.
 - Minor stochastic divergence is acceptable when its distributions remain compatible and it does not materially harm policy transfer.
+- Raw fidelity evaluation must precede observation preprocessing and use ViZDoom deathmatch’s 320×240 RGB24 output with the full Doom HUD.
 - Pixel-exact rendering is not required, but policy-facing observations must support reliable transfer.
 - Domain randomization may improve resilience to bounded rendering and simulation differences but must not conceal material semantic incompatibility.
 

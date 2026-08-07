@@ -479,7 +479,7 @@ def compile_indexed_weapon_overlays(
     wad: WadArchive,
     frame_names: tuple[str, ...],
 ) -> tuple[tuple[str, ...], np.ndarray, np.ndarray]:
-    """Rasterize ready-state psprites in Doom's native 320x200 play view."""
+    """Rasterize ready-state psprites in ViZDoom's 320x208 play view."""
 
     resolved_names: list[str] = []
     values: list[np.ndarray] = []
@@ -490,17 +490,17 @@ def compile_indexed_weapon_overlays(
             raise KeyError(f"IWAD has no weapon frame {normalized!r}")
         patch = decode_patch(wad.read(normalized), normalized)
         left = -patch.left_offset
-        # ViZDoom's 320x240 software path keeps the 320x200 play view but
-        # applies the classic aspect-corrected psprite baseline.
+        # The full 320x240 output reserves exactly 32 rows for the status bar.
+        # Keep the classic aspect-corrected psprite baseline in that 208-row view.
         top = -patch.top_offset + 49
         x0 = max(left, 0)
         y0 = max(top, 0)
         x1 = min(left + patch.width, 320)
-        y1 = min(top + patch.height, 200)
+        y1 = min(top + patch.height, 208)
         if x0 >= x1 or y0 >= y1:
             raise ValueError(f"weapon frame {normalized!r} lies outside the logical view")
-        value_canvas = np.zeros((200, 320), dtype=np.uint8)
-        alpha_canvas = np.zeros((200, 320), dtype=np.bool_)
+        value_canvas = np.zeros((208, 320), dtype=np.uint8)
+        alpha_canvas = np.zeros((208, 320), dtype=np.bool_)
         patch_x0 = x0 - left
         patch_y0 = y0 - top
         patch_x1 = patch_x0 + x1 - x0
