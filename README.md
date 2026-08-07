@@ -1,32 +1,76 @@
-<p align="center">
-  <img src="logo.png" alt="GraDOOM logo" width="720">
-</p>
+<div align="center">
+  <img src="./logo.png" alt="GraDOOM" width="560" />
 
-# GraDOOM
+  **⚡ GPU-native Doom reinforcement learning ⚡**
+</div>
 
-GraDOOM exists to produce the fastest reproducibly benchmarked Doom reinforcement-learning training environment on Earth. Its decisive metric is wall-clock time to train a policy that passes an unchanged evaluation in reference ViZDoom.
+GraDOOM is a Python library for reinforcement-learning researchers and engineers who need to train Doom policies at high throughput. It runs batched deathmatch simulation, rendering, rewards, and resets in PyTorch on the same device as the learner, then targets zero-shot evaluation in comparable ViZDoom environments.
 
-The first certified target is ViZDoom's single-player deathmatch scenario on one RTX 4090. The steady-state path keeps simulation, observations, actions, rewards, resets, rollout storage, policy inference, and learning on the GPU. Doom II and Freedoom data remain external inputs and are never committed to this repository.
+Use `GraDoomVecEnv` with an operator-supplied Doom II or Freedoom IWAD and the pinned ViZDoom deathmatch scenario. The current alpha provides a device-tensor API, a `vizdoom-turbo`-shaped vector API, a scenario compiler, and a vectorized Torch execution model.
 
-## Status
+## Install
 
-GraDOOM is under active construction and is **not yet parity-certified**. The current implementation establishes the scenario compiler, device tensor contract, `vizdoom-turbo`-shaped vector API, and a vectorized reference execution model. A release may call itself certified only after its zero-shot policies pass the reference ViZDoom gate and its matched benchmarks pass the performance gate.
-
-## Development setup
+GraDOOM requires Python 3.11 or newer and [uv](https://docs.astral.sh/uv/).
 
 ```bash
+git clone https://github.com/tsilva/GraDOOM.git
+cd GraDOOM
 uv sync --group dev
-uv run pytest
 ```
 
-The initial deathmatch smoke can use the ViZDoom scenario WAD and either Doom II or Freedoom as the external IWAD:
+## Use
+
+```python
+import torch
+
+from gradoom import GraDoomVecEnv
+
+num_envs = 128
+device = torch.device("cuda")
+env = GraDoomVecEnv(
+    scenario="/path/to/vizdoom/scenarios/deathmatch.wad",
+    rom_path="/path/to/doom2.wad",
+    num_envs=num_envs,
+    device=device,
+    compile_engine=True,
+)
+
+lanes = torch.arange(num_envs, device=device)
+observations, signals = env.reset_device(
+    torch.ones(num_envs, device=device, dtype=torch.bool),
+    lanes + 1,
+)
+actions = lanes % env.single_action_space.n
+transition = env.step_and_reset_device(actions, lanes + num_envs + 1)
+env.close()
+```
+
+`observations`, rewards, episode flags, and signals remain Torch tensors on the selected device.
+
+## Commands
 
 ```bash
+uv run pytest                                             # run the test suite
+uv run ruff check .                                      # lint the repository
 uv run python -m gradoom.inspect_scenario \
-  --scenario /path/to/vizdoom/scenarios/deathmatch.wad \
-  --iwad /path/to/doom2.wad
+  --scenario /path/to/deathmatch.wad --iwad /path/to/doom2.wad  # inspect assets
+uv run python tools/cuda_correctness_smoke.py --compile-engine   # check CUDA residency
 ```
 
-## Performance discipline
+## Notes
 
-Do not publish or infer a throughput claim from an unmatched run. The release benchmark must pin source and container digests, WAD hashes, action/observation/reward contracts, policy, hardware state, raw samples, and reference evaluation results. Beast-3 performance runs require an operator-confirmed quiet window.
+- GraDOOM is under active construction and is not yet parity-certified. No current release supports a public fastest-training claim.
+- The first certification candidate is single-player `deathmatch-p1-v1`: 17 actions, frame skip 2, and 84×84 grayscale CHW observations with four-frame stacking.
+- The initial certification hardware target is one NVIDIA RTX 4090 integrated with GradLab.
+- Pass asset paths directly or set `GRADOOM_IWAD` and `GRADOOM_DEATHMATCH_WAD`. WADs and other game data are not distributed with this repository.
+- Torch tensors are the performance transport. NumPy transport is available only for CPU diagnostics and compatibility testing.
+- Operator-run benchmarks require a controlled quiet window and matched reference evidence; see [deathmatch parity](./docs/deathmatch-parity.md).
+- See [third-party notices](./THIRD_PARTY_NOTICES.md) for source and game-data policy.
+
+## Architecture
+
+![GraDOOM architecture](./architecture.png)
+
+## License
+
+[MIT](./LICENSE)
