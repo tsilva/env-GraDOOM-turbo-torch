@@ -47,6 +47,7 @@ _PLAYER_FORWARD_ACCELERATION_FIXED = 25 << 11
 _PLAYER_RUN_FORWARD_ACCELERATION_FIXED = 50 << 11
 _PLAYER_SIDE_ACCELERATION_FIXED = 24 << 11
 _PLAYER_RUN_SIDE_ACCELERATION_FIXED = 40 << 11
+_CHAINSAW_PULL_ACCELERATION_FIXED = 100 << 11
 _PLAYER_FRICTION_FIXED = 0xE800
 _ACTOR_STOP_SPEED_FIXED = _FIXED_UNIT // 16
 _PLAYER_AIR_CONTROL_FIXED = 0x0100
@@ -77,6 +78,18 @@ _WEAPON_ACTION_DELAY = (4, 0, 4, 3, 3, 0, 8, 0)
 _WEAPON_READY_DURATION = (21, 7, 18, 43, 61, 7, 19, 22)
 _WEAPON_AMMO_SLOT = (-1, -1, 1, 2, 2, 1, 4, 5)
 _WEAPON_AMMO_COST = (0.0, 0.0, 1.0, 1.0, 2.0, 1.0, 1.0, 1.0)
+_HITSCAN_PELLET_COUNTS = (0, 0, 1, 7, 20, 1, 0, 0)
+_HITSCAN_MAX_PELLETS = 20
+_BULLET_AUTOAIM_RANGE = 1024.0
+_PLAYER_HITSCAN_RANGE = 8192.0
+_BULLET_AUTOAIM_OFFSET = 2.0 * math.pi / 64.0
+_BULLET_AUTOAIM_MAX_SLOPE = math.tan(35.0 * math.pi / 180.0)
+_BAM_TO_RADIANS = 2.0 * math.pi / float(1 << 32)
+_FIST_RANGE = 64.0
+_CHAINSAW_RANGE = 65.0
+_CHAINSAW_SPREAD_RADIANS = 2.8125 * math.pi / 180.0
+_CHAINSAW_TURN_STEP = (90.0 / 20.0) * math.pi / 180.0
+_CHAINSAW_TURN_OFFSET = (90.0 / 21.0) * math.pi / 180.0
 # Ascending Doom Weapon.SelectionOrder, restricted to the certified profile.
 _WEAPON_AUTO_SWITCH_ORDER = (7, 4, 5, 3, 2, 1, 6, 0)
 _MONSTER_DROP_TYPE = (2007, 2001, -1, 2002, -1, -1)
@@ -931,6 +944,7 @@ class TorchDeathmatchEngine:
         self.weapon_state_cooldown = torch.zeros(n, device=device, dtype=torch.int32)
         self.pending_attack_weapon = torch.full((n,), -1, device=device, dtype=torch.int64)
         self.pending_attack_delay = torch.zeros(n, device=device, dtype=torch.int32)
+        self.pending_attack_accurate = torch.zeros(n, device=device, dtype=torch.bool)
         self.weapon_fire_count = torch.zeros(n, device=device, dtype=torch.int32)
         self.weapon_ready_tics = torch.zeros(n, device=device, dtype=torch.int32)
         self.weapon_raise_cooldown = torch.zeros(n, device=device, dtype=torch.int32)
@@ -950,6 +964,7 @@ class TorchDeathmatchEngine:
         )
         self.mugshot_rng_state = torch.ones(n, device=device, dtype=torch.int64)
         self.attack_held_tics = torch.zeros(n, device=device, dtype=torch.int32)
+        self.chainsaw_pull = torch.zeros(n, device=device, dtype=torch.bool)
         self.reaction_time = torch.zeros(n, device=device, dtype=torch.int32)
         self.enemy_x = torch.zeros((n, self.enemy_slots), device=device)
         self.enemy_y = torch.zeros((n, self.enemy_slots), device=device)
@@ -1089,6 +1104,11 @@ class TorchDeathmatchEngine:
         )
         self._weapon_ammo_slot = torch.tensor(_WEAPON_AMMO_SLOT, device=device, dtype=torch.int64)
         self._weapon_ammo_cost = torch.tensor(_WEAPON_AMMO_COST, device=device)
+        self._hitscan_pellet_counts = torch.tensor(
+            _HITSCAN_PELLET_COUNTS,
+            device=device,
+            dtype=torch.int64,
+        )
         self._player_projectile_speed = torch.tensor(_PLAYER_PROJECTILE_SPEED, device=device)
         self._monster_drop_type = torch.tensor(_MONSTER_DROP_TYPE, device=device, dtype=torch.int64)
         self._damage_to_alpha = torch.tensor(
@@ -1288,6 +1308,7 @@ class TorchDeathmatchEngine:
         self.weapon_state_cooldown.masked_fill_(mask, 0)
         self.pending_attack_weapon.masked_fill_(mask, -1)
         self.pending_attack_delay.masked_fill_(mask, 0)
+        self.pending_attack_accurate.masked_fill_(mask, False)
         self.weapon_fire_count.masked_fill_(mask, 0)
         self.weapon_ready_tics.masked_fill_(mask, 0)
         self.weapon_raise_cooldown.masked_fill_(mask, _WEAPON_SPAWN_RAISE_TICS)
@@ -1304,6 +1325,7 @@ class TorchDeathmatchEngine:
         self.mugshot_face_index.masked_fill_(mask, 1)
         self.mugshot_face_tics.masked_fill_(mask, _MUGSHOT_NORMAL_FRAME_TICS)
         self.attack_held_tics.masked_fill_(mask, 0)
+        self.chainsaw_pull.masked_fill_(mask, False)
         self.reaction_time.masked_fill_(mask, _PLAYER_TELEPORT_LOCK_TICS)
         self.player_dead.masked_fill_(mask, False)
         self.pending_reset.masked_fill_(mask, False)
@@ -1930,7 +1952,7 @@ class TorchDeathmatchEngine:
             result_ceiling,
         )
 
-    def _sight_blocked(
+    def _sight_opening(
         self,
         origin_x: torch.Tensor,
         origin_y: torch.Tensor,
@@ -1939,8 +1961,8 @@ class TorchDeathmatchEngine:
         target_y: torch.Tensor,
         target_z: torch.Tensor,
         target_height: torch.Tensor,
-    ) -> torch.Tensor:
-        """Reproduce Doom sight-cone clipping across simple sector portals."""
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return solid blockage and the portal-clipped target Z interval."""
         direction_x = target_x - origin_x
         direction_y = target_y - origin_y
         walls = self.map.portal_walls
@@ -1950,20 +1972,14 @@ class TorchDeathmatchEngine:
         segment_y = walls[:, 3] - start_y
         offset_x = start_x - origin_x[..., None]
         offset_y = start_y - origin_y[..., None]
-        denominator = (
-            direction_x[..., None] * segment_y
-            - direction_y[..., None] * segment_x
-        )
+        denominator = direction_x[..., None] * segment_y - direction_y[..., None] * segment_x
         safe = torch.where(
             denominator.abs() < 1e-6,
             torch.ones_like(denominator),
             denominator,
         )
         along_ray = (offset_x * segment_y - offset_y * segment_x) / safe
-        along_wall = (
-            offset_x * direction_y[..., None]
-            - offset_y * direction_x[..., None]
-        ) / safe
+        along_wall = (offset_x * direction_y[..., None] - offset_y * direction_x[..., None]) / safe
         intersects = (
             (denominator.abs() >= 1e-6)
             & (along_ray > 1e-4)
@@ -1983,14 +1999,8 @@ class TorchDeathmatchEngine:
             self.map.sector_heights[safe_sectors, 1],
             dim=1,
         )
-        solid = intersects & (
-            self.map.portal_wall_blocks_sight | ~valid_portal
-        )
-        portal = (
-            intersects
-            & ~self.map.portal_wall_blocks_sight
-            & valid_portal
-        )
+        solid = intersects & (self.map.portal_wall_blocks_sight | ~valid_portal)
+        portal = intersects & ~self.map.portal_wall_blocks_sight & valid_portal
         safe_fraction = torch.where(
             portal,
             along_ray,
@@ -2014,7 +2024,101 @@ class TorchDeathmatchEngine:
             target_z + target_height - sight_z,
             torch.amin(top_clip, dim=-1),
         )
-        return torch.any(solid, dim=-1) | (top_slope <= bottom_slope)
+        return torch.any(solid, dim=-1), bottom_slope, top_slope
+
+    def _sight_blocked(
+        self,
+        origin_x: torch.Tensor,
+        origin_y: torch.Tensor,
+        sight_z: torch.Tensor,
+        target_x: torch.Tensor,
+        target_y: torch.Tensor,
+        target_z: torch.Tensor,
+        target_height: torch.Tensor,
+    ) -> torch.Tensor:
+        """Reproduce Doom sight-cone clipping across simple sector portals."""
+        solid, bottom_slope, top_slope = self._sight_opening(
+            origin_x,
+            origin_y,
+            sight_z,
+            target_x,
+            target_y,
+            target_z,
+            target_height,
+        )
+        return solid | (top_slope <= bottom_slope)
+
+    def _player_ray_actor_distance(
+        self,
+        ray_angle: torch.Tensor,
+        target_x: torch.Tensor,
+        target_y: torch.Tensor,
+        target_radius: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return Doom-compatible XY trace intercepts for player rays."""
+        cosine = torch.cos(ray_angle)[..., None]
+        sine = torch.sin(ray_angle)[..., None]
+        radius = target_radius[:, None, :]
+        target_x = target_x[:, None, :]
+        target_y = target_y[:, None, :]
+
+        # PT_COMPATIBLE intersects one actor-box diagonal. Doom selects its
+        # slope from the trace signs, rather than tracing a circle or near box
+        # edge. This notably puts a horizontal actor intercept at its center.
+        same_sign = (cosine >= 0) == (sine >= 0)
+        diagonal_x = target_x - radius
+        diagonal_y = target_y + torch.where(same_sign, radius, -radius)
+        diagonal_dx = radius * 2.0
+        diagonal_dy = torch.where(same_sign, -radius * 2.0, radius * 2.0)
+        offset_x = diagonal_x - self.x[:, None, None]
+        offset_y = diagonal_y - self.y[:, None, None]
+        denominator = cosine * diagonal_dy - sine * diagonal_dx
+        safe = torch.where(
+            denominator.abs() < 1e-6,
+            torch.ones_like(denominator),
+            denominator,
+        )
+        along_ray = (offset_x * diagonal_dy - offset_y * diagonal_dx) / safe
+        along_diagonal = (offset_x * sine - offset_y * cosine) / safe
+        intersects = (
+            (denominator.abs() >= 1e-6)
+            & (along_ray >= 0)
+            & (along_diagonal >= 0)
+            & (along_diagonal <= 1)
+        )
+        return torch.where(
+            intersects,
+            along_ray,
+            torch.full_like(along_ray, torch.inf),
+        )
+
+    def _player_ray_wall_distance(self, ray_angle: torch.Tensor) -> torch.Tensor:
+        """Return horizontal distances to every linedef crossed by each ray."""
+        cosine = torch.cos(ray_angle)[..., None]
+        sine = torch.sin(ray_angle)[..., None]
+        walls = self.map.portal_walls
+        start_x = walls[:, 0]
+        start_y = walls[:, 1]
+        segment_x = walls[:, 2] - start_x
+        segment_y = walls[:, 3] - start_y
+        offset_x = start_x - self.x[:, None, None]
+        offset_y = start_y - self.y[:, None, None]
+        denominator = cosine * segment_y - sine * segment_x
+        safe = torch.where(
+            denominator.abs() < 1e-6,
+            torch.ones_like(denominator),
+            denominator,
+        )
+        along_ray = (offset_x * segment_y - offset_y * segment_x) / safe
+        along_wall = (offset_x * sine - offset_y * cosine) / safe
+        intersects = (
+            (denominator.abs() >= 1e-6) & (along_ray > 1e-4) & (along_wall >= 0) & (along_wall <= 1)
+        )
+        return torch.where(
+            intersects,
+            along_ray,
+            torch.full_like(along_ray, torch.inf),
+        )
 
     def _rocket_splash_blocked(
         self,
@@ -2420,6 +2524,9 @@ class TorchDeathmatchEngine:
 
         playing = ~self.player_dead & (self.episode_time < self.episode_timeout)
         active = (self.reaction_time <= 0) & playing
+        pull_requested = self.chainsaw_pull & playing
+        pull_active = pull_requested & active
+        self.chainsaw_pull &= ~pull_requested
         self.reaction_time.sub_(1).clamp_min_(0)
         current_floor = self.player_floor_z
         self.previous_player_floor_z.copy_(current_floor)
@@ -2428,6 +2535,7 @@ class TorchDeathmatchEngine:
         turn = (buttons[:, 8].to(torch.float32) - buttons[:, 7].to(torch.float32)) * active.to(
             torch.float32
         )
+        turn = torch.where(pull_requested, torch.zeros_like(turn), turn)
         self.angle.add_(turn * speed * (_PLAYER_TURN_DEGREES * math.pi / 180.0))
         self.angle.remainder_(2 * math.pi)
         forward = (buttons[:, 6].to(torch.float32) - buttons[:, 5].to(torch.float32)) * active.to(
@@ -2436,10 +2544,20 @@ class TorchDeathmatchEngine:
         side = (buttons[:, 3].to(torch.float32) - buttons[:, 4].to(torch.float32)) * active.to(
             torch.float32
         )
+        forward = torch.where(pull_active, torch.ones_like(forward), forward)
+        side = torch.where(pull_requested, torch.zeros_like(side), side)
         forward_acceleration_fixed = torch.where(
             buttons[:, 1],
             torch.full_like(self._momentum_x_fixed, _PLAYER_RUN_FORWARD_ACCELERATION_FIXED),
             torch.full_like(self._momentum_x_fixed, _PLAYER_FORWARD_ACCELERATION_FIXED),
+        )
+        forward_acceleration_fixed = torch.where(
+            pull_active,
+            torch.full_like(
+                forward_acceleration_fixed,
+                _CHAINSAW_PULL_ACCELERATION_FIXED,
+            ),
+            forward_acceleration_fixed,
         )
         side_acceleration_fixed = torch.where(
             buttons[:, 1],
@@ -2755,26 +2873,92 @@ class TorchDeathmatchEngine:
         self._cycle_weapon(buttons[:, 16] & new_press, -1)
         self.weapon_change_latched.copy_(selection_down)
 
-    def _weapon_damage_roll(self, weapon: torch.Tensor, fires: torch.Tensor) -> torch.Tensor:
-        damage = torch.zeros(self.num_envs, device=self.device)
+    def _melee_attack_rolls(
+        self,
+        weapon: torch.Tensor,
+        fires: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Roll Doom's fist/chainsaw damage and triangular XY spread."""
+        melee = fires & (weapon <= 1)
+        chainsaw = melee & (weapon == 1)
+        damage_roll = torch.remainder(self._random_u32(melee), 10).to(torch.float32) + 1.0
+        damage = torch.where(melee, damage_roll * 2.0, 0.0)
+        first_horizontal = torch.bitwise_and(self._random_u32(melee), 255).to(torch.float32)
+        second_horizontal = torch.bitwise_and(self._random_u32(melee), 255).to(torch.float32)
+        random2 = first_horizontal - second_horizontal
+        fist_spread = random2 * float(1 << 18) * _BAM_TO_RADIANS
+        chainsaw_spread = random2 * (_CHAINSAW_SPREAD_RADIANS / 255.0)
 
-        def add_dice(code: int, count: int, sides: int, multiplier: float) -> None:
-            mask = fires & (weapon == code)
-            subtotal = torch.zeros_like(damage)
-            for _ in range(count):
-                roll = torch.remainder(self._random_u32(mask), sides).to(torch.float32) + 1
-                subtotal.add_(roll * multiplier)
-            damage.add_(torch.where(mask, subtotal, torch.zeros_like(subtotal)))
+        # A_Saw evaluates Random2 for its zero default vertical spread too.
+        # Retain the reference stream consumption even though the result is 0.
+        self._random_u32(chainsaw)
+        self._random_u32(chainsaw)
+        return damage, torch.where(chainsaw, chainsaw_spread, fist_spread)
 
-        add_dice(0, 1, 10, 2.0)
-        add_dice(1, 1, 10, 2.0)
-        add_dice(2, 1, 3, 5.0)
-        add_dice(3, 7, 3, 5.0)
-        add_dice(4, 20, 3, 5.0)
-        add_dice(5, 1, 3, 5.0)
-        add_dice(6, 1, 8, 20.0)
-        add_dice(7, 1, 8, 5.0)
-        return damage
+    def _hitscan_pellet_rolls(
+        self,
+        weapon: torch.Tensor,
+        fires: torch.Tensor,
+        accurate: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Roll Doom's per-pellet damage and horizontal/vertical spread."""
+        pellet_count = self._hitscan_pellet_counts[weapon]
+        pistol_or_chaingun = (weapon == 2) | (weapon == 5)
+        shotgun = weapon == 3
+        super_shotgun = weapon == 4
+        damage_pellets: list[torch.Tensor] = []
+        horizontal_offsets: list[torch.Tensor] = []
+        vertical_offsets: list[torch.Tensor] = []
+
+        for pellet_index in range(_HITSCAN_MAX_PELLETS):
+            active = fires & (pellet_count > pellet_index)
+            damage_roll = torch.remainder(self._random_u32(active), 3).to(torch.float32)
+            damage_pellets.append(torch.where(active, (damage_roll + 1.0) * 5.0, 0.0))
+
+            spread = active & (shotgun | super_shotgun | (pistol_or_chaingun & ~accurate))
+            first_horizontal = torch.bitwise_and(
+                self._random_u32(spread),
+                255,
+            ).to(torch.float32)
+            second_horizontal = torch.bitwise_and(
+                self._random_u32(spread),
+                255,
+            ).to(torch.float32)
+            horizontal_random2 = first_horizontal - second_horizontal
+            horizontal_bam_scale = torch.where(
+                super_shotgun,
+                torch.full_like(horizontal_random2, float(1 << 19)),
+                torch.full_like(horizontal_random2, float(1 << 18)),
+            )
+            horizontal_offsets.append(
+                torch.where(
+                    spread,
+                    horizontal_random2 * horizontal_bam_scale * _BAM_TO_RADIANS,
+                    0.0,
+                )
+            )
+
+            first_vertical = torch.bitwise_and(
+                self._random_u32(active & super_shotgun),
+                255,
+            ).to(torch.float32)
+            second_vertical = torch.bitwise_and(
+                self._random_u32(active & super_shotgun),
+                255,
+            ).to(torch.float32)
+            vertical_offsets.append(
+                torch.where(
+                    active & super_shotgun,
+                    (first_vertical - second_vertical) * 332063.0 * _BAM_TO_RADIANS,
+                    0.0,
+                )
+            )
+
+        return (
+            torch.stack(damage_pellets, dim=1),
+            torch.stack(horizontal_offsets, dim=1),
+            torch.stack(vertical_offsets, dim=1),
+        )
 
     def _enemy_damage_thrust_components(
         self,
@@ -2826,6 +3010,7 @@ class TorchDeathmatchEngine:
         kickback: torch.Tensor | float = 100.0,
         thrust_x_fixed: torch.Tensor | None = None,
         thrust_y_fixed: torch.Tensor | None = None,
+        pain_override: torch.Tensor | None = None,
     ) -> torch.Tensor:
         applied = torch.where(self.enemy_alive, damage, torch.zeros_like(damage))
         if (
@@ -2860,12 +3045,15 @@ class TorchDeathmatchEngine:
         killed = self.enemy_alive & (previous > 0) & (updated <= 0)
         killed_type = self.enemy_type.clamp_min(0)
         hurt = self.enemy_alive & (applied > 0) & ~killed
-        random_bits = self._random_u32(torch.any(hurt, dim=1))[:, None]
-        slot = torch.arange(self.enemy_slots, device=self.device, dtype=torch.int64)[None, :]
-        mixed = random_bits ^ (slot * _HASH_GOLDEN_RATIO_SIGNED)
-        mixed ^= mixed >> 16
-        pain_roll = torch.remainder(mixed, 256)
-        pain = hurt & (pain_roll < self._enemy_pain_chance[killed_type])
+        if pain_override is None:
+            random_bits = self._random_u32(torch.any(hurt, dim=1))[:, None]
+            slot = torch.arange(self.enemy_slots, device=self.device, dtype=torch.int64)[None, :]
+            mixed = random_bits ^ (slot * _HASH_GOLDEN_RATIO_SIGNED)
+            mixed ^= mixed >> 16
+            pain_roll = torch.remainder(mixed, 256)
+            pain = hurt & (pain_roll < self._enemy_pain_chance[killed_type])
+        else:
+            pain = hurt & pain_override
         self.enemy_pain_tics.copy_(
             torch.where(pain, self._enemy_pain_duration[killed_type], self.enemy_pain_tics)
         )
@@ -3384,6 +3572,423 @@ class TorchDeathmatchEngine:
         self.projectile_type.masked_fill_(impact, -1)
         return reward
 
+    def _apply_player_melee(
+        self,
+        weapon: torch.Tensor,
+        fires: torch.Tensor,
+        target_x: torch.Tensor,
+        target_y: torch.Tensor,
+        target_z: torch.Tensor,
+        target_radius: torch.Tensor,
+        target_height: torch.Tensor,
+        target_alive: torch.Tensor,
+        solid_sight: torch.Tensor,
+        opening_bottom: torch.Tensor,
+        opening_top: torch.Tensor,
+    ) -> torch.Tensor:
+        """Trace and apply Doom's fist and chainsaw attacks."""
+        melee_fires = fires & (weapon <= 1)
+        damage, spread = self._melee_attack_rolls(weapon, melee_fires)
+        attack_angle = self.angle + spread
+        actor_distance = self._player_ray_actor_distance(
+            attack_angle[:, None],
+            target_x,
+            target_y,
+            target_radius,
+        ).squeeze(1)
+        wall_distance = self._player_ray_wall_distance(attack_angle[:, None]).squeeze(1)
+        wall_sectors = self.map.portal_wall_sectors
+        solid_wall = self.map.portal_wall_blocks_sight | torch.any(
+            wall_sectors < 0,
+            dim=1,
+        )
+        nearest_solid_wall = torch.amin(
+            torch.where(
+                solid_wall[None, :],
+                wall_distance,
+                torch.full_like(wall_distance, torch.inf),
+            ),
+            dim=1,
+        )
+
+        center_dx = target_x - self.x[:, None]
+        center_dy = target_y - self.y[:, None]
+        center_distance = torch.sqrt(
+            center_dx * center_dx + center_dy * center_dy
+        ).clamp_min_(1e-4)
+        bottom_slope = torch.maximum(
+            opening_bottom / center_distance,
+            torch.full_like(center_distance, -_BULLET_AUTOAIM_MAX_SLOPE),
+        )
+        top_slope = torch.minimum(
+            opening_top / center_distance,
+            torch.full_like(center_distance, _BULLET_AUTOAIM_MAX_SLOPE),
+        )
+        target_visible = target_alive & ~solid_sight & (top_slope > bottom_slope)
+        melee_range = torch.where(
+            weapon == 1,
+            torch.full_like(self.angle, _CHAINSAW_RANGE),
+            torch.full_like(self.angle, _FIST_RANGE),
+        )
+        valid = (
+            target_visible
+            & (actor_distance <= melee_range[:, None])
+            & (actor_distance < nearest_solid_wall[:, None])
+        )
+        target_distance = torch.where(
+            valid,
+            actor_distance,
+            torch.full_like(actor_distance, torch.inf),
+        )
+        target = torch.argmin(target_distance, dim=1)
+        row = torch.arange(self.num_envs, device=self.device)
+        has_target = melee_fires & torch.isfinite(target_distance[row, target])
+        enemy_target = target.clamp_max(self.enemy_slots - 1)
+        hits_enemy = has_target & (target < self.enemy_slots)
+        hits_doll = has_target & (target >= self.enemy_slots)
+        damage_by_enemy = torch.zeros_like(self.enemy_health)
+        damage_by_enemy.scatter_add_(
+            1,
+            enemy_target[:, None],
+            torch.where(hits_enemy, damage, torch.zeros_like(damage))[:, None],
+        )
+        self._apply_player_damage(
+            torch.where(hits_doll, damage, torch.zeros_like(damage))
+        )
+        kickback = torch.where(
+            weapon == 1,
+            torch.zeros_like(damage),
+            torch.full_like(damage, 100.0),
+        )
+        reward = self._apply_enemy_damage(
+            damage_by_enemy,
+            self.x[:, None],
+            self.y[:, None],
+            kickback=kickback[:, None],
+        )
+
+        target_angle = torch.atan2(
+            target_y[row, target] - self.y,
+            target_x[row, target] - self.x,
+        )
+        relative_angle = self._wrap_angle(target_angle - self.angle)
+        far_turn = relative_angle.abs() > _CHAINSAW_TURN_STEP
+        left_turn = relative_angle < 0
+        chainsaw_angle = torch.where(
+            left_turn,
+            torch.where(
+                far_turn,
+                target_angle + _CHAINSAW_TURN_OFFSET,
+                self.angle - _CHAINSAW_TURN_STEP,
+            ),
+            torch.where(
+                far_turn,
+                target_angle - _CHAINSAW_TURN_OFFSET,
+                self.angle + _CHAINSAW_TURN_STEP,
+            ),
+        )
+        fist_hit = has_target & (weapon == 0)
+        chainsaw_hit = has_target & (weapon == 1)
+        next_angle = torch.where(
+            fist_hit,
+            target_angle,
+            torch.where(chainsaw_hit, chainsaw_angle, self.angle),
+        )
+        self.angle.copy_(torch.remainder(next_angle, 2.0 * math.pi))
+        self.chainsaw_pull |= chainsaw_hit
+        return reward
+
+    def _apply_player_hitscan(
+        self,
+        weapon: torch.Tensor,
+        fires: torch.Tensor,
+        accurate: torch.Tensor,
+        target_x: torch.Tensor,
+        target_y: torch.Tensor,
+        target_z: torch.Tensor,
+        target_radius: torch.Tensor,
+        target_height: torch.Tensor,
+        target_alive: torch.Tensor,
+        solid_sight: torch.Tensor,
+        opening_bottom: torch.Tensor,
+        opening_top: torch.Tensor,
+    ) -> torch.Tensor:
+        """Trace and apply every Doom bullet pellet independently."""
+        hitscan_fires = fires & (weapon >= 2) & (weapon <= 5)
+        shoot_z = self.z + 36.0
+        center_dx = target_x - self.x[:, None]
+        center_dy = target_y - self.y[:, None]
+        center_distance = torch.sqrt(center_dx * center_dx + center_dy * center_dy).clamp_min_(1e-4)
+        bottom_slope = torch.maximum(
+            opening_bottom / center_distance,
+            torch.full_like(center_distance, -_BULLET_AUTOAIM_MAX_SLOPE),
+        )
+        top_slope = torch.minimum(
+            opening_top / center_distance,
+            torch.full_like(center_distance, _BULLET_AUTOAIM_MAX_SLOPE),
+        )
+        target_visible = target_alive & ~solid_sight & (top_slope > bottom_slope)
+        target_pitch = -torch.atan((bottom_slope + top_slope) * 0.5)
+
+        # P_BulletSlope probes center, +5.625 degrees, then -5.625 degrees.
+        # The selected probe contributes only pitch: P_LineAttack still uses
+        # the weapon's independently spread horizontal angle.
+        aim_angles = torch.stack(
+            (
+                self.angle,
+                self.angle + _BULLET_AUTOAIM_OFFSET,
+                self.angle - _BULLET_AUTOAIM_OFFSET,
+            ),
+            dim=1,
+        )
+        aim_distance = self._player_ray_actor_distance(
+            aim_angles,
+            target_x,
+            target_y,
+            target_radius,
+        )
+        aim_wall_distance = self._player_ray_wall_distance(aim_angles)
+        wall_sectors = self.map.portal_wall_sectors
+        solid_wall = self.map.portal_wall_blocks_sight | torch.any(
+            wall_sectors < 0,
+            dim=1,
+        )
+        nearest_solid_wall = torch.amin(
+            torch.where(
+                solid_wall[None, None, :],
+                aim_wall_distance,
+                torch.full_like(aim_wall_distance, torch.inf),
+            ),
+            dim=2,
+        )
+        aim_valid = (
+            target_visible[:, None, :]
+            & (aim_distance <= _BULLET_AUTOAIM_RANGE)
+            & (aim_distance < nearest_solid_wall[:, :, None])
+        )
+        aim_target_distance = torch.where(
+            aim_valid,
+            aim_distance,
+            torch.full_like(aim_distance, torch.inf),
+        )
+        aim_target = torch.argmin(aim_target_distance, dim=2)
+        aim_exists = torch.isfinite(
+            aim_target_distance.gather(2, aim_target[:, :, None]).squeeze(2)
+        )
+        pitch_by_aim = (
+            target_pitch[:, None, :]
+            .expand(-1, 3, -1)
+            .gather(
+                2,
+                aim_target[:, :, None],
+            )
+            .squeeze(2)
+        )
+        selected_aim = torch.argmax(aim_exists.to(torch.int32), dim=1)
+        row = torch.arange(self.num_envs, device=self.device)
+        has_autoaim = torch.any(aim_exists, dim=1)
+        base_pitch = torch.where(
+            has_autoaim,
+            pitch_by_aim[row, selected_aim],
+            torch.zeros_like(self.angle),
+        )
+
+        pellet_damage, horizontal_spread, vertical_spread = self._hitscan_pellet_rolls(
+            weapon, hitscan_fires, accurate
+        )
+        pellet_angle = self.angle[:, None] + horizontal_spread
+        pellet_pitch = base_pitch[:, None] + vertical_spread
+        actor_distance = self._player_ray_actor_distance(
+            pellet_angle,
+            target_x,
+            target_y,
+            target_radius,
+        )
+        actor_intercept = torch.isfinite(actor_distance)
+        safe_actor_distance = torch.where(
+            actor_intercept,
+            actor_distance,
+            torch.zeros_like(actor_distance),
+        )
+        vertical_slope = -torch.tan(pellet_pitch)
+        intercept_z = shoot_z[:, None, None] + vertical_slope[:, :, None] * safe_actor_distance
+        target_bottom = target_z[:, None, :]
+        target_top = target_bottom + target_height[:, None, :]
+        enters_actor_side = (
+            actor_intercept & (intercept_z >= target_bottom) & (intercept_z <= target_top)
+        )
+
+        safe_vertical_slope = torch.where(
+            vertical_slope.abs() < 1e-6,
+            torch.ones_like(vertical_slope),
+            vertical_slope,
+        )
+        top_plane_distance = (target_top - shoot_z[:, None, None]) / safe_vertical_slope[:, :, None]
+        bottom_plane_distance = (target_bottom - shoot_z[:, None, None]) / safe_vertical_slope[
+            :, :, None
+        ]
+        ray_cosine = torch.cos(pellet_angle)[:, :, None]
+        ray_sine = torch.sin(pellet_angle)[:, :, None]
+
+        def inside_target_box(distance: torch.Tensor) -> torch.Tensor:
+            hit_x = self.x[:, None, None] + ray_cosine * distance
+            hit_y = self.y[:, None, None] + ray_sine * distance
+            return ((hit_x - target_x[:, None, :]).abs() <= target_radius[:, None, :]) & (
+                (hit_y - target_y[:, None, :]).abs() <= target_radius[:, None, :]
+            )
+
+        enters_actor_top = (
+            actor_intercept
+            & (intercept_z > target_top)
+            & (vertical_slope[:, :, None] < 0)
+            & (top_plane_distance >= 0)
+            & inside_target_box(top_plane_distance)
+        )
+        enters_actor_bottom = (
+            actor_intercept
+            & (intercept_z < target_bottom)
+            & (vertical_slope[:, :, None] > 0)
+            & (bottom_plane_distance >= 0)
+            & inside_target_box(bottom_plane_distance)
+        )
+        hit_distance = torch.where(
+            enters_actor_top,
+            top_plane_distance,
+            torch.where(
+                enters_actor_bottom,
+                bottom_plane_distance,
+                safe_actor_distance,
+            ),
+        )
+        actor_hit = enters_actor_side | enters_actor_top | enters_actor_bottom
+
+        cosine_pitch = torch.cos(pellet_pitch).clamp_min_(1e-4)
+        maximum_horizontal_distance = _PLAYER_HITSCAN_RANGE * cosine_pitch
+        actor_hit &= hit_distance <= maximum_horizontal_distance[:, :, None]
+
+        pellet_wall_distance = self._player_ray_wall_distance(pellet_angle)
+        wall_intercept = torch.isfinite(pellet_wall_distance)
+        safe_wall_distance = torch.where(
+            wall_intercept,
+            pellet_wall_distance,
+            torch.zeros_like(pellet_wall_distance),
+        )
+        wall_hit_z = shoot_z[:, None, None] + vertical_slope[:, :, None] * safe_wall_distance
+        valid_portal = torch.all(wall_sectors >= 0, dim=1)
+        safe_sectors = wall_sectors.clamp_min(0)
+        portal_bottom = torch.amax(
+            self.map.sector_heights[safe_sectors, 0],
+            dim=1,
+        )
+        portal_top = torch.amin(
+            self.map.sector_heights[safe_sectors, 1],
+            dim=1,
+        )
+        wall_blocks_pellet = wall_intercept & (
+            self.map.portal_wall_blocks_sight[None, None, :]
+            | ~valid_portal[None, None, :]
+            | (wall_hit_z <= portal_bottom[None, None, :])
+            | (wall_hit_z >= portal_top[None, None, :])
+        )
+        wall_blocks_pellet &= pellet_wall_distance < maximum_horizontal_distance[:, :, None]
+        nearest_blocking_wall = torch.amin(
+            torch.where(
+                wall_blocks_pellet,
+                pellet_wall_distance,
+                torch.full_like(pellet_wall_distance, torch.inf),
+            ),
+            dim=2,
+        )
+        actor_hit &= hit_distance < nearest_blocking_wall[:, :, None]
+        actor_hit &= target_alive[:, None, :]
+
+        # Pellets are processed in reference order. Once a pellet kills a
+        # monster it stops being shootable, allowing later pellets through to
+        # an actor behind it during the same shotgun blast.
+        shootable = target_alive.clone()
+        remaining_enemy_health = self.enemy_health.clone()
+        damage_by_enemy_pellet: list[torch.Tensor] = []
+        damage_by_doll_pellet: list[torch.Tensor] = []
+        hurt_by_enemy_pellet: list[torch.Tensor] = []
+        target_count = target_x.shape[1]
+        for pellet_index in range(_HITSCAN_MAX_PELLETS):
+            candidate_distance = torch.where(
+                actor_hit[:, pellet_index, :] & shootable,
+                hit_distance[:, pellet_index, :],
+                torch.full_like(hit_distance[:, pellet_index, :], torch.inf),
+            )
+            target = torch.argmin(candidate_distance, dim=1)
+            has_target = (pellet_damage[:, pellet_index] > 0) & torch.isfinite(
+                candidate_distance.gather(1, target[:, None]).squeeze(1)
+            )
+            damage_by_target = torch.zeros(
+                (self.num_envs, target_count),
+                device=self.device,
+            )
+            damage_by_target.scatter_add_(
+                1,
+                target[:, None],
+                torch.where(
+                    has_target,
+                    pellet_damage[:, pellet_index],
+                    torch.zeros_like(pellet_damage[:, pellet_index]),
+                )[:, None],
+            )
+            enemy_damage = damage_by_target[:, : self.enemy_slots]
+            damage_by_enemy_pellet.append(enemy_damage)
+            damage_by_doll_pellet.append(torch.sum(damage_by_target[:, self.enemy_slots :], dim=1))
+            next_enemy_health = remaining_enemy_health - enemy_damage
+            hurt_by_enemy_pellet.append(
+                (enemy_damage > 0) & (next_enemy_health > 0)
+            )
+            remaining_enemy_health.copy_(next_enemy_health)
+            shootable[:, : self.enemy_slots] &= remaining_enemy_health > 0
+
+        damage_by_enemy = torch.stack(damage_by_enemy_pellet, dim=1)
+        damage_by_doll = torch.stack(damage_by_doll_pellet, dim=1)
+        hurt_by_enemy = torch.stack(hurt_by_enemy_pellet, dim=1)
+        self._apply_player_damage(
+            torch.sum(damage_by_doll, dim=1),
+            armor_absorb_request=torch.sum(
+                torch.floor(damage_by_doll * self.armor_save_fraction[:, None]),
+                dim=1,
+            ),
+        )
+        thrust_x, thrust_y = self._enemy_damage_thrust_components(
+            damage_by_enemy,
+            self.x[:, None, None],
+            self.y[:, None, None],
+        )
+        pain_random = self._random_u32(torch.any(hurt_by_enemy, dim=(1, 2)))[:, None, None]
+        pellet = torch.arange(
+            _HITSCAN_MAX_PELLETS,
+            device=self.device,
+            dtype=torch.int64,
+        )[None, :, None]
+        enemy_slot = torch.arange(
+            self.enemy_slots,
+            device=self.device,
+            dtype=torch.int64,
+        )[None, None, :]
+        pain_mixed = (
+            pain_random
+            ^ (pellet * _HASH_MURMUR_SIGNED)
+            ^ (enemy_slot * _HASH_GOLDEN_RATIO_SIGNED)
+        )
+        pain_mixed ^= pain_mixed >> 16
+        pain_roll = torch.remainder(pain_mixed, 256)
+        pain_chance = self._enemy_pain_chance[self.enemy_type.clamp_min(0)][:, None, :]
+        pain_override = torch.any(
+            hurt_by_enemy & (pain_roll < pain_chance),
+            dim=1,
+        )
+        return self._apply_enemy_damage(
+            torch.sum(damage_by_enemy, dim=1),
+            thrust_x_fixed=torch.sum(thrust_x, dim=1),
+            thrust_y_fixed=torch.sum(thrust_y, dim=1),
+            pain_override=pain_override,
+        )
+
     def _player_attack(self, buttons: torch.Tensor) -> torch.Tensor:
         reward = torch.zeros(self.num_envs, device=self.device)
         pending = self.pending_attack_weapon >= 0
@@ -3394,12 +3999,8 @@ class TorchDeathmatchEngine:
             & (self.episode_time < self.episode_timeout)
         )
         execute_pending = pending_valid & (next_delay <= 0)
-        reward.add_(
-            self._execute_player_attack(
-                self.pending_attack_weapon.clamp_min(0),
-                execute_pending,
-            )
-        )
+        pending_weapon_to_execute = self.pending_attack_weapon.clamp_min(0)
+        pending_accuracy_to_execute = self.pending_attack_accurate.clone()
         keep_pending = pending_valid & ~execute_pending
         self.pending_attack_delay.copy_(
             torch.where(keep_pending, next_delay, torch.zeros_like(next_delay))
@@ -3409,6 +4010,13 @@ class TorchDeathmatchEngine:
                 keep_pending,
                 self.pending_attack_weapon,
                 torch.full_like(self.pending_attack_weapon, -1),
+            )
+        )
+        self.pending_attack_accurate.copy_(
+            torch.where(
+                keep_pending,
+                self.pending_attack_accurate,
+                torch.zeros_like(self.pending_attack_accurate),
             )
         )
 
@@ -3462,13 +4070,34 @@ class TorchDeathmatchEngine:
             )
         )
         delayed = fires & (action_delay > 0)
+        accurate = self.attack_held_tics <= 1
         self.pending_attack_weapon.copy_(
             torch.where(delayed, weapon, self.pending_attack_weapon)
         )
         self.pending_attack_delay.copy_(
             torch.where(delayed, action_delay, self.pending_attack_delay)
         )
-        reward.add_(self._execute_player_attack(weapon, fires & ~delayed))
+        self.pending_attack_accurate.copy_(
+            torch.where(delayed, accurate, self.pending_attack_accurate)
+        )
+        immediate = fires & ~delayed
+        execute_weapon = torch.where(
+            execute_pending,
+            pending_weapon_to_execute,
+            weapon,
+        )
+        execute_accurate = torch.where(
+            execute_pending,
+            pending_accuracy_to_execute,
+            accurate,
+        )
+        reward.add_(
+            self._execute_player_attack(
+                execute_weapon,
+                execute_pending | immediate,
+                execute_accurate,
+            )
+        )
         forced_second_action = fires & ((weapon == 1) | (weapon == 5))
         self.pending_attack_weapon.copy_(
             torch.where(forced_second_action, weapon, self.pending_attack_weapon)
@@ -3480,12 +4109,20 @@ class TorchDeathmatchEngine:
                 self.pending_attack_delay,
             )
         )
+        self.pending_attack_accurate.copy_(
+            torch.where(
+                forced_second_action,
+                accurate,
+                self.pending_attack_accurate,
+            )
+        )
         return reward
 
     def _execute_player_attack(
         self,
         weapon: torch.Tensor,
         fires: torch.Tensor,
+        accurate: torch.Tensor,
     ) -> torch.Tensor:
         ammo_slot = self._weapon_ammo_slot[weapon]
         safe_ammo_slot = ammo_slot.clamp_min(0)
@@ -3524,6 +4161,13 @@ class TorchDeathmatchEngine:
                 ),
                 dim=1,
             )
+            target_radius = torch.cat(
+                (
+                    self._enemy_radius[self.enemy_type.clamp_min(0)],
+                    torch.full_like(doll_x, _PLAYER_RADIUS),
+                ),
+                dim=1,
+            )
             target_alive = torch.cat(
                 (
                     self.enemy_alive,
@@ -3536,20 +4180,23 @@ class TorchDeathmatchEngine:
             target_y = self.enemy_y
             target_z = self.enemy_z
             target_height = self._enemy_height[self.enemy_type.clamp_min(0)]
+            target_radius = self._enemy_radius[self.enemy_type.clamp_min(0)]
             target_alive = self.enemy_alive
         dx = target_x - self.x[:, None]
         dy = target_y - self.y[:, None]
         distance = torch.sqrt(dx * dx + dy * dy).clamp_min_(1e-4)
         bearing = self._wrap_angle(torch.atan2(dy, dx) - self.angle[:, None]).abs()
-        melee = (weapon == 0) | (weapon == 1)
-        max_range = torch.where(melee, 72.0, 2048.0)
-        valid = target_alive & (bearing < (8.0 * math.pi / 180.0)) & (distance < max_range[:, None])
+        valid = (
+            target_alive
+            & (bearing < (8.0 * math.pi / 180.0))
+            & (distance < 2048.0)
+        )
         shoot_z = self.z[:, None] + 36.0
         max_autoaim_slope = math.tan(35.0 * math.pi / 180.0)
         bottom_slope = (target_z - shoot_z) / distance
         top_slope = (target_z + target_height - shoot_z) / distance
         valid &= (top_slope >= -max_autoaim_slope) & (bottom_slope <= max_autoaim_slope)
-        valid &= ~self._sight_blocked(
+        solid_sight, opening_bottom, opening_top = self._sight_opening(
             self.x[:, None],
             self.y[:, None],
             shoot_z,
@@ -3558,6 +4205,7 @@ class TorchDeathmatchEngine:
             target_z,
             target_height,
         )
+        valid &= ~solid_sight & (opening_top > opening_bottom)
         target_distance = torch.where(valid, distance, torch.full_like(distance, torch.inf))
         target = torch.argmin(target_distance, dim=1)
         row = torch.arange(self.num_envs, device=self.device)
@@ -3571,32 +4219,34 @@ class TorchDeathmatchEngine:
             target_height[row, target],
             selected_target_exists,
         )
-        hitscan_fires = fires & (weapon <= 5)
-        has_target = hitscan_fires & torch.isfinite(
-            target_distance.gather(1, target[:, None]).squeeze(1)
+        melee_reward = self._apply_player_melee(
+            weapon,
+            fires,
+            target_x,
+            target_y,
+            target_z,
+            target_radius,
+            target_height,
+            target_alive,
+            solid_sight,
+            opening_bottom,
+            opening_top,
         )
-        damage = self._weapon_damage_roll(weapon, hitscan_fires)
-        enemy_target = target.clamp_max(self.enemy_slots - 1)
-        hits_enemy = has_target & (target < self.enemy_slots)
-        hits_doll = has_target & (target >= self.enemy_slots)
-        damage_by_enemy = torch.zeros_like(self.enemy_health)
-        damage_by_enemy.scatter_add_(
-            1,
-            enemy_target[:, None],
-            torch.where(hits_enemy, damage, torch.zeros_like(damage))[:, None],
+        hitscan_reward = self._apply_player_hitscan(
+            weapon,
+            fires,
+            accurate,
+            target_x,
+            target_y,
+            target_z,
+            target_radius,
+            target_height,
+            target_alive,
+            solid_sight,
+            opening_bottom,
+            opening_top,
         )
-        self._apply_player_damage(torch.where(hits_doll, damage, torch.zeros_like(damage)))
-        weapon_kickback = torch.where(
-            weapon == 1,
-            torch.zeros_like(damage),
-            torch.full_like(damage, 100.0),
-        )
-        return self._apply_enemy_damage(
-            damage_by_enemy,
-            self.x[:, None],
-            self.y[:, None],
-            kickback=weapon_kickback[:, None],
-        )
+        return hitscan_reward + melee_reward
 
     def _enemy_damage_roll(
         self,

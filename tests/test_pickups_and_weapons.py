@@ -16,6 +16,33 @@ def _item_scenario(square_scenario, *type_ids: int):
     )
 
 
+def _large_arena_scenario(square_scenario, half_extent: float = 4096.0):
+    walls = np.asarray(
+        [
+            (-half_extent, -half_extent, half_extent, -half_extent),
+            (half_extent, -half_extent, half_extent, half_extent),
+            (half_extent, half_extent, -half_extent, half_extent),
+            (-half_extent, half_extent, -half_extent, -half_extent),
+        ],
+        dtype=np.float32,
+    )
+    vertices = np.asarray(
+        [
+            (-half_extent, -half_extent),
+            (half_extent, -half_extent),
+            (half_extent, half_extent),
+            (-half_extent, half_extent),
+        ],
+        dtype=np.float32,
+    )
+    return replace(
+        square_scenario,
+        vertices=vertices,
+        wall_segments=walls,
+        blocking_segments=walls.copy(),
+    )
+
+
 def _engine(scenario) -> TorchDeathmatchEngine:
     engine = TorchDeathmatchEngine(
         scenario,
@@ -352,6 +379,258 @@ def test_chaingun_single_trigger_always_fires_two_rounds(square_scenario) -> Non
 
     assert engine.ammo[:, 1].tolist() == [48.0, 48.0]
     assert torch.equal(engine.ammo[:, 1], engine.ammo[:, 3])
+
+
+def test_hitscan_rolls_reference_pellet_counts_and_spread(square_scenario) -> None:
+    engine = _engine(square_scenario)
+    engine.rng_state.copy_(torch.tensor([12345, 67890]))
+    pistol_damage, pistol_horizontal, pistol_vertical = engine._hitscan_pellet_rolls(
+        torch.full((2,), 2),
+        torch.ones(2, dtype=torch.bool),
+        torch.tensor([True, False]),
+    )
+
+    assert torch.count_nonzero(pistol_damage, dim=1).tolist() == [1, 1]
+    assert pistol_horizontal[0, 0] == 0
+    assert pistol_horizontal[1, 0] != 0
+    assert not torch.any(pistol_vertical)
+
+    engine.rng_state.copy_(torch.tensor([12345, 67890]))
+    damage, horizontal, vertical = engine._hitscan_pellet_rolls(
+        torch.tensor([3, 4]),
+        torch.ones(2, dtype=torch.bool),
+        torch.ones(2, dtype=torch.bool),
+    )
+
+    assert torch.count_nonzero(damage, dim=1).tolist() == [7, 20]
+    live_damage = damage[damage > 0]
+    assert torch.all(
+        (live_damage == 5) | (live_damage == 10) | (live_damage == 15)
+    )
+    assert torch.any(horizontal[0, :7] != 0)
+    assert torch.any(horizontal[1] != 0)
+    assert not torch.any(vertical[0])
+    assert torch.any(vertical[1] != 0)
+
+
+def test_delayed_pistol_preserves_first_shot_accuracy(square_scenario) -> None:
+    engine = _engine(square_scenario)
+    engine.selected_weapon.fill_(2)
+    engine.attack_held_tics.copy_(torch.tensor([1, 8]))
+    attack = torch.zeros((2, 20), dtype=torch.bool)
+    attack[:, 0] = True
+
+    engine._player_attack(attack)
+
+    assert engine.pending_attack_weapon.tolist() == [2, 2]
+    assert engine.pending_attack_accurate.tolist() == [True, False]
+
+
+def test_melee_rolls_use_reference_damage_and_spread_scales(square_scenario) -> None:
+    engine = _engine(square_scenario)
+    engine.rng_state.fill_(12345)
+
+    damage, spread = engine._melee_attack_rolls(
+        torch.tensor([0, 1]),
+        torch.ones(2, dtype=torch.bool),
+    )
+
+    assert damage.tolist() == [2.0, 2.0]
+    assert torch.allclose(
+        torch.rad2deg(spread),
+        torch.tensor([0.32958984375, 0.16544117033481598]),
+    )
+
+
+def test_fist_uses_reference_range_and_snaps_to_hit_target(square_scenario) -> None:
+    engine = _engine(square_scenario)
+    engine.enemy_alive.zero_()
+    engine.x.zero_()
+    engine.y.zero_()
+    engine.z.zero_()
+    engine.angle.zero_()
+    engine.enemy_x[:, 0] = torch.tensor([60.0, 70.0])
+    engine.enemy_y[:, 0] = 0
+    engine.enemy_z[:, 0] = 0
+    engine.enemy_type[:, 0] = 0
+    engine.enemy_health[:, 0] = 100
+    engine.enemy_alive[:, 0] = True
+    engine.rng_state.fill_(12345)
+
+    engine._execute_player_attack(
+        torch.zeros(2, dtype=torch.int64),
+        torch.ones(2, dtype=torch.bool),
+        torch.ones(2, dtype=torch.bool),
+    )
+
+    assert engine.enemy_health[:, 0].tolist() == [98.0, 100.0]
+
+    engine.enemy_x[:, 0] = 48
+    engine.enemy_y[:, 0] = 8
+    engine.enemy_health[:, 0] = 100
+    engine.enemy_alive[:, 0] = True
+    engine.rng_state.fill_(12345)
+    engine._execute_player_attack(
+        torch.zeros(2, dtype=torch.int64),
+        torch.ones(2, dtype=torch.bool),
+        torch.ones(2, dtype=torch.bool),
+    )
+
+    expected = torch.atan2(torch.tensor(8.0), torch.tensor(48.0))
+    assert torch.allclose(engine.angle, torch.full((2,), expected))
+
+
+def test_chainsaw_hit_turns_and_forces_next_tic_pull(square_scenario) -> None:
+    engine = _engine(square_scenario)
+    engine.enemy_alive.zero_()
+    engine.x.zero_()
+    engine.y.zero_()
+    engine.z.zero_()
+    engine.angle.zero_()
+    engine.reaction_time.zero_()
+    engine.enemy_x[:, 0] = 48
+    engine.enemy_y[:, 0] = 8
+    engine.enemy_z[:, 0] = 0
+    engine.enemy_type[:, 0] = 5
+    engine.enemy_health[:, 0] = 500
+    engine.enemy_alive[:, 0] = True
+    engine.rng_state.fill_(12345)
+
+    engine._execute_player_attack(
+        torch.ones(2, dtype=torch.int64),
+        torch.ones(2, dtype=torch.bool),
+        torch.ones(2, dtype=torch.bool),
+    )
+
+    target_angle = torch.atan2(torch.tensor(8.0), torch.tensor(48.0))
+    expected_angle = target_angle - torch.deg2rad(torch.tensor(90.0 / 21.0))
+    assert engine.enemy_health[:, 0].tolist() == [498.0, 498.0]
+    assert torch.allclose(engine.angle, torch.full((2,), expected_angle))
+    assert torch.all(engine.chainsaw_pull)
+
+    contrary_input = torch.zeros((2, 20), dtype=torch.bool)
+    contrary_input[:, 1] = True
+    contrary_input[:, 3] = True
+    contrary_input[:, 5] = True
+    contrary_input[:, 7] = True
+    engine._move_player(contrary_input)
+
+    assert torch.allclose(engine.angle, torch.full((2,), expected_angle))
+    assert engine._x_fixed.tolist() == [203959, 203959]
+    assert engine._y_fixed.tolist() == [18353, 18353]
+    assert engine._momentum_x_fixed.tolist() == [184837, 184837]
+    assert engine._momentum_y_fixed.tolist() == [16632, 16632]
+    assert not torch.any(engine.chainsaw_pull)
+
+
+def test_shotgun_pellets_can_hit_distinct_angular_targets(square_scenario) -> None:
+    engine = _engine(_large_arena_scenario(square_scenario))
+    engine.enemy_alive.zero_()
+    engine.x.zero_()
+    engine.y.zero_()
+    engine.z.zero_()
+    engine.angle.zero_()
+    angles = torch.deg2rad(torch.tensor([2.48291015625, -2.39501953125]))
+    engine.enemy_x[:, :2] = torch.cos(angles) * 512.0
+    engine.enemy_y[:, :2] = torch.sin(angles) * 512.0
+    engine.enemy_z[:, :2] = 0
+    engine.enemy_type[:, :2] = 0
+    engine.enemy_health[:, :2] = 200
+    engine.enemy_alive[:, :2] = True
+    engine.ammo[:, 2] = 10
+    engine.rng_state.copy_(torch.tensor([12345, 67890]))
+
+    engine._execute_player_attack(
+        torch.full((2,), 3),
+        torch.tensor([True, False]),
+        torch.ones(2, dtype=torch.bool),
+    )
+
+    assert torch.all(engine.enemy_health[0, :2] < 200)
+    assert engine.enemy_health[1, :2].tolist() == [200.0, 200.0]
+
+
+def test_later_shotgun_pellets_pass_through_newly_killed_actor(square_scenario) -> None:
+    engine = _engine(square_scenario)
+    engine.enemy_alive.zero_()
+    engine.x.zero_()
+    engine.y.zero_()
+    engine.z.zero_()
+    engine.angle.zero_()
+    engine.enemy_x[:, :2] = torch.tensor([64.0, 128.0])
+    engine.enemy_y[:, :2] = 0
+    engine.enemy_z[:, :2] = 0
+    engine.enemy_type[:, :2] = 0
+    engine.enemy_health[:, :2] = torch.tensor([1.0, 200.0])
+    engine.enemy_alive[:, :2] = True
+    engine.ammo[:, 2] = 10
+    engine.rng_state.copy_(torch.tensor([12345, 67890]))
+
+    reward = engine._execute_player_attack(
+        torch.full((2,), 3),
+        torch.ones(2, dtype=torch.bool),
+        torch.ones(2, dtype=torch.bool),
+    )
+
+    assert not torch.any(engine.enemy_alive[:, 0])
+    assert torch.all(engine.enemy_health[:, 1] < 200)
+    assert reward.tolist() == [1.0, 1.0]
+
+
+def test_hitscan_preserves_per_pellet_pain_result(square_scenario) -> None:
+    engine = _engine(square_scenario)
+    engine.enemy_alive.zero_()
+    engine.enemy_type[:, 0] = 5
+    engine.enemy_health[:, 0] = 500
+    engine.enemy_alive[:, 0] = True
+    damage = torch.zeros_like(engine.enemy_health)
+    damage[:, 0] = 10
+    pain_override = torch.zeros_like(engine.enemy_alive)
+    pain_override[0, 0] = True
+    rng_before = engine.rng_state.clone()
+
+    engine._apply_enemy_damage(damage, pain_override=pain_override)
+
+    assert engine.enemy_pain_tics[:, 0].tolist() == [4, 0]
+    assert torch.equal(engine.rng_state, rng_before)
+
+
+def test_bullet_autoaim_and_trace_use_distinct_reference_ranges(square_scenario) -> None:
+    engine = _engine(_large_arena_scenario(square_scenario))
+    engine.enemy_alive.zero_()
+    engine.x.zero_()
+    engine.y.zero_()
+    engine.z.zero_()
+    engine.angle.zero_()
+    engine.enemy_x[:, 0] = torch.tensor([1000.0, 1500.0])
+    engine.enemy_y[:, 0] = 0
+    engine.enemy_z[:, 0] = 100
+    engine.enemy_type[:, 0] = 0
+    engine.enemy_health[:, 0] = 100
+    engine.enemy_alive[:, 0] = True
+    engine.ammo[:, 1] = 10
+
+    engine._execute_player_attack(
+        torch.full((2,), 2),
+        torch.ones(2, dtype=torch.bool),
+        torch.ones(2, dtype=torch.bool),
+    )
+
+    assert engine.enemy_health[0, 0] < 100
+    assert engine.enemy_health[1, 0] == 100
+
+    engine.enemy_x[:, 0] = 3000
+    engine.enemy_z[:, 0] = 0
+    engine.enemy_health[:, 0] = 100
+    engine.enemy_alive[:, 0] = True
+    engine.rng_state.copy_(torch.tensor([12345, 67890]))
+    engine._execute_player_attack(
+        torch.full((2,), 2),
+        torch.ones(2, dtype=torch.bool),
+        torch.ones(2, dtype=torch.bool),
+    )
+
+    assert torch.all(engine.enemy_health[:, 0] < 100)
 
 
 def test_shotgun_guy_drop_waits_for_death_state_and_gives_half_ammo(square_scenario) -> None:
