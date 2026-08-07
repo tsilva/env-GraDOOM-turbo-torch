@@ -622,6 +622,147 @@ def test_rocket_radius_thrust_can_launch_player_upward(square_scenario) -> None:
     assert torch.equal(engine.velocity_z, torch.full((2,), 14.33599853515625))
 
 
+def test_rocket_radius_thrust_launches_enemy_with_reference_gravity(
+    square_scenario,
+) -> None:
+    scenario = replace(
+        square_scenario,
+        blocking_segments=np.asarray([(-128.0, 10.0, 128.0, 10.0)], dtype=np.float32),
+    )
+    engine = _engine(scenario)
+    engine.x.fill_(-200)
+    engine.y.fill_(200)
+    engine.health.fill_(1000)
+    engine.enemy_x[:, 0] = 40
+    engine.enemy_y[:, 0] = 0
+    engine.enemy_z[:, 0] = 0
+    engine.enemy_type[:, 0] = 0
+    engine.enemy_health[:, 0] = 1000
+    engine.enemy_alive[:, 0] = True
+    engine.projectile_x[:, 0] = 0
+    engine.projectile_y[:, 0] = 0
+    engine.projectile_z[:, 0] = 0
+    engine.projectile_velocity_x[:, 0] = 0
+    engine.projectile_velocity_y[:, 0] = 20
+    engine.projectile_type[:, 0] = 0
+    engine.projectile_alive[:, 0] = True
+
+    engine._projectile_tick(torch.ones(2, dtype=torch.bool))
+
+    assert engine.enemy_health[:, 0].tolist() == [892.0, 892.0]
+    # Radius thrust is 108 * 0.5 / mass 100, with the non-source vertical
+    # factor 0.5 applied to the 28-unit center offset: 7.56 units/tic.
+    assert torch.equal(
+        engine._enemy_velocity_z_fixed[:, 0],
+        torch.full((2,), 495452, dtype=torch.int64),
+    )
+
+    engine._move_enemy_thrust(torch.ones(2, dtype=torch.bool))
+
+    assert torch.equal(
+        engine._enemy_z_fixed[:, 0],
+        torch.full((2,), 495452, dtype=torch.int64),
+    )
+    assert torch.equal(
+        engine._enemy_velocity_z_fixed[:, 0],
+        torch.full((2,), 495452 - 65536, dtype=torch.int64),
+    )
+
+
+def test_rocket_splash_respects_walls_and_pushes_only_visible_enemy(
+    square_scenario,
+) -> None:
+    divider = np.asarray([(0.0, -256.0, 0.0, 256.0)], dtype=np.float32)
+    walls = np.concatenate((square_scenario.wall_segments, divider), axis=0)
+    scenario = replace(
+        square_scenario,
+        wall_segments=walls,
+        blocking_segments=divider,
+        blocking_wall_indices=np.asarray([4], dtype=np.int32),
+        wall_texture_ids=np.zeros(5, dtype=np.int32),
+        wall_texture_offsets=np.zeros((5, 2), dtype=np.float32),
+        wall_side_texture_ids=np.concatenate(
+            (
+                np.zeros((5, 1, 1), dtype=np.int32),
+                np.full((5, 1, 1), -1, dtype=np.int32),
+            ),
+            axis=1,
+        ).repeat(3, axis=2),
+        wall_side_texture_offsets=np.zeros((5, 2, 2), dtype=np.float32),
+        wall_sectors=np.zeros((5, 2), dtype=np.int32),
+        sector_edge_mask=np.ones((1, 5), dtype=np.bool_),
+    )
+    engine = _engine(scenario)
+    engine.x.fill_(-200)
+    engine.y.fill_(200)
+    engine.health.fill_(1000)
+    engine.enemy_x[:, 0] = 30
+    engine.enemy_x[:, 1] = -60
+    engine.enemy_y[:, :2] = 0
+    engine.enemy_z[:, :2] = 0
+    engine.enemy_type[:, :2] = 5
+    engine.enemy_health[:, :2] = 500
+    engine.enemy_alive[:, :2] = True
+    engine.projectile_x[:, 0] = -20
+    engine.projectile_y[:, 0] = 0
+    engine.projectile_z[:, 0] = 32
+    engine.projectile_velocity_x[:, 0] = 20
+    engine.projectile_velocity_y[:, 0] = 0
+    engine.projectile_type[:, 0] = 0
+    engine.projectile_alive[:, 0] = True
+
+    engine._projectile_tick(torch.ones(2, dtype=torch.bool))
+
+    # The explosion remains at x=-13.333 when its next substep touches the
+    # wall. The knight at x=30 is geometrically in range but has no sight line;
+    # the knight on the explosion side takes 105 damage and both Doom thrusts.
+    assert engine.enemy_health[:, :2].tolist() == [
+        [500.0, 395.0],
+        [500.0, 395.0],
+    ]
+    assert torch.equal(
+        engine._enemy_momentum_x_fixed[:, :2],
+        torch.tensor([[0, -89466], [0, -89466]], dtype=torch.int64),
+    )
+    assert torch.equal(
+        engine._enemy_momentum_y_fixed[:, :2],
+        torch.zeros((2, 2), dtype=torch.int64),
+    )
+
+
+def test_direct_rocket_kill_does_not_splash_already_dead_target(square_scenario) -> None:
+    engine = _engine(square_scenario)
+    engine.x.fill_(-200)
+    engine.y.fill_(200)
+    engine.health.fill_(1000)
+    engine.enemy_x[:, 0] = 20
+    engine.enemy_y[:, 0] = 0
+    engine.enemy_type[:, 0] = 0
+    engine.enemy_health[:, 0] = 20
+    engine.enemy_alive[:, 0] = True
+    engine.projectile_x[:, 0] = 0
+    engine.projectile_y[:, 0] = 0
+    engine.projectile_z[:, 0] = 32
+    engine.projectile_velocity_x[:, 0] = 20
+    engine.projectile_type[:, 0] = 0
+    engine.projectile_alive[:, 0] = True
+
+    engine._projectile_tick(torch.ones(2, dtype=torch.bool))
+
+    assert not torch.any(engine.enemy_alive[:, 0])
+    assert engine.killcount.tolist() == [1, 1]
+    # The seeded direct rolls are 120 and 60 damage. P_DamageMobj produces
+    # exactly 15 and 7.5 units of thrust; radius damage never revisits a corpse.
+    assert torch.equal(
+        engine._enemy_momentum_x_fixed[:, 0],
+        torch.tensor([15 * 65536, 15 * 65536 // 2], dtype=torch.int64),
+    )
+    assert torch.equal(
+        engine._enemy_momentum_y_fixed[:, 0],
+        torch.zeros(2, dtype=torch.int64),
+    )
+
+
 def test_plasma_uses_delayed_projectile_without_splash(square_scenario) -> None:
     engine = _engine(square_scenario)
     engine.angle.zero_()
@@ -670,6 +811,36 @@ def test_missile_substeps_respect_actor_radius_when_grazing_walls(square_scenari
     assert not torch.any(engine.projectile_alive[:, 0])
     assert engine.projectile_y[:, 0].tolist() == [0.0, 0.0]
     assert engine.projectile_impact_tics[:, 0].tolist() == [18, 18]
+
+
+def test_missiles_clamp_explosion_origin_to_floor_and_ceiling(square_scenario) -> None:
+    engine = _engine(square_scenario)
+    engine.enemy_alive.zero_()
+    engine.x.fill_(-200)
+    engine.y.fill_(200)
+    engine.health.fill_(1000)
+    engine.projectile_x[:, 0] = 0
+    engine.projectile_y[:, 0] = 0
+    engine.projectile_z[:, 0] = torch.tensor([4.0, 120.0])
+    engine.projectile_velocity_z[:, 0] = torch.tensor([-10.0, 10.0])
+    engine.projectile_type[:, 0] = 0
+    engine.projectile_alive[:, 0] = True
+
+    engine._projectile_tick(torch.ones(2, dtype=torch.bool))
+
+    assert engine.projectile_z[:, 0].tolist() == [0.0, 120.0]
+    assert not torch.any(engine.projectile_alive[:, 0])
+
+    engine.enemy_projectile_x[:, 0] = 0
+    engine.enemy_projectile_y[:, 0] = 0
+    engine.enemy_projectile_z[:, 0] = torch.tensor([4.0, 112.0])
+    engine.enemy_projectile_velocity_z[:, 0] = torch.tensor([-10.0, 10.0])
+    engine.enemy_projectile_alive[:, 0] = True
+
+    engine._enemy_projectile_tick(torch.ones(2, dtype=torch.bool))
+
+    assert engine.enemy_projectile_z[:, 0].tolist() == [0.0, 112.0]
+    assert not torch.any(engine.enemy_projectile_alive[:, 0])
 
 
 def test_enemy_missile_uses_reference_four_substeps(square_scenario) -> None:

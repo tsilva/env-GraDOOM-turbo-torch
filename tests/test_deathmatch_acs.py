@@ -722,6 +722,28 @@ def test_moving_monsters_treat_other_monsters_as_solid(square_scenario) -> None:
     assert engine.enemy_x[:, 1].tolist() == [52.0, 52.0]
 
 
+def test_solid_corpses_retain_actor_specific_collision_radius(square_scenario) -> None:
+    engine = _engine(square_scenario)
+    engine.x.fill_(-100)
+    engine.y.fill_(-100)
+    engine.enemy_x[:, 0] = 0
+    engine.enemy_y[:, 0] = 0
+    engine.enemy_z[:, 0] = 0
+    engine.enemy_type[:, 0] = -1
+    engine.enemy_death_type[:, 0] = torch.tensor([4, 0])
+    engine.enemy_death_tics[:, 0] = 10
+    engine.enemy_death_elapsed[:, 0] = 0
+
+    collision = engine._player_collides(
+        torch.full((2,), 45.0),
+        torch.zeros(2),
+    )
+
+    # Demon radius 30 plus player radius 16 overlaps at distance 45. The
+    # zombieman corpse in the second lane retains radius 20 and does not.
+    assert collision.tolist() == [True, False]
+
+
 def test_zombieman_chase_uses_eight_unit_four_tic_cadence(square_scenario) -> None:
     engine = _engine(square_scenario)
     engine.x.zero_()
@@ -978,6 +1000,66 @@ def test_two_sided_portal_does_not_occlude_hitscan_or_monster_sight(square_scena
     engine.enemy_cooldown[:, 0] = 1
     engine._enemy_tick()
     assert torch.all(engine.health < 100)
+
+
+def test_height_transition_portal_clips_sight_from_deep_pit(square_scenario) -> None:
+    portal = np.asarray([(0, -256, 0, 256)], dtype=np.float32)
+    walls = np.concatenate((square_scenario.wall_segments, portal), axis=0)
+    scenario = replace(
+        square_scenario,
+        wall_segments=walls,
+        wall_texture_ids=np.zeros(5, dtype=np.int32),
+        wall_texture_offsets=np.zeros((5, 2), dtype=np.float32),
+        wall_side_texture_ids=np.concatenate(
+            (
+                np.zeros((5, 1, 1), dtype=np.int32),
+                np.full((5, 1, 1), -1, dtype=np.int32),
+            ),
+            axis=1,
+        ).repeat(3, axis=2),
+        wall_side_texture_offsets=np.zeros((5, 2, 2), dtype=np.float32),
+        wall_sectors=np.asarray(
+            [[0, -1], [0, -1], [1, -1], [1, -1], [0, 1]],
+            dtype=np.int32,
+        ),
+        sector_edge_mask=np.ones((2, 5), dtype=np.bool_),
+        sector_heights=np.asarray([(-128, 128), (0, 128)], dtype=np.float32),
+        sector_lights=np.asarray([192, 192], dtype=np.int16),
+        sector_floor_texture_ids=np.zeros(2, dtype=np.int32),
+        sector_ceiling_texture_ids=np.zeros(2, dtype=np.int32),
+    )
+    engine = _engine(scenario)
+    engine.x.fill_(-64)
+    engine.y.zero_()
+    engine.z.copy_(torch.tensor([-128.0, -64.0]))
+    engine.angle.zero_()
+    engine.enemy_x[:, 0] = 64
+    engine.enemy_y[:, 0] = 0
+    engine.enemy_z[:, 0] = 0
+    engine.enemy_type[:, 0] = 0
+    engine.enemy_health[:, 0] = 20
+    engine.enemy_alive[:, 0] = True
+    buttons = torch.zeros((2, 20), dtype=torch.bool)
+    buttons[:, 0] = True
+
+    engine._player_attack(buttons)
+    _finish_pending_attack(engine)
+
+    # At z=-128 the portal's floor clips the entire target sight cone. At
+    # z=-64, the upper part of the zombieman remains visible over the rim.
+    assert engine.enemy_health[0, 0].item() == 20
+    assert engine.enemy_health[1, 0].item() < 20
+
+    rocket_blocked = engine._rocket_splash_blocked(
+        torch.full((2, 1), -64.0),
+        torch.zeros((2, 1)),
+        torch.tensor([[-128.0], [-32.0]]),
+        torch.full((2, 1), 64.0),
+        torch.zeros((2, 1)),
+        torch.zeros((2, 1)),
+        torch.full((2, 1), 56.0),
+    )
+    assert rocket_blocked[:, 0, 0].tolist() == [True, False]
 
 
 def test_reference_monster_damage_distributions(square_scenario) -> None:

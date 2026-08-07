@@ -60,6 +60,8 @@ _PLAYER_MAX_DAMAGE_THRUST_FIXED = 32 * _FIXED_UNIT
 _PLAYER_RADIUS_THRUST_DENOMINATOR_FIXED = 200 * _FIXED_UNIT
 _PLAYER_SELF_RADIUS_VERTICAL_THRUST_DENOMINATOR_FIXED = 1000 * _FIXED_UNIT
 _ROCKET_SPLASH_DAMAGE = 128.0
+_ROCKET_WALL_GRID_CELL = 64.0
+_ROCKET_MAX_TARGET_CENTER_OFFSET = _ROCKET_SPLASH_DAMAGE + max(_ENEMY_RADIUS)
 _WEAPON_LOWER_TICS = 16
 _WEAPON_RAISE_TICS = 16
 _WEAPON_SPAWN_RAISE_TICS = 14
@@ -234,6 +236,59 @@ def _build_tangent_to_angle() -> np.ndarray:
     return np.trunc(((1 << 32) - 1) * fraction).astype(np.int64)
 
 
+def _build_rocket_wall_grid(
+    scenario: CompiledScenario,
+) -> tuple[float, float, int, int, np.ndarray, np.ndarray]:
+    """Index every wall that can cross a nonzero rocket-splash trace."""
+    minimum_x, maximum_x, minimum_y, maximum_y = scenario.bounds
+    grid_minimum_x = math.floor(minimum_x / _ROCKET_WALL_GRID_CELL) * _ROCKET_WALL_GRID_CELL
+    grid_minimum_y = math.floor(minimum_y / _ROCKET_WALL_GRID_CELL) * _ROCKET_WALL_GRID_CELL
+    grid_width = max(
+        math.ceil((maximum_x - grid_minimum_x) / _ROCKET_WALL_GRID_CELL),
+        1,
+    )
+    grid_height = max(
+        math.ceil((maximum_y - grid_minimum_y) / _ROCKET_WALL_GRID_CELL),
+        1,
+    )
+    walls = scenario.wall_segments
+    candidates: list[np.ndarray] = []
+    for grid_y in range(grid_height):
+        cell_minimum_y = grid_minimum_y + grid_y * _ROCKET_WALL_GRID_CELL
+        cell_maximum_y = cell_minimum_y + _ROCKET_WALL_GRID_CELL
+        for grid_x in range(grid_width):
+            cell_minimum_x = grid_minimum_x + grid_x * _ROCKET_WALL_GRID_CELL
+            cell_maximum_x = cell_minimum_x + _ROCKET_WALL_GRID_CELL
+            if len(walls):
+                overlaps = (
+                    (np.maximum(walls[:, 0], walls[:, 2])
+                    >= cell_minimum_x - _ROCKET_MAX_TARGET_CENTER_OFFSET)
+                    & (np.minimum(walls[:, 0], walls[:, 2])
+                    <= cell_maximum_x + _ROCKET_MAX_TARGET_CENTER_OFFSET)
+                    & (np.maximum(walls[:, 1], walls[:, 3])
+                    >= cell_minimum_y - _ROCKET_MAX_TARGET_CENTER_OFFSET)
+                    & (np.minimum(walls[:, 1], walls[:, 3])
+                    <= cell_maximum_y + _ROCKET_MAX_TARGET_CENTER_OFFSET)
+                )
+                candidates.append(np.flatnonzero(overlaps).astype(np.int64))
+            else:
+                candidates.append(np.empty(0, dtype=np.int64))
+    candidate_width = max(max((len(value) for value in candidates), default=0), 1)
+    wall_indices = np.zeros((len(candidates), candidate_width), dtype=np.int64)
+    wall_valid = np.zeros((len(candidates), candidate_width), dtype=np.bool_)
+    for cell_index, values in enumerate(candidates):
+        wall_indices[cell_index, : len(values)] = values
+        wall_valid[cell_index, : len(values)] = True
+    return (
+        grid_minimum_x,
+        grid_minimum_y,
+        grid_width,
+        grid_height,
+        wall_indices,
+        wall_valid,
+    )
+
+
 _FINE_SINE_FIXED = _build_fine_sine_fixed()
 _TANGENT_TO_ANGLE = _build_tangent_to_angle()
 _ITEM_SPRITE_INDEX = {
@@ -294,6 +349,7 @@ class DeviceScenario:
     texture_animation_counts: torch.Tensor
     portal_walls: torch.Tensor
     portal_wall_sectors: torch.Tensor
+    portal_wall_blocks_sight: torch.Tensor
     portal_wall_lights: torch.Tensor
     portal_texture_ids: torch.Tensor
     portal_texture_offsets: torch.Tensor
@@ -363,6 +419,8 @@ class DeviceScenario:
     @classmethod
     def from_host(cls, scenario: CompiledScenario, device: torch.device) -> DeviceScenario:
         blocking_indices = scenario.blocking_wall_indices
+        wall_blocks_sight = np.zeros(len(scenario.wall_segments), dtype=np.bool_)
+        wall_blocks_sight[blocking_indices] = True
         sector_indices = scenario.wall_sectors[blocking_indices, 0].clip(min=0)
         wall_lights = scenario.sector_lights[sector_indices].astype("float32")
         blocking_walls = scenario.blocking_segments
@@ -635,6 +693,11 @@ class DeviceScenario:
             portal_wall_sectors=torch.as_tensor(
                 scenario.wall_sectors, device=device, dtype=torch.int64
             ),
+            portal_wall_blocks_sight=torch.as_tensor(
+                wall_blocks_sight,
+                device=device,
+                dtype=torch.bool,
+            ),
             portal_wall_lights=torch.as_tensor(portal_wall_lights, device=device),
             portal_texture_ids=torch.as_tensor(
                 scenario.wall_texture_ids, device=device, dtype=torch.int64
@@ -804,6 +867,24 @@ class TorchDeathmatchEngine:
         self.mask_hud = mask_hud
         self.debug_checks = device.type == "cpu" if debug_checks is None else debug_checks
         self.map = DeviceScenario.from_host(scenario, device)
+        (
+            self._rocket_wall_grid_minimum_x,
+            self._rocket_wall_grid_minimum_y,
+            self._rocket_wall_grid_width,
+            self._rocket_wall_grid_height,
+            rocket_wall_indices,
+            rocket_wall_valid,
+        ) = _build_rocket_wall_grid(scenario)
+        self._rocket_wall_indices = torch.as_tensor(
+            rocket_wall_indices,
+            device=device,
+            dtype=torch.int64,
+        )
+        self._rocket_wall_valid = torch.as_tensor(
+            rocket_wall_valid,
+            device=device,
+            dtype=torch.bool,
+        )
         n = num_envs
         self.rng_state = torch.ones(n, device=device, dtype=torch.int64)
         self.episode_time = torch.zeros(n, device=device, dtype=torch.int32)
@@ -880,10 +961,16 @@ class TorchDeathmatchEngine:
         self._enemy_y_fixed = torch.zeros(
             (n, self.enemy_slots), device=device, dtype=torch.int64
         )
+        self._enemy_z_fixed = torch.zeros(
+            (n, self.enemy_slots), device=device, dtype=torch.int64
+        )
         self._enemy_momentum_x_fixed = torch.zeros(
             (n, self.enemy_slots), device=device, dtype=torch.int64
         )
         self._enemy_momentum_y_fixed = torch.zeros(
+            (n, self.enemy_slots), device=device, dtype=torch.int64
+        )
+        self._enemy_velocity_z_fixed = torch.zeros(
             (n, self.enemy_slots), device=device, dtype=torch.int64
         )
         self.enemy_type = torch.full((n, self.enemy_slots), -1, device=device, dtype=torch.int64)
@@ -1243,8 +1330,10 @@ class TorchDeathmatchEngine:
         self.enemy_angle[mask] = 0
         self._enemy_x_fixed[mask] = 0
         self._enemy_y_fixed[mask] = 0
+        self._enemy_z_fixed[mask] = 0
         self._enemy_momentum_x_fixed[mask] = 0
         self._enemy_momentum_y_fixed[mask] = 0
+        self._enemy_velocity_z_fixed[mask] = 0
         self.enemy_type[mask] = -1
         self.enemy_health[mask] = 0
         self.enemy_alive[mask] = False
@@ -1418,7 +1507,7 @@ class TorchDeathmatchEngine:
             )
             enemy_dx = candidate_x[..., None] - self.enemy_x[:, None, :]
             enemy_dy = candidate_y[..., None] - self.enemy_y[:, None, :]
-            enemy_radius = self._enemy_radius[self.enemy_type.clamp_min(0)]
+            enemy_radius = self._enemy_radius[self._effective_enemy_type()]
             overlaps_enemy = self._enemy_solid_mask()[:, None, :] & (
                 (enemy_dx.abs() < radius + enemy_radius[:, None, :])
                 & (enemy_dy.abs() < radius + enemy_radius[:, None, :])
@@ -1455,6 +1544,13 @@ class TorchDeathmatchEngine:
         )
         return self.enemy_alive | dying_solid
 
+    def _effective_enemy_type(self) -> torch.Tensor:
+        return torch.where(
+            self.enemy_type >= 0,
+            self.enemy_type,
+            self.enemy_death_type,
+        ).clamp_min(0)
+
     def _player_collides(
         self,
         x: torch.Tensor,
@@ -1467,7 +1563,7 @@ class TorchDeathmatchEngine:
             floor, ceiling = self._player_opening_at(x, y)
         collision |= floor > self.z + 24.0
         collision |= ceiling - torch.maximum(self.z, floor) < 56.0
-        enemy_type = self.enemy_type.clamp_min(0)
+        enemy_type = self._effective_enemy_type()
         enemy_radius = self._enemy_radius[enemy_type]
         enemy_dx = x[:, None] - self.enemy_x
         enemy_dy = y[:, None] - self.enemy_y
@@ -1519,12 +1615,13 @@ class TorchDeathmatchEngine:
         collision |= ceiling - torch.maximum(self.enemy_z, floor) < height
         dx = x[:, :, None] - self.enemy_x[:, None, :]
         dy = y[:, :, None] - self.enemy_y[:, None, :]
-        other_radius = self._enemy_radius[self.enemy_type.clamp_min(0)]
+        other_type = self._effective_enemy_type()
+        other_radius = self._enemy_radius[other_type]
         vertical_overlap = self._vertical_overlap(
             self.enemy_z[:, :, None],
             height[:, :, None],
             self.enemy_z[:, None, :],
-            self._enemy_height[self.enemy_type.clamp_min(0)][:, None, :],
+            self._enemy_height[other_type][:, None, :],
         )
         not_self = ~torch.eye(
             self.enemy_slots,
@@ -1833,32 +1930,40 @@ class TorchDeathmatchEngine:
             result_ceiling,
         )
 
-    def _line_blocked(
+    def _sight_blocked(
         self,
         origin_x: torch.Tensor,
         origin_y: torch.Tensor,
+        sight_z: torch.Tensor,
         target_x: torch.Tensor,
         target_y: torch.Tensor,
+        target_z: torch.Tensor,
+        target_height: torch.Tensor,
     ) -> torch.Tensor:
+        """Reproduce Doom sight-cone clipping across simple sector portals."""
         direction_x = target_x - origin_x
         direction_y = target_y - origin_y
-        # Two-sided linedefs in the certified map are open portals whose
-        # vertical openings contain all supported attack origins and targets.
-        # Only one-sided blocking lines stop sight and hitscan traversal.
-        start_x = self.map.blocking_walls[:, 0]
-        start_y = self.map.blocking_walls[:, 1]
-        segment_x = self.map.blocking_walls[:, 2] - start_x
-        segment_y = self.map.blocking_walls[:, 3] - start_y
+        walls = self.map.portal_walls
+        start_x = walls[:, 0]
+        start_y = walls[:, 1]
+        segment_x = walls[:, 2] - start_x
+        segment_y = walls[:, 3] - start_y
         offset_x = start_x - origin_x[..., None]
         offset_y = start_y - origin_y[..., None]
-        denominator = direction_x[..., None] * segment_y - direction_y[..., None] * segment_x
+        denominator = (
+            direction_x[..., None] * segment_y
+            - direction_y[..., None] * segment_x
+        )
         safe = torch.where(
             denominator.abs() < 1e-6,
             torch.ones_like(denominator),
             denominator,
         )
         along_ray = (offset_x * segment_y - offset_y * segment_x) / safe
-        along_wall = (offset_x * direction_y[..., None] - offset_y * direction_x[..., None]) / safe
+        along_wall = (
+            offset_x * direction_y[..., None]
+            - offset_y * direction_x[..., None]
+        ) / safe
         intersects = (
             (denominator.abs() >= 1e-6)
             & (along_ray > 1e-4)
@@ -1866,7 +1971,165 @@ class TorchDeathmatchEngine:
             & (along_wall >= 0)
             & (along_wall <= 1)
         )
-        return torch.any(intersects, dim=-1)
+
+        wall_sectors = self.map.portal_wall_sectors
+        valid_portal = torch.all(wall_sectors >= 0, dim=1)
+        safe_sectors = wall_sectors.clamp_min(0)
+        opening_bottom = torch.amax(
+            self.map.sector_heights[safe_sectors, 0],
+            dim=1,
+        )
+        opening_top = torch.amin(
+            self.map.sector_heights[safe_sectors, 1],
+            dim=1,
+        )
+        solid = intersects & (
+            self.map.portal_wall_blocks_sight | ~valid_portal
+        )
+        portal = (
+            intersects
+            & ~self.map.portal_wall_blocks_sight
+            & valid_portal
+        )
+        safe_fraction = torch.where(
+            portal,
+            along_ray,
+            torch.ones_like(along_ray),
+        )
+        bottom_clip = torch.where(
+            portal,
+            (opening_bottom - sight_z[..., None]) / safe_fraction,
+            torch.full_like(along_ray, -torch.inf),
+        )
+        top_clip = torch.where(
+            portal,
+            (opening_top - sight_z[..., None]) / safe_fraction,
+            torch.full_like(along_ray, torch.inf),
+        )
+        bottom_slope = torch.maximum(
+            target_z - sight_z,
+            torch.amax(bottom_clip, dim=-1),
+        )
+        top_slope = torch.minimum(
+            target_z + target_height - sight_z,
+            torch.amin(top_clip, dim=-1),
+        )
+        return torch.any(solid, dim=-1) | (top_slope <= bottom_slope)
+
+    def _rocket_splash_blocked(
+        self,
+        origin_x: torch.Tensor,
+        origin_y: torch.Tensor,
+        origin_z: torch.Tensor,
+        target_x: torch.Tensor,
+        target_y: torch.Tensor,
+        target_z: torch.Tensor,
+        target_height: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply P_CheckSight to every in-range rocket/target pair."""
+        grid_x = torch.floor(
+            (origin_x - self._rocket_wall_grid_minimum_x) / _ROCKET_WALL_GRID_CELL
+        ).to(torch.int64)
+        grid_y = torch.floor(
+            (origin_y - self._rocket_wall_grid_minimum_y) / _ROCKET_WALL_GRID_CELL
+        ).to(torch.int64)
+        grid_x.clamp_(0, self._rocket_wall_grid_width - 1)
+        grid_y.clamp_(0, self._rocket_wall_grid_height - 1)
+        grid_index = grid_y * self._rocket_wall_grid_width + grid_x
+        wall_indices = self._rocket_wall_indices[grid_index]
+        wall_valid = self._rocket_wall_valid[grid_index]
+        walls = self.map.portal_walls[wall_indices]
+
+        # P_RadiusAttack asks whether the damaged actor can see the bomb spot.
+        # The trace therefore starts at three quarters of the actor height and
+        # clips a cone against the rocket's eight-unit actor box.
+        direction_x = origin_x[:, :, None] - target_x[:, None, :]
+        direction_y = origin_y[:, :, None] - target_y[:, None, :]
+        start_x = walls[..., 0]
+        start_y = walls[..., 1]
+        segment_x = walls[..., 2] - start_x
+        segment_y = walls[..., 3] - start_y
+        offset_x = start_x[..., None, :] - target_x[:, None, :, None]
+        offset_y = start_y[..., None, :] - target_y[:, None, :, None]
+        denominator = (
+            direction_x[..., None] * segment_y[..., None, :]
+            - direction_y[..., None] * segment_x[..., None, :]
+        )
+        safe = torch.where(
+            denominator.abs() < 1e-6,
+            torch.ones_like(denominator),
+            denominator,
+        )
+        along_ray = (
+            offset_x * segment_y[..., None, :]
+            - offset_y * segment_x[..., None, :]
+        ) / safe
+        along_wall = (
+            offset_x * direction_y[..., None]
+            - offset_y * direction_x[..., None]
+        ) / safe
+        intersects = (
+            wall_valid[..., None, :]
+            & (denominator.abs() >= 1e-6)
+            & (along_ray > 1e-4)
+            & (along_ray < 1 - 1e-4)
+            & (along_wall >= 0)
+            & (along_wall <= 1)
+        )
+
+        wall_sectors = self.map.portal_wall_sectors[wall_indices]
+        valid_portal = torch.all(wall_sectors >= 0, dim=-1)
+        safe_sectors = wall_sectors.clamp_min(0)
+        opening_bottom = torch.amax(
+            self.map.sector_heights[safe_sectors, 0],
+            dim=-1,
+        )
+        opening_top = torch.amin(
+            self.map.sector_heights[safe_sectors, 1],
+            dim=-1,
+        )
+        blocks_sight = self.map.portal_wall_blocks_sight[wall_indices]
+        solid = intersects & (
+            blocks_sight[..., None, :] | ~valid_portal[..., None, :]
+        )
+        portal = (
+            intersects
+            & ~blocks_sight[..., None, :]
+            & valid_portal[..., None, :]
+        )
+        safe_fraction = torch.where(
+            portal,
+            along_ray,
+            torch.ones_like(along_ray),
+        )
+        sight_z = target_z + target_height * 0.75
+        bottom_clip = torch.where(
+            portal,
+            (
+                opening_bottom[..., None, :]
+                - sight_z[:, None, :, None]
+            )
+            / safe_fraction,
+            torch.full_like(along_ray, -torch.inf),
+        )
+        top_clip = torch.where(
+            portal,
+            (
+                opening_top[..., None, :]
+                - sight_z[:, None, :, None]
+            )
+            / safe_fraction,
+            torch.full_like(along_ray, torch.inf),
+        )
+        bottom_slope = torch.maximum(
+            origin_z[:, :, None] - sight_z[:, None, :],
+            torch.amax(bottom_clip, dim=-1),
+        )
+        top_slope = torch.minimum(
+            origin_z[:, :, None] + 8.0 - sight_z[:, None, :],
+            torch.amin(top_clip, dim=-1),
+        )
+        return torch.any(solid, dim=-1) | (top_slope <= bottom_slope)
 
     def _spawn_enemy_type(self, enemy_type: int, requested: torch.Tensor) -> None:
         free = (
@@ -1910,6 +2173,11 @@ class TorchDeathmatchEngine:
         spawn_sector = self._sector_at(x, y)
         spawn_z = self.map.sector_heights[spawn_sector, 0]
         self.enemy_z[row, slot] = torch.where(spawn, spawn_z, old_z)
+        self._enemy_z_fixed[row, slot] = torch.where(
+            spawn,
+            torch.round(spawn_z * _FIXED_UNIT).to(torch.int64),
+            self._enemy_z_fixed[row, slot],
+        )
         self.enemy_angle[row, slot] = torch.where(spawn, angle, old_angle)
         self.enemy_type[row, slot] = torch.where(
             spawn, torch.full_like(old_type, enemy_type), old_type
@@ -1942,6 +2210,11 @@ class TorchDeathmatchEngine:
             spawn,
             torch.zeros_like(self._enemy_momentum_y_fixed[row, slot]),
             self._enemy_momentum_y_fixed[row, slot],
+        )
+        self._enemy_velocity_z_fixed[row, slot] = torch.where(
+            spawn,
+            torch.zeros_like(self._enemy_velocity_z_fixed[row, slot]),
+            self._enemy_velocity_z_fixed[row, slot],
         )
         self.enemy_death_type[row, slot] = torch.where(
             spawn,
@@ -2510,10 +2783,18 @@ class TorchDeathmatchEngine:
         attacker_y: torch.Tensor,
         kickback: torch.Tensor | float = 100.0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        enemy_type = self.enemy_type.clamp_min(0)
+        source_dimensions = damage.ndim - 2
+        enemy_shape = (
+            self.num_envs,
+            *((1,) * source_dimensions),
+            self.enemy_slots,
+        )
+        enemy_type = self.enemy_type.clamp_min(0).reshape(enemy_shape)
+        enemy_x = self.enemy_x.reshape(enemy_shape)
+        enemy_y = self.enemy_y.reshape(enemy_shape)
         fine_angle = self._doom_fine_angle(
-            torch.round((self.enemy_x - attacker_x) * _FIXED_UNIT).to(torch.int64),
-            torch.round((self.enemy_y - attacker_y) * _FIXED_UNIT).to(torch.int64),
+            torch.round((enemy_x - attacker_x) * _FIXED_UNIT).to(torch.int64),
+            torch.round((enemy_y - attacker_y) * _FIXED_UNIT).to(torch.int64),
         )
         sine_fixed = self._fine_sine_fixed[fine_angle]
         cosine_fixed = self._fine_sine_fixed[
@@ -2547,14 +2828,18 @@ class TorchDeathmatchEngine:
         thrust_y_fixed: torch.Tensor | None = None,
     ) -> torch.Tensor:
         applied = torch.where(self.enemy_alive, damage, torch.zeros_like(damage))
-        if attacker_x is not None and attacker_y is not None:
-            if thrust_x_fixed is None or thrust_y_fixed is None:
-                thrust_x_fixed, thrust_y_fixed = self._enemy_damage_thrust_components(
-                    applied,
-                    attacker_x,
-                    attacker_y,
-                    kickback,
-                )
+        if (
+            (thrust_x_fixed is None or thrust_y_fixed is None)
+            and attacker_x is not None
+            and attacker_y is not None
+        ):
+            thrust_x_fixed, thrust_y_fixed = self._enemy_damage_thrust_components(
+                applied,
+                attacker_x,
+                attacker_y,
+                kickback,
+            )
+        if thrust_x_fixed is not None and thrust_y_fixed is not None:
             self._enemy_momentum_x_fixed.add_(
                 torch.where(
                     self.enemy_alive,
@@ -2843,7 +3128,16 @@ class TorchDeathmatchEngine:
         plane_impact = moving & (
             (next_z < floor) | (next_z + projectile_height > ceiling)
         )
-        current_z.copy_(torch.where(moving, next_z, current_z))
+        clipped_next_z = torch.where(
+            next_z < floor,
+            floor,
+            torch.where(
+                next_z + projectile_height > ceiling,
+                ceiling - projectile_height,
+                next_z,
+            ),
+        )
+        current_z.copy_(torch.where(moving, clipped_next_z, current_z))
         impact |= plane_impact
 
         random_bits = self._random_u32(torch.any(impact, dim=1))[:, None]
@@ -2857,11 +3151,23 @@ class TorchDeathmatchEngine:
         die = torch.remainder(mixed, 8).to(torch.float32) + 1
         direct_damage = torch.where(self.projectile_type == 0, die * 20.0, die * 5.0)
         direct_damage *= (impact & enemy_impact).to(torch.float32)
-        damage_by_enemy = torch.zeros_like(self.enemy_health)
-        damage_by_enemy.scatter_add_(1, nearest_enemy, direct_damage)
+        direct_damage_by_enemy = torch.zeros(
+            (
+                self.num_envs,
+                self.player_projectile_slots,
+                self.enemy_slots,
+            ),
+            device=self.device,
+            dtype=direct_damage.dtype,
+        )
+        direct_damage_by_enemy.scatter_add_(
+            2,
+            nearest_enemy[:, :, None],
+            direct_damage[:, :, None],
+        )
 
         rocket_impact = impact & (self.projectile_type == 0)
-        splash_damage, _enemy_splash_points_fixed = self._rocket_radius_damage(
+        splash_damage, enemy_splash_points_fixed = self._rocket_radius_damage(
             current_x[:, :, None],
             current_y[:, :, None],
             current_z[:, :, None],
@@ -2871,10 +3177,102 @@ class TorchDeathmatchEngine:
             self._enemy_radius[enemy_type][:, None, :],
             self._enemy_height[enemy_type][:, None, :],
         )
-        splash_damage *= (
-            rocket_impact[:, :, None] & self.enemy_alive[:, None, :]
-        ).to(torch.float32)
-        damage_by_enemy.add_(torch.sum(splash_damage, dim=1))
+        visible_to_enemy = ~self._rocket_splash_blocked(
+            current_x,
+            current_y,
+            current_z,
+            self.enemy_x,
+            self.enemy_y,
+            self.enemy_z,
+            self._enemy_height[enemy_type],
+        )
+        killed_by_direct_impact = (
+            (direct_damage_by_enemy > 0)
+            & (direct_damage_by_enemy >= self.enemy_health[:, None, :])
+        )
+        enemy_splash = (
+            rocket_impact[:, :, None]
+            & self.enemy_alive[:, None, :]
+            & visible_to_enemy
+            & ~killed_by_direct_impact
+        )
+        splash_damage *= enemy_splash.to(torch.float32)
+        enemy_splash_points_fixed *= enemy_splash.to(torch.int64)
+        damage_by_enemy = torch.sum(
+            direct_damage_by_enemy + splash_damage,
+            dim=1,
+        )
+
+        direct_enemy_thrust_x, direct_enemy_thrust_y = (
+            self._enemy_damage_thrust_components(
+                direct_damage_by_enemy,
+                current_x[:, :, None],
+                current_y[:, :, None],
+            )
+        )
+        splash_enemy_thrust_x, splash_enemy_thrust_y = (
+            self._enemy_damage_thrust_components(
+                splash_damage,
+                current_x[:, :, None],
+                current_y[:, :, None],
+            )
+        )
+        enemy_fine_angle = self._doom_fine_angle(
+            torch.round(
+                (self.enemy_x[:, None, :] - current_x[:, :, None]) * _FIXED_UNIT
+            ).to(torch.int64),
+            torch.round(
+                (self.enemy_y[:, None, :] - current_y[:, :, None]) * _FIXED_UNIT
+            ).to(torch.int64),
+        )
+        enemy_sine_fixed = self._fine_sine_fixed[enemy_fine_angle]
+        enemy_cosine_fixed = self._fine_sine_fixed[
+            (enemy_fine_angle + _FINE_ANGLES // 4) & (_FINE_ANGLES - 1)
+        ]
+        enemy_radius_thrust_denominator = torch.round(
+            self._enemy_mass[enemy_type][:, None, :] * (2 * _FIXED_UNIT)
+        ).to(torch.int64)
+        enemy_radius_thrust_x = torch.div(
+            enemy_cosine_fixed * enemy_splash_points_fixed,
+            enemy_radius_thrust_denominator,
+            rounding_mode="trunc",
+        )
+        enemy_radius_thrust_y = torch.div(
+            enemy_sine_fixed * enemy_splash_points_fixed,
+            enemy_radius_thrust_denominator,
+            rounding_mode="trunc",
+        )
+        enemy_center_delta_z_fixed = torch.round(
+            (
+                self.enemy_z[:, None, :]
+                + self._enemy_height[enemy_type][:, None, :] * 0.5
+                - current_z[:, :, None]
+            )
+            * _FIXED_UNIT
+        ).to(torch.int64)
+        enemy_radius_vertical_denominator = torch.round(
+            self._enemy_mass[enemy_type][:, None, :] * (4 * _FIXED_UNIT)
+        ).to(torch.int64)
+        enemy_radius_thrust_z = torch.div(
+            enemy_center_delta_z_fixed * enemy_splash_points_fixed,
+            enemy_radius_vertical_denominator,
+            rounding_mode="trunc",
+        )
+        enemy_thrust_x = torch.sum(
+            direct_enemy_thrust_x
+            + splash_enemy_thrust_x
+            + enemy_radius_thrust_x,
+            dim=1,
+        )
+        enemy_thrust_y = torch.sum(
+            direct_enemy_thrust_y
+            + splash_enemy_thrust_y
+            + enemy_radius_thrust_y,
+            dim=1,
+        )
+        self._enemy_velocity_z_fixed.add_(
+            torch.sum(enemy_radius_thrust_z, dim=1)
+        )
 
         player_splash_damage, player_splash_points_fixed = self._rocket_radius_damage(
             current_x,
@@ -2886,12 +3284,15 @@ class TorchDeathmatchEngine:
             torch.full_like(current_x, _PLAYER_RADIUS),
             torch.full_like(current_x, _PLAYER_HEIGHT),
         )
-        visible_to_player = ~self._line_blocked(
+        visible_to_player = ~self._rocket_splash_blocked(
             current_x,
             current_y,
+            current_z,
             self.x[:, None],
             self.y[:, None],
-        )
+            self.z[:, None],
+            torch.full((self.num_envs, 1), _PLAYER_HEIGHT, device=self.device),
+        )[:, :, 0]
         player_splash = rocket_impact & visible_to_player
         player_splash_damage *= player_splash.to(torch.float32)
         player_splash_points_fixed *= player_splash.to(torch.int64)
@@ -2958,7 +3359,11 @@ class TorchDeathmatchEngine:
                 dim=1,
             ),
         )
-        reward = self._apply_enemy_damage(damage_by_enemy)
+        reward = self._apply_enemy_damage(
+            damage_by_enemy,
+            thrust_x_fixed=enemy_thrust_x,
+            thrust_y_fixed=enemy_thrust_y,
+        )
 
         self.projectile_x.copy_(torch.where(alive, current_x, self.projectile_x))
         self.projectile_y.copy_(torch.where(alive, current_y, self.projectile_y))
@@ -3144,11 +3549,14 @@ class TorchDeathmatchEngine:
         bottom_slope = (target_z - shoot_z) / distance
         top_slope = (target_z + target_height - shoot_z) / distance
         valid &= (top_slope >= -max_autoaim_slope) & (bottom_slope <= max_autoaim_slope)
-        valid &= ~self._line_blocked(
+        valid &= ~self._sight_blocked(
             self.x[:, None],
             self.y[:, None],
+            shoot_z,
             target_x,
             target_y,
+            target_z,
+            target_height,
         )
         target_distance = torch.where(valid, distance, torch.full_like(distance, torch.inf))
         target = torch.argmin(target_distance, dim=1)
@@ -3371,7 +3779,12 @@ class TorchDeathmatchEngine:
         floor = self.map.sector_heights[sector, 0]
         ceiling = self.map.sector_heights[sector, 1]
         plane_impact = moving & ((next_z < floor) | (next_z + 16.0 > ceiling))
-        current_z.copy_(torch.where(moving, next_z, current_z))
+        clipped_next_z = torch.where(
+            next_z < floor,
+            floor,
+            torch.where(next_z + 16.0 > ceiling, ceiling - 16.0, next_z),
+        )
+        current_z.copy_(torch.where(moving, clipped_next_z, current_z))
         impact |= plane_impact
         random_bits = self._random_u32(torch.any(impact, dim=1))[:, None]
         slot_bits = torch.arange(
@@ -3436,6 +3849,7 @@ class TorchDeathmatchEngine:
     def _move_enemy_thrust(self, active: torch.Tensor) -> None:
         visible_x = self._enemy_x_fixed.to(torch.float32) / _FIXED_UNIT
         visible_y = self._enemy_y_fixed.to(torch.float32) / _FIXED_UNIT
+        visible_z = self._enemy_z_fixed.to(torch.float32) / _FIXED_UNIT
         self._enemy_x_fixed.copy_(
             torch.where(
                 self.enemy_x != visible_x,
@@ -3448,6 +3862,13 @@ class TorchDeathmatchEngine:
                 self.enemy_y != visible_y,
                 torch.round(self.enemy_y * _FIXED_UNIT).to(torch.int64),
                 self._enemy_y_fixed,
+            )
+        )
+        self._enemy_z_fixed.copy_(
+            torch.where(
+                self.enemy_z != visible_z,
+                torch.round(self.enemy_z * _FIXED_UNIT).to(torch.int64),
+                self._enemy_z_fixed,
             )
         )
         actor_exists = active[:, None] & (
@@ -3490,13 +3911,58 @@ class TorchDeathmatchEngine:
         )
         self.enemy_x.copy_(self._enemy_x_fixed.to(torch.float32) / _FIXED_UNIT)
         self.enemy_y.copy_(self._enemy_y_fixed.to(torch.float32) / _FIXED_UNIT)
-        self.enemy_z.copy_(
+        actor_sector = self._sector_at(
+            self.enemy_x.reshape(-1),
+            self.enemy_y.reshape(-1),
+        ).reshape_as(self.enemy_x)
+        floor_z_fixed = torch.round(
+            self.map.sector_heights[actor_sector, 0] * _FIXED_UNIT
+        ).to(torch.int64)
+        ceiling_z_fixed = torch.round(
+            self.map.sector_heights[actor_sector, 1] * _FIXED_UNIT
+        ).to(torch.int64)
+        actor_height_fixed = torch.round(
+            self._enemy_height[actor_type] * _FIXED_UNIT
+        ).to(torch.int64)
+        proposed_z_fixed = self._enemy_z_fixed + torch.where(
+            actor_exists,
+            self._enemy_velocity_z_fixed,
+            torch.zeros_like(self._enemy_velocity_z_fixed),
+        )
+        above_floor = proposed_z_fixed > floor_z_fixed
+        next_velocity_z = torch.where(
+            above_floor,
+            self._enemy_velocity_z_fixed - _FIXED_UNIT,
+            self._enemy_velocity_z_fixed,
+        )
+        hit_floor = proposed_z_fixed <= floor_z_fixed
+        ceiling_limit_fixed = ceiling_z_fixed - actor_height_fixed
+        hit_ceiling = proposed_z_fixed > ceiling_limit_fixed
+        clipped_z_fixed = torch.minimum(
+            torch.maximum(proposed_z_fixed, floor_z_fixed),
+            ceiling_limit_fixed,
+        )
+        next_velocity_z = torch.where(
+            hit_floor & (next_velocity_z < 0),
+            torch.zeros_like(next_velocity_z),
+            next_velocity_z,
+        )
+        next_velocity_z = torch.where(
+            hit_ceiling & (next_velocity_z > 0),
+            torch.zeros_like(next_velocity_z),
+            next_velocity_z,
+        )
+        self._enemy_z_fixed.copy_(
+            torch.where(actor_exists, clipped_z_fixed, self._enemy_z_fixed)
+        )
+        self._enemy_velocity_z_fixed.copy_(
             torch.where(
-                moved,
-                self.map.sector_heights[proposed_sector, 0],
-                self.enemy_z,
+                actor_exists,
+                next_velocity_z,
+                torch.zeros_like(next_velocity_z),
             )
         )
+        self.enemy_z.copy_(self._enemy_z_fixed.to(torch.float32) / _FIXED_UNIT)
 
         retained_x = torch.where(
             moved,
@@ -3548,11 +4014,14 @@ class TorchDeathmatchEngine:
         dx = self.x[:, None] - self.enemy_x
         dy = self.y[:, None] - self.enemy_y
         distance = torch.sqrt(dx * dx + dy * dy).clamp_min_(1e-4)
-        visible = ~self._line_blocked(
+        visible = ~self._sight_blocked(
             self.enemy_x,
             self.enemy_y,
+            self.enemy_z + self._enemy_height[enemy_type] * 0.75,
             self.x[:, None],
             self.y[:, None],
+            self.z[:, None],
+            torch.full_like(self.z[:, None], _PLAYER_HEIGHT),
         )
         shoot_z = self.enemy_z + 36.0
         player_bottom_slope = (self.z[:, None] - shoot_z) / distance
@@ -3776,8 +4245,6 @@ class TorchDeathmatchEngine:
                 self.enemy_y,
             )
         )
-        proposed_z = self.map.sector_heights[proposed_sector, 0]
-        self.enemy_z.copy_(torch.where(ai_moved, proposed_z, self.enemy_z))
         self.enemy_angle.copy_(
             torch.where(
                 ai_moved,
