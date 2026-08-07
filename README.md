@@ -42,6 +42,7 @@ observations, signals = env.reset_device(
 )
 actions = lanes % env.single_action_space.n
 transition = env.step_and_reset_device(actions, lanes + num_envs + 1)
+raw_rgb_with_hud = env.render()  # 320x240 RGB24, no observation preprocessing
 env.close()
 ```
 
@@ -61,6 +62,7 @@ uv run python tools/cuda_correctness_smoke.py --compile-engine   # check CUDA re
 
 - GraDOOM is under active construction and is not yet parity-certified. No current release supports a public fastest-training claim.
 - The first certification candidate is single-player `deathmatch-p1-v1`: 17 actions, frame skip 2, and 84×84 grayscale CHW observations with four-frame stacking.
+- `render()` and `render_lane()` expose the unprocessed 320×240 RGB24 comparison view with the full Doom HUD; observation preprocessing remains separate from this diagnostic render path.
 - The initial certification hardware target is one NVIDIA RTX 4090 integrated with GradLab.
 - Pass asset paths directly or set `GRADOOM_IWAD` and `GRADOOM_DEATHMATCH_WAD`. WADs and other game data are not distributed with this repository.
 - Torch tensors are the performance transport. NumPy transport is available only for CPU diagnostics and compatibility testing.

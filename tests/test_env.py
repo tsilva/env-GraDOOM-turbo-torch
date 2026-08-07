@@ -54,6 +54,9 @@ def test_turbo_shaped_api_contract_and_numpy_transport(square_scenario) -> None:
         assert env.capabilities["supports_enemy_variants"] is False
         assert env.capabilities["supports_surface_variants"] is False
         assert env.capabilities["supports_info_frame_stack"] is True
+        assert env.capabilities["native_render_shape"] == (240, 320, 3)
+        assert env.capabilities["native_render_format"] == "RGB24"
+        assert env.capabilities["native_render_includes_hud"] is True
         assert env.observation_ownership == "safe_view"
         assert env.observation_buffer_depth == 2
         assert infos["health"].tolist() == [100.0, 100.0]
@@ -62,7 +65,7 @@ def test_turbo_shaped_api_contract_and_numpy_transport(square_scenario) -> None:
         assert result[1].dtype == np.float32
         assert result[2].dtype == np.bool_
         assert result[3].dtype == np.bool_
-        assert env.render_lane(1).shape == (84, 84, 3)
+        assert env.render_lane(1).shape == (240, 320, 3)
     finally:
         env.close()
 

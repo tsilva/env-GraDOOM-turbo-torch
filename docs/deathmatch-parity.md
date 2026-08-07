@@ -12,6 +12,12 @@ Hashes identify operator-supplied inputs; the files are not distributed here.
 
 Tick/action timing, movement, collision, weapon selection and state, ammo, hitscan/projectile behavior, damage, armor, pickups, monster state machines, kills, player death, episode boundaries, and task signals must match deterministic reference fixtures or have an explicitly accepted deviation.
 
+## Raw visual reference
+
+- Visual parity is measured before observation preprocessing at ViZDoom `RES_320X240` in `RGB24` format.
+- Raw fidelity captures explicitly enable the full Doom HUD, even though the pinned training config disables it.
+- Geometry, palette colors, lighting, weapon/HUD composition, directional sprites, and walk, attack, and death animation timing are compared at matched player poses and native tics.
+
 ## Permitted statistical parity
 
 Spawn selection, random damage, monster decisions, and equivalent tie-breaking may use different random streams only when distribution tests and zero-shot policy transfer pass.

@@ -9,7 +9,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn.functional as functional
 
 from gradoom.engine import TorchDeathmatchEngine
 from gradoom.scenario import compile_deathmatch_scenario
@@ -29,7 +28,9 @@ def _reference_frame(
     game = vzd.DoomGame()
     game.load_config(str(config))
     game.set_doom_game_path(str(iwad))
-    game.set_screen_format(vzd.ScreenFormat.GRAY8)
+    game.set_screen_resolution(vzd.ScreenResolution.RES_320X240)
+    game.set_screen_format(vzd.ScreenFormat.RGB24)
+    game.set_render_hud(True)
     variables = (
         vzd.GameVariable.POSITION_X,
         vzd.GameVariable.POSITION_Y,
@@ -49,14 +50,9 @@ def _reference_frame(
         if state is None:
             raise RuntimeError("ViZDoom did not expose an initial state")
         raw = np.asarray(state.screen_buffer).copy()
-        if raw.shape != (240, 320):
-            raise RuntimeError(f"expected a 240x320 GRAY8 frame, got {raw.shape}")
-        raw[-32:] = 0
-        frame = functional.interpolate(
-            torch.from_numpy(raw)[None, None].to(torch.float32),
-            size=(84, 84),
-            mode="area",
-        )[0, 0]
+        if raw.shape != (240, 320, 3):
+            raise RuntimeError(f"expected a 240x320 RGB24 frame, got {raw.shape}")
+        frame = torch.from_numpy(raw).to(torch.float32)
         x, y, z, angle = (float(game.get_game_variable(variable)) for variable in variables)
         return frame, x, y, z, angle
     finally:
@@ -93,7 +89,8 @@ def main() -> int:
         engine.y.fill_(y)
         engine.z.fill_(z)
         engine.angle.fill_(angle_degrees * math.pi / 180.0)
-        actual = engine.render_frame()[0].to(torch.float32)
+        engine.episode_time.fill_(args.settle_tics + 1)
+        actual = engine.render_native_frame(include_hud=True)[0].to(torch.float32)
         flattened = torch.stack((reference.flatten(), actual.flatten()))
         records.append(
             {
@@ -121,7 +118,7 @@ def main() -> int:
                 "median_mae": float(np.median(errors)),
                 "records": records,
                 "scenario_sha256": scenario.scenario_sha256,
-                "schema": "gradoom.renderer-parity.v1",
+                "schema": "gradoom.renderer-parity.raw-rgb-hud.v1",
             },
             sort_keys=True,
         )

@@ -206,6 +206,155 @@ def compile_grayscale_atlas(
     return atlas, widths, heights
 
 
+def compile_indexed_atlas(
+    wad: WadArchive,
+    names: tuple[str, ...],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compile textures without discarding Doom's PLAYPAL indices."""
+
+    catalog = TextureCatalog.from_wad(wad)
+    textures = tuple(catalog.decode(wad, name) for name in names)
+    max_height = max((texture.height for texture in textures), default=1)
+    max_width = max((texture.width for texture in textures), default=1)
+    atlas = np.zeros((len(textures), max_height, max_width), dtype=np.uint8)
+    widths = np.empty(len(textures), dtype=np.int32)
+    heights = np.empty(len(textures), dtype=np.int32)
+    for index, texture in enumerate(textures):
+        atlas[index, : texture.height, : texture.width] = texture.pixels
+        widths[index] = texture.width
+        heights[index] = texture.height
+    return atlas, widths, heights
+
+
+def _resolve_sprite_frame(
+    wad: WadArchive,
+    requested_name: str,
+) -> tuple[str, bool]:
+    """Resolve a Doom sprite frame/rotation, including mirrored combined lumps."""
+
+    normalized = requested_name.upper()
+    if len(normalized) != 6 or not normalized[5].isdigit():
+        raise ValueError(f"sprite request must be PREFIX+frame+rotation, got {requested_name!r}")
+    prefix = normalized[:4]
+    frame = normalized[4]
+    rotation = normalized[5]
+    rotation_zero: tuple[str, bool] | None = None
+    for lump in wad.lumps:
+        name = lump.name
+        if len(name) < 6 or name[:4] != prefix:
+            continue
+        pairs = ((name[4], name[5], False),)
+        if len(name) >= 8:
+            pairs += ((name[6], name[7], True),)
+        for candidate_frame, candidate_rotation, flipped in pairs:
+            if candidate_frame != frame:
+                continue
+            if candidate_rotation == rotation:
+                return name, flipped
+            if candidate_rotation == "0":
+                rotation_zero = (name, flipped)
+    if rotation_zero is not None:
+        return rotation_zero
+    raise KeyError(f"IWAD has no sprite frame {normalized!r}")
+
+
+def compile_indexed_sprite_atlas(
+    wad: WadArchive,
+    frame_names: tuple[str, ...],
+) -> tuple[
+    tuple[str, ...],
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
+    """Compile exact indexed sprite rotations in request order."""
+
+    resolved_names: list[str] = []
+    sprites: list[IndexedTexture] = []
+    for requested_name in frame_names:
+        resolved, flipped = _resolve_sprite_frame(wad, requested_name)
+        sprite = decode_patch(wad.read(resolved), resolved)
+        if flipped:
+            sprite = IndexedTexture(
+                name=f"{resolved}:FLIPPED",
+                pixels=np.ascontiguousarray(np.fliplr(sprite.pixels)),
+                opaque=np.ascontiguousarray(np.fliplr(sprite.opaque)),
+                left_offset=sprite.width - sprite.left_offset,
+                top_offset=sprite.top_offset,
+            )
+        resolved_names.append(sprite.name)
+        sprites.append(sprite)
+    max_height = max((sprite.height for sprite in sprites), default=1)
+    max_width = max((sprite.width for sprite in sprites), default=1)
+    atlas = np.zeros((len(sprites), max_height, max_width), dtype=np.uint8)
+    opaque = np.zeros_like(atlas, dtype=np.bool_)
+    widths = np.empty(len(sprites), dtype=np.int32)
+    heights = np.empty(len(sprites), dtype=np.int32)
+    left_offsets = np.empty(len(sprites), dtype=np.int32)
+    top_offsets = np.empty(len(sprites), dtype=np.int32)
+    for index, sprite in enumerate(sprites):
+        atlas[index, : sprite.height, : sprite.width] = sprite.pixels
+        opaque[index, : sprite.height, : sprite.width] = sprite.opaque
+        widths[index] = sprite.width
+        heights[index] = sprite.height
+        left_offsets[index] = sprite.left_offset
+        top_offsets[index] = sprite.top_offset
+    return (
+        tuple(resolved_names),
+        atlas,
+        opaque,
+        widths,
+        heights,
+        left_offsets,
+        top_offsets,
+    )
+
+
+def compile_indexed_patch_atlas(
+    wad: WadArchive,
+    names: tuple[str, ...],
+) -> tuple[
+    tuple[str, ...],
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
+    """Compile named Doom patches as palette indices with transparency."""
+
+    normalized_names = tuple(name.upper() for name in names)
+    sprites = tuple(decode_patch(wad.read(name), name) for name in normalized_names)
+    max_height = max((sprite.height for sprite in sprites), default=1)
+    max_width = max((sprite.width for sprite in sprites), default=1)
+    atlas = np.zeros((len(sprites), max_height, max_width), dtype=np.uint8)
+    opaque = np.zeros_like(atlas, dtype=np.bool_)
+    widths = np.empty(len(sprites), dtype=np.int32)
+    heights = np.empty(len(sprites), dtype=np.int32)
+    left_offsets = np.empty(len(sprites), dtype=np.int32)
+    top_offsets = np.empty(len(sprites), dtype=np.int32)
+    for index, sprite in enumerate(sprites):
+        atlas[index, : sprite.height, : sprite.width] = sprite.pixels
+        opaque[index, : sprite.height, : sprite.width] = sprite.opaque
+        widths[index] = sprite.width
+        heights[index] = sprite.height
+        left_offsets[index] = sprite.left_offset
+        top_offsets[index] = sprite.top_offset
+    return (
+        normalized_names,
+        atlas,
+        opaque,
+        widths,
+        heights,
+        left_offsets,
+        top_offsets,
+    )
+
+
 def compile_sprite_atlas(
     wad: WadArchive,
     frame_names: tuple[str, ...],
@@ -326,10 +475,54 @@ def compile_weapon_overlays(
     )
 
 
+def compile_indexed_weapon_overlays(
+    wad: WadArchive,
+    frame_names: tuple[str, ...],
+) -> tuple[tuple[str, ...], np.ndarray, np.ndarray]:
+    """Rasterize ready-state psprites in Doom's native 320x200 play view."""
+
+    resolved_names: list[str] = []
+    values: list[np.ndarray] = []
+    alphas: list[np.ndarray] = []
+    for requested_name in frame_names:
+        normalized = requested_name.upper()
+        if normalized not in wad.by_name:
+            raise KeyError(f"IWAD has no weapon frame {normalized!r}")
+        patch = decode_patch(wad.read(normalized), normalized)
+        left = -patch.left_offset
+        # ViZDoom's 320x240 software path keeps the 320x200 play view but
+        # applies the classic aspect-corrected psprite baseline.
+        top = -patch.top_offset + 49
+        x0 = max(left, 0)
+        y0 = max(top, 0)
+        x1 = min(left + patch.width, 320)
+        y1 = min(top + patch.height, 200)
+        if x0 >= x1 or y0 >= y1:
+            raise ValueError(f"weapon frame {normalized!r} lies outside the logical view")
+        value_canvas = np.zeros((200, 320), dtype=np.uint8)
+        alpha_canvas = np.zeros((200, 320), dtype=np.bool_)
+        patch_x0 = x0 - left
+        patch_y0 = y0 - top
+        patch_x1 = patch_x0 + x1 - x0
+        patch_y1 = patch_y0 + y1 - y0
+        source = np.s_[patch_y0:patch_y1, patch_x0:patch_x1]
+        destination = np.s_[y0:y1, x0:x1]
+        value_canvas[destination] = patch.pixels[source]
+        alpha_canvas[destination] = patch.opaque[source]
+        values.append(value_canvas)
+        alphas.append(alpha_canvas)
+        resolved_names.append(normalized)
+    return tuple(resolved_names), np.stack(values), np.stack(alphas)
+
+
 __all__ = [
     "IndexedTexture",
     "TextureCatalog",
     "compile_grayscale_atlas",
+    "compile_indexed_atlas",
+    "compile_indexed_patch_atlas",
+    "compile_indexed_sprite_atlas",
+    "compile_indexed_weapon_overlays",
     "compile_sprite_atlas",
     "compile_weapon_overlays",
     "decode_patch",

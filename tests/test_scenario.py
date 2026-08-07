@@ -63,6 +63,31 @@ def test_pinned_deathmatch_compiles_external_doom2_data() -> None:
     assert scenario.weapon_screen_values.shape == (8, 84, 84)
     assert scenario.weapon_screen_alpha.shape == (8, 84, 84)
     assert scenario.weapon_screen_alpha.any(axis=(1, 2)).all()
+    assert scenario.texture_index_atlas is not None
+    assert scenario.texture_index_atlas.shape == scenario.texture_atlas.shape
+    assert scenario.colormap is not None
+    assert scenario.colormap.shape == (34, 256)
+    assert scenario.raw_sprite_atlas is not None
+    assert scenario.raw_sprite_opaque is not None
+    assert scenario.raw_sprite_atlas.shape == scenario.raw_sprite_opaque.shape
+    assert scenario.enemy_walk_sprite_ids is not None
+    assert scenario.enemy_walk_sprite_ids.shape == (6, 4, 8)
+    assert len(set(scenario.enemy_walk_sprite_ids[0, :, 0].tolist())) == 4
+    assert scenario.enemy_attack_sprite_ids is not None
+    assert scenario.enemy_attack_sprite_ids.shape == (6, 4, 8)
+    assert scenario.enemy_death_sprite_ids is not None
+    assert scenario.enemy_death_sprite_ids.shape == (6, 16)
+    assert scenario.enemy_death_frame_counts is not None
+    assert scenario.enemy_death_frame_counts.tolist() == [14, 14, 16, 13, 6, 7]
+    assert scenario.raw_static_sprite_ids is not None
+    assert scenario.raw_static_sprite_ids.shape == (20,)
+    assert scenario.native_weapon_screen_values is not None
+    assert scenario.native_weapon_screen_values.shape == (8, 200, 320)
+    assert scenario.native_weapon_screen_alpha is not None
+    assert scenario.native_weapon_screen_alpha.any(axis=(1, 2)).all()
+    assert scenario.hud_patch_names[0:2] == ("STBAR", "STARMS")
+    assert scenario.hud_patch_atlas is not None
+    assert scenario.hud_patch_atlas.shape == (28, 32, 320)
     assert scenario.sector_heights.shape == (14, 2)
     assert scenario.player_starts.shape == (3, 3)
     assert scenario.item_spawns.shape == (192, 3)
@@ -80,3 +105,5 @@ def test_pinned_deathmatch_compiles_external_freedoom2_data() -> None:
 
     assert scenario.weapon_screen_values.shape == (8, 84, 84)
     assert scenario.weapon_screen_alpha.any(axis=(1, 2)).all()
+    assert scenario.native_weapon_screen_values is not None
+    assert scenario.native_weapon_screen_values.shape == (8, 200, 320)

@@ -7,7 +7,15 @@ from pathlib import Path
 
 import numpy as np
 
-from .textures import compile_grayscale_atlas, compile_sprite_atlas, compile_weapon_overlays
+from .textures import (
+    compile_grayscale_atlas,
+    compile_indexed_atlas,
+    compile_indexed_patch_atlas,
+    compile_indexed_sprite_atlas,
+    compile_indexed_weapon_overlays,
+    compile_sprite_atlas,
+    compile_weapon_overlays,
+)
 from .wad import UdmfDocument, WadArchive, parse_udmf
 
 PINNED_DEATHMATCH_WAD_SHA256 = "1d06c2113f2c1546062635ad599f49cd852287a08b7b07b26d30b8f4c362a42d"
@@ -50,6 +58,31 @@ DEATHMATCH_WEAPON_FRAMES = (
     "MISGA0",
     "PLSGA0",
 )
+DEATHMATCH_ENEMY_PREFIXES = ("POSS", "SPOS", "PLAY", "CPOS", "SARG", "BOS2")
+DEATHMATCH_ENEMY_ATTACK_FRAMES = (
+    ("E", "F", "E", "F"),
+    ("E", "F", "E", "F"),
+    ("E", "F", "E", "F"),
+    ("E", "F", "G", "F"),
+    ("E", "F", "G", "H"),
+    ("E", "F", "G", "H"),
+)
+DEATHMATCH_ENEMY_DEATH_FRAMES = (
+    tuple("HIJKLMNOPQRSTU"),
+    tuple("HIJKLMNOPQRSTU"),
+    tuple("HIJKLMNOPQRSTUVW"),
+    tuple("HIJKLMNOPQRST"),
+    tuple("IJKLMN"),
+    tuple("IJKLMNO"),
+)
+DEATHMATCH_HUD_PATCHES = (
+    "STBAR",
+    "STARMS",
+    *(f"STTNUM{digit}" for digit in range(10)),
+    "STTPRCNT",
+    *(f"STFST{pain}0" for pain in range(5)),
+    *(f"STYSNUM{digit}" for digit in range(10)),
+)
 
 
 @dataclass(frozen=True)
@@ -91,6 +124,27 @@ class CompiledScenario:
     weapon_sprite_names: tuple[str, ...]
     weapon_screen_values: np.ndarray
     weapon_screen_alpha: np.ndarray
+    texture_index_atlas: np.ndarray | None = None
+    colormap: np.ndarray | None = None
+    raw_sprite_names: tuple[str, ...] = ()
+    raw_sprite_atlas: np.ndarray | None = None
+    raw_sprite_opaque: np.ndarray | None = None
+    raw_sprite_widths: np.ndarray | None = None
+    raw_sprite_heights: np.ndarray | None = None
+    raw_sprite_left_offsets: np.ndarray | None = None
+    raw_sprite_top_offsets: np.ndarray | None = None
+    enemy_walk_sprite_ids: np.ndarray | None = None
+    enemy_attack_sprite_ids: np.ndarray | None = None
+    enemy_death_sprite_ids: np.ndarray | None = None
+    enemy_death_frame_counts: np.ndarray | None = None
+    raw_static_sprite_ids: np.ndarray | None = None
+    native_weapon_screen_values: np.ndarray | None = None
+    native_weapon_screen_alpha: np.ndarray | None = None
+    hud_patch_names: tuple[str, ...] = ()
+    hud_patch_atlas: np.ndarray | None = None
+    hud_patch_opaque: np.ndarray | None = None
+    hud_patch_widths: np.ndarray | None = None
+    hud_patch_heights: np.ndarray | None = None
 
     @property
     def bounds(self) -> tuple[float, float, float, float]:
@@ -226,6 +280,7 @@ def compile_deathmatch_scenario(
         )
     )
     texture_atlas, texture_widths, texture_heights = compile_grayscale_atlas(game, texture_names)
+    texture_index_atlas, _, _ = compile_indexed_atlas(game, texture_names)
     (
         sprite_names,
         sprite_atlas,
@@ -239,6 +294,63 @@ def compile_deathmatch_scenario(
         game,
         DEATHMATCH_WEAPON_FRAMES,
     )
+    raw_sprite_requests: list[str] = []
+
+    def request_raw_sprite(name: str) -> int:
+        raw_sprite_requests.append(name)
+        return len(raw_sprite_requests) - 1
+
+    enemy_walk_sprite_ids = np.empty((6, 4, 8), dtype=np.int32)
+    enemy_attack_sprite_ids = np.empty((6, 4, 8), dtype=np.int32)
+    for enemy_type, prefix in enumerate(DEATHMATCH_ENEMY_PREFIXES):
+        for frame_index, frame in enumerate(("A", "B", "C", "D")):
+            for rotation in range(1, 9):
+                enemy_walk_sprite_ids[enemy_type, frame_index, rotation - 1] = (
+                    request_raw_sprite(f"{prefix}{frame}{rotation}")
+                )
+        for frame_index, frame in enumerate(DEATHMATCH_ENEMY_ATTACK_FRAMES[enemy_type]):
+            for rotation in range(1, 9):
+                enemy_attack_sprite_ids[enemy_type, frame_index, rotation - 1] = (
+                    request_raw_sprite(f"{prefix}{frame}{rotation}")
+                )
+    max_death_frames = max(len(frames) for frames in DEATHMATCH_ENEMY_DEATH_FRAMES)
+    enemy_death_sprite_ids = np.empty((6, max_death_frames), dtype=np.int32)
+    enemy_death_frame_counts = np.asarray(
+        [len(frames) for frames in DEATHMATCH_ENEMY_DEATH_FRAMES],
+        dtype=np.int32,
+    )
+    for enemy_type, prefix in enumerate(DEATHMATCH_ENEMY_PREFIXES):
+        frames = DEATHMATCH_ENEMY_DEATH_FRAMES[enemy_type]
+        for frame_index in range(max_death_frames):
+            frame = frames[min(frame_index, len(frames) - 1)]
+            enemy_death_sprite_ids[enemy_type, frame_index] = request_raw_sprite(
+                f"{prefix}{frame}0"
+            )
+    raw_static_sprite_ids = np.asarray(
+        [request_raw_sprite(name) for name in DEATHMATCH_SPRITE_FRAMES[6:]],
+        dtype=np.int32,
+    )
+    (
+        raw_sprite_names,
+        raw_sprite_atlas,
+        raw_sprite_opaque,
+        raw_sprite_widths,
+        raw_sprite_heights,
+        raw_sprite_left_offsets,
+        raw_sprite_top_offsets,
+    ) = compile_indexed_sprite_atlas(game, tuple(raw_sprite_requests))
+    _, native_weapon_screen_values, native_weapon_screen_alpha = (
+        compile_indexed_weapon_overlays(game, DEATHMATCH_WEAPON_FRAMES)
+    )
+    (
+        hud_patch_names,
+        hud_patch_atlas,
+        hud_patch_opaque,
+        hud_patch_widths,
+        hud_patch_heights,
+        _hud_left_offsets,
+        _hud_top_offsets,
+    ) = compile_indexed_patch_atlas(game, DEATHMATCH_HUD_PATCHES)
     texture_ids_by_name = {name: index for index, name in enumerate(texture_names)}
     wall_texture_ids = np.full(len(linedefs), -1, dtype=np.int32)
     for index, name in enumerate(wall_texture_names):
@@ -298,6 +410,10 @@ def compile_deathmatch_scenario(
     if len(playpal_bytes) < 256 * 3:
         raise ValueError("IWAD PLAYPAL lump is too small")
     playpal = np.frombuffer(playpal_bytes[: 256 * 3], dtype=np.uint8).reshape(256, 3).copy()
+    colormap_bytes = game.read("COLORMAP")
+    if len(colormap_bytes) < 34 * 256:
+        raise ValueError("IWAD COLORMAP lump is too small")
+    colormap = np.frombuffer(colormap_bytes[: 34 * 256], dtype=np.uint8).reshape(34, 256).copy()
     return CompiledScenario(
         scenario_sha256=scenario.sha256,
         iwad_sha256=game.sha256,
@@ -334,4 +450,25 @@ def compile_deathmatch_scenario(
         weapon_sprite_names=weapon_sprite_names,
         weapon_screen_values=weapon_screen_values,
         weapon_screen_alpha=weapon_screen_alpha,
+        texture_index_atlas=texture_index_atlas,
+        colormap=colormap,
+        raw_sprite_names=raw_sprite_names,
+        raw_sprite_atlas=raw_sprite_atlas,
+        raw_sprite_opaque=raw_sprite_opaque,
+        raw_sprite_widths=raw_sprite_widths,
+        raw_sprite_heights=raw_sprite_heights,
+        raw_sprite_left_offsets=raw_sprite_left_offsets,
+        raw_sprite_top_offsets=raw_sprite_top_offsets,
+        enemy_walk_sprite_ids=enemy_walk_sprite_ids,
+        enemy_attack_sprite_ids=enemy_attack_sprite_ids,
+        enemy_death_sprite_ids=enemy_death_sprite_ids,
+        enemy_death_frame_counts=enemy_death_frame_counts,
+        raw_static_sprite_ids=raw_static_sprite_ids,
+        native_weapon_screen_values=native_weapon_screen_values,
+        native_weapon_screen_alpha=native_weapon_screen_alpha,
+        hud_patch_names=hud_patch_names,
+        hud_patch_atlas=hud_patch_atlas,
+        hud_patch_opaque=hud_patch_opaque,
+        hud_patch_widths=hud_patch_widths,
+        hud_patch_heights=hud_patch_heights,
     )

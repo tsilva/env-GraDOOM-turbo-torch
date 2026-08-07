@@ -400,6 +400,9 @@ class GraDoomVecEnv(VectorEnv):
                 "supports_state_catalog": False,
                 "supports_live_snapshots": False,
                 "supports_per_lane_rgb": True,
+                "native_render_shape": (240, 320, 3),
+                "native_render_format": "RGB24",
+                "native_render_includes_hud": True,
                 "supports_enemy_variants": False,
                 "supports_surface_variants": False,
                 "supports_info_frame_stack": True,
@@ -635,8 +638,12 @@ class GraDoomVecEnv(VectorEnv):
         lane_index = operator.index(lane)
         if not 0 <= lane_index < self.num_envs:
             raise IndexError(f"lane must be in [0, {self.num_envs - 1}]")
-        frame = self._engine.frames[lane_index, -1].detach().to("cpu").numpy()
-        return np.repeat(frame[..., None], 3, axis=-1)
+        return (
+            self._engine.render_native_frame(include_hud=True)[lane_index]
+            .detach()
+            .to("cpu")
+            .numpy()
+        )
 
     def render(self) -> np.ndarray:
         return self.render_lane(0)

@@ -140,6 +140,27 @@ class DeviceScenario:
     item_spawns: torch.Tensor
     item_types: torch.Tensor
     item_visual_types: torch.Tensor
+    item_raw_visual_types: torch.Tensor
+    playpal: torch.Tensor
+    colormap: torch.Tensor
+    texture_index_atlas: torch.Tensor
+    raw_sprite_atlas: torch.Tensor
+    raw_sprite_opaque: torch.Tensor
+    raw_sprite_widths: torch.Tensor
+    raw_sprite_heights: torch.Tensor
+    raw_sprite_left_offsets: torch.Tensor
+    raw_sprite_top_offsets: torch.Tensor
+    enemy_walk_sprite_ids: torch.Tensor
+    enemy_attack_sprite_ids: torch.Tensor
+    enemy_death_sprite_ids: torch.Tensor
+    enemy_death_frame_counts: torch.Tensor
+    raw_static_sprite_ids: torch.Tensor
+    native_weapon_screen_values: torch.Tensor
+    native_weapon_screen_alpha: torch.Tensor
+    hud_patch_atlas: torch.Tensor
+    hud_patch_opaque: torch.Tensor
+    hud_patch_widths: torch.Tensor
+    hud_patch_heights: torch.Tensor
     bounds: torch.Tensor
     spawn_bounds: torch.Tensor
 
@@ -178,6 +199,112 @@ class DeviceScenario:
         if np.any(item_visual_types < 0):
             unsupported = sorted(set(scenario.item_types[item_visual_types < 0].tolist()))
             raise ValueError(f"scenario contains unsupported item types: {unsupported}")
+        texture_index_atlas = (
+            scenario.texture_atlas
+            if scenario.texture_index_atlas is None
+            else scenario.texture_index_atlas
+        )
+        colormap = (
+            np.broadcast_to(np.arange(256, dtype=np.uint8), (34, 256)).copy()
+            if scenario.colormap is None
+            else scenario.colormap
+        )
+        raw_sprite_atlas = (
+            scenario.sprite_atlas
+            if scenario.raw_sprite_atlas is None
+            else scenario.raw_sprite_atlas
+        )
+        raw_sprite_opaque = (
+            scenario.sprite_opaque
+            if scenario.raw_sprite_opaque is None
+            else scenario.raw_sprite_opaque
+        )
+        raw_sprite_widths = (
+            scenario.sprite_widths
+            if scenario.raw_sprite_widths is None
+            else scenario.raw_sprite_widths
+        )
+        raw_sprite_heights = (
+            scenario.sprite_heights
+            if scenario.raw_sprite_heights is None
+            else scenario.raw_sprite_heights
+        )
+        raw_sprite_left_offsets = (
+            scenario.sprite_left_offsets
+            if scenario.raw_sprite_left_offsets is None
+            else scenario.raw_sprite_left_offsets
+        )
+        raw_sprite_top_offsets = (
+            scenario.sprite_top_offsets
+            if scenario.raw_sprite_top_offsets is None
+            else scenario.raw_sprite_top_offsets
+        )
+        fallback_enemy_ids = np.empty((6, 4, 8), dtype=np.int32)
+        for enemy_type in range(6):
+            fallback_enemy_ids[enemy_type].fill(min(enemy_type, len(raw_sprite_atlas) - 1))
+        enemy_walk_sprite_ids = (
+            fallback_enemy_ids
+            if scenario.enemy_walk_sprite_ids is None
+            else scenario.enemy_walk_sprite_ids
+        )
+        enemy_attack_sprite_ids = (
+            fallback_enemy_ids
+            if scenario.enemy_attack_sprite_ids is None
+            else scenario.enemy_attack_sprite_ids
+        )
+        enemy_death_sprite_ids = (
+            fallback_enemy_ids[:, :1, 0]
+            if scenario.enemy_death_sprite_ids is None
+            else scenario.enemy_death_sprite_ids
+        )
+        enemy_death_frame_counts = (
+            np.ones(6, dtype=np.int32)
+            if scenario.enemy_death_frame_counts is None
+            else scenario.enemy_death_frame_counts
+        )
+        if scenario.raw_static_sprite_ids is None:
+            last_sprite = max(len(raw_sprite_atlas) - 1, 0)
+            raw_static_sprite_ids = np.asarray(
+                [min(index, last_sprite) for index in range(6, 26)],
+                dtype=np.int32,
+            )
+        else:
+            raw_static_sprite_ids = scenario.raw_static_sprite_ids
+        item_raw_visual_types = np.full(len(scenario.item_types), -1, dtype=np.int64)
+        for type_id, sprite_index in _ITEM_SPRITE_INDEX.items():
+            item_raw_visual_types[scenario.item_types == type_id] = raw_static_sprite_ids[
+                sprite_index - 6
+            ]
+        native_weapon_screen_values = (
+            np.zeros((8, 200, 320), dtype=np.uint8)
+            if scenario.native_weapon_screen_values is None
+            else scenario.native_weapon_screen_values
+        )
+        native_weapon_screen_alpha = (
+            np.zeros((8, 200, 320), dtype=np.bool_)
+            if scenario.native_weapon_screen_alpha is None
+            else scenario.native_weapon_screen_alpha
+        )
+        hud_patch_atlas = (
+            np.zeros((28, 32, 320), dtype=np.uint8)
+            if scenario.hud_patch_atlas is None
+            else scenario.hud_patch_atlas
+        )
+        hud_patch_opaque = (
+            np.zeros_like(hud_patch_atlas, dtype=np.bool_)
+            if scenario.hud_patch_opaque is None
+            else scenario.hud_patch_opaque
+        )
+        hud_patch_widths = (
+            np.zeros(len(hud_patch_atlas), dtype=np.int32)
+            if scenario.hud_patch_widths is None
+            else scenario.hud_patch_widths
+        )
+        hud_patch_heights = (
+            np.zeros(len(hud_patch_atlas), dtype=np.int32)
+            if scenario.hud_patch_heights is None
+            else scenario.hud_patch_heights
+        )
         return cls(
             walls=torch.as_tensor(scenario.blocking_segments, device=device),
             wall_lights=torch.as_tensor(wall_lights, device=device),
@@ -245,6 +372,55 @@ class DeviceScenario:
             item_spawns=torch.as_tensor(scenario.item_spawns, device=device),
             item_types=torch.as_tensor(scenario.item_types, device=device, dtype=torch.int64),
             item_visual_types=torch.as_tensor(item_visual_types, device=device),
+            item_raw_visual_types=torch.as_tensor(
+                item_raw_visual_types, device=device, dtype=torch.int64
+            ),
+            playpal=torch.as_tensor(scenario.playpal, device=device),
+            colormap=torch.as_tensor(colormap, device=device),
+            texture_index_atlas=torch.as_tensor(texture_index_atlas, device=device),
+            raw_sprite_atlas=torch.as_tensor(raw_sprite_atlas, device=device),
+            raw_sprite_opaque=torch.as_tensor(raw_sprite_opaque, device=device),
+            raw_sprite_widths=torch.as_tensor(
+                raw_sprite_widths, device=device, dtype=torch.int64
+            ),
+            raw_sprite_heights=torch.as_tensor(
+                raw_sprite_heights, device=device, dtype=torch.int64
+            ),
+            raw_sprite_left_offsets=torch.as_tensor(
+                raw_sprite_left_offsets, device=device, dtype=torch.float32
+            ),
+            raw_sprite_top_offsets=torch.as_tensor(
+                raw_sprite_top_offsets, device=device, dtype=torch.float32
+            ),
+            enemy_walk_sprite_ids=torch.as_tensor(
+                enemy_walk_sprite_ids, device=device, dtype=torch.int64
+            ),
+            enemy_attack_sprite_ids=torch.as_tensor(
+                enemy_attack_sprite_ids, device=device, dtype=torch.int64
+            ),
+            enemy_death_sprite_ids=torch.as_tensor(
+                enemy_death_sprite_ids, device=device, dtype=torch.int64
+            ),
+            enemy_death_frame_counts=torch.as_tensor(
+                enemy_death_frame_counts, device=device, dtype=torch.int64
+            ),
+            raw_static_sprite_ids=torch.as_tensor(
+                raw_static_sprite_ids, device=device, dtype=torch.int64
+            ),
+            native_weapon_screen_values=torch.as_tensor(
+                native_weapon_screen_values, device=device
+            ),
+            native_weapon_screen_alpha=torch.as_tensor(
+                native_weapon_screen_alpha, device=device
+            ),
+            hud_patch_atlas=torch.as_tensor(hud_patch_atlas, device=device),
+            hud_patch_opaque=torch.as_tensor(hud_patch_opaque, device=device),
+            hud_patch_widths=torch.as_tensor(
+                hud_patch_widths, device=device, dtype=torch.int64
+            ),
+            hud_patch_heights=torch.as_tensor(
+                hud_patch_heights, device=device, dtype=torch.int64
+            ),
             bounds=torch.tensor(bounds, device=device),
             spawn_bounds=torch.tensor(spawn_bounds, device=device),
         )
@@ -255,6 +431,9 @@ class TorchDeathmatchEngine:
 
     observation_height = 84
     observation_width = 84
+    native_view_height = 200
+    native_screen_height = 240
+    native_screen_width = 320
     enemy_slots = 64
     player_projectile_slots = 32
 
@@ -321,6 +500,12 @@ class TorchDeathmatchEngine:
             (n, self.enemy_slots), device=device, dtype=torch.int32
         )
         self.enemy_move_cooldown = torch.zeros(
+            (n, self.enemy_slots), device=device, dtype=torch.int32
+        )
+        self.enemy_death_type = torch.full(
+            (n, self.enemy_slots), -1, device=device, dtype=torch.int64
+        )
+        self.enemy_death_tics = torch.zeros(
             (n, self.enemy_slots), device=device, dtype=torch.int32
         )
         self.drop_type = torch.full((n, self.enemy_slots), -1, device=device, dtype=torch.int64)
@@ -392,13 +577,27 @@ class TorchDeathmatchEngine:
             (0, 0, 2, 3, 5, 6, 7), device=device, dtype=torch.int64
         )
         self._ray_offsets = torch.linspace(
-            -math.pi / 4,
             math.pi / 4,
+            -math.pi / 4,
             self.observation_width,
             device=device,
         )
         self._pixel_x = torch.arange(self.observation_width, device=device).view(1, 1, -1)
         self._pixel_y = torch.arange(self.observation_height, device=device).view(1, -1, 1)
+        native_columns = (
+            torch.arange(self.native_screen_width, device=device, dtype=torch.float32)
+            + 0.5
+            - self.native_screen_width / 2.0
+        )
+        self._native_ray_offsets = -torch.atan(
+            native_columns / (self.native_screen_width / 2.0)
+        )
+        self._native_pixel_x = torch.arange(self.native_screen_width, device=device).view(
+            1, 1, -1
+        )
+        self._native_pixel_y = torch.arange(self.native_view_height, device=device).view(
+            1, -1, 1
+        )
         player_start_sectors = self._sector_at(
             self.map.player_starts[:, 0], self.map.player_starts[:, 1]
         )
@@ -503,6 +702,8 @@ class TorchDeathmatchEngine:
         self.enemy_cooldown[mask] = 0
         self.enemy_attack_phase[mask] = 0
         self.enemy_move_cooldown[mask] = 0
+        self.enemy_death_type[mask] = -1
+        self.enemy_death_tics[mask] = 0
         self.drop_type[mask] = -1
         self.drop_delay[mask] = 0
         self.projectile_x[mask] = 0
@@ -849,6 +1050,16 @@ class TorchDeathmatchEngine:
             self._enemy_move_interval[enemy_type] - 1,
             old_move_cooldown,
         )
+        self.enemy_death_type[row, slot] = torch.where(
+            spawn,
+            torch.full_like(self.enemy_death_type[row, slot], -1),
+            self.enemy_death_type[row, slot],
+        )
+        self.enemy_death_tics[row, slot] = torch.where(
+            spawn,
+            torch.zeros_like(self.enemy_death_tics[row, slot]),
+            self.enemy_death_tics[row, slot],
+        )
         self.enemy_alive[row, slot] |= spawn
 
     def _spawn_tick(self, active: torch.Tensor | None = None) -> None:
@@ -1127,6 +1338,13 @@ class TorchDeathmatchEngine:
         self.enemy_health.copy_(torch.where(self.enemy_alive, updated, previous))
         killed = self.enemy_alive & (previous > 0) & (updated <= 0)
         killed_type = self.enemy_type.clamp_min(0)
+        death_duration = self.map.enemy_death_frame_counts[killed_type] * 4
+        self.enemy_death_type.copy_(
+            torch.where(killed, killed_type, self.enemy_death_type)
+        )
+        self.enemy_death_tics.copy_(
+            torch.where(killed, death_duration.to(torch.int32), self.enemy_death_tics)
+        )
         reward = torch.sum(
             torch.where(
                 killed,
@@ -1985,6 +2203,8 @@ class TorchDeathmatchEngine:
         self.item_available &= ~consumed
 
     def _collect_drops(self) -> None:
+        self.enemy_death_tics.sub_(1).clamp_min_(0)
+        self.enemy_death_type.masked_fill_(self.enemy_death_tics <= 0, -1)
         self.drop_delay.sub_(1).clamp_min_(0)
         available = (self.drop_type >= 0) & (self.drop_delay <= 0)
         touched = available & self._touching(self.enemy_x, self.enemy_y, self.enemy_z)
@@ -2381,7 +2601,7 @@ class TorchDeathmatchEngine:
         dy = actor_y - self.y[:, None]
         actor_distance = torch.sqrt(dx * dx + dy * dy).clamp_min_(1)
         relative = self._wrap_angle(torch.atan2(dy, dx) - self.angle[:, None])
-        screen_center = (relative / (math.pi / 2) + 0.5) * self.observation_width
+        screen_center = (0.5 - relative / (math.pi / 2)) * self.observation_width
         safe_actor_type = actor_type.clamp_min(0)
         projection_scale = (self.observation_width * 0.5) / actor_distance
         sprite_width = self.map.sprite_widths[safe_actor_type].to(torch.float32)
@@ -2449,6 +2669,548 @@ class TorchDeathmatchEngine:
         if self.mask_hud:
             frame[:, -11:, :] = 0
         return frame.clamp(0, 255).to(torch.uint8)
+
+    def _native_raycast(self) -> torch.Tensor:
+        ray_angles = self.angle[:, None] + self._native_ray_offsets[None, :]
+        direction = torch.stack((torch.cos(ray_angles), torch.sin(ray_angles)), dim=-1)
+        origin = torch.stack((self.x, self.y), dim=-1)[:, None, None, :]
+        start = self.map.walls[None, None, :, :2]
+        segment = self.map.walls[None, None, :, 2:] - start
+        ray = direction[:, :, None, :]
+        offset = start - origin
+        denominator = ray[..., 0] * segment[..., 1] - ray[..., 1] * segment[..., 0]
+        safe = torch.where(
+            denominator.abs() < 1e-6,
+            torch.ones_like(denominator),
+            denominator,
+        )
+        distance = (offset[..., 0] * segment[..., 1] - offset[..., 1] * segment[..., 0]) / safe
+        along = (offset[..., 0] * ray[..., 1] - offset[..., 1] * ray[..., 0]) / safe
+        valid = (denominator.abs() >= 1e-6) & (distance > 0) & (along >= 0) & (along <= 1)
+        distance = torch.where(valid, distance, torch.full_like(distance, torch.inf))
+        nearest_distance = torch.min(distance, dim=2).values
+        corrected = nearest_distance * torch.cos(self._native_ray_offsets)[None, :]
+        return corrected.clamp(1, 4096)
+
+    def _native_sector_grid(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        flat_x = x.reshape(-1)
+        flat_y = y.reshape(-1)
+        sectors: list[torch.Tensor] = []
+        for start in range(0, flat_x.numel(), 2048):
+            sectors.append(
+                self._sector_at(
+                    flat_x[start : start + 2048],
+                    flat_y[start : start + 2048],
+                )
+            )
+        return torch.cat(sectors).reshape_as(x)
+
+    def _native_apply_colormap(
+        self,
+        indices: torch.Tensor,
+        light: torch.Tensor,
+        distance: torch.Tensor,
+    ) -> torch.Tensor:
+        shade = torch.floor((255.0 - light) / 32.0 + distance / 96.0).to(torch.int64)
+        shade = shade.clamp(0, 31)
+        return self.map.colormap[shade, indices.to(torch.int64)]
+
+    def _native_render_flats(
+        self,
+        current_sector: torch.Tensor,
+        view_z: torch.Tensor,
+    ) -> torch.Tensor:
+        center = self.native_view_height / 2.0
+        focal_length = self.native_screen_width / 2.0
+        ray_angles = self.angle[:, None] + self._native_ray_offsets[None, :]
+        cosine_correction = torch.cos(self._native_ray_offsets)[None, None, :]
+        pixel_delta = self._native_pixel_y.to(torch.float32) - center
+        floor_pixels = pixel_delta > 0
+        sectors = current_sector[:, None, None].expand(
+            -1, self.native_view_height, self.native_screen_width
+        )
+        ray_distance = torch.zeros_like(sectors, dtype=torch.float32)
+        world_x = torch.zeros_like(ray_distance)
+        world_y = torch.zeros_like(ray_distance)
+        for _ in range(2):
+            floor_height = view_z[:, None, None] - self.map.sector_heights[sectors, 0]
+            ceiling_height = self.map.sector_heights[sectors, 1] - view_z[:, None, None]
+            plane_height = torch.where(floor_pixels, floor_height, ceiling_height)
+            perpendicular_depth = plane_height * focal_length / pixel_delta.abs().clamp_min(0.5)
+            ray_distance = (perpendicular_depth / cosine_correction).clamp(1, 4096)
+            world_x = (
+                self.x[:, None, None]
+                + torch.cos(ray_angles)[:, None, :] * ray_distance
+            )
+            world_y = (
+                self.y[:, None, None]
+                + torch.sin(ray_angles)[:, None, :] * ray_distance
+            )
+            sectors = self._native_sector_grid(world_x, world_y)
+        floor_texture = self.map.sector_floor_texture_ids[sectors]
+        ceiling_texture = self.map.sector_ceiling_texture_ids[sectors]
+        texture_id = torch.where(floor_pixels, floor_texture, ceiling_texture)
+        texture_width = self.map.texture_widths[texture_id]
+        texture_height = self.map.texture_heights[texture_id]
+        texture_u = torch.remainder(torch.floor(world_x).to(torch.int64), texture_width)
+        texture_v = torch.remainder(torch.floor(-world_y).to(torch.int64), texture_height)
+        indices = self.map.texture_index_atlas[texture_id, texture_v, texture_u]
+        light = self.map.sector_lights[sectors]
+        return self._native_apply_colormap(indices, light, ray_distance)
+
+    def _native_portal_intersections(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        ray_angles = self.angle[:, None] + self._native_ray_offsets[None, :]
+        direction = torch.stack((torch.cos(ray_angles), torch.sin(ray_angles)), dim=-1)
+        origin = torch.stack((self.x, self.y), dim=-1)[:, None, None, :]
+        start = self.map.portal_walls[None, None, :, :2]
+        segment = self.map.portal_walls[None, None, :, 2:] - start
+        ray = direction[:, :, None, :]
+        offset = start - origin
+        denominator = ray[..., 0] * segment[..., 1] - ray[..., 1] * segment[..., 0]
+        safe = torch.where(
+            denominator.abs() < 1e-6,
+            torch.ones_like(denominator),
+            denominator,
+        )
+        distance = (offset[..., 0] * segment[..., 1] - offset[..., 1] * segment[..., 0]) / safe
+        along = (offset[..., 0] * ray[..., 1] - offset[..., 1] * ray[..., 0]) / safe
+        valid = (denominator.abs() >= 1e-6) & (distance > 0) & (along >= 0) & (along <= 1)
+        distance = torch.where(valid, distance, torch.full_like(distance, torch.inf))
+        distance *= torch.cos(self._native_ray_offsets)[None, :, None]
+        return distance, along.clamp(0, 1)
+
+    def _native_render_portal_walls(
+        self,
+        frame: torch.Tensor,
+        view_z: torch.Tensor,
+    ) -> torch.Tensor:
+        center = self.native_view_height / 2.0
+        focal_length = self.native_screen_width / 2.0
+        distances, wall_along = self._native_portal_intersections()
+        filled = torch.zeros_like(frame, dtype=torch.bool)
+        pixel_y = self._native_pixel_y.to(torch.float32)
+        current_sector = self._current_sector()[:, None].expand(
+            -1, self.native_screen_width
+        ).clone()
+        previous_distance = torch.zeros_like(current_sector, dtype=torch.float32)
+        all_sectors = self.map.portal_wall_sectors
+        for _ in range(32):
+            current = current_sector.clamp_min(0)
+            incident = (all_sectors[None, None, :, 0] == current[:, :, None]) | (
+                all_sectors[None, None, :, 1] == current[:, :, None]
+            )
+            candidates = torch.where(
+                incident
+                & (current_sector[:, :, None] >= 0)
+                & (distances > previous_distance[:, :, None] + 1e-3),
+                distances,
+                torch.full_like(distances, torch.inf),
+            )
+            distance, wall_index = torch.min(candidates, dim=2)
+            valid = torch.isfinite(distance)
+            along = wall_along.gather(2, wall_index[:, :, None]).squeeze(2)
+            sectors = self.map.portal_wall_sectors[wall_index]
+            front = sectors[..., 0]
+            back = sectors[..., 1]
+            from_front = current_sector == front
+            side_index = (~from_front).to(torch.int64)
+            other_sector = torch.where(from_front, back, front)
+            safe_other = other_sector.clamp_min(0)
+            view_floor = self.map.sector_heights[current, 0]
+            view_ceiling = self.map.sector_heights[current, 1]
+            other_floor = self.map.sector_heights[safe_other, 0]
+            other_ceiling = self.map.sector_heights[safe_other, 1]
+            one_sided = other_sector < 0
+
+            def project(
+                world_z: torch.Tensor,
+                layer_distance: torch.Tensor = distance,
+            ) -> torch.Tensor:
+                return center - (
+                    (world_z - view_z[:, None]) * focal_length / layer_distance
+                )
+
+            one_top = project(view_ceiling)
+            one_bottom = project(view_floor)
+            lower_top = project(other_floor)
+            lower_bottom = project(view_floor)
+            upper_top = project(view_ceiling)
+            upper_bottom = project(other_ceiling)
+            one_span = (
+                (one_sided & valid)[:, None, :]
+                & (pixel_y >= one_top[:, None, :])
+                & (pixel_y <= one_bottom[:, None, :])
+            )
+            lower_span = (
+                (~one_sided & valid & (view_floor < other_floor))[:, None, :]
+                & (pixel_y >= lower_top[:, None, :])
+                & (pixel_y <= lower_bottom[:, None, :])
+            )
+            upper_span = (
+                (~one_sided & valid & (view_ceiling > other_ceiling))[:, None, :]
+                & (pixel_y >= upper_top[:, None, :])
+                & (pixel_y <= upper_bottom[:, None, :])
+            )
+            side_textures = self.map.portal_side_texture_ids[wall_index, side_index]
+            texture_id = torch.where(
+                one_span,
+                side_textures[..., 0][:, None, :],
+                torch.where(
+                    lower_span,
+                    side_textures[..., 1][:, None, :],
+                    side_textures[..., 2][:, None, :],
+                ),
+            )
+            span = (
+                (one_span | lower_span | upper_span)
+                & (texture_id >= 0)
+                & ~filled
+            )
+            safe_texture_id = texture_id.clamp_min(0)
+            texture_width = self.map.texture_widths[safe_texture_id]
+            texture_height = self.map.texture_heights[safe_texture_id]
+            texture_offset = self.map.portal_side_texture_offsets[wall_index, side_index]
+            texture_u = torch.remainder(
+                torch.floor(
+                    along * self.map.portal_wall_lengths[wall_index]
+                    + texture_offset[..., 0]
+                ).to(torch.int64)[:, None, :],
+                texture_width,
+            ).expand(-1, self.native_view_height, -1)
+            world_z = view_z[:, None, None] + (
+                (center - pixel_y) * distance[:, None, :] / focal_length
+            )
+            texture_v = torch.remainder(
+                torch.floor(-world_z + texture_offset[:, None, :, 1]).to(torch.int64),
+                texture_height,
+            )
+            texture = self.map.texture_index_atlas[
+                safe_texture_id,
+                texture_v,
+                texture_u,
+            ]
+            light = self.map.sector_lights[current][:, None, :]
+            wall_value = self._native_apply_colormap(
+                texture,
+                light,
+                distance[:, None, :],
+            )
+            frame = torch.where(span, wall_value, frame)
+            filled |= span
+            previous_distance = torch.where(valid, distance, previous_distance)
+            current_sector = torch.where(
+                valid & (other_sector >= 0),
+                other_sector,
+                torch.full_like(current_sector, -1),
+            )
+        return frame
+
+    def _native_enemy_sprite_ids(self) -> torch.Tensor:
+        enemy_type = self.enemy_type.clamp(0, 5)
+        viewer_angle = torch.atan2(
+            self.y[:, None] - self.enemy_y,
+            self.x[:, None] - self.enemy_x,
+        )
+        relative = torch.remainder(
+            viewer_angle - self.enemy_angle + math.pi + math.pi / 8,
+            2 * math.pi,
+        )
+        rotation = torch.floor(relative / (math.pi / 4)).to(torch.int64)
+        slot = torch.arange(self.enemy_slots, device=self.device)[None, :]
+        walk_frame = torch.remainder(self.episode_time[:, None] // 4 + slot, 4).to(torch.int64)
+        attack_frame = torch.remainder(self.episode_time[:, None] // 3 + slot, 4).to(
+            torch.int64
+        )
+        walk = self.map.enemy_walk_sprite_ids[enemy_type, walk_frame, rotation]
+        attack = self.map.enemy_attack_sprite_ids[enemy_type, attack_frame, rotation]
+        return torch.where(self.enemy_attack_phase > 0, attack, walk)
+
+    def _native_render_sprites(
+        self,
+        frame: torch.Tensor,
+        wall_distance: torch.Tensor,
+        view_z: torch.Tensor,
+    ) -> torch.Tensor:
+        center = self.native_view_height / 2.0
+        focal_length = self.native_screen_width / 2.0
+        enemy_sprite = self._native_enemy_sprite_ids()
+        static = self.map.raw_static_sprite_ids
+        actor_x = self.enemy_x
+        actor_y = self.enemy_y
+        actor_z = self.enemy_z
+        actor_alive = self.enemy_alive
+        actor_sprite = enemy_sprite
+
+        death_type = self.enemy_death_type.clamp(0, 5)
+        death_count = self.map.enemy_death_frame_counts[death_type]
+        death_elapsed = death_count * 4 - self.enemy_death_tics.to(torch.int64)
+        death_frame = torch.minimum(
+            torch.clamp_min(death_elapsed // 4, 0),
+            death_count - 1,
+        )
+        death_sprite = self.map.enemy_death_sprite_ids[death_type, death_frame]
+        actor_x = torch.cat((actor_x, self.enemy_x), dim=1)
+        actor_y = torch.cat((actor_y, self.enemy_y), dim=1)
+        actor_z = torch.cat((actor_z, self.enemy_z), dim=1)
+        actor_alive = torch.cat((actor_alive, self.enemy_death_tics > 0), dim=1)
+        actor_sprite = torch.cat((actor_sprite, death_sprite), dim=1)
+
+        player_projectile_sprite = static[17 + self.projectile_type.clamp(0, 1)]
+        actor_x = torch.cat((actor_x, self.projectile_x), dim=1)
+        actor_y = torch.cat((actor_y, self.projectile_y), dim=1)
+        actor_z = torch.cat((actor_z, self.projectile_z), dim=1)
+        actor_alive = torch.cat((actor_alive, self.projectile_alive), dim=1)
+        actor_sprite = torch.cat((actor_sprite, player_projectile_sprite), dim=1)
+
+        enemy_projectile_sprite = static[19].expand_as(self.enemy_projectile_age)
+        actor_x = torch.cat((actor_x, self.enemy_projectile_x), dim=1)
+        actor_y = torch.cat((actor_y, self.enemy_projectile_y), dim=1)
+        actor_z = torch.cat((actor_z, self.enemy_projectile_z), dim=1)
+        actor_alive = torch.cat((actor_alive, self.enemy_projectile_alive), dim=1)
+        actor_sprite = torch.cat((actor_sprite, enemy_projectile_sprite), dim=1)
+
+        map_item_x = self.map.item_spawns[None, :, 0].expand(self.num_envs, -1)
+        map_item_y = self.map.item_spawns[None, :, 1].expand(self.num_envs, -1)
+        map_item_z = self._item_z[None, :].expand(self.num_envs, -1)
+        map_item_sprite = self.map.item_raw_visual_types[None, :].expand(self.num_envs, -1)
+        actor_x = torch.cat((actor_x, map_item_x), dim=1)
+        actor_y = torch.cat((actor_y, map_item_y), dim=1)
+        actor_z = torch.cat((actor_z, map_item_z), dim=1)
+        actor_alive = torch.cat((actor_alive, self.item_available), dim=1)
+        actor_sprite = torch.cat((actor_sprite, map_item_sprite), dim=1)
+
+        drop_visible = (self.drop_type >= 0) & (self.drop_delay <= 0)
+        drop_sprite = static[12].expand_as(self.drop_type)
+        drop_sprite = torch.where(self.drop_type == 2007, static[6], drop_sprite)
+        drop_sprite = torch.where(self.drop_type == 2002, static[14], drop_sprite)
+        actor_x = torch.cat((actor_x, self.enemy_x), dim=1)
+        actor_y = torch.cat((actor_y, self.enemy_y), dim=1)
+        actor_z = torch.cat((actor_z, self.enemy_z), dim=1)
+        actor_alive = torch.cat((actor_alive, drop_visible), dim=1)
+        actor_sprite = torch.cat((actor_sprite, drop_sprite), dim=1)
+
+        dx = actor_x - self.x[:, None]
+        dy = actor_y - self.y[:, None]
+        actor_distance = torch.sqrt(dx * dx + dy * dy).clamp_min_(1)
+        relative = self._wrap_angle(torch.atan2(dy, dx) - self.angle[:, None])
+        actor_depth = actor_distance * torch.cos(relative)
+        screen_center = (
+            self.native_screen_width / 2.0 - torch.tan(relative) * focal_length
+        )
+        projection_scale = focal_length / actor_distance
+        sprite_width = self.map.raw_sprite_widths[actor_sprite].to(torch.float32)
+        sprite_height = self.map.raw_sprite_heights[actor_sprite].to(torch.float32)
+        sprite_left = (
+            screen_center
+            - self.map.raw_sprite_left_offsets[actor_sprite] * projection_scale
+        )
+        sprite_top = (
+            center
+            + (view_z[:, None] - actor_z) * projection_scale
+            - self.map.raw_sprite_top_offsets[actor_sprite] * projection_scale
+        )
+        sprite_right = sprite_left + sprite_width * projection_scale
+        column_inside = (self._native_pixel_x >= sprite_left[:, :, None]) & (
+            self._native_pixel_x < sprite_right[:, :, None]
+        )
+        candidate = (
+            column_inside
+            & actor_alive[:, :, None]
+            & (relative[:, :, None].abs() < math.pi / 4)
+            & (actor_depth[:, :, None] > 0)
+            & (actor_depth[:, :, None] < wall_distance[:, None, :])
+        )
+        candidate_distance = torch.where(
+            candidate,
+            actor_depth[:, :, None],
+            torch.full_like(actor_depth[:, :, None], torch.inf),
+        )
+        nearest_distance, nearest_actor = torch.min(candidate_distance, dim=1)
+        selected_sprite = actor_sprite.gather(1, nearest_actor)
+        selected_scale = projection_scale.gather(1, nearest_actor)
+        selected_left = sprite_left.gather(1, nearest_actor)
+        selected_top = sprite_top.gather(1, nearest_actor)
+        selected_width = sprite_width.gather(1, nearest_actor).to(torch.int64)
+        selected_height = sprite_height.gather(1, nearest_actor).to(torch.int64)
+        sprite_u = torch.floor(
+            (self._native_pixel_x[:, 0, :] - selected_left) / selected_scale
+        ).to(torch.int64)
+        sprite_v = torch.floor(
+            (self._native_pixel_y - selected_top[:, None, :])
+            / selected_scale[:, None, :]
+        ).to(torch.int64)
+        inside_sprite = (
+            torch.isfinite(nearest_distance)[:, None, :]
+            & (sprite_u[:, None, :] >= 0)
+            & (sprite_u[:, None, :] < selected_width[:, None, :])
+            & (sprite_v >= 0)
+            & (sprite_v < selected_height[:, None, :])
+        )
+        sprite_u = sprite_u.clamp_min(0)[:, None, :].expand(
+            -1, self.native_view_height, -1
+        )
+        sprite_v = sprite_v.clamp_min(0)
+        sprite_u = torch.minimum(sprite_u, (selected_width - 1)[:, None, :])
+        sprite_v = torch.minimum(sprite_v, (selected_height - 1)[:, None, :])
+        sprite_type = selected_sprite[:, None, :].expand(
+            -1, self.native_view_height, -1
+        )
+        sprite_opaque = self.map.raw_sprite_opaque[sprite_type, sprite_v, sprite_u]
+        sprite_value = self.map.raw_sprite_atlas[sprite_type, sprite_v, sprite_u]
+        actor_sector = self._sector_at(actor_x.reshape(-1), actor_y.reshape(-1)).reshape_as(
+            actor_x
+        )
+        actor_light = self.map.sector_lights[actor_sector]
+        selected_light = actor_light.gather(1, nearest_actor)[:, None, :]
+        lit_sprite = self._native_apply_colormap(
+            sprite_value,
+            selected_light,
+            nearest_distance[:, None, :],
+        )
+        return torch.where(inside_sprite & sprite_opaque, lit_sprite, frame)
+
+    def _native_render_weapon(self, frame: torch.Tensor) -> torch.Tensor:
+        weapon = self._active_weapon().clamp(0, 7)
+        value = self.map.native_weapon_screen_values[weapon]
+        alpha = self.map.native_weapon_screen_alpha[weapon]
+        lower_vertical_tics = torch.clamp(
+            _WEAPON_LOWER_TICS - self.weapon_lower_cooldown,
+            0,
+            _WEAPON_LOWER_TICS,
+        )
+        vertical_tics = torch.where(
+            self.pending_weapon >= 0,
+            lower_vertical_tics,
+            self.weapon_raise_cooldown,
+        )
+        spawn_raise_tics = torch.clamp(
+            _WEAPON_RAISE_TICS - (self.episode_time - 1),
+            0,
+            _WEAPON_RAISE_TICS,
+        )
+        vertical_tics = torch.maximum(vertical_tics, spawn_raise_tics)
+        raise_pixels = torch.round(vertical_tics.to(torch.float32) * 6.0).to(torch.int64)
+        source_y = self._native_pixel_y.to(torch.int64) - raise_pixels[:, None, None]
+        valid = (source_y >= 0) & (source_y < self.native_view_height)
+        source_y = source_y.clamp(0, self.native_view_height - 1).expand(
+            -1, -1, self.native_screen_width
+        )
+        value = value.gather(1, source_y)
+        alpha = alpha.gather(1, source_y)
+        visible = valid & ~self.player_dead[:, None, None]
+        return torch.where(alpha & visible, value, frame)
+
+    def _native_draw_hud_patch(
+        self,
+        canvas: torch.Tensor,
+        patch_index: int,
+        x: int,
+        y: int,
+    ) -> None:
+        width = int(self.map.hud_patch_widths[patch_index].item())
+        height = int(self.map.hud_patch_heights[patch_index].item())
+        if width <= 0 or height <= 0:
+            return
+        source_x = max(-x, 0)
+        source_y = max(-y, 0)
+        target_x = max(x, 0)
+        target_y = max(y, 0)
+        copy_width = min(width - source_x, canvas.shape[1] - target_x)
+        copy_height = min(height - source_y, canvas.shape[0] - target_y)
+        if copy_width <= 0 or copy_height <= 0:
+            return
+        source = np.s_[
+            source_y : source_y + copy_height,
+            source_x : source_x + copy_width,
+        ]
+        target = np.s_[
+            target_y : target_y + copy_height,
+            target_x : target_x + copy_width,
+        ]
+        value = self.map.hud_patch_atlas[patch_index][source]
+        opaque = self.map.hud_patch_opaque[patch_index][source]
+        canvas[target].copy_(torch.where(opaque, value, canvas[target]))
+
+    def _native_draw_hud_number(
+        self,
+        canvas: torch.Tensor,
+        value: int,
+        right: int,
+        y: int,
+        *,
+        small: bool = False,
+    ) -> None:
+        text = str(max(-99, min(value, 999)))
+        digit_width = 4 if small else 14
+        base = 18 if small else 2
+        x = right - len(text) * digit_width
+        for character in text:
+            if character == "-":
+                x += digit_width
+                continue
+            self._native_draw_hud_patch(canvas, base + int(character), x, y)
+            x += digit_width
+
+    def _native_render_hud(self) -> torch.Tensor:
+        hud = torch.zeros(
+            (self.num_envs, 40, self.native_screen_width),
+            device=self.device,
+            dtype=torch.uint8,
+        )
+        for lane in range(self.num_envs):
+            canvas = hud[lane]
+            self._native_draw_hud_patch(canvas, 0, 0, 0)
+            self._native_draw_hud_patch(canvas, 1, 104, 0)
+            active_weapon = int(self._active_weapon()[lane].item())
+            ammo_slot = int(self._weapon_ammo_slot[active_weapon].item())
+            ammo = 0 if ammo_slot < 0 else int(self.ammo[lane, ammo_slot].item())
+            health = int(self.health[lane].clamp(0, 999).item())
+            armor = int(self.armor[lane].clamp(0, 999).item())
+            self._native_draw_hud_number(canvas, ammo, 44, 3)
+            self._native_draw_hud_number(canvas, health, 90, 3)
+            self._native_draw_hud_patch(canvas, 12, 90, 3)
+            self._native_draw_hud_number(canvas, armor, 221, 3)
+            self._native_draw_hud_patch(canvas, 12, 221, 3)
+            pain = max(0, min((100 - health) // 20, 4))
+            self._native_draw_hud_patch(canvas, 13 + pain, 143, 1)
+            for weapon_index, (x, y) in enumerate(
+                ((111, 4), (123, 4), (135, 4), (111, 14), (123, 14), (135, 14))
+            ):
+                if bool(self.weapons[lane, weapon_index]):
+                    self._native_draw_hud_patch(canvas, 18 + weapon_index + 2, x, y)
+            ammo_values = (
+                int(self.ammo[lane, 1].item()),
+                int(self.ammo[lane, 2].item()),
+                int(self.ammo[lane, 4].item()),
+                int(self.ammo[lane, 5].item()),
+            )
+            for row, (value, maximum) in enumerate(
+                zip(ammo_values, (200, 50, 50, 300), strict=True)
+            ):
+                y = 5 + row * 6
+                self._native_draw_hud_number(canvas, value, 288, y, small=True)
+                self._native_draw_hud_number(canvas, maximum, 314, y, small=True)
+        return hud
+
+    def render_native_frame(self, *, include_hud: bool = True) -> torch.Tensor:
+        """Render the unprocessed ViZDoom-compatible 320x240 RGB24 view."""
+
+        wall_distance = self._native_raycast()
+        sector = self._current_sector()
+        view_z = self.z + _VIEW_HEIGHT
+        frame = self._native_render_flats(sector, view_z)
+        frame = self._native_render_portal_walls(frame, view_z)
+        frame = self._native_render_sprites(frame, wall_distance, view_z)
+        frame = self._native_render_weapon(frame)
+        if include_hud:
+            frame = torch.cat((frame, self._native_render_hud()), dim=1)
+        rgb = self.map.playpal[frame.to(torch.int64)]
+        flash = self.damage_flash.clamp(0, 1)[:, None, None, None]
+        red = torch.tensor((255.0, 0.0, 0.0), device=self.device)
+        rgb = rgb.to(torch.float32) * (1 - flash * 0.35) + red * flash * 0.35
+        return rgb.clamp(0, 255).to(torch.uint8)
 
     def _update_signal_buffer(self) -> None:
         weapon_index = (self.selected_weapon - 1)[:, None]
