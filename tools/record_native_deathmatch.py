@@ -53,6 +53,9 @@ def main() -> int:
     engine.x.fill_(668.9710083007812)
     engine.y.fill_(393.1371307373047)
     engine.z.zero_()
+    engine.view_z.fill_(41.0)
+    engine.view_height.fill_(41.0)
+    engine.delta_view_height.zero_()
     engine.angle.fill_(math.radians(145.95336917460742))
 
     frame_count = round(args.seconds * args.fps)

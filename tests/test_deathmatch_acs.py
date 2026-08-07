@@ -16,7 +16,16 @@ def _engine(square_scenario) -> TorchDeathmatchEngine:
         frame_skip=2,
     )
     engine.reset(torch.ones(2, dtype=torch.bool), torch.tensor([123, 456]))
+    engine.weapon_raise_cooldown.zero_()
     return engine
+
+
+def _finish_pending_attack(engine: TorchDeathmatchEngine) -> torch.Tensor:
+    reward = torch.zeros(engine.num_envs)
+    noop = torch.zeros((engine.num_envs, 20), dtype=torch.bool)
+    while torch.any(engine.pending_attack_weapon >= 0):
+        reward += engine._player_attack(noop)
+    return reward
 
 
 def test_reset_uses_acs_teleport_and_delayed_spawn(square_scenario) -> None:
@@ -88,10 +97,54 @@ def test_kill_reward_comes_from_spawned_actor_class(square_scenario) -> None:
     buttons[:, 0] = True
 
     reward = engine._player_attack(buttons)
+    reward += _finish_pending_attack(engine)
 
     assert reward.tolist() == [10.0, 10.0]
     assert engine.killcount.tolist() == [1, 1]
     assert not torch.any(engine.enemy_alive[:, 0])
+
+
+def test_nonlethal_damage_enters_reference_pain_state(square_scenario) -> None:
+    engine = _engine(square_scenario)
+    engine.enemy_type[:, 0] = torch.tensor([0, 5])
+    engine.enemy_health[:, 0] = torch.tensor([20.0, 500.0])
+    engine.enemy_alive[:, 0] = True
+    engine.enemy_attack_phase[:, 0] = 2
+    engine.enemy_cooldown[:, 0] = 8
+    engine._enemy_pain_chance.fill_(256)
+    damage = torch.zeros_like(engine.enemy_health)
+    damage[:, 0] = 1
+
+    engine._apply_enemy_damage(damage)
+
+    assert engine.enemy_pain_tics[:, 0].tolist() == [6, 4]
+    assert engine.enemy_attack_phase[:, 0].tolist() == [0, 0]
+    assert engine.enemy_cooldown[:, 0].tolist() == [0, 0]
+
+    before_x = engine.enemy_x[:, 0].clone()
+    engine._enemy_tick()
+    assert engine.enemy_pain_tics[:, 0].tolist() == [5, 3]
+    assert torch.equal(engine.enemy_x[:, 0], before_x)
+
+
+def test_dying_monsters_remain_solid_until_no_block_frame(square_scenario) -> None:
+    engine = _engine(square_scenario)
+    engine.enemy_type[:, 0] = torch.tensor([0, 5])
+    engine.enemy_health[:, 0] = 1
+    engine.enemy_alive[:, 0] = True
+    damage = torch.zeros_like(engine.enemy_health)
+    damage[:, 0] = 1
+
+    engine._apply_enemy_damage(damage)
+
+    assert engine._enemy_solid_mask()[:, 0].tolist() == [True, True]
+    assert engine.drop_delay[:, 0].tolist() == [10, 0]
+    for _ in range(10):
+        engine._collect_drops()
+    assert engine._enemy_solid_mask()[:, 0].tolist() == [False, True]
+    for _ in range(14):
+        engine._collect_drops()
+    assert engine._enemy_solid_mask()[:, 0].tolist() == [False, False]
 
 
 def test_voodoo_doll_hits_damage_shared_player_health(square_scenario) -> None:
@@ -105,9 +158,30 @@ def test_voodoo_doll_hits_damage_shared_player_health(square_scenario) -> None:
     buttons[:, 0] = True
 
     reward = engine._player_attack(buttons)
+    reward += _finish_pending_attack(engine)
 
     assert reward.tolist() == [0.0, 0.0]
     assert torch.all(engine.health < 100)
+
+
+def test_reference_damage_and_pickup_flash_counters(square_scenario) -> None:
+    engine = _engine(square_scenario)
+    engine._apply_player_damage(torch.tensor([10.0, 25.0]))
+
+    assert engine.damage_count.tolist() == [10, 25]
+
+    pickup_scenario = replace(
+        square_scenario,
+        item_spawns=np.asarray([(0, 0, 0)], dtype=np.float32),
+        item_types=np.asarray([2014], dtype=np.int32),
+    )
+    pickup_engine = _engine(pickup_scenario)
+    pickup_engine.x.zero_()
+    pickup_engine.y.zero_()
+    pickup_engine.z.zero_()
+    pickup_engine._collect_map_items()
+
+    assert pickup_engine.bonus_count.tolist() == [6, 6]
 
 
 def test_pistol_and_chaingun_views_share_bullet_ammo(square_scenario) -> None:
@@ -117,6 +191,7 @@ def test_pistol_and_chaingun_views_share_bullet_ammo(square_scenario) -> None:
     buttons[:, 0] = True
 
     engine._player_attack(buttons)
+    _finish_pending_attack(engine)
 
     assert engine.ammo[:, 1].tolist() == [49.0, 49.0]
     assert torch.equal(engine.ammo[:, 1], engine.ammo[:, 3])
@@ -169,11 +244,13 @@ def test_reference_gravity_trace_lands_on_lowered_floor(square_scenario) -> None
     active = torch.ones(2, dtype=torch.bool)
     z_trace = []
     velocity_trace = []
+    view_z_trace = []
 
     for _ in range(12):
         engine._vertical_player_tick(active)
         z_trace.append(float(engine.z[0]))
         velocity_trace.append(float(engine.velocity_z[0]))
+        view_z_trace.append(float(engine.view_z[0]))
 
     assert z_trace == [
         0.0,
@@ -202,6 +279,35 @@ def test_reference_gravity_trace_lands_on_lowered_floor(square_scenario) -> None
         -10.0,
         -11.0,
         0.0,
+    ]
+    for _ in range(12):
+        engine._vertical_player_tick(active)
+        view_z_trace.append(float(engine.view_z[0]))
+    assert view_z_trace == [
+        41.0,
+        41.0,
+        40.0,
+        38.0,
+        35.0,
+        31.0,
+        26.0,
+        20.0,
+        13.0,
+        5.0,
+        -4.0,
+        -14.0,
+        -24.375,
+        -25.5,
+        -26.375,
+        -27.0,
+        -27.375,
+        -27.5,
+        -27.375,
+        -27.0,
+        -26.375,
+        -25.5,
+        -24.375,
+        -23.0,
     ]
 
 
@@ -272,12 +378,15 @@ def test_hitscan_autoaim_rejects_target_outside_vertical_window(square_scenario)
     buttons[:, 0] = True
 
     engine._player_attack(buttons)
+    _finish_pending_attack(engine)
 
     assert engine.enemy_health[:, 0].tolist() == [20.0, 20.0]
 
     engine.attack_cooldown.zero_()
+    engine.weapon_state_cooldown.zero_()
     engine.enemy_z[:, 0] = 0
     engine._player_attack(buttons)
+    _finish_pending_attack(engine)
 
     assert torch.all(engine.enemy_health[:, 0] < 20)
 
@@ -554,6 +663,7 @@ def test_blocking_linedef_occludes_hitscan_and_monster_attacks(square_scenario) 
     buttons[:, 0] = True
 
     engine._player_attack(buttons)
+    _finish_pending_attack(engine)
     engine._enemy_tick()
 
     assert engine.enemy_health[:, 0].tolist() == [20.0, 20.0]
@@ -609,12 +719,15 @@ def test_hell_knight_ranged_attack_travels_before_damage(square_scenario) -> Non
     engine._enemy_tick()
 
     assert torch.sum(engine.enemy_projectile_alive, dim=1).tolist() == [1, 1]
+    assert engine.enemy_projectile_x[:, 0].tolist() == [56.5, 56.5]
     active = torch.ones(2, dtype=torch.bool)
     for _ in range(8):
         engine._enemy_projectile_tick(active)
 
     assert torch.all(engine.health < 100)
     assert not torch.any(engine.enemy_projectile_alive)
+    assert torch.all(engine.enemy_projectile_impact_tics[:, 0] > 0)
+    assert torch.all(engine.enemy_projectile_impact_tics[:, 0] <= 18)
 
 
 def test_hell_knight_melee_attack_fires_after_reference_prefire(square_scenario) -> None:

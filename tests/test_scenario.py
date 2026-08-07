@@ -99,18 +99,55 @@ def test_pinned_deathmatch_compiles_external_doom2_data() -> None:
     assert scenario.enemy_attack_sprite_ids is not None
     assert scenario.enemy_attack_sprite_ids.shape == (6, 4, 8)
     assert scenario.enemy_death_sprite_ids is not None
-    assert scenario.enemy_death_sprite_ids.shape == (6, 16)
+    assert scenario.enemy_death_sprite_ids.shape == (6, 7)
     assert scenario.enemy_death_frame_counts is not None
-    assert scenario.enemy_death_frame_counts.tolist() == [14, 14, 16, 13, 6, 7]
+    assert scenario.enemy_death_frame_counts.tolist() == [5, 5, 7, 7, 6, 7]
     assert scenario.raw_static_sprite_ids is not None
     assert scenario.raw_static_sprite_ids.shape == (20,)
+    assert scenario.raw_item_animation_sprite_ids is not None
+    assert scenario.raw_item_animation_sprite_ids.shape == (8,)
     assert scenario.native_weapon_screen_values is not None
     assert scenario.native_weapon_screen_values.shape == (8, 208, 320)
     assert scenario.native_weapon_screen_alpha is not None
     assert scenario.native_weapon_screen_alpha.any(axis=(1, 2)).all()
+    assert scenario.native_weapon_frame_values is not None
+    assert scenario.native_weapon_frame_values.shape[1:] == (208, 320)
+    assert scenario.native_weapon_frame_alpha is not None
+    assert scenario.native_weapon_frame_alpha.any(axis=(1, 2)).all()
+    assert scenario.native_weapon_frame_ids is not None
+    assert scenario.native_weapon_frame_ids.shape == (8, 2, 62)
+    assert scenario.native_weapon_flash_ids is not None
+    assert scenario.native_weapon_flash_ids.shape == (8, 2, 62)
+    assert scenario.native_weapon_flash_lights is not None
+    assert scenario.native_weapon_flash_lights.shape == (8, 2, 62)
+    assert scenario.enemy_death_frame_durations is not None
+    assert scenario.enemy_death_frame_durations.shape == (6, 7)
+    assert scenario.enemy_death_total_tics is not None
+    assert scenario.enemy_death_total_tics.tolist() == [21, 21, 61, 31, 29, 49]
+    assert scenario.enemy_pain_sprite_ids is not None
+    assert scenario.enemy_pain_sprite_ids.shape == (6, 8)
+    assert scenario.raw_projectile_flight_sprite_ids is not None
+    assert scenario.raw_projectile_flight_sprite_ids.shape == (3, 2, 8)
+    assert scenario.raw_projectile_explosion_sprite_ids is not None
+    assert scenario.raw_projectile_explosion_sprite_ids.shape == (3, 5)
+    assert scenario.projectile_explosion_frame_counts is not None
+    assert scenario.projectile_explosion_frame_counts.tolist() == [3, 5, 3]
+    assert scenario.projectile_explosion_frame_durations is not None
+    assert scenario.projectile_explosion_total_tics is not None
+    assert scenario.projectile_explosion_total_tics.tolist() == [18, 20, 18]
+    assert scenario.projectile_additive_luts is not None
+    assert scenario.projectile_additive_luts.shape == (2, 256, 256)
+    assert scenario.projectile_additive_luts[0, 0, 3] == 107
+    assert scenario.projectile_additive_luts[1, 0, 3] == 3
+    assert scenario.projectile_additive_luts[0, 71, 73] == 62
+    assert scenario.projectile_additive_luts[1, 71, 73] == 213
     assert scenario.hud_patch_names[0:2] == ("STBAR", "STARMS")
+    assert scenario.hud_patch_names[44:49] == tuple(
+        f"STFTR{pain}0" for pain in range(5)
+    )
+    assert scenario.hud_patch_names[69] == "STFDEAD0"
     assert scenario.hud_patch_atlas is not None
-    assert scenario.hud_patch_atlas.shape == (38, 32, 320)
+    assert scenario.hud_patch_atlas.shape == (70, 32, 320)
     assert scenario.hud_patch_left_offsets is not None
     assert scenario.hud_patch_top_offsets is not None
     assert scenario.hud_patch_left_offsets[14] == -5

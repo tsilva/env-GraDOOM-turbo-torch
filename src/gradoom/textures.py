@@ -479,7 +479,7 @@ def compile_indexed_weapon_overlays(
     wad: WadArchive,
     frame_names: tuple[str, ...],
 ) -> tuple[tuple[str, ...], np.ndarray, np.ndarray]:
-    """Rasterize ready-state psprites in ViZDoom's 320x208 play view."""
+    """Rasterize aspect-corrected ready-state psprites in ViZDoom's play view."""
 
     resolved_names: list[str] = []
     values: list[np.ndarray] = []
@@ -490,25 +490,29 @@ def compile_indexed_weapon_overlays(
             raise KeyError(f"IWAD has no weapon frame {normalized!r}")
         patch = decode_patch(wad.read(normalized), normalized)
         left = -patch.left_offset
-        # The full 320x240 output reserves exactly 32 rows for the status bar.
-        # Keep the classic aspect-corrected psprite baseline in that 208-row view.
-        top = -patch.top_offset + 49
+        vertical_scale = 1.2
+        ready_y = 32.0
+        top = 104.0 - (100.0 - ready_y + patch.top_offset) * vertical_scale
         x0 = max(left, 0)
-        y0 = max(top, 0)
         x1 = min(left + patch.width, 320)
-        y1 = min(top + patch.height, 208)
-        if x0 >= x1 or y0 >= y1:
+        source_rows = np.floor((np.arange(208, dtype=np.float32) - top) / vertical_scale).astype(
+            np.int32
+        )
+        visible_rows = (source_rows >= 0) & (source_rows < patch.height)
+        if x0 >= x1 or not visible_rows.any():
             raise ValueError(f"weapon frame {normalized!r} lies outside the logical view")
         value_canvas = np.zeros((208, 320), dtype=np.uint8)
         alpha_canvas = np.zeros((208, 320), dtype=np.bool_)
         patch_x0 = x0 - left
-        patch_y0 = y0 - top
         patch_x1 = patch_x0 + x1 - x0
-        patch_y1 = patch_y0 + y1 - y0
-        source = np.s_[patch_y0:patch_y1, patch_x0:patch_x1]
-        destination = np.s_[y0:y1, x0:x1]
-        value_canvas[destination] = patch.pixels[source]
-        alpha_canvas[destination] = patch.opaque[source]
+        destination_rows = np.flatnonzero(visible_rows)
+        selected_rows = source_rows[visible_rows]
+        value_canvas[destination_rows, x0:x1] = patch.pixels[
+            selected_rows[:, None], np.arange(patch_x0, patch_x1)[None, :]
+        ]
+        alpha_canvas[destination_rows, x0:x1] = patch.opaque[
+            selected_rows[:, None], np.arange(patch_x0, patch_x1)[None, :]
+        ]
         values.append(value_canvas)
         alphas.append(alpha_canvas)
         resolved_names.append(normalized)

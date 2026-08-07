@@ -19,11 +19,15 @@ _UINT32_MASK = (1 << 32) - 1
 _ENEMY_HEALTH = (20.0, 30.0, 100.0, 70.0, 150.0, 500.0)
 _ENEMY_STRIDE = (8.0, 8.0, 8.0, 8.0, 10.0, 8.0)
 _ENEMY_MOVE_INTERVAL = (4, 3, 4, 3, 2, 3)
+_ENEMY_WALK_FRAME_TICS = (8, 6, 4, 6, 4, 6)
 _ENEMY_RADIUS = (20.0, 20.0, 20.0, 20.0, 30.0, 24.0)
 _ENEMY_HEIGHT = (56.0, 56.0, 56.0, 56.0, 56.0, 64.0)
 _ENEMY_ATTACK_RANGE = (2048.0, 2048.0, 64.0, 2048.0, 64.0, 2048.0)
 _ENEMY_ATTACK_PREFIRE = (10, 10, 4, 10, 16, 16)
 _ENEMY_ATTACK_RECOVERY = (16, 20, 4, 4, 8, 8)
+_ENEMY_PAIN_CHANCE = (200, 170, 160, 170, 180, 50)
+_ENEMY_PAIN_TICS = (6, 6, 8, 6, 4, 4)
+_ENEMY_NO_BLOCK_DELAY = (10, 10, 20, 10, 20, 24)
 _ENEMY_KILL_REWARD = (1.0, 3.0, 3.0, 4.0, 3.0, 10.0)
 _ENEMY_SPAWN_THRESHOLD = (2621, 2621, 1310, 1310, 655, 655)
 _ENEMY_SPAWN_DELAY = 105
@@ -34,11 +38,18 @@ _PLAYER_FRICTION = 0.90625
 _PLAYER_SLIDE_FRACTION = 31.0 / 32.0
 _PLAYER_TURN_DEGREES = 3.515625
 _WEAPON_LOWER_TICS = 16
-_WEAPON_RAISE_TICS = 18
+_WEAPON_RAISE_TICS = 16
+_WEAPON_SPAWN_RAISE_TICS = 14
+_WEAPON_VERTICAL_STEP_PIXELS = 7.2
 # Internal weapon order follows the DoomPlayer slot lists exactly:
 # fist, chainsaw, pistol, shotgun, super shotgun, chaingun, rocket, plasma.
 _WEAPON_SLOT = (1, 1, 2, 3, 3, 4, 5, 6)
-_WEAPON_COOLDOWN = (22, 4, 14, 37, 51, 4, 20, 3)
+_WEAPON_COOLDOWN = (17, 8, 14, 37, 51, 8, 20, 3)
+_WEAPON_ACTION_DELAY = (4, 0, 4, 3, 3, 0, 8, 0)
+# Remaining fire-state tics immediately after the trigger transition. These
+# include recovery frames after A_ReFire, unlike _WEAPON_COOLDOWN, which is
+# the interval until the next legal refire action.
+_WEAPON_READY_DURATION = (21, 7, 18, 43, 61, 7, 19, 22)
 _WEAPON_AMMO_SLOT = (-1, -1, 1, 2, 2, 1, 4, 5)
 _WEAPON_AMMO_COST = (0.0, 0.0, 1.0, 1.0, 2.0, 1.0, 1.0, 1.0)
 # Ascending Doom Weapon.SelectionOrder, restricted to the certified profile.
@@ -51,14 +62,131 @@ _PLAYER_HEIGHT = 56.0
 _PICKUP_RADIUS = 20.0
 _PICKUP_REACH_BELOW = 32.0
 _VIEW_HEIGHT = 41.0
+_MUGSHOT_STATE_TICS = 35
+_MUGSHOT_RAMPAGE_DELAY = 70
+_MUGSHOT_NORMAL_FRAME_TICS = 18
 _PROJECTION_FOCAL_LENGTH = 42.0
 _PORTAL_LAYERS = 8
 _HASH_GOLDEN_RATIO_SIGNED = -1640531527
 _HASH_MURMUR_SIGNED = -2048144789
 _PLAYER_PROJECTILE_SPEED = (20.0, 25.0)
-_PLAYER_PROJECTILE_LIFETIME = 100
 _ENEMY_PROJECTILE_SPEED = 15.0
-_ENEMY_PROJECTILE_LIFETIME = 140
+_DAMAGE_TO_ALPHA = (
+    0,
+    8,
+    16,
+    23,
+    30,
+    36,
+    42,
+    47,
+    53,
+    58,
+    62,
+    67,
+    71,
+    75,
+    79,
+    83,
+    87,
+    90,
+    94,
+    97,
+    100,
+    103,
+    107,
+    109,
+    112,
+    115,
+    118,
+    120,
+    123,
+    125,
+    128,
+    130,
+    133,
+    135,
+    137,
+    139,
+    141,
+    143,
+    145,
+    147,
+    149,
+    151,
+    153,
+    155,
+    157,
+    159,
+    160,
+    162,
+    164,
+    165,
+    167,
+    169,
+    170,
+    172,
+    173,
+    175,
+    176,
+    178,
+    179,
+    181,
+    182,
+    183,
+    185,
+    186,
+    187,
+    189,
+    190,
+    191,
+    192,
+    194,
+    195,
+    196,
+    197,
+    198,
+    200,
+    201,
+    202,
+    203,
+    204,
+    205,
+    206,
+    207,
+    209,
+    210,
+    211,
+    212,
+    213,
+    214,
+    215,
+    216,
+    217,
+    218,
+    219,
+    220,
+    221,
+    221,
+    222,
+    223,
+    224,
+    225,
+    226,
+    227,
+    228,
+    229,
+    229,
+    230,
+    231,
+    232,
+    233,
+    234,
+    235,
+    235,
+    236,
+    237,
+)
 _ITEM_SPRITE_INDEX = {
     2011: 6,
     2012: 7,
@@ -156,9 +284,24 @@ class DeviceScenario:
     enemy_attack_sprite_ids: torch.Tensor
     enemy_death_sprite_ids: torch.Tensor
     enemy_death_frame_counts: torch.Tensor
+    enemy_death_frame_durations: torch.Tensor
+    enemy_death_total_tics: torch.Tensor
+    enemy_pain_sprite_ids: torch.Tensor
+    raw_projectile_flight_sprite_ids: torch.Tensor
+    raw_projectile_explosion_sprite_ids: torch.Tensor
+    projectile_explosion_frame_counts: torch.Tensor
+    projectile_explosion_frame_durations: torch.Tensor
+    projectile_explosion_total_tics: torch.Tensor
+    projectile_additive_luts: torch.Tensor
     raw_static_sprite_ids: torch.Tensor
+    raw_item_animation_sprite_ids: torch.Tensor
     native_weapon_screen_values: torch.Tensor
     native_weapon_screen_alpha: torch.Tensor
+    native_weapon_frame_values: torch.Tensor
+    native_weapon_frame_alpha: torch.Tensor
+    native_weapon_frame_ids: torch.Tensor
+    native_weapon_flash_ids: torch.Tensor
+    native_weapon_flash_lights: torch.Tensor
     hud_patch_atlas: torch.Tensor
     hud_patch_opaque: torch.Tensor
     hud_patch_widths: torch.Tensor
@@ -276,6 +419,61 @@ class DeviceScenario:
             if scenario.enemy_death_frame_counts is None
             else scenario.enemy_death_frame_counts
         )
+        enemy_death_frame_durations = (
+            np.ones_like(enemy_death_sprite_ids, dtype=np.int32)
+            if scenario.enemy_death_frame_durations is None
+            else scenario.enemy_death_frame_durations
+        )
+        enemy_death_total_tics = (
+            enemy_death_frame_durations.sum(axis=1, dtype=np.int32)
+            if scenario.enemy_death_total_tics is None
+            else scenario.enemy_death_total_tics
+        )
+        enemy_pain_sprite_ids = (
+            fallback_enemy_ids[:, 0]
+            if scenario.enemy_pain_sprite_ids is None
+            else scenario.enemy_pain_sprite_ids
+        )
+        raw_projectile_flight_sprite_ids = (
+            np.zeros((3, 2, 8), dtype=np.int32)
+            if scenario.raw_projectile_flight_sprite_ids is None
+            else scenario.raw_projectile_flight_sprite_ids
+        )
+        raw_projectile_explosion_sprite_ids = (
+            np.zeros((3, 5), dtype=np.int32)
+            if scenario.raw_projectile_explosion_sprite_ids is None
+            else scenario.raw_projectile_explosion_sprite_ids
+        )
+        projectile_explosion_frame_counts = (
+            np.asarray((3, 5, 3), dtype=np.int32)
+            if scenario.projectile_explosion_frame_counts is None
+            else scenario.projectile_explosion_frame_counts
+        )
+        projectile_explosion_frame_durations = (
+            np.asarray(
+                (
+                    (8, 6, 4, 0, 0),
+                    (4, 4, 4, 4, 4),
+                    (6, 6, 6, 0, 0),
+                ),
+                dtype=np.int32,
+            )
+            if scenario.projectile_explosion_frame_durations is None
+            else scenario.projectile_explosion_frame_durations
+        )
+        projectile_explosion_total_tics = (
+            projectile_explosion_frame_durations.sum(axis=1, dtype=np.int32)
+            if scenario.projectile_explosion_total_tics is None
+            else scenario.projectile_explosion_total_tics
+        )
+        projectile_additive_luts = (
+            np.broadcast_to(
+                np.arange(256, dtype=np.uint8)[None, None, :],
+                (2, 256, 256),
+            ).copy()
+            if scenario.projectile_additive_luts is None
+            else scenario.projectile_additive_luts
+        )
         if scenario.raw_static_sprite_ids is None:
             last_sprite = max(len(raw_sprite_atlas) - 1, 0)
             raw_static_sprite_ids = np.asarray(
@@ -284,6 +482,11 @@ class DeviceScenario:
             )
         else:
             raw_static_sprite_ids = scenario.raw_static_sprite_ids
+        raw_item_animation_sprite_ids = (
+            np.zeros(8, dtype=np.int32)
+            if scenario.raw_item_animation_sprite_ids is None
+            else scenario.raw_item_animation_sprite_ids
+        )
         item_raw_visual_types = np.full(len(scenario.item_types), -1, dtype=np.int64)
         for type_id, sprite_index in _ITEM_SPRITE_INDEX.items():
             item_raw_visual_types[scenario.item_types == type_id] = raw_static_sprite_ids[
@@ -299,8 +502,35 @@ class DeviceScenario:
             if scenario.native_weapon_screen_alpha is None
             else scenario.native_weapon_screen_alpha
         )
+        native_weapon_frame_values = (
+            native_weapon_screen_values
+            if scenario.native_weapon_frame_values is None
+            else scenario.native_weapon_frame_values
+        )
+        native_weapon_frame_alpha = (
+            native_weapon_screen_alpha
+            if scenario.native_weapon_frame_alpha is None
+            else scenario.native_weapon_frame_alpha
+        )
+        if scenario.native_weapon_frame_ids is None:
+            native_weapon_frame_ids = np.broadcast_to(
+                np.arange(8, dtype=np.int32)[:, None, None],
+                (8, 2, 52),
+            ).copy()
+        else:
+            native_weapon_frame_ids = scenario.native_weapon_frame_ids
+        native_weapon_flash_ids = (
+            np.full((8, 2, 52), -1, dtype=np.int32)
+            if scenario.native_weapon_flash_ids is None
+            else scenario.native_weapon_flash_ids
+        )
+        native_weapon_flash_lights = (
+            np.zeros((8, 2, 52), dtype=np.int32)
+            if scenario.native_weapon_flash_lights is None
+            else scenario.native_weapon_flash_lights
+        )
         hud_patch_atlas = (
-            np.zeros((38, 32, 320), dtype=np.uint8)
+            np.zeros((70, 32, 320), dtype=np.uint8)
             if scenario.hud_patch_atlas is None
             else scenario.hud_patch_atlas
         )
@@ -432,11 +662,52 @@ class DeviceScenario:
             enemy_death_frame_counts=torch.as_tensor(
                 enemy_death_frame_counts, device=device, dtype=torch.int64
             ),
+            enemy_death_frame_durations=torch.as_tensor(
+                enemy_death_frame_durations, device=device, dtype=torch.int64
+            ),
+            enemy_death_total_tics=torch.as_tensor(
+                enemy_death_total_tics, device=device, dtype=torch.int64
+            ),
+            enemy_pain_sprite_ids=torch.as_tensor(
+                enemy_pain_sprite_ids, device=device, dtype=torch.int64
+            ),
+            raw_projectile_flight_sprite_ids=torch.as_tensor(
+                raw_projectile_flight_sprite_ids, device=device, dtype=torch.int64
+            ),
+            raw_projectile_explosion_sprite_ids=torch.as_tensor(
+                raw_projectile_explosion_sprite_ids, device=device, dtype=torch.int64
+            ),
+            projectile_explosion_frame_counts=torch.as_tensor(
+                projectile_explosion_frame_counts, device=device, dtype=torch.int64
+            ),
+            projectile_explosion_frame_durations=torch.as_tensor(
+                projectile_explosion_frame_durations, device=device, dtype=torch.int64
+            ),
+            projectile_explosion_total_tics=torch.as_tensor(
+                projectile_explosion_total_tics, device=device, dtype=torch.int64
+            ),
+            projectile_additive_luts=torch.as_tensor(
+                projectile_additive_luts, device=device, dtype=torch.uint8
+            ),
             raw_static_sprite_ids=torch.as_tensor(
                 raw_static_sprite_ids, device=device, dtype=torch.int64
             ),
+            raw_item_animation_sprite_ids=torch.as_tensor(
+                raw_item_animation_sprite_ids, device=device, dtype=torch.int64
+            ),
             native_weapon_screen_values=torch.as_tensor(native_weapon_screen_values, device=device),
             native_weapon_screen_alpha=torch.as_tensor(native_weapon_screen_alpha, device=device),
+            native_weapon_frame_values=torch.as_tensor(native_weapon_frame_values, device=device),
+            native_weapon_frame_alpha=torch.as_tensor(native_weapon_frame_alpha, device=device),
+            native_weapon_frame_ids=torch.as_tensor(
+                native_weapon_frame_ids, device=device, dtype=torch.int64
+            ),
+            native_weapon_flash_ids=torch.as_tensor(
+                native_weapon_flash_ids, device=device, dtype=torch.int64
+            ),
+            native_weapon_flash_lights=torch.as_tensor(
+                native_weapon_flash_lights, device=device, dtype=torch.int64
+            ),
             hud_patch_atlas=torch.as_tensor(hud_patch_atlas, device=device),
             hud_patch_opaque=torch.as_tensor(hud_patch_opaque, device=device),
             hud_patch_widths=torch.as_tensor(hud_patch_widths, device=device, dtype=torch.int64),
@@ -460,6 +731,7 @@ class TorchDeathmatchEngine:
     native_view_height = 208
     native_screen_height = 240
     native_screen_width = 320
+    native_vertical_aspect = 1.2
     enemy_slots = 64
     player_projectile_slots = 32
 
@@ -492,6 +764,9 @@ class TorchDeathmatchEngine:
         self.x = torch.zeros(n, device=device)
         self.y = torch.zeros(n, device=device)
         self.z = torch.zeros(n, device=device)
+        self.view_z = torch.zeros(n, device=device)
+        self.view_height = torch.full((n,), _VIEW_HEIGHT, device=device)
+        self.delta_view_height = torch.zeros(n, device=device)
         self.angle = torch.zeros(n, device=device)
         self.momentum_x = torch.zeros(n, device=device)
         self.momentum_y = torch.zeros(n, device=device)
@@ -507,12 +782,32 @@ class TorchDeathmatchEngine:
         self.shotgun_owned = torch.zeros(n, device=device, dtype=torch.bool)
         self.super_shotgun_owned = torch.zeros(n, device=device, dtype=torch.bool)
         self.ammo = torch.zeros((n, 6), device=device)
+        # SBARINFO caches the ready weapon's ammo during Draw and consumes that
+        # cache on the next status-bar Tick.  The large current-ammo number is
+        # therefore one rendered observation behind inventory/game variables.
+        self.hud_ready_ammo = torch.zeros(n, device=device)
         self.attack_cooldown = torch.zeros(n, device=device, dtype=torch.int32)
+        self.weapon_state_cooldown = torch.zeros(n, device=device, dtype=torch.int32)
+        self.pending_attack_weapon = torch.full((n,), -1, device=device, dtype=torch.int64)
+        self.pending_attack_delay = torch.zeros(n, device=device, dtype=torch.int32)
+        self.weapon_fire_count = torch.zeros(n, device=device, dtype=torch.int32)
+        self.weapon_ready_tics = torch.zeros(n, device=device, dtype=torch.int32)
         self.weapon_raise_cooldown = torch.zeros(n, device=device, dtype=torch.int32)
         self.pending_weapon = torch.full((n,), -1, device=device, dtype=torch.int64)
         self.weapon_lower_cooldown = torch.zeros(n, device=device, dtype=torch.int32)
         self.weapon_change_latched = torch.zeros(n, device=device, dtype=torch.bool)
-        self.damage_flash = torch.zeros(n, device=device)
+        self.damage_count = torch.zeros(n, device=device, dtype=torch.int32)
+        self.bonus_count = torch.zeros(n, device=device, dtype=torch.int32)
+        self.mugshot_pain_tics = torch.zeros(n, device=device, dtype=torch.int32)
+        self.mugshot_pain_direction = torch.ones(n, device=device, dtype=torch.int64)
+        self.mugshot_ouch = torch.zeros(n, device=device, dtype=torch.bool)
+        self.mugshot_grin = torch.zeros(n, device=device, dtype=torch.bool)
+        self.mugshot_face_index = torch.ones(n, device=device, dtype=torch.int64)
+        self.mugshot_face_tics = torch.full(
+            (n,), _MUGSHOT_NORMAL_FRAME_TICS, device=device, dtype=torch.int32
+        )
+        self.mugshot_rng_state = torch.ones(n, device=device, dtype=torch.int64)
+        self.attack_held_tics = torch.zeros(n, device=device, dtype=torch.int32)
         self.reaction_time = torch.zeros(n, device=device, dtype=torch.int32)
         self.enemy_x = torch.zeros((n, self.enemy_slots), device=device)
         self.enemy_y = torch.zeros((n, self.enemy_slots), device=device)
@@ -528,10 +823,19 @@ class TorchDeathmatchEngine:
         self.enemy_move_cooldown = torch.zeros(
             (n, self.enemy_slots), device=device, dtype=torch.int32
         )
+        self.enemy_animation_tics = torch.zeros(
+            (n, self.enemy_slots), device=device, dtype=torch.int32
+        )
+        self.enemy_pain_tics = torch.zeros(
+            (n, self.enemy_slots), device=device, dtype=torch.int32
+        )
         self.enemy_death_type = torch.full(
             (n, self.enemy_slots), -1, device=device, dtype=torch.int64
         )
         self.enemy_death_tics = torch.zeros((n, self.enemy_slots), device=device, dtype=torch.int32)
+        self.enemy_death_elapsed = torch.zeros(
+            (n, self.enemy_slots), device=device, dtype=torch.int32
+        )
         self.drop_type = torch.full((n, self.enemy_slots), -1, device=device, dtype=torch.int64)
         self.drop_delay = torch.zeros((n, self.enemy_slots), device=device, dtype=torch.int32)
         self.projectile_x = torch.zeros((n, self.player_projectile_slots), device=device)
@@ -549,6 +853,12 @@ class TorchDeathmatchEngine:
         self.projectile_alive = torch.zeros(
             (n, self.player_projectile_slots), device=device, dtype=torch.bool
         )
+        self.projectile_impact_type = torch.full(
+            (n, self.player_projectile_slots), -1, device=device, dtype=torch.int64
+        )
+        self.projectile_impact_tics = torch.zeros(
+            (n, self.player_projectile_slots), device=device, dtype=torch.int32
+        )
         self.enemy_projectile_x = torch.zeros((n, self.enemy_slots), device=device)
         self.enemy_projectile_y = torch.zeros((n, self.enemy_slots), device=device)
         self.enemy_projectile_z = torch.zeros((n, self.enemy_slots), device=device)
@@ -560,6 +870,9 @@ class TorchDeathmatchEngine:
         )
         self.enemy_projectile_alive = torch.zeros(
             (n, self.enemy_slots), device=device, dtype=torch.bool
+        )
+        self.enemy_projectile_impact_tics = torch.zeros(
+            (n, self.enemy_slots), device=device, dtype=torch.int32
         )
         self.next_spawn_check = torch.zeros(n, device=device, dtype=torch.int32)
         self.item_available = torch.ones(
@@ -578,6 +891,9 @@ class TorchDeathmatchEngine:
         self._enemy_move_interval = torch.tensor(
             _ENEMY_MOVE_INTERVAL, device=device, dtype=torch.int32
         )
+        self._enemy_walk_frame_tics = torch.tensor(
+            _ENEMY_WALK_FRAME_TICS, device=device, dtype=torch.int32
+        )
         self._enemy_radius = torch.tensor(_ENEMY_RADIUS, device=device)
         self._enemy_height = torch.tensor(_ENEMY_HEIGHT, device=device)
         self._enemy_attack_range = torch.tensor(_ENEMY_ATTACK_RANGE, device=device)
@@ -587,16 +903,38 @@ class TorchDeathmatchEngine:
         self._enemy_attack_recovery = torch.tensor(
             _ENEMY_ATTACK_RECOVERY, device=device, dtype=torch.int32
         )
+        self._enemy_pain_chance = torch.tensor(
+            _ENEMY_PAIN_CHANCE, device=device, dtype=torch.int64
+        )
+        self._enemy_pain_duration = torch.tensor(
+            _ENEMY_PAIN_TICS, device=device, dtype=torch.int32
+        )
+        self._enemy_no_block_delay = torch.tensor(
+            _ENEMY_NO_BLOCK_DELAY, device=device, dtype=torch.int32
+        )
         self._enemy_kill_reward = torch.tensor(_ENEMY_KILL_REWARD, device=device)
         self._enemy_spawn_threshold = torch.tensor(
             _ENEMY_SPAWN_THRESHOLD, device=device, dtype=torch.int64
         )
         self._weapon_slot = torch.tensor(_WEAPON_SLOT, device=device, dtype=torch.int64)
         self._weapon_cooldown = torch.tensor(_WEAPON_COOLDOWN, device=device, dtype=torch.int32)
+        self._weapon_ready_duration = torch.tensor(
+            _WEAPON_READY_DURATION,
+            device=device,
+            dtype=torch.int32,
+        )
+        self._weapon_action_delay = torch.tensor(
+            _WEAPON_ACTION_DELAY, device=device, dtype=torch.int32
+        )
         self._weapon_ammo_slot = torch.tensor(_WEAPON_AMMO_SLOT, device=device, dtype=torch.int64)
         self._weapon_ammo_cost = torch.tensor(_WEAPON_AMMO_COST, device=device)
         self._player_projectile_speed = torch.tensor(_PLAYER_PROJECTILE_SPEED, device=device)
         self._monster_drop_type = torch.tensor(_MONSTER_DROP_TYPE, device=device, dtype=torch.int64)
+        self._damage_to_alpha = torch.tensor(
+            _DAMAGE_TO_ALPHA,
+            device=device,
+            dtype=torch.float32,
+        )
         self._slot_base_weapon = torch.tensor(
             (0, 0, 2, 3, 5, 6, 7), device=device, dtype=torch.int64
         )
@@ -610,7 +948,6 @@ class TorchDeathmatchEngine:
         self._pixel_y = torch.arange(self.observation_height, device=device).view(1, -1, 1)
         native_columns = (
             torch.arange(self.native_screen_width, device=device, dtype=torch.float32)
-            + 0.5
             - self.native_screen_width / 2.0
         )
         self._native_ray_offsets = -torch.atan(native_columns / (self.native_screen_width / 2.0))
@@ -656,6 +993,9 @@ class TorchDeathmatchEngine:
             safe_seeds,
         )
         self.rng_state.copy_(torch.where(mask, safe_seeds, self.rng_state))
+        self.mugshot_rng_state.copy_(
+            torch.where(mask, safe_seeds, self.mugshot_rng_state)
+        )
         # Sequential lane seeds have strongly correlated first xorshift32 outputs.
         # Four masked diffusion rounds retain deterministic streams while preventing
         # the first spatial sample from collapsing toward the low edge of the map.
@@ -669,6 +1009,9 @@ class TorchDeathmatchEngine:
         spawn_sector = self._sector_at(spawn_x, spawn_y)
         spawn_z = self.map.sector_heights[spawn_sector, 0]
         self.z.copy_(torch.where(mask, spawn_z, self.z))
+        self.view_z.copy_(torch.where(mask, spawn_z + _VIEW_HEIGHT, self.view_z))
+        self.view_height.masked_fill_(mask, _VIEW_HEIGHT)
+        self.delta_view_height.masked_fill_(mask, 0)
         for tensor in (
             self.momentum_x,
             self.momentum_y,
@@ -684,11 +1027,24 @@ class TorchDeathmatchEngine:
         self.selected_weapon.masked_fill_(mask, 2)
         self.selected_weapon_variant.masked_fill_(mask, False)
         self.attack_cooldown.masked_fill_(mask, 0)
-        self.weapon_raise_cooldown.masked_fill_(mask, 0)
+        self.weapon_state_cooldown.masked_fill_(mask, 0)
+        self.pending_attack_weapon.masked_fill_(mask, -1)
+        self.pending_attack_delay.masked_fill_(mask, 0)
+        self.weapon_fire_count.masked_fill_(mask, 0)
+        self.weapon_ready_tics.masked_fill_(mask, 0)
+        self.weapon_raise_cooldown.masked_fill_(mask, _WEAPON_SPAWN_RAISE_TICS)
         self.pending_weapon.masked_fill_(mask, -1)
         self.weapon_lower_cooldown.masked_fill_(mask, 0)
         self.weapon_change_latched.masked_fill_(mask, False)
-        self.damage_flash.masked_fill_(mask, 0)
+        self.damage_count.masked_fill_(mask, 0)
+        self.bonus_count.masked_fill_(mask, 0)
+        self.mugshot_pain_tics.masked_fill_(mask, 0)
+        self.mugshot_pain_direction.masked_fill_(mask, 1)
+        self.mugshot_ouch.masked_fill_(mask, False)
+        self.mugshot_grin.masked_fill_(mask, False)
+        self.mugshot_face_index.masked_fill_(mask, 1)
+        self.mugshot_face_tics.masked_fill_(mask, _MUGSHOT_NORMAL_FRAME_TICS)
+        self.attack_held_tics.masked_fill_(mask, 0)
         self.reaction_time.masked_fill_(mask, _PLAYER_TELEPORT_LOCK_TICS)
         self.player_dead.masked_fill_(mask, False)
         self.pending_reset.masked_fill_(mask, False)
@@ -701,6 +1057,7 @@ class TorchDeathmatchEngine:
         self.ammo[mask] = 0
         self.ammo[mask, 1] = 50
         self.ammo[mask, 3] = 50
+        self.hud_ready_ammo.masked_fill_(mask, 50)
         self.item_available[mask] = True
         frame = self.render_frame()
         self.frames[mask] = frame[mask, None].expand(-1, self.frame_stack, -1, -1)
@@ -718,8 +1075,11 @@ class TorchDeathmatchEngine:
         self.enemy_cooldown[mask] = 0
         self.enemy_attack_phase[mask] = 0
         self.enemy_move_cooldown[mask] = 0
+        self.enemy_animation_tics[mask] = 0
+        self.enemy_pain_tics[mask] = 0
         self.enemy_death_type[mask] = -1
         self.enemy_death_tics[mask] = 0
+        self.enemy_death_elapsed[mask] = 0
         self.drop_type[mask] = -1
         self.drop_delay[mask] = 0
         self.projectile_x[mask] = 0
@@ -731,6 +1091,8 @@ class TorchDeathmatchEngine:
         self.projectile_type[mask] = -1
         self.projectile_age[mask] = 0
         self.projectile_alive[mask] = False
+        self.projectile_impact_type[mask] = -1
+        self.projectile_impact_tics[mask] = 0
         self.enemy_projectile_x[mask] = 0
         self.enemy_projectile_y[mask] = 0
         self.enemy_projectile_z[mask] = 0
@@ -739,6 +1101,7 @@ class TorchDeathmatchEngine:
         self.enemy_projectile_velocity_z[mask] = 0
         self.enemy_projectile_age[mask] = 0
         self.enemy_projectile_alive[mask] = False
+        self.enemy_projectile_impact_tics[mask] = 0
         self.next_spawn_check.masked_fill_(mask, 1 + _ENEMY_SPAWN_DELAY)
 
     def _points_collide(
@@ -792,7 +1155,7 @@ class TorchDeathmatchEngine:
             enemy_dx = candidate_x[..., None] - self.enemy_x[:, None, :]
             enemy_dy = candidate_y[..., None] - self.enemy_y[:, None, :]
             enemy_radius = self._enemy_radius[self.enemy_type.clamp_min(0)]
-            overlaps_enemy = self.enemy_alive[:, None, :] & (
+            overlaps_enemy = self._enemy_solid_mask()[:, None, :] & (
                 enemy_dx * enemy_dx + enemy_dy * enemy_dy < (radius + enemy_radius[:, None, :]) ** 2
             )
             valid &= ~torch.any(overlaps_enemy, dim=-1)
@@ -818,6 +1181,15 @@ class TorchDeathmatchEngine:
     ) -> torch.Tensor:
         return (first_z < second_z + second_height) & (second_z < first_z + first_height)
 
+    def _enemy_solid_mask(self) -> torch.Tensor:
+        death_type = self.enemy_death_type.clamp(0, 5)
+        dying_solid = (
+            (self.enemy_death_type >= 0)
+            & (self.enemy_death_tics > 0)
+            & (self.enemy_death_elapsed < self._enemy_no_block_delay[death_type])
+        )
+        return self.enemy_alive | dying_solid
+
     def _player_collides(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         collision = self._collides(x, y)
         sector = self._sector_at(x, y)
@@ -836,7 +1208,7 @@ class TorchDeathmatchEngine:
             self._enemy_height[enemy_type],
         )
         collision |= torch.any(
-            self.enemy_alive
+            self._enemy_solid_mask()
             & enemy_vertical_overlap
             & (enemy_dx * enemy_dx + enemy_dy * enemy_dy < (_PLAYER_RADIUS + enemy_radius) ** 2),
             dim=1,
@@ -886,7 +1258,7 @@ class TorchDeathmatchEngine:
             device=self.device,
             dtype=torch.bool,
         )[None, :, :]
-        solid_enemy = self.enemy_alive[:, None, :] & not_self
+        solid_enemy = self._enemy_solid_mask()[:, None, :] & not_self
         collision |= torch.any(
             solid_enemy
             & vertical_overlap
@@ -1022,7 +1394,12 @@ class TorchDeathmatchEngine:
         return torch.any(intersects, dim=-1)
 
     def _spawn_enemy_type(self, enemy_type: int, requested: torch.Tensor) -> None:
-        free = ~self.enemy_alive & (self.drop_type < 0) & ~self.enemy_projectile_alive
+        free = (
+            ~self.enemy_alive
+            & (self.enemy_death_tics <= 0)
+            & (self.drop_type < 0)
+            & ~self.enemy_projectile_alive
+        )
         has_free_slot = torch.any(free, dim=1)
         slot = torch.argmax(free.to(torch.int32), dim=1)
         spawn_mask = requested & has_free_slot
@@ -1042,6 +1419,7 @@ class TorchDeathmatchEngine:
         old_cooldown = self.enemy_cooldown[row, slot]
         old_attack_phase = self.enemy_attack_phase[row, slot]
         old_move_cooldown = self.enemy_move_cooldown[row, slot]
+        old_animation_tics = self.enemy_animation_tics[row, slot]
         self.enemy_x[row, slot] = torch.where(spawn, x, old_x)
         self.enemy_y[row, slot] = torch.where(spawn, y, old_y)
         spawn_sector = self._sector_at(x, y)
@@ -1065,6 +1443,11 @@ class TorchDeathmatchEngine:
             self._enemy_move_interval[enemy_type] - 1,
             old_move_cooldown,
         )
+        self.enemy_animation_tics[row, slot] = torch.where(
+            spawn,
+            torch.zeros_like(old_animation_tics),
+            old_animation_tics,
+        )
         self.enemy_death_type[row, slot] = torch.where(
             spawn,
             torch.full_like(self.enemy_death_type[row, slot], -1),
@@ -1074,6 +1457,11 @@ class TorchDeathmatchEngine:
             spawn,
             torch.zeros_like(self.enemy_death_tics[row, slot]),
             self.enemy_death_tics[row, slot],
+        )
+        self.enemy_death_elapsed[row, slot] = torch.where(
+            spawn,
+            torch.zeros_like(self.enemy_death_elapsed[row, slot]),
+            self.enemy_death_elapsed[row, slot],
         )
         self.enemy_alive[row, slot] |= spawn
 
@@ -1093,7 +1481,12 @@ class TorchDeathmatchEngine:
             requested = check & (roll <= self._enemy_spawn_threshold[enemy_type])
             self._spawn_enemy_type(enemy_type, requested)
 
-    def _apply_player_damage(self, incoming: torch.Tensor) -> None:
+    def _apply_player_damage(
+        self,
+        incoming: torch.Tensor,
+        attacker_x: torch.Tensor | None = None,
+        attacker_y: torch.Tensor | None = None,
+    ) -> None:
         incoming = torch.floor(incoming)
         absorbed = torch.floor(incoming * self.armor_save_fraction)
         absorbed = torch.minimum(self.armor, absorbed)
@@ -1107,7 +1500,34 @@ class TorchDeathmatchEngine:
         )
         actual = incoming - absorbed
         self.health.sub_(actual)
-        self.damage_flash.copy_(torch.maximum(self.damage_flash * 0.8, actual / 40.0))
+        self.damage_count.add_(actual.to(torch.int32)).clamp_max_(100)
+        damaged = actual > 0
+        if attacker_x is None or attacker_y is None:
+            direction = torch.ones_like(self.mugshot_pain_direction)
+        else:
+            relative = self._wrap_angle(
+                torch.atan2(attacker_y - self.y, attacker_x - self.x) - self.angle
+            )
+            direction = torch.where(
+                relative > math.pi / 4,
+                torch.full_like(self.mugshot_pain_direction, 2),
+                torch.where(
+                    relative < -math.pi / 4,
+                    torch.zeros_like(self.mugshot_pain_direction),
+                    torch.ones_like(self.mugshot_pain_direction),
+                ),
+            )
+        self.mugshot_pain_direction.copy_(
+            torch.where(damaged, direction, self.mugshot_pain_direction)
+        )
+        self.mugshot_ouch |= damaged & (actual > 20)
+        self.mugshot_pain_tics.copy_(
+            torch.where(
+                damaged,
+                torch.full_like(self.mugshot_pain_tics, _MUGSHOT_STATE_TICS),
+                self.mugshot_pain_tics,
+            )
+        )
 
     def _move_player(self, buttons: torch.Tensor) -> None:
         playing = ~self.player_dead & (self.episode_time < self.episode_timeout)
@@ -1180,6 +1600,37 @@ class TorchDeathmatchEngine:
         self.momentum_y.mul_(_PLAYER_FRICTION)
 
     def _vertical_player_tick(self, active: torch.Tensor) -> None:
+        next_view_height = self.view_height + self.delta_view_height
+        above_default = next_view_height > _VIEW_HEIGHT
+        below_half = next_view_height < _VIEW_HEIGHT / 2.0
+        next_view_height = torch.where(
+            above_default,
+            torch.full_like(next_view_height, _VIEW_HEIGHT),
+            torch.where(
+                below_half,
+                torch.full_like(next_view_height, _VIEW_HEIGHT / 2.0),
+                next_view_height,
+            ),
+        )
+        next_delta_view_height = torch.where(
+            above_default,
+            torch.zeros_like(self.delta_view_height),
+            self.delta_view_height,
+        )
+        next_delta_view_height = torch.where(
+            below_half & (next_delta_view_height <= 0),
+            torch.full_like(next_delta_view_height, 1.0 / 65536.0),
+            next_delta_view_height,
+        )
+        moving_view = next_delta_view_height != 0
+        next_delta_view_height = torch.where(
+            moving_view,
+            next_delta_view_height + 0.25,
+            next_delta_view_height,
+        )
+        self.view_height.copy_(torch.where(active, next_view_height, self.view_height))
+        self.view_z.copy_(torch.where(active, self.z + next_view_height, self.view_z))
+
         sector = self._current_sector()
         floor = self.map.sector_heights[sector, 0]
         proposed_z = self.z + self.velocity_z
@@ -1191,9 +1642,18 @@ class TorchDeathmatchEngine:
         )
         landed = proposed_z <= floor
         next_z = torch.where(landed, floor, proposed_z)
+        landed_from_air = landed & airborne
+        next_delta_view_height = torch.where(
+            landed_from_air,
+            self.velocity_z / 8.0,
+            next_delta_view_height,
+        )
         next_velocity = torch.where(landed, torch.zeros_like(next_velocity), next_velocity)
         self.z.copy_(torch.where(active, next_z, self.z))
         self.velocity_z.copy_(torch.where(active, next_velocity, self.velocity_z))
+        self.delta_view_height.copy_(
+            torch.where(active, next_delta_view_height, self.delta_view_height)
+        )
 
     def _active_weapon(self) -> torch.Tensor:
         weapon = self._slot_base_weapon[self.selected_weapon]
@@ -1233,6 +1693,21 @@ class TorchDeathmatchEngine:
         changed = mask & (weapon != target)
         current_vertical_tics = self.weapon_raise_cooldown.clamp(0, _WEAPON_LOWER_TICS)
         lower_tics = torch.clamp_min(_WEAPON_LOWER_TICS - current_vertical_tics, 0)
+        initial_pistol_raise = (
+            (self.episode_time <= _WEAPON_SPAWN_RAISE_TICS + 1)
+            & (current == 2)
+            & (self.weapon_fire_count == 0)
+            & (
+                (self.weapon_raise_cooldown > 0)
+                | (self.episode_time == _WEAPON_SPAWN_RAISE_TICS + 1)
+            )
+        )
+        lower_tics = torch.where(
+            initial_pistol_raise,
+            self.episode_time.clamp(0, _WEAPON_LOWER_TICS),
+            lower_tics,
+        )
+        lower_tics = lower_tics + self.weapon_state_cooldown
         self.pending_weapon.copy_(torch.where(changed, weapon, self.pending_weapon))
         self.weapon_lower_cooldown.copy_(
             torch.where(changed, lower_tics, self.weapon_lower_cooldown)
@@ -1353,11 +1828,25 @@ class TorchDeathmatchEngine:
         self.enemy_health.copy_(torch.where(self.enemy_alive, updated, previous))
         killed = self.enemy_alive & (previous > 0) & (updated <= 0)
         killed_type = self.enemy_type.clamp_min(0)
-        death_duration = self.map.enemy_death_frame_counts[killed_type] * 4
+        hurt = self.enemy_alive & (applied > 0) & ~killed
+        random_bits = self._random_u32(torch.any(hurt, dim=1))[:, None]
+        slot = torch.arange(self.enemy_slots, device=self.device, dtype=torch.int64)[None, :]
+        mixed = random_bits ^ (slot * _HASH_GOLDEN_RATIO_SIGNED)
+        mixed ^= mixed >> 16
+        pain_roll = torch.remainder(mixed, 256)
+        pain = hurt & (pain_roll < self._enemy_pain_chance[killed_type])
+        self.enemy_pain_tics.copy_(
+            torch.where(pain, self._enemy_pain_duration[killed_type], self.enemy_pain_tics)
+        )
+        self.enemy_attack_phase.masked_fill_(pain, 0)
+        self.enemy_cooldown.masked_fill_(pain, 0)
+        self.enemy_move_cooldown.masked_fill_(pain, 0)
+        death_duration = self.map.enemy_death_total_tics[killed_type]
         self.enemy_death_type.copy_(torch.where(killed, killed_type, self.enemy_death_type))
         self.enemy_death_tics.copy_(
             torch.where(killed, death_duration.to(torch.int32), self.enemy_death_tics)
         )
+        self.enemy_death_elapsed.masked_fill_(killed, 0)
         reward = torch.sum(
             torch.where(
                 killed,
@@ -1367,13 +1856,18 @@ class TorchDeathmatchEngine:
             dim=1,
         )
         self.enemy_alive &= ~killed
+        self.enemy_pain_tics.masked_fill_(killed, 0)
         self.enemy_cooldown.masked_fill_(killed, 0)
         self.enemy_attack_phase.masked_fill_(killed, 0)
         drop = self._monster_drop_type[killed_type]
         self.drop_type.copy_(torch.where(killed, drop, self.drop_type))
         has_drop = killed & (drop >= 0)
         self.drop_delay.copy_(
-            torch.where(has_drop, torch.full_like(self.drop_delay, 10), self.drop_delay)
+            torch.where(
+                has_drop,
+                self._enemy_no_block_delay[killed_type],
+                self.drop_delay,
+            )
         )
         self.enemy_type.copy_(
             torch.where(killed, torch.full_like(self.enemy_type, -1), self.enemy_type)
@@ -1392,7 +1886,7 @@ class TorchDeathmatchEngine:
         has_target: torch.Tensor,
     ) -> None:
         requested = fires & ((weapon == 6) | (weapon == 7))
-        free = ~self.projectile_alive
+        free = ~self.projectile_alive & (self.projectile_impact_tics <= 0)
         has_slot = torch.any(free, dim=1)
         slot = torch.argmax(free.to(torch.int32), dim=1)
         spawn = requested & has_slot
@@ -1410,26 +1904,37 @@ class TorchDeathmatchEngine:
             torch.zeros_like(spawn_z),
         )
         aim_norm = torch.sqrt(aim_dx * aim_dx + aim_dy * aim_dy + aim_dz * aim_dz).clamp_min_(1e-4)
-        self.projectile_x[row, slot] = torch.where(spawn, self.x, self.projectile_x[row, slot])
-        self.projectile_y[row, slot] = torch.where(spawn, self.y, self.projectile_y[row, slot])
+        velocity_x = aim_dx / aim_norm * speed
+        velocity_y = aim_dy / aim_norm * speed
+        velocity_z = aim_dz / aim_norm * speed
+        self.projectile_x[row, slot] = torch.where(
+            spawn,
+            self.x + velocity_x * 0.5,
+            self.projectile_x[row, slot],
+        )
+        self.projectile_y[row, slot] = torch.where(
+            spawn,
+            self.y + velocity_y * 0.5,
+            self.projectile_y[row, slot],
+        )
         self.projectile_z[row, slot] = torch.where(
             spawn,
-            spawn_z,
+            spawn_z + velocity_z * 0.5,
             self.projectile_z[row, slot],
         )
         self.projectile_velocity_x[row, slot] = torch.where(
             spawn,
-            aim_dx / aim_norm * speed,
+            velocity_x,
             self.projectile_velocity_x[row, slot],
         )
         self.projectile_velocity_y[row, slot] = torch.where(
             spawn,
-            aim_dy / aim_norm * speed,
+            velocity_y,
             self.projectile_velocity_y[row, slot],
         )
         self.projectile_velocity_z[row, slot] = torch.where(
             spawn,
-            aim_dz / aim_norm * speed,
+            velocity_z,
             self.projectile_velocity_z[row, slot],
         )
         self.projectile_type[row, slot] = torch.where(
@@ -1445,49 +1950,104 @@ class TorchDeathmatchEngine:
         self.projectile_alive[row, slot] |= spawn
 
     def _projectile_tick(self, active: torch.Tensor) -> torch.Tensor:
-        alive = self.projectile_alive & active[:, None]
-        next_x = self.projectile_x + self.projectile_velocity_x
-        next_y = self.projectile_y + self.projectile_velocity_y
-        next_z = self.projectile_z + self.projectile_velocity_z
-        wall_impact = alive & self._line_blocked(
-            self.projectile_x,
-            self.projectile_y,
-            next_x,
-            next_y,
-        )
-        dx = next_x[:, :, None] - self.enemy_x[:, None, :]
-        dy = next_y[:, :, None] - self.enemy_y[:, None, :]
-        enemy_distance = torch.sqrt(dx * dx + dy * dy)
-        projectile_radius = torch.where(self.projectile_type == 0, 11.0, 13.0)
-        enemy_type = self.enemy_type.clamp_min(0)
-        enemy_overlap = self._vertical_overlap(
-            next_z[:, :, None],
-            8.0,
-            self.enemy_z[:, None, :],
-            self._enemy_height[enemy_type][:, None, :],
-        )
-        candidate = (
-            alive[:, :, None]
-            & self.enemy_alive[:, None, :]
-            & enemy_overlap
-            & (
-                enemy_distance
-                < projectile_radius[:, :, None] + self._enemy_radius[enemy_type][:, None, :]
+        self.projectile_impact_tics.copy_(
+            torch.where(
+                active[:, None],
+                torch.clamp_min(self.projectile_impact_tics - 1, 0),
+                self.projectile_impact_tics,
             )
         )
-        candidate_distance = torch.where(
-            candidate,
-            enemy_distance,
-            torch.full_like(enemy_distance, torch.inf),
+        self.projectile_impact_type.masked_fill_(self.projectile_impact_tics <= 0, -1)
+        alive = self.projectile_alive & active[:, None]
+        projectile_radius = torch.where(self.projectile_type == 0, 11.0, 13.0)
+        projectile_height = torch.full_like(projectile_radius, 8.0)
+        dominant_speed = torch.maximum(
+            self.projectile_velocity_x.abs(),
+            self.projectile_velocity_y.abs(),
         )
-        nearest_distance, nearest_enemy = torch.min(candidate_distance, dim=2)
-        enemy_impact = torch.isfinite(nearest_distance)
-        expired = self.projectile_age >= _PLAYER_PROJECTILE_LIFETIME
-        sector = self._sector_at(next_x.reshape(-1), next_y.reshape(-1)).reshape_as(next_x)
+        max_step = projectile_radius - 1.0
+        movement_steps = torch.where(
+            dominant_speed > max_step,
+            1 + torch.floor(dominant_speed / max_step).to(torch.int32),
+            torch.ones_like(self.projectile_age),
+        )
+
+        start_x = self.projectile_x.clone()
+        start_y = self.projectile_y.clone()
+        current_x = start_x.clone()
+        current_y = start_y.clone()
+        current_z = self.projectile_z.clone()
+        moving = alive.clone()
+        impact = torch.zeros_like(alive)
+        enemy_impact = torch.zeros_like(alive)
+        nearest_enemy = torch.zeros_like(self.projectile_age, dtype=torch.int64)
+        enemy_type = self.enemy_type.clamp_min(0)
+        # Rocket and plasma definitions require at most three P_XYMovement
+        # subdivisions. Keeping this bound static avoids a device sync per tic.
+        for step in range(1, 4):
+            enabled = moving & (movement_steps >= step)
+            fraction = step / movement_steps.clamp_min(1).to(torch.float32)
+            candidate_x = start_x + self.projectile_velocity_x * fraction
+            candidate_y = start_y + self.projectile_velocity_y * fraction
+            wall_impact = enabled & self._points_collide(
+                candidate_x,
+                candidate_y,
+                projectile_radius,
+            )
+            sector = self._sector_at(candidate_x.reshape(-1), candidate_y.reshape(-1)).reshape_as(
+                candidate_x
+            )
+            floor = self.map.sector_heights[sector, 0]
+            ceiling = self.map.sector_heights[sector, 1]
+            opening_impact = enabled & (
+                (current_z < floor) | (current_z + projectile_height > ceiling)
+            )
+            dx = candidate_x[:, :, None] - self.enemy_x[:, None, :]
+            dy = candidate_y[:, :, None] - self.enemy_y[:, None, :]
+            enemy_distance = torch.sqrt(dx * dx + dy * dy)
+            enemy_overlap = self._vertical_overlap(
+                current_z[:, :, None],
+                projectile_height[:, :, None],
+                self.enemy_z[:, None, :],
+                self._enemy_height[enemy_type][:, None, :],
+            )
+            candidate = (
+                enabled[:, :, None]
+                & self.enemy_alive[:, None, :]
+                & enemy_overlap
+                & (
+                    enemy_distance
+                    < projectile_radius[:, :, None]
+                    + self._enemy_radius[enemy_type][:, None, :]
+                )
+            )
+            candidate_distance = torch.where(
+                candidate,
+                enemy_distance,
+                torch.full_like(enemy_distance, torch.inf),
+            )
+            nearest_distance, step_nearest_enemy = torch.min(candidate_distance, dim=2)
+            step_enemy_impact = torch.isfinite(nearest_distance)
+            step_impact = enabled & (wall_impact | opening_impact | step_enemy_impact)
+            successful = enabled & ~step_impact
+            current_x.copy_(torch.where(successful, candidate_x, current_x))
+            current_y.copy_(torch.where(successful, candidate_y, current_y))
+            nearest_enemy.copy_(
+                torch.where(step_impact & step_enemy_impact, step_nearest_enemy, nearest_enemy)
+            )
+            enemy_impact |= step_impact & step_enemy_impact
+            impact |= step_impact
+            moving &= ~step_impact
+
+        next_z = current_z + self.projectile_velocity_z
+        sector = self._sector_at(current_x.reshape(-1), current_y.reshape(-1)).reshape_as(current_x)
         floor = self.map.sector_heights[sector, 0]
         ceiling = self.map.sector_heights[sector, 1]
-        plane_impact = (next_z < floor) | (next_z + 8.0 > ceiling)
-        impact = alive & (wall_impact | plane_impact | enemy_impact | expired)
+        plane_impact = moving & (
+            (next_z < floor) | (next_z + projectile_height > ceiling)
+        )
+        current_z.copy_(torch.where(moving, next_z, current_z))
+        impact |= plane_impact
 
         random_bits = self._random_u32(torch.any(impact, dim=1))[:, None]
         slot_bits = torch.arange(
@@ -1503,12 +2063,15 @@ class TorchDeathmatchEngine:
         damage_by_enemy = torch.zeros_like(self.enemy_health)
         damage_by_enemy.scatter_add_(1, nearest_enemy, direct_damage)
 
+        dx = current_x[:, :, None] - self.enemy_x[:, None, :]
+        dy = current_y[:, :, None] - self.enemy_y[:, None, :]
+        enemy_distance = torch.sqrt(dx * dx + dy * dy)
         rocket_impact = impact & (self.projectile_type == 0)
         splash = torch.clamp_min(128.0 - enemy_distance, 0)
         splash *= rocket_impact[:, :, None].to(torch.float32)
         damage_by_enemy.add_(torch.sum(splash, dim=1))
         player_distance = torch.sqrt(
-            (next_x - self.x[:, None]) ** 2 + (next_y - self.y[:, None]) ** 2
+            (current_x - self.x[:, None]) ** 2 + (current_y - self.y[:, None]) ** 2
         )
         self_damage = torch.sum(
             torch.clamp_min(128.0 - player_distance, 0) * rocket_impact.to(torch.float32),
@@ -1517,42 +2080,132 @@ class TorchDeathmatchEngine:
         self._apply_player_damage(self_damage)
         reward = self._apply_enemy_damage(damage_by_enemy)
 
-        self.projectile_x.copy_(torch.where(alive, next_x, self.projectile_x))
-        self.projectile_y.copy_(torch.where(alive, next_y, self.projectile_y))
-        self.projectile_z.copy_(torch.where(alive, next_z, self.projectile_z))
+        self.projectile_x.copy_(torch.where(alive, current_x, self.projectile_x))
+        self.projectile_y.copy_(torch.where(alive, current_y, self.projectile_y))
+        self.projectile_z.copy_(torch.where(alive, current_z, self.projectile_z))
         self.projectile_age.add_(alive.to(torch.int32))
+        impact_type = self.projectile_type.clamp(0, 1)
+        self.projectile_impact_type.copy_(
+            torch.where(impact, impact_type, self.projectile_impact_type)
+        )
+        self.projectile_impact_tics.copy_(
+            torch.where(
+                impact,
+                self.map.projectile_explosion_total_tics[impact_type].to(torch.int32),
+                self.projectile_impact_tics,
+            )
+        )
         self.projectile_alive &= ~impact
         self.projectile_type.masked_fill_(impact, -1)
         return reward
 
     def _player_attack(self, buttons: torch.Tensor) -> torch.Tensor:
+        reward = torch.zeros(self.num_envs, device=self.device)
+        pending = self.pending_attack_weapon >= 0
+        next_delay = torch.clamp_min(self.pending_attack_delay - 1, 0)
+        pending_valid = (
+            pending
+            & ~self.player_dead
+            & (self.episode_time < self.episode_timeout)
+        )
+        execute_pending = pending_valid & (next_delay <= 0)
+        reward.add_(
+            self._execute_player_attack(
+                self.pending_attack_weapon.clamp_min(0),
+                execute_pending,
+            )
+        )
+        keep_pending = pending_valid & ~execute_pending
+        self.pending_attack_delay.copy_(
+            torch.where(keep_pending, next_delay, torch.zeros_like(next_delay))
+        )
+        self.pending_attack_weapon.copy_(
+            torch.where(
+                keep_pending,
+                self.pending_attack_weapon,
+                torch.full_like(self.pending_attack_weapon, -1),
+            )
+        )
+
         weapon = self._active_weapon()
         ammo_slot = self._weapon_ammo_slot[weapon]
         safe_ammo_slot = ammo_slot.clamp_min(0)
         ammo = self.ammo.gather(1, safe_ammo_slot[:, None]).squeeze(1)
         cost = self._weapon_ammo_cost[weapon]
+        refire_tail = torch.clamp_min(
+            self._weapon_ready_duration[weapon] - self._weapon_cooldown[weapon],
+            0,
+        )
+        weapon_action_ready = (self.weapon_state_cooldown <= 0) | (
+            self.weapon_state_cooldown == refire_tail
+        )
         attempted_empty_fire = (
             buttons[:, 0]
             & (self.attack_cooldown <= 0)
+            & weapon_action_ready
             & (self.weapon_raise_cooldown <= 0)
             & ~self.player_dead
             & (self.episode_time < self.episode_timeout)
             & self._weapon_owned(weapon)
             & (ammo_slot >= 0)
             & (ammo < cost)
+            & ~pending
         )
         replacement = self._best_ready_weapon()
         self._set_active_weapon(replacement, attempted_empty_fire)
         fires = (
             buttons[:, 0]
             & (self.attack_cooldown <= 0)
+            & weapon_action_ready
             & (self.weapon_raise_cooldown <= 0)
             & (self.pending_weapon < 0)
             & ~self.player_dead
             & (self.episode_time < self.episode_timeout)
             & self._weapon_owned(weapon)
             & ((ammo_slot < 0) | (ammo >= cost))
+            & ~pending
         )
+        action_delay = self._weapon_action_delay[weapon]
+        self.attack_cooldown.copy_(
+            torch.where(fires, self._weapon_cooldown[weapon], self.attack_cooldown)
+        )
+        self.weapon_state_cooldown.copy_(
+            torch.where(
+                fires,
+                self._weapon_ready_duration[weapon],
+                self.weapon_state_cooldown,
+            )
+        )
+        delayed = fires & (action_delay > 0)
+        self.pending_attack_weapon.copy_(
+            torch.where(delayed, weapon, self.pending_attack_weapon)
+        )
+        self.pending_attack_delay.copy_(
+            torch.where(delayed, action_delay, self.pending_attack_delay)
+        )
+        reward.add_(self._execute_player_attack(weapon, fires & ~delayed))
+        forced_second_action = fires & ((weapon == 1) | (weapon == 5))
+        self.pending_attack_weapon.copy_(
+            torch.where(forced_second_action, weapon, self.pending_attack_weapon)
+        )
+        self.pending_attack_delay.copy_(
+            torch.where(
+                forced_second_action,
+                torch.full_like(self.pending_attack_delay, 4),
+                self.pending_attack_delay,
+            )
+        )
+        return reward
+
+    def _execute_player_attack(
+        self,
+        weapon: torch.Tensor,
+        fires: torch.Tensor,
+    ) -> torch.Tensor:
+        ammo_slot = self._weapon_ammo_slot[weapon]
+        safe_ammo_slot = ammo_slot.clamp_min(0)
+        ammo = self.ammo.gather(1, safe_ammo_slot[:, None]).squeeze(1)
+        cost = self._weapon_ammo_cost[weapon]
         new_ammo = torch.clamp_min(ammo - cost, 0)
         uses_ammo = fires & (ammo_slot >= 0)
         self.ammo.scatter_(
@@ -1564,9 +2217,7 @@ class TorchDeathmatchEngine:
         shared_bullets = torch.where(uses_bullets, new_ammo, self.ammo[:, 1])
         self.ammo[:, 1].copy_(shared_bullets)
         self.ammo[:, 3].copy_(shared_bullets)
-        self.attack_cooldown.copy_(
-            torch.where(fires, self._weapon_cooldown[weapon], self.attack_cooldown)
-        )
+        self.weapon_fire_count.add_(fires.to(torch.int32))
         doll_count = max(len(self.map.player_starts) - 1, 0)
         if doll_count:
             dolls = self.map.player_starts[:-1, :2]
@@ -1710,31 +2361,44 @@ class TorchDeathmatchEngine:
         dx: torch.Tensor,
         dy: torch.Tensor,
     ) -> None:
-        spawn = requested & ~self.enemy_projectile_alive
+        spawn = (
+            requested
+            & ~self.enemy_projectile_alive
+            & (self.enemy_projectile_impact_tics <= 0)
+        )
         spawn_z = self.enemy_z + 32.0
         dz = self.z[:, None] - self.enemy_z
         aim_norm = torch.sqrt(dx * dx + dy * dy + dz * dz).clamp_min_(1e-4)
-        self.enemy_projectile_x.copy_(torch.where(spawn, self.enemy_x, self.enemy_projectile_x))
-        self.enemy_projectile_y.copy_(torch.where(spawn, self.enemy_y, self.enemy_projectile_y))
-        self.enemy_projectile_z.copy_(torch.where(spawn, spawn_z, self.enemy_projectile_z))
+        velocity_x = dx / aim_norm * _ENEMY_PROJECTILE_SPEED
+        velocity_y = dy / aim_norm * _ENEMY_PROJECTILE_SPEED
+        velocity_z = dz / aim_norm * _ENEMY_PROJECTILE_SPEED
+        self.enemy_projectile_x.copy_(
+            torch.where(spawn, self.enemy_x + velocity_x * 0.5, self.enemy_projectile_x)
+        )
+        self.enemy_projectile_y.copy_(
+            torch.where(spawn, self.enemy_y + velocity_y * 0.5, self.enemy_projectile_y)
+        )
+        self.enemy_projectile_z.copy_(
+            torch.where(spawn, spawn_z + velocity_z * 0.5, self.enemy_projectile_z)
+        )
         self.enemy_projectile_velocity_x.copy_(
             torch.where(
                 spawn,
-                dx / aim_norm * _ENEMY_PROJECTILE_SPEED,
+                velocity_x,
                 self.enemy_projectile_velocity_x,
             )
         )
         self.enemy_projectile_velocity_y.copy_(
             torch.where(
                 spawn,
-                dy / aim_norm * _ENEMY_PROJECTILE_SPEED,
+                velocity_y,
                 self.enemy_projectile_velocity_y,
             )
         )
         self.enemy_projectile_velocity_z.copy_(
             torch.where(
                 spawn,
-                dz / aim_norm * _ENEMY_PROJECTILE_SPEED,
+                velocity_z,
                 self.enemy_projectile_velocity_z,
             )
         )
@@ -1746,32 +2410,78 @@ class TorchDeathmatchEngine:
         self.enemy_projectile_alive |= spawn
 
     def _enemy_projectile_tick(self, active: torch.Tensor) -> None:
+        self.enemy_projectile_impact_tics.copy_(
+            torch.where(
+                active[:, None],
+                torch.clamp_min(self.enemy_projectile_impact_tics - 1, 0),
+                self.enemy_projectile_impact_tics,
+            )
+        )
         alive = self.enemy_projectile_alive & active[:, None]
-        next_x = self.enemy_projectile_x + self.enemy_projectile_velocity_x
-        next_y = self.enemy_projectile_y + self.enemy_projectile_velocity_y
-        next_z = self.enemy_projectile_z + self.enemy_projectile_velocity_z
-        wall_impact = alive & self._line_blocked(
-            self.enemy_projectile_x,
-            self.enemy_projectile_y,
-            next_x,
-            next_y,
+        projectile_radius = torch.full_like(self.enemy_projectile_x, 6.0)
+        dominant_speed = torch.maximum(
+            self.enemy_projectile_velocity_x.abs(),
+            self.enemy_projectile_velocity_y.abs(),
         )
-        player_distance = torch.sqrt(
-            (next_x - self.x[:, None]) ** 2 + (next_y - self.y[:, None]) ** 2
+        movement_steps = torch.where(
+            dominant_speed > 5.0,
+            1 + torch.floor(dominant_speed / 5.0).to(torch.int32),
+            torch.ones_like(self.enemy_projectile_age),
         )
-        player_vertical_overlap = self._vertical_overlap(
-            next_z,
-            16.0,
-            self.z[:, None],
-            _PLAYER_HEIGHT,
-        )
-        player_impact = alive & player_vertical_overlap & (player_distance < 22.0)
-        expired = self.enemy_projectile_age >= _ENEMY_PROJECTILE_LIFETIME
-        sector = self._sector_at(next_x.reshape(-1), next_y.reshape(-1)).reshape_as(next_x)
+        start_x = self.enemy_projectile_x.clone()
+        start_y = self.enemy_projectile_y.clone()
+        current_x = start_x.clone()
+        current_y = start_y.clone()
+        current_z = self.enemy_projectile_z.clone()
+        moving = alive.clone()
+        impact = torch.zeros_like(alive)
+        player_impact = torch.zeros_like(alive)
+        # BaronBall has radius 6 and speed 15, so cardinal movement requires
+        # four fixed-size subdivisions in the reference P_XYMovement path.
+        for step in range(1, 5):
+            enabled = moving & (movement_steps >= step)
+            fraction = step / movement_steps.clamp_min(1).to(torch.float32)
+            candidate_x = start_x + self.enemy_projectile_velocity_x * fraction
+            candidate_y = start_y + self.enemy_projectile_velocity_y * fraction
+            wall_impact = enabled & self._points_collide(
+                candidate_x,
+                candidate_y,
+                projectile_radius,
+            )
+            sector = self._sector_at(candidate_x.reshape(-1), candidate_y.reshape(-1)).reshape_as(
+                candidate_x
+            )
+            floor = self.map.sector_heights[sector, 0]
+            ceiling = self.map.sector_heights[sector, 1]
+            opening_impact = enabled & ((current_z < floor) | (current_z + 16.0 > ceiling))
+            player_distance = torch.sqrt(
+                (candidate_x - self.x[:, None]) ** 2
+                + (candidate_y - self.y[:, None]) ** 2
+            )
+            player_vertical_overlap = self._vertical_overlap(
+                current_z,
+                16.0,
+                self.z[:, None],
+                _PLAYER_HEIGHT,
+            )
+            step_player_impact = (
+                enabled & player_vertical_overlap & (player_distance < 22.0)
+            )
+            step_impact = enabled & (wall_impact | opening_impact | step_player_impact)
+            successful = enabled & ~step_impact
+            current_x.copy_(torch.where(successful, candidate_x, current_x))
+            current_y.copy_(torch.where(successful, candidate_y, current_y))
+            player_impact |= step_impact & step_player_impact
+            impact |= step_impact
+            moving &= ~step_impact
+
+        next_z = current_z + self.enemy_projectile_velocity_z
+        sector = self._sector_at(current_x.reshape(-1), current_y.reshape(-1)).reshape_as(current_x)
         floor = self.map.sector_heights[sector, 0]
         ceiling = self.map.sector_heights[sector, 1]
-        plane_impact = (next_z < floor) | (next_z + 16.0 > ceiling)
-        impact = alive & (wall_impact | plane_impact | player_impact | expired)
+        plane_impact = moving & ((next_z < floor) | (next_z + 16.0 > ceiling))
+        current_z.copy_(torch.where(moving, next_z, current_z))
+        impact |= plane_impact
         random_bits = self._random_u32(torch.any(impact, dim=1))[:, None]
         slot_bits = torch.arange(
             self.enemy_slots,
@@ -1785,17 +2495,46 @@ class TorchDeathmatchEngine:
             torch.where(player_impact, damage, torch.zeros_like(damage)),
             dim=1,
         )
-        self._apply_player_damage(incoming)
-        self.enemy_projectile_x.copy_(torch.where(alive, next_x, self.enemy_projectile_x))
-        self.enemy_projectile_y.copy_(torch.where(alive, next_y, self.enemy_projectile_y))
-        self.enemy_projectile_z.copy_(torch.where(alive, next_z, self.enemy_projectile_z))
+        damaging_slot = torch.argmax(
+            torch.where(player_impact, damage, torch.zeros_like(damage)), dim=1
+        )
+        row = torch.arange(self.num_envs, device=self.device)
+        self._apply_player_damage(
+            incoming,
+            current_x[row, damaging_slot],
+            current_y[row, damaging_slot],
+        )
+        self.enemy_projectile_x.copy_(
+            torch.where(alive, current_x, self.enemy_projectile_x)
+        )
+        self.enemy_projectile_y.copy_(
+            torch.where(alive, current_y, self.enemy_projectile_y)
+        )
+        self.enemy_projectile_z.copy_(
+            torch.where(alive, current_z, self.enemy_projectile_z)
+        )
         self.enemy_projectile_age.add_(alive.to(torch.int32))
+        self.enemy_projectile_impact_tics.copy_(
+            torch.where(
+                impact,
+                self.map.projectile_explosion_total_tics[2].to(torch.int32),
+                self.enemy_projectile_impact_tics,
+            )
+        )
         self.enemy_projectile_alive &= ~impact
 
     def _enemy_tick(self, active: torch.Tensor | None = None) -> None:
         if active is None:
             active = torch.ones(self.num_envs, device=self.device, dtype=torch.bool)
-        alive = self.enemy_alive & active[:, None]
+        in_pain = self.enemy_alive & active[:, None] & (self.enemy_pain_tics > 0)
+        self.enemy_pain_tics.copy_(
+            torch.where(
+                active[:, None],
+                torch.clamp_min(self.enemy_pain_tics - 1, 0),
+                self.enemy_pain_tics,
+            )
+        )
+        alive = self.enemy_alive & active[:, None] & ~in_pain
         enemy_type = self.enemy_type.clamp_min(0)
         dx = self.x[:, None] - self.enemy_x
         dy = self.y[:, None] - self.enemy_y
@@ -1841,11 +2580,15 @@ class TorchDeathmatchEngine:
             melee_vertical_overlap | (distance >= 64.0)
         )
         direct_attack &= distance < self._enemy_attack_range[enemy_type]
-        incoming = torch.sum(
-            self._enemy_damage_roll(enemy_type, direct_attack, distance),
-            dim=1,
+        damage_by_attacker = self._enemy_damage_roll(enemy_type, direct_attack, distance)
+        incoming = torch.sum(damage_by_attacker, dim=1)
+        damaging_slot = torch.argmax(damage_by_attacker, dim=1)
+        row = torch.arange(self.num_envs, device=self.device)
+        self._apply_player_damage(
+            incoming,
+            self.enemy_x[row, damaging_slot],
+            self.enemy_y[row, damaging_slot],
         )
-        self._apply_player_damage(incoming)
 
         next_cooldown = torch.where(
             active[:, None],
@@ -2013,6 +2756,16 @@ class TorchDeathmatchEngine:
             self._enemy_attack_prefire[enemy_type],
             next_cooldown,
         )
+        returning_to_walk = alive & (attack_phase > 0) & (next_phase == 0)
+        walking = alive & (next_phase == 0)
+        next_animation_tics = torch.where(
+            walking,
+            self.enemy_animation_tics + 1,
+            self.enemy_animation_tics,
+        )
+        self.enemy_animation_tics.copy_(
+            torch.where(returning_to_walk | can_attack, 0, next_animation_tics)
+        )
         self.enemy_attack_phase.copy_(next_phase)
         self.enemy_cooldown.copy_(next_cooldown)
 
@@ -2102,6 +2855,7 @@ class TorchDeathmatchEngine:
         successful = touched & can_pick_up[:, None]
         acquired = torch.any(successful, dim=1)
         newly_owned = acquired & ~previously_owned
+        self.mugshot_grin |= newly_owned
         self._grant_weapon_code(code, acquired)
         if ammo_slot >= 0:
             count = torch.sum(successful, dim=1).to(torch.float32)
@@ -2207,10 +2961,32 @@ class TorchDeathmatchEngine:
                 ammo_cap=ammo_cap,
             )
         self.item_available &= ~consumed
+        self.bonus_count.copy_(
+            torch.where(
+                torch.any(consumed, dim=1),
+                torch.full_like(self.bonus_count, 6),
+                self.bonus_count,
+            )
+        )
 
     def _collect_drops(self) -> None:
-        self.enemy_death_tics.sub_(1).clamp_min_(0)
-        self.enemy_death_type.masked_fill_(self.enemy_death_tics <= 0, -1)
+        # Doom death states hold their final frame forever (duration -1).
+        # A value of one therefore means a persistent corpse, not one tic left.
+        self.enemy_death_tics.copy_(
+            torch.where(
+                self.enemy_death_tics > 1,
+                self.enemy_death_tics - 1,
+                self.enemy_death_tics,
+            )
+        )
+        corpse = self.enemy_death_type >= 0
+        self.enemy_death_elapsed.copy_(
+            torch.where(
+                corpse,
+                self.enemy_death_elapsed + 1,
+                self.enemy_death_elapsed,
+            )
+        )
         self.drop_delay.sub_(1).clamp_min_(0)
         available = (self.drop_type >= 0) & (self.drop_delay <= 0)
         touched = available & self._touching(self.enemy_x, self.enemy_y, self.enemy_z)
@@ -2232,6 +3008,13 @@ class TorchDeathmatchEngine:
             ammo_cap=200.0,
         )
         self.drop_type.masked_fill_(consumed, -1)
+        self.bonus_count.copy_(
+            torch.where(
+                torch.any(consumed, dim=1),
+                torch.full_like(self.bonus_count, 6),
+                self.bonus_count,
+            )
+        )
 
     def _collect_items(self) -> None:
         self._collect_map_items()
@@ -2243,20 +3026,105 @@ class TorchDeathmatchEngine:
         if self.debug_checks and torch.any(self.pending_reset):
             lanes = torch.nonzero(self.pending_reset).flatten().to("cpu").tolist()
             raise RuntimeError(f"terminal lanes must be reset before step: {lanes}")
+        hud_weapon = self._active_weapon()
+        hud_ammo_slot = self._weapon_ammo_slot[hud_weapon]
+        hud_ammo = self.ammo.gather(1, hud_ammo_slot.clamp_min(0)[:, None]).squeeze(1)
+        self.hud_ready_ammo.copy_(
+            torch.where(hud_ammo_slot < 0, torch.zeros_like(hud_ammo), hud_ammo)
+        )
         reward = torch.zeros(self.num_envs, device=self.device)
         for _ in range(self.frame_skip):
             self.player_dead |= self.health <= 0
             active = ~self.player_dead & (self.episode_time < self.episode_timeout)
+            self.damage_count.copy_(
+                torch.where(active, torch.clamp_min(self.damage_count - 1, 0), self.damage_count)
+            )
+            self.bonus_count.copy_(
+                torch.where(active, torch.clamp_min(self.bonus_count - 1, 0), self.bonus_count)
+            )
+            decayed_pain = torch.clamp_min(self.mugshot_pain_tics - 1, 0)
+            self.mugshot_pain_tics.copy_(
+                torch.where(
+                    active & (self.damage_count > 0),
+                    torch.full_like(self.mugshot_pain_tics, _MUGSHOT_STATE_TICS),
+                    torch.where(active, decayed_pain, self.mugshot_pain_tics),
+                )
+            )
+            self.mugshot_ouch &= self.mugshot_pain_tics > 0
+            self.mugshot_grin &= self.bonus_count > 0
+            next_face_tics = torch.clamp_min(self.mugshot_face_tics - 1, 0)
+            change_face = active & (next_face_tics <= 0)
+            mugshot_random = self.mugshot_rng_state
+            next_mugshot_random = torch.bitwise_xor(
+                mugshot_random,
+                torch.bitwise_and(mugshot_random << 13, _UINT32_MASK),
+            )
+            next_mugshot_random = torch.bitwise_xor(
+                next_mugshot_random,
+                next_mugshot_random >> 17,
+            )
+            next_mugshot_random = torch.bitwise_xor(
+                next_mugshot_random,
+                torch.bitwise_and(next_mugshot_random << 5, _UINT32_MASK),
+            )
+            next_mugshot_random = torch.bitwise_and(
+                next_mugshot_random,
+                _UINT32_MASK,
+            )
+            self.mugshot_rng_state.copy_(
+                torch.where(change_face, next_mugshot_random, mugshot_random)
+            )
+            self.mugshot_face_index.copy_(
+                torch.where(
+                    change_face,
+                    torch.remainder(next_mugshot_random, 3),
+                    self.mugshot_face_index,
+                )
+            )
+            self.mugshot_face_tics.copy_(
+                torch.where(
+                    change_face,
+                    torch.full_like(next_face_tics, _MUGSHOT_NORMAL_FRAME_TICS),
+                    torch.where(active, next_face_tics, self.mugshot_face_tics),
+                )
+            )
             active_buttons = buttons & active[:, None]
+            self.attack_held_tics.copy_(
+                torch.where(
+                    active_buttons[:, 0],
+                    torch.clamp_max(self.attack_held_tics + 1, _MUGSHOT_RAMPAGE_DELAY),
+                    torch.zeros_like(self.attack_held_tics),
+                )
+            )
             decremented_attack = torch.clamp_min(self.attack_cooldown - 1, 0)
             self.attack_cooldown.copy_(
                 torch.where(active, decremented_attack, self.attack_cooldown)
+            )
+            decremented_weapon_state = torch.clamp_min(
+                self.weapon_state_cooldown - 1,
+                0,
+            )
+            self.weapon_state_cooldown.copy_(
+                torch.where(active, decremented_weapon_state, self.weapon_state_cooldown)
             )
             self._weapon_switch_tick(active)
             self._select_weapons(active_buttons)
             self._move_player(active_buttons)
             self._vertical_player_tick(active)
             reward.add_(self._player_attack(active_buttons))
+            weapon_ready = (
+                active
+                & (self.weapon_state_cooldown <= 0)
+                & (self.weapon_raise_cooldown <= 0)
+                & (self.pending_weapon < 0)
+            )
+            self.weapon_ready_tics.copy_(
+                torch.where(
+                    weapon_ready,
+                    self.weapon_ready_tics + 1,
+                    torch.zeros_like(self.weapon_ready_tics),
+                )
+            )
             reward.add_(self._projectile_tick(active))
             self.player_dead |= self.health <= 0
             self._enemy_tick(active & ~self.player_dead)
@@ -2532,7 +3400,7 @@ class TorchDeathmatchEngine:
         distance, _wall_index, _wall_along = self._raycast()
         center = self.observation_height * 0.48
         sector = self._current_sector()
-        view_z = self.z + _VIEW_HEIGHT
+        view_z = self.view_z
         frame = self._render_flats(sector, view_z, center)
         frame = self._render_portal_walls(frame, view_z, center)
 
@@ -2670,8 +3538,14 @@ class TorchDeathmatchEngine:
         sprite_value = self.map.sprite_atlas[sprite_type, sprite_v, sprite_u].to(torch.float32)
         frame = torch.where(inside_sprite & sprite_opaque, sprite_value, frame)
         frame = self._render_weapon(frame)
-        flash = self.damage_flash.clamp(0, 1)[:, None, None]
-        frame = frame * (1 - flash * 0.35) + 255 * flash * 0.35
+        flash = self._damage_to_alpha[self.damage_count.clamp(0, 113).to(torch.int64)] / 255.0
+        bonus = torch.minimum(
+            self.bonus_count.to(torch.float32) * 8.0, torch.full_like(self.health, 128.0)
+        )
+        bonus = (bonus / 255.0)[:, None, None]
+        frame = frame * (1 - bonus) + 184.89 * bonus
+        flash = flash[:, None, None]
+        frame = frame * (1 - flash) + 53.55 * flash
         if self.mask_hud:
             frame[:, -11:, :] = 0
         return frame.clamp(0, 255).to(torch.uint8)
@@ -2717,27 +3591,25 @@ class TorchDeathmatchEngine:
         light: torch.Tensor,
         distance: torch.Tensor,
     ) -> torch.Tensor:
-        shade = torch.floor((255.0 - light) / 32.0 + distance / 96.0).to(torch.int64)
+        base_shade = 61.0 - light / 4.0
+        visibility = (1280.0 / distance.clamp_min(1)).clamp_max(24.0)
+        shade = torch.floor(base_shade - visibility).to(torch.int64)
         shade = shade.clamp(0, 31)
         return self.map.colormap[shade, indices.to(torch.int64)]
 
     def _native_animated_texture_ids(self, texture_ids: torch.Tensor) -> torch.Tensor:
-        animation_counts = self.map.texture_animation_counts[texture_ids]
-        phase_shape = (self.num_envs,) + (1,) * (texture_ids.ndim - 1)
-        phase = torch.div(self.episode_time.to(torch.int64), 8, rounding_mode="floor").view(
-            phase_shape
-        )
-        phase = torch.remainder(phase, animation_counts)
-        animation_ids = self.map.texture_animation_ids[texture_ids]
-        return animation_ids.gather(-1, phase[..., None]).squeeze(-1)
+        # ViZDoom's certified deathmatch runtime never advances texture
+        # translations: BFALL1 remains BFALL1 across consecutive rendered
+        # tics. Preserve that observable behavior in the raw-fidelity path.
+        return texture_ids
 
     def _native_render_flats(
         self,
         current_sector: torch.Tensor,
         view_z: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        center = self.native_view_height / 2.0
-        focal_length = self.native_screen_width / 2.0
+        center = self.native_view_height / 2.0 - 1.0
+        focal_length = self.native_screen_width / 2.0 * self.native_vertical_aspect
         ray_angles = self.angle[:, None] + self._native_ray_offsets[None, :]
         cosine_correction = torch.cos(self._native_ray_offsets)[None, None, :]
         pixel_delta = self._native_pixel_y.to(torch.float32) - center
@@ -2832,8 +3704,9 @@ class TorchDeathmatchEngine:
         texture_u = torch.remainder(torch.floor(world_x).to(torch.int64), texture_width)
         texture_v = torch.remainder(torch.floor(-world_y).to(torch.int64), texture_height)
         indices = self.map.texture_index_atlas[texture_id, texture_v, texture_u]
-        light = self.map.sector_lights[sectors]
-        frame = self._native_apply_colormap(indices, light, ray_distance.clamp(1, 4096))
+        _weapon_frame, _weapon_flash, flash_light = self._native_weapon_frame_selection()
+        light = self.map.sector_lights[sectors] + flash_light[:, None, None] * 16
+        frame = self._native_apply_colormap(indices, light, surface_depth.clamp(1, 4096))
         return frame, surface_depth
 
     def _native_portal_intersections(
@@ -2864,11 +3737,12 @@ class TorchDeathmatchEngine:
         frame: torch.Tensor,
         view_z: torch.Tensor,
         surface_depth: torch.Tensor,
-    ) -> torch.Tensor:
-        center = self.native_view_height / 2.0
-        focal_length = self.native_screen_width / 2.0
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        center = self.native_view_height / 2.0 - 1.0
+        focal_length = self.native_screen_width / 2.0 * self.native_vertical_aspect
         distances, wall_along = self._native_portal_intersections()
         filled = torch.zeros_like(frame, dtype=torch.bool)
+        scene_depth = surface_depth.clone()
         pixel_y = self._native_pixel_y.to(torch.float32)
         current_sector = (
             self._current_sector()[:, None].expand(-1, self.native_screen_width).clone()
@@ -2951,17 +3825,30 @@ class TorchDeathmatchEngine:
             texture_width = self.map.texture_widths[safe_texture_id]
             texture_height = self.map.texture_heights[safe_texture_id]
             texture_offset = self.map.portal_side_texture_offsets[wall_index, side_index]
+            texture_along = torch.where(side_index == 0, along, 1.0 - along)
             texture_u = torch.remainder(
                 torch.floor(
-                    along * self.map.portal_wall_lengths[wall_index] + texture_offset[..., 0]
+                    texture_along * self.map.portal_wall_lengths[wall_index]
+                    + texture_offset[..., 0]
                 ).to(torch.int64)[:, None, :],
                 texture_width,
             ).expand(-1, self.native_view_height, -1)
             world_z = view_z[:, None, None] + (
                 (center - pixel_y) * distance[:, None, :] / focal_length
             )
+            texture_origin_z = torch.where(
+                one_span,
+                view_ceiling[:, None, :],
+                torch.where(
+                    lower_span,
+                    other_floor[:, None, :],
+                    other_ceiling[:, None, :],
+                ),
+            )
             texture_v = torch.remainder(
-                torch.floor(-world_z + texture_offset[:, None, :, 1]).to(torch.int64),
+                torch.floor(texture_origin_z - world_z + texture_offset[:, None, :, 1]).to(
+                    torch.int64
+                ),
                 texture_height,
             )
             texture = self.map.texture_index_atlas[
@@ -2969,13 +3856,24 @@ class TorchDeathmatchEngine:
                 texture_v,
                 texture_u,
             ]
-            light = self.map.sector_lights[current][:, None, :]
+            _weapon_frame, _weapon_flash, flash_light = self._native_weapon_frame_selection()
+            light = self.map.sector_lights[current][:, None, :] + flash_light[:, None, None] * 16
+            wall = self.map.portal_walls[wall_index]
+            horizontal = (wall[..., 3] - wall[..., 1]).abs() < 1e-6
+            vertical = (wall[..., 2] - wall[..., 0]).abs() < 1e-6
+            fake_contrast = torch.where(
+                vertical,
+                16.0,
+                torch.where(horizontal, -16.0, 0.0),
+            )
+            light = light + fake_contrast[:, None, :]
             wall_value = self._native_apply_colormap(
                 texture,
                 light,
                 distance[:, None, :],
             )
             frame = torch.where(span, wall_value, frame)
+            scene_depth = torch.where(span, distance[:, None, :], scene_depth)
             filled |= span
             previous_distance = torch.where(valid, distance, previous_distance)
             current_sector = torch.where(
@@ -2983,7 +3881,7 @@ class TorchDeathmatchEngine:
                 other_sector,
                 torch.full_like(current_sector, -1),
             )
-        return frame
+        return frame, scene_depth
 
     def _native_enemy_sprite_ids(self) -> torch.Tensor:
         enemy_type = self.enemy_type.clamp(0, 5)
@@ -2996,21 +3894,76 @@ class TorchDeathmatchEngine:
             2 * math.pi,
         )
         rotation = torch.floor(relative / (math.pi / 4)).to(torch.int64)
-        slot = torch.arange(self.enemy_slots, device=self.device)[None, :]
-        walk_frame = torch.remainder(self.episode_time[:, None] // 4 + slot, 4).to(torch.int64)
-        attack_frame = torch.remainder(self.episode_time[:, None] // 3 + slot, 4).to(torch.int64)
+        walk_frame = torch.remainder(
+            self.enemy_animation_tics // self._enemy_walk_frame_tics[enemy_type],
+            4,
+        ).to(torch.int64)
+        phase = self.enemy_attack_phase
+        cooldown = self.enemy_cooldown
+        ranged_recovery_frame = (cooldown > (self._enemy_attack_recovery[enemy_type] // 2)).to(
+            torch.int64
+        )
+        attack_frame = torch.where(
+            (enemy_type == 0) | (enemy_type == 1),
+            torch.where(phase == 2, ranged_recovery_frame, 0),
+            torch.zeros_like(enemy_type),
+        )
+        attack_frame = torch.where(
+            ((enemy_type == 4) | (enemy_type == 5)) & (phase == 1),
+            (cooldown <= 8).to(torch.int64),
+            attack_frame,
+        )
+        attack_frame = torch.where(
+            ((enemy_type == 4) | (enemy_type == 5)) & (phase == 2),
+            torch.full_like(attack_frame, 2),
+            attack_frame,
+        )
+        attack_frame = torch.where(
+            (enemy_type == 3) & (phase == 2),
+            torch.ones_like(attack_frame),
+            attack_frame,
+        )
+        attack_frame = torch.where(
+            (enemy_type == 3) & (phase == 3),
+            torch.where(
+                cooldown > 1, torch.full_like(attack_frame, 2), torch.ones_like(attack_frame)
+            ),
+            attack_frame,
+        )
         walk = self.map.enemy_walk_sprite_ids[enemy_type, walk_frame, rotation]
         attack = self.map.enemy_attack_sprite_ids[enemy_type, attack_frame, rotation]
-        return torch.where(self.enemy_attack_phase > 0, attack, walk)
+        pain = self.map.enemy_pain_sprite_ids[enemy_type, rotation]
+        animated = torch.where(phase > 0, attack, walk)
+        return torch.where(self.enemy_pain_tics > 0, pain, animated)
+
+    def _native_projectile_explosion_sprite_ids(
+        self,
+        projectile_type: torch.Tensor,
+        remaining_tics: torch.Tensor,
+    ) -> torch.Tensor:
+        safe_type = projectile_type.clamp(0, 2)
+        elapsed = self.map.projectile_explosion_total_tics[safe_type] - remaining_tics.to(
+            torch.int64
+        )
+        durations = self.map.projectile_explosion_frame_durations[safe_type]
+        frame_ends = torch.cumsum(durations, dim=-1)
+        frame = torch.sum(elapsed[..., None] >= frame_ends, dim=-1)
+        frame = torch.minimum(
+            frame,
+            self.map.projectile_explosion_frame_counts[safe_type] - 1,
+        )
+        return self.map.raw_projectile_explosion_sprite_ids[safe_type, frame]
 
     def _native_render_sprites(
         self,
         frame: torch.Tensor,
         wall_distance: torch.Tensor,
         view_z: torch.Tensor,
+        scene_depth: torch.Tensor,
     ) -> torch.Tensor:
-        center = self.native_view_height / 2.0
-        focal_length = self.native_screen_width / 2.0
+        center = self.native_view_height / 2.0 - 1.0
+        horizontal_focal_length = self.native_screen_width / 2.0
+        vertical_focal_length = horizontal_focal_length * self.native_vertical_aspect
         enemy_sprite = self._native_enemy_sprite_ids()
         static = self.map.raw_static_sprite_ids
         actor_x = self.enemy_x
@@ -3018,12 +3971,72 @@ class TorchDeathmatchEngine:
         actor_z = self.enemy_z
         actor_alive = self.enemy_alive
         actor_sprite = enemy_sprite
+        enemy_type = self.enemy_type.clamp(0, 5)
+        ranged_muzzle = (
+            ((enemy_type == 0) | (enemy_type == 1))
+            & (self.enemy_attack_phase == 2)
+            & (self.enemy_cooldown > (self._enemy_attack_recovery[enemy_type] // 2))
+        )
+        chaingun_muzzle = (enemy_type == 3) & (
+            (self.enemy_attack_phase == 2)
+            | ((self.enemy_attack_phase == 3) & (self.enemy_cooldown > 1))
+        )
+        actor_fullbright = ranged_muzzle | chaingun_muzzle
+        actor_additive_style = torch.full_like(actor_sprite, -1, dtype=torch.int64)
+
+        doll_count = max(len(self.map.player_starts) - 1, 0)
+        if doll_count:
+            dolls = self.map.player_starts[:-1]
+            doll_x = dolls[None, :, 0].expand(self.num_envs, -1)
+            doll_y = dolls[None, :, 1].expand(self.num_envs, -1)
+            doll_angle = torch.deg2rad(dolls[None, :, 2]).expand(self.num_envs, -1)
+            viewer_angle = torch.atan2(
+                self.y[:, None] - doll_y,
+                self.x[:, None] - doll_x,
+            )
+            relative_doll_angle = torch.remainder(
+                viewer_angle - doll_angle + math.pi + math.pi / 8,
+                2 * math.pi,
+            )
+            doll_rotation = torch.floor(relative_doll_angle / (math.pi / 4)).to(torch.int64)
+            doll_sprite = self.map.enemy_walk_sprite_ids[2, 0, doll_rotation]
+            actor_x = torch.cat((actor_x, doll_x), dim=1)
+            actor_y = torch.cat((actor_y, doll_y), dim=1)
+            actor_z = torch.cat(
+                (
+                    actor_z,
+                    self._player_start_z[:-1][None, :].expand(self.num_envs, -1),
+                ),
+                dim=1,
+            )
+            actor_alive = torch.cat(
+                (
+                    actor_alive,
+                    (~self.player_dead)[:, None].expand(-1, doll_count),
+                ),
+                dim=1,
+            )
+            actor_sprite = torch.cat((actor_sprite, doll_sprite), dim=1)
+            actor_fullbright = torch.cat(
+                (actor_fullbright, torch.zeros_like(doll_sprite, dtype=torch.bool)),
+                dim=1,
+            )
+            actor_additive_style = torch.cat(
+                (actor_additive_style, torch.full_like(doll_sprite, -1, dtype=torch.int64)),
+                dim=1,
+            )
 
         death_type = self.enemy_death_type.clamp(0, 5)
         death_count = self.map.enemy_death_frame_counts[death_type]
-        death_elapsed = death_count * 4 - self.enemy_death_tics.to(torch.int64)
+        death_elapsed = self.enemy_death_elapsed.to(torch.int64)
+        death_durations = self.map.enemy_death_frame_durations[death_type]
+        death_frame_ends = torch.cumsum(death_durations, dim=2)
+        death_frame = torch.sum(
+            death_elapsed[:, :, None] >= death_frame_ends,
+            dim=2,
+        )
         death_frame = torch.minimum(
-            torch.clamp_min(death_elapsed // 4, 0),
+            death_frame,
             death_count - 1,
         )
         death_sprite = self.map.enemy_death_sprite_ids[death_type, death_frame]
@@ -3032,30 +4045,221 @@ class TorchDeathmatchEngine:
         actor_z = torch.cat((actor_z, self.enemy_z), dim=1)
         actor_alive = torch.cat((actor_alive, self.enemy_death_tics > 0), dim=1)
         actor_sprite = torch.cat((actor_sprite, death_sprite), dim=1)
+        actor_fullbright = torch.cat(
+            (actor_fullbright, torch.zeros_like(death_sprite, dtype=torch.bool)),
+            dim=1,
+        )
+        actor_additive_style = torch.cat(
+            (actor_additive_style, torch.full_like(death_sprite, -1, dtype=torch.int64)),
+            dim=1,
+        )
 
-        player_projectile_sprite = static[17 + self.projectile_type.clamp(0, 1)]
+        player_projectile_type = self.projectile_type.clamp(0, 1)
+        player_projectile_angle = torch.atan2(
+            self.projectile_velocity_y,
+            self.projectile_velocity_x,
+        )
+        player_projectile_viewer_angle = torch.atan2(
+            self.y[:, None] - self.projectile_y,
+            self.x[:, None] - self.projectile_x,
+        )
+        player_projectile_relative = torch.remainder(
+            player_projectile_viewer_angle
+            - player_projectile_angle
+            + math.pi
+            + math.pi / 8,
+            2 * math.pi,
+        )
+        player_projectile_rotation = torch.floor(
+            player_projectile_relative / (math.pi / 4)
+        ).to(torch.int64)
+        player_projectile_frame = torch.where(
+            player_projectile_type == 1,
+            torch.remainder(self.projectile_age // 6, 2).to(torch.int64),
+            torch.zeros_like(player_projectile_type),
+        )
+        player_projectile_sprite = self.map.raw_projectile_flight_sprite_ids[
+            player_projectile_type,
+            player_projectile_frame,
+            player_projectile_rotation,
+        ]
         actor_x = torch.cat((actor_x, self.projectile_x), dim=1)
         actor_y = torch.cat((actor_y, self.projectile_y), dim=1)
         actor_z = torch.cat((actor_z, self.projectile_z), dim=1)
         actor_alive = torch.cat((actor_alive, self.projectile_alive), dim=1)
         actor_sprite = torch.cat((actor_sprite, player_projectile_sprite), dim=1)
+        actor_fullbright = torch.cat(
+            (actor_fullbright, self.projectile_alive.clone()),
+            dim=1,
+        )
+        actor_additive_style = torch.cat(
+            (
+                actor_additive_style,
+                torch.where(
+                    player_projectile_type == 1,
+                    torch.zeros_like(player_projectile_type),
+                    torch.full_like(player_projectile_type, -1),
+                ),
+            ),
+            dim=1,
+        )
 
-        enemy_projectile_sprite = static[19].expand_as(self.enemy_projectile_age)
+        enemy_projectile_angle = torch.atan2(
+            self.enemy_projectile_velocity_y,
+            self.enemy_projectile_velocity_x,
+        )
+        enemy_projectile_viewer_angle = torch.atan2(
+            self.y[:, None] - self.enemy_projectile_y,
+            self.x[:, None] - self.enemy_projectile_x,
+        )
+        enemy_projectile_relative = torch.remainder(
+            enemy_projectile_viewer_angle
+            - enemy_projectile_angle
+            + math.pi
+            + math.pi / 8,
+            2 * math.pi,
+        )
+        enemy_projectile_rotation = torch.floor(
+            enemy_projectile_relative / (math.pi / 4)
+        ).to(torch.int64)
+        enemy_projectile_frame = torch.remainder(self.enemy_projectile_age // 4, 2).to(
+            torch.int64
+        )
+        enemy_projectile_sprite = self.map.raw_projectile_flight_sprite_ids[
+            2,
+            enemy_projectile_frame,
+            enemy_projectile_rotation,
+        ]
         actor_x = torch.cat((actor_x, self.enemy_projectile_x), dim=1)
         actor_y = torch.cat((actor_y, self.enemy_projectile_y), dim=1)
         actor_z = torch.cat((actor_z, self.enemy_projectile_z), dim=1)
         actor_alive = torch.cat((actor_alive, self.enemy_projectile_alive), dim=1)
         actor_sprite = torch.cat((actor_sprite, enemy_projectile_sprite), dim=1)
+        actor_fullbright = torch.cat(
+            (actor_fullbright, self.enemy_projectile_alive.clone()),
+            dim=1,
+        )
+        actor_additive_style = torch.cat(
+            (actor_additive_style, torch.ones_like(enemy_projectile_frame)),
+            dim=1,
+        )
+
+        player_impact_sprite = self._native_projectile_explosion_sprite_ids(
+            self.projectile_impact_type,
+            self.projectile_impact_tics,
+        )
+        actor_x = torch.cat((actor_x, self.projectile_x), dim=1)
+        actor_y = torch.cat((actor_y, self.projectile_y), dim=1)
+        actor_z = torch.cat((actor_z, self.projectile_z), dim=1)
+        actor_alive = torch.cat((actor_alive, self.projectile_impact_tics > 0), dim=1)
+        actor_sprite = torch.cat((actor_sprite, player_impact_sprite), dim=1)
+        actor_fullbright = torch.cat(
+            (actor_fullbright, self.projectile_impact_tics > 0),
+            dim=1,
+        )
+        actor_additive_style = torch.cat(
+            (
+                actor_additive_style,
+                torch.where(
+                    self.projectile_impact_type == 1,
+                    torch.zeros_like(self.projectile_impact_type),
+                    torch.full_like(self.projectile_impact_type, -1),
+                ),
+            ),
+            dim=1,
+        )
+
+        enemy_impact_type = torch.full_like(self.enemy_projectile_age, 2, dtype=torch.int64)
+        enemy_impact_sprite = self._native_projectile_explosion_sprite_ids(
+            enemy_impact_type,
+            self.enemy_projectile_impact_tics,
+        )
+        actor_x = torch.cat((actor_x, self.enemy_projectile_x), dim=1)
+        actor_y = torch.cat((actor_y, self.enemy_projectile_y), dim=1)
+        actor_z = torch.cat((actor_z, self.enemy_projectile_z), dim=1)
+        actor_alive = torch.cat(
+            (actor_alive, self.enemy_projectile_impact_tics > 0),
+            dim=1,
+        )
+        actor_sprite = torch.cat((actor_sprite, enemy_impact_sprite), dim=1)
+        actor_fullbright = torch.cat(
+            (actor_fullbright, self.enemy_projectile_impact_tics > 0),
+            dim=1,
+        )
+        actor_additive_style = torch.cat(
+            (actor_additive_style, torch.ones_like(enemy_impact_type)),
+            dim=1,
+        )
 
         map_item_x = self.map.item_spawns[None, :, 0].expand(self.num_envs, -1)
         map_item_y = self.map.item_spawns[None, :, 1].expand(self.num_envs, -1)
         map_item_z = self._item_z[None, :].expand(self.num_envs, -1)
         map_item_sprite = self.map.item_raw_visual_types[None, :].expand(self.num_envs, -1)
+        item_types = self.map.item_types[None, :]
+        item_animation = self.map.raw_item_animation_sprite_ids
+        bonus_phase = torch.remainder((self.episode_time - 1) // 6, 6)[:, None]
+        health_bonus_frames = torch.stack(
+            (
+                map_item_sprite,
+                item_animation[0].expand_as(map_item_sprite),
+                item_animation[1].expand_as(map_item_sprite),
+                item_animation[2].expand_as(map_item_sprite),
+                item_animation[1].expand_as(map_item_sprite),
+                item_animation[0].expand_as(map_item_sprite),
+            ),
+            dim=2,
+        )
+        armor_bonus_frames = torch.stack(
+            (
+                map_item_sprite,
+                item_animation[3].expand_as(map_item_sprite),
+                item_animation[4].expand_as(map_item_sprite),
+                item_animation[5].expand_as(map_item_sprite),
+                item_animation[4].expand_as(map_item_sprite),
+                item_animation[3].expand_as(map_item_sprite),
+            ),
+            dim=2,
+        )
+        item_row = torch.arange(self.num_envs, device=self.device)[:, None]
+        item_column = torch.arange(len(self.map.item_types), device=self.device)[None, :]
+        map_item_sprite = torch.where(
+            item_types == 2014,
+            health_bonus_frames[item_row, item_column, bonus_phase],
+            map_item_sprite,
+        )
+        map_item_sprite = torch.where(
+            item_types == 2015,
+            armor_bonus_frames[item_row, item_column, bonus_phase],
+            map_item_sprite,
+        )
+        green_armor_phase = torch.remainder(self.episode_time - 1, 13)[:, None]
+        blue_armor_phase = torch.remainder(self.episode_time - 1, 12)[:, None]
+        green_armor_bright = (item_types == 2018) & (green_armor_phase >= 6)
+        blue_armor_bright = (item_types == 2019) & (blue_armor_phase >= 6)
+        map_item_sprite = torch.where(
+            green_armor_bright,
+            item_animation[6],
+            map_item_sprite,
+        )
+        map_item_sprite = torch.where(
+            blue_armor_bright,
+            item_animation[7],
+            map_item_sprite,
+        )
+        map_item_fullbright = green_armor_bright | blue_armor_bright
         actor_x = torch.cat((actor_x, map_item_x), dim=1)
         actor_y = torch.cat((actor_y, map_item_y), dim=1)
         actor_z = torch.cat((actor_z, map_item_z), dim=1)
         actor_alive = torch.cat((actor_alive, self.item_available), dim=1)
         actor_sprite = torch.cat((actor_sprite, map_item_sprite), dim=1)
+        actor_fullbright = torch.cat((actor_fullbright, map_item_fullbright), dim=1)
+        actor_additive_style = torch.cat(
+            (
+                actor_additive_style,
+                torch.full_like(map_item_sprite, -1, dtype=torch.int64),
+            ),
+            dim=1,
+        )
 
         drop_visible = (self.drop_type >= 0) & (self.drop_delay <= 0)
         drop_sprite = static[12].expand_as(self.drop_type)
@@ -3066,25 +4270,38 @@ class TorchDeathmatchEngine:
         actor_z = torch.cat((actor_z, self.enemy_z), dim=1)
         actor_alive = torch.cat((actor_alive, drop_visible), dim=1)
         actor_sprite = torch.cat((actor_sprite, drop_sprite), dim=1)
+        actor_fullbright = torch.cat(
+            (actor_fullbright, torch.zeros_like(drop_sprite, dtype=torch.bool)),
+            dim=1,
+        )
+        actor_additive_style = torch.cat(
+            (actor_additive_style, torch.full_like(drop_sprite, -1, dtype=torch.int64)),
+            dim=1,
+        )
 
         dx = actor_x - self.x[:, None]
         dy = actor_y - self.y[:, None]
         actor_distance = torch.sqrt(dx * dx + dy * dy).clamp_min_(1)
         relative = self._wrap_angle(torch.atan2(dy, dx) - self.angle[:, None])
         actor_depth = actor_distance * torch.cos(relative)
-        screen_center = self.native_screen_width / 2.0 - torch.tan(relative) * focal_length
-        projection_scale = focal_length / actor_distance
+        screen_center = (
+            self.native_screen_width / 2.0
+            - 1.0
+            - torch.tan(relative) * horizontal_focal_length
+        )
+        horizontal_scale = horizontal_focal_length / actor_depth.clamp_min(1)
+        vertical_scale = vertical_focal_length / actor_depth.clamp_min(1)
         sprite_width = self.map.raw_sprite_widths[actor_sprite].to(torch.float32)
         sprite_height = self.map.raw_sprite_heights[actor_sprite].to(torch.float32)
         sprite_left = (
-            screen_center - self.map.raw_sprite_left_offsets[actor_sprite] * projection_scale
+            screen_center - self.map.raw_sprite_left_offsets[actor_sprite] * horizontal_scale
         )
         sprite_top = (
             center
-            + (view_z[:, None] - actor_z) * projection_scale
-            - self.map.raw_sprite_top_offsets[actor_sprite] * projection_scale
+            + (view_z[:, None] - actor_z) * vertical_scale
+            - self.map.raw_sprite_top_offsets[actor_sprite] * vertical_scale
         )
-        sprite_right = sprite_left + sprite_width * projection_scale
+        sprite_right = sprite_left + sprite_width * horizontal_scale
         column_inside = (self._native_pixel_x >= sprite_left[:, :, None]) & (
             self._native_pixel_x < sprite_right[:, :, None]
         )
@@ -3100,47 +4317,139 @@ class TorchDeathmatchEngine:
             actor_depth[:, :, None],
             torch.full_like(actor_depth[:, :, None], torch.inf),
         )
-        nearest_distance, nearest_actor = torch.min(candidate_distance, dim=1)
-        selected_sprite = actor_sprite.gather(1, nearest_actor)
-        selected_scale = projection_scale.gather(1, nearest_actor)
-        selected_left = sprite_left.gather(1, nearest_actor)
-        selected_top = sprite_top.gather(1, nearest_actor)
-        selected_width = sprite_width.gather(1, nearest_actor).to(torch.int64)
-        selected_height = sprite_height.gather(1, nearest_actor).to(torch.int64)
-        sprite_u = torch.floor((self._native_pixel_x[:, 0, :] - selected_left) / selected_scale).to(
-            torch.int64
-        )
-        sprite_v = torch.floor(
-            (self._native_pixel_y - selected_top[:, None, :]) / selected_scale[:, None, :]
-        ).to(torch.int64)
-        inside_sprite = (
-            torch.isfinite(nearest_distance)[:, None, :]
-            & (sprite_u[:, None, :] >= 0)
-            & (sprite_u[:, None, :] < selected_width[:, None, :])
-            & (sprite_v >= 0)
-            & (sprite_v < selected_height[:, None, :])
-        )
-        sprite_u = sprite_u.clamp_min(0)[:, None, :].expand(-1, self.native_view_height, -1)
-        sprite_v = sprite_v.clamp_min(0)
-        sprite_u = torch.minimum(sprite_u, (selected_width - 1)[:, None, :])
-        sprite_v = torch.minimum(sprite_v, (selected_height - 1)[:, None, :])
-        sprite_type = selected_sprite[:, None, :].expand(-1, self.native_view_height, -1)
-        sprite_opaque = self.map.raw_sprite_opaque[sprite_type, sprite_v, sprite_u]
-        sprite_value = self.map.raw_sprite_atlas[sprite_type, sprite_v, sprite_u]
         actor_sector = self._sector_at(actor_x.reshape(-1), actor_y.reshape(-1)).reshape_as(actor_x)
         actor_light = self.map.sector_lights[actor_sector]
-        selected_light = actor_light.gather(1, nearest_actor)[:, None, :]
-        lit_sprite = self._native_apply_colormap(
-            sprite_value,
-            selected_light,
-            nearest_distance[:, None, :],
+        _weapon_frame, _weapon_flash, flash_light = self._native_weapon_frame_selection()
+        layer_count = min(4, candidate_distance.shape[1])
+        nearest_distances, nearest_actors = torch.topk(
+            candidate_distance,
+            k=layer_count,
+            dim=1,
+            largest=False,
+            sorted=True,
         )
-        return torch.where(inside_sprite & sprite_opaque, lit_sprite, frame)
+        composited = frame
+        # Paint far-to-near so transparent texels reveal the next valid sprite
+        # and additive missiles blend over any sprite behind them.
+        for layer in range(layer_count - 1, -1, -1):
+            selected_actor = nearest_actors[:, layer, :]
+            selected_distance = nearest_distances[:, layer, :]
+            selected_sprite = actor_sprite.gather(1, selected_actor)
+            selected_horizontal_scale = horizontal_scale.gather(1, selected_actor)
+            selected_vertical_scale = vertical_scale.gather(1, selected_actor)
+            selected_left = sprite_left.gather(1, selected_actor)
+            selected_top = sprite_top.gather(1, selected_actor)
+            selected_width = sprite_width.gather(1, selected_actor).to(torch.int64)
+            selected_height = sprite_height.gather(1, selected_actor).to(torch.int64)
+            sprite_u = torch.floor(
+                (self._native_pixel_x[:, 0, :] - selected_left) / selected_horizontal_scale
+            ).to(torch.int64)
+            sprite_v = torch.floor(
+                (self._native_pixel_y - selected_top[:, None, :])
+                / selected_vertical_scale[:, None, :]
+            ).to(torch.int64)
+            inside_sprite = (
+                torch.isfinite(selected_distance)[:, None, :]
+                & (selected_distance[:, None, :] < scene_depth)
+                & (sprite_u[:, None, :] >= 0)
+                & (sprite_u[:, None, :] < selected_width[:, None, :])
+                & (sprite_v >= 0)
+                & (sprite_v < selected_height[:, None, :])
+            )
+            sprite_u = sprite_u.clamp_min(0)[:, None, :].expand(
+                -1, self.native_view_height, -1
+            )
+            sprite_v = sprite_v.clamp_min(0)
+            sprite_u = torch.minimum(sprite_u, (selected_width - 1)[:, None, :])
+            sprite_v = torch.minimum(sprite_v, (selected_height - 1)[:, None, :])
+            sprite_type = selected_sprite[:, None, :].expand(
+                -1, self.native_view_height, -1
+            )
+            sprite_opaque = self.map.raw_sprite_opaque[sprite_type, sprite_v, sprite_u]
+            sprite_value = self.map.raw_sprite_atlas[sprite_type, sprite_v, sprite_u]
+            selected_light = actor_light.gather(1, selected_actor)[:, None, :]
+            selected_light = selected_light + flash_light[:, None, None] * 16
+            selected_fullbright = actor_fullbright.gather(1, selected_actor)[:, None, :]
+            selected_light = torch.where(
+                selected_fullbright,
+                torch.full_like(selected_light, 255),
+                selected_light,
+            )
+            lit_sprite = self._native_apply_colormap(
+                sprite_value,
+                selected_light,
+                selected_distance[:, None, :],
+            )
+            selected_additive_style = actor_additive_style.gather(
+                1, selected_actor
+            )[:, None, :]
+            additive_style = selected_additive_style.clamp(0, 1)
+            additive_sprite = self.map.projectile_additive_luts[
+                additive_style,
+                composited.to(torch.int64),
+                lit_sprite.to(torch.int64),
+            ]
+            rendered_sprite = torch.where(
+                selected_additive_style >= 0,
+                additive_sprite,
+                lit_sprite,
+            )
+            composited = torch.where(
+                inside_sprite & sprite_opaque,
+                rendered_sprite,
+                composited,
+            )
+        return composited
+
+    def _native_weapon_frame_selection(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        weapon = self._active_weapon().clamp(0, 7)
+        cooldown = self.weapon_state_cooldown.to(torch.int64).clamp(
+            0,
+            self.map.native_weapon_frame_ids.shape[2] - 1,
+        )
+        parity = torch.remainder(self.weapon_fire_count, 2).to(torch.int64)
+        idle_chainsaw = (weapon == 1) & (cooldown == 0)
+        idle_phase = torch.remainder(
+            torch.clamp_min(self.weapon_ready_tics - 1, 0) // 4,
+            2,
+        ).to(torch.int64)
+        parity = torch.where(idle_chainsaw, idle_phase, parity)
+        frame_id = self.map.native_weapon_frame_ids[weapon, parity, cooldown]
+        flash_id = self.map.native_weapon_flash_ids[weapon, parity, cooldown]
+        flash_light = self.map.native_weapon_flash_lights[weapon, parity, cooldown]
+        return frame_id, flash_id, flash_light
+
+    def _native_shift_weapon_overlay(
+        self,
+        value: torch.Tensor,
+        alpha: torch.Tensor,
+        horizontal_pixels: torch.Tensor,
+        vertical_pixels: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        source_y = self._native_pixel_y.to(torch.int64) - vertical_pixels[:, None, None]
+        source_x = self._native_pixel_x.to(torch.int64) - horizontal_pixels[:, None, None]
+        valid = (
+            (source_y >= 0)
+            & (source_y < self.native_view_height)
+            & (source_x >= 0)
+            & (source_x < self.native_screen_width)
+        )
+        source_y = source_y.clamp(0, self.native_view_height - 1).expand(
+            -1, -1, self.native_screen_width
+        )
+        source_x = source_x.clamp(0, self.native_screen_width - 1).expand(
+            -1, self.native_view_height, -1
+        )
+        return value.gather(1, source_y).gather(2, source_x), (
+            alpha.gather(1, source_y).gather(2, source_x) & valid
+        )
 
     def _native_render_weapon(self, frame: torch.Tensor) -> torch.Tensor:
-        weapon = self._active_weapon().clamp(0, 7)
-        value = self.map.native_weapon_screen_values[weapon]
-        alpha = self.map.native_weapon_screen_alpha[weapon]
+        frame_id, flash_id, _flash_light = self._native_weapon_frame_selection()
+        value = self.map.native_weapon_frame_values[frame_id]
+        alpha = self.map.native_weapon_frame_alpha[frame_id]
         lower_vertical_tics = torch.clamp(
             _WEAPON_LOWER_TICS - self.weapon_lower_cooldown,
             0,
@@ -3152,21 +4461,57 @@ class TorchDeathmatchEngine:
             self.weapon_raise_cooldown,
         )
         spawn_raise_tics = torch.clamp(
-            _WEAPON_RAISE_TICS - (self.episode_time - 1),
+            _WEAPON_SPAWN_RAISE_TICS - (self.episode_time - 1),
             0,
-            _WEAPON_RAISE_TICS,
+            _WEAPON_SPAWN_RAISE_TICS,
         )
         vertical_tics = torch.maximum(vertical_tics, spawn_raise_tics)
-        raise_pixels = torch.round(vertical_tics.to(torch.float32) * 6.0).to(torch.int64)
-        source_y = self._native_pixel_y.to(torch.int64) - raise_pixels[:, None, None]
-        valid = (source_y >= 0) & (source_y < self.native_view_height)
-        source_y = source_y.clamp(0, self.native_view_height - 1).expand(
-            -1, -1, self.native_screen_width
+        raise_pixels = torch.floor(
+            vertical_tics.to(torch.float32) * _WEAPON_VERTICAL_STEP_PIXELS
+        ).to(torch.int64)
+        ready = (
+            (self.weapon_state_cooldown <= 0)
+            & (self.weapon_raise_cooldown <= 0)
+            & (self.pending_weapon < 0)
         )
-        value = value.gather(1, source_y)
-        alpha = alpha.gather(1, source_y)
-        visible = valid & ~self.player_dead[:, None, None]
-        return torch.where(alpha & visible, value, frame)
+        motion_bob = torch.clamp(
+            (self.momentum_x * self.momentum_x + self.momentum_y * self.momentum_y) * 0.25,
+            0,
+            16,
+        )
+        bob_phase = self.episode_time.to(torch.float32) * (2.0 * math.pi / 64.0)
+        bob_x = torch.round(motion_bob * torch.cos(bob_phase)).to(torch.int64)
+        bob_y = torch.round(
+            motion_bob
+            * torch.sin(torch.remainder(bob_phase, math.pi))
+            * self.native_vertical_aspect
+        ).to(torch.int64)
+        bob_x = torch.where(ready, bob_x, torch.zeros_like(bob_x))
+        bob_y = torch.where(ready, bob_y, torch.zeros_like(bob_y))
+        value, alpha = self._native_shift_weapon_overlay(
+            value,
+            alpha,
+            bob_x,
+            raise_pixels + bob_y,
+        )
+        visible = ~self.player_dead[:, None, None]
+        frame = torch.where(alpha & visible, value, frame)
+
+        has_flash = flash_id >= 0
+        safe_flash_id = flash_id.clamp_min(0)
+        flash_value = self.map.native_weapon_frame_values[safe_flash_id]
+        flash_alpha = self.map.native_weapon_frame_alpha[safe_flash_id]
+        flash_value, flash_alpha = self._native_shift_weapon_overlay(
+            flash_value,
+            flash_alpha,
+            bob_x,
+            raise_pixels + bob_y,
+        )
+        return torch.where(
+            flash_alpha & has_flash[:, None, None] & visible,
+            flash_value,
+            frame,
+        )
 
     def _native_draw_hud_patch(
         self,
@@ -3218,8 +4563,29 @@ class TorchDeathmatchEngine:
             if character == "-":
                 x += digit_width
                 continue
-            self._native_draw_hud_patch(canvas, base + int(character), x, y)
+            patch = base + int(character)
+            glyph_x = x - int(self.map.hud_patch_left_offsets[patch].item())
+            glyph_y = y - int(self.map.hud_patch_top_offsets[patch].item())
+            self._native_draw_hud_patch(canvas, patch, glyph_x, glyph_y)
             x += digit_width
+
+    def _native_mugshot_patch_index(self, lane: int, health: int) -> int:
+        pain = max(0, min((100 - health) // 20, 4))
+        straight = int(self.mugshot_face_index[lane].item())
+        face_patch = 13 + pain * 3 + straight
+        if bool(self.mugshot_grin[lane]) and bool(self.bonus_count[lane] > 0):
+            face_patch = 64 + pain
+        elif bool(self.mugshot_pain_tics[lane] > 0):
+            if bool(self.mugshot_ouch[lane]):
+                face_patch = 59 + pain
+            else:
+                direction = int(self.mugshot_pain_direction[lane].item())
+                face_patch = (44, 49, 54)[direction] + pain
+        elif bool(self.attack_held_tics[lane] >= _MUGSHOT_RAMPAGE_DELAY):
+            face_patch = 49 + pain
+        if health <= 0:
+            face_patch = 69
+        return face_patch
 
     def _native_render_hud(self) -> torch.Tensor:
         hud = torch.zeros(
@@ -3233,7 +4599,7 @@ class TorchDeathmatchEngine:
             self._native_draw_hud_patch(canvas, 1, 104, 0)
             active_weapon = int(self._active_weapon()[lane].item())
             ammo_slot = int(self._weapon_ammo_slot[active_weapon].item())
-            ammo = 0 if ammo_slot < 0 else int(self.ammo[lane, ammo_slot].item())
+            ammo = 0 if ammo_slot < 0 else int(self.hud_ready_ammo[lane].item())
             health = int(self.health[lane].clamp(0, 999).item())
             armor = int(self.armor[lane].clamp(0, 999).item())
             self._native_draw_hud_number(canvas, ammo, 44, 3)
@@ -3241,14 +4607,14 @@ class TorchDeathmatchEngine:
             self._native_draw_hud_patch(canvas, 12, 90, 3)
             self._native_draw_hud_number(canvas, armor, 221, 3)
             self._native_draw_hud_patch(canvas, 12, 221, 3)
-            pain = max(0, min((100 - health) // 20, 4))
-            straight = int((self.episode_time[lane] // 17).remainder(3).item())
-            self._native_draw_hud_patch(canvas, 13 + pain * 3 + straight, 143, 0)
+            face_patch = self._native_mugshot_patch_index(lane, health)
+            self._native_draw_hud_patch(canvas, face_patch, 143, 0)
             for weapon_index, (x, y) in enumerate(
                 ((111, 4), (123, 4), (135, 4), (111, 14), (123, 14), (135, 14))
             ):
-                if bool(self.weapons[lane, weapon_index]):
-                    self._native_draw_hud_patch(canvas, 28 + weapon_index + 2, x, y)
+                owned = weapon_index < 5 and bool(self.weapons[lane, weapon_index + 1])
+                patch = 28 + weapon_index + 2 if owned else 38 + weapon_index
+                self._native_draw_hud_patch(canvas, patch, x, y)
             ammo_values = (
                 int(self.ammo[lane, 1].item()),
                 int(self.ammo[lane, 2].item()),
@@ -3268,17 +4634,24 @@ class TorchDeathmatchEngine:
 
         wall_distance = self._native_raycast()
         sector = self._current_sector()
-        view_z = self.z + _VIEW_HEIGHT
+        view_z = self.view_z
         frame, surface_depth = self._native_render_flats(sector, view_z)
-        frame = self._native_render_portal_walls(frame, view_z, surface_depth)
-        frame = self._native_render_sprites(frame, wall_distance, view_z)
+        frame, scene_depth = self._native_render_portal_walls(frame, view_z, surface_depth)
+        frame = self._native_render_sprites(frame, wall_distance, view_z, scene_depth)
         frame = self._native_render_weapon(frame)
         if include_hud:
             frame = torch.cat((frame, self._native_render_hud()), dim=1)
         rgb = self.map.playpal[frame.to(torch.int64)]
-        flash = self.damage_flash.clamp(0, 1)[:, None, None, None]
+        bonus = torch.minimum(
+            self.bonus_count.to(torch.float32) * 8.0, torch.full_like(self.health, 128.0)
+        )
+        bonus = (bonus / 255.0)[:, None, None, None]
+        gold = torch.tensor((215.0, 186.0, 69.0), device=self.device)
+        rgb = rgb.to(torch.float32) * (1 - bonus) + gold * bonus
+        flash = self._damage_to_alpha[self.damage_count.clamp(0, 113).to(torch.int64)] / 255.0
+        flash = flash[:, None, None, None]
         red = torch.tensor((255.0, 0.0, 0.0), device=self.device)
-        rgb = rgb.to(torch.float32) * (1 - flash * 0.35) + red * flash * 0.35
+        rgb = rgb * (1 - flash) + red * flash
         return rgb.clamp(0, 255).to(torch.uint8)
 
     def _update_signal_buffer(self) -> None:
