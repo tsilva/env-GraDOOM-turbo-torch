@@ -323,6 +323,33 @@ def test_enemy_projectile_only_passes_corpse_after_no_block_frame(
     assert engine.enemy_projectile_x[:, 0].tolist() == [-27.0, -12.0]
 
 
+def test_monster_hitscan_hits_intervening_voodoo_doll_without_player_thrust(
+    square_scenario,
+) -> None:
+    engine = _engine(square_scenario)
+    engine.x.fill_(-200)
+    engine.y.fill_(-128)
+    engine.z.zero_()
+    engine.enemy_alive.zero_()
+    engine.enemy_x[:, 0] = 0
+    engine.enemy_y[:, 0] = -128
+    engine.enemy_z[:, 0] = 0
+    engine.enemy_type[:, 0] = 0
+    engine.enemy_health[:, 0] = 20
+    engine.enemy_alive[:, 0] = True
+    engine.enemy_attack_phase[:, 0] = 1
+    engine.enemy_cooldown[:, 0] = 1
+
+    engine._enemy_tick()
+
+    # The first static Player 1 body at (-128, -128) intercepts both spread
+    # bullets before they can reach the controlled body at (-200, -128).
+    assert engine.health.tolist() == [91.0, 94.0]
+    assert torch.equal(engine.momentum_x, torch.zeros(2))
+    assert torch.equal(engine.momentum_y, torch.zeros(2))
+    assert engine.enemy_attack_phase[:, 0].tolist() == [2, 2]
+
+
 def test_reference_damage_and_pickup_flash_counters(square_scenario) -> None:
     engine = _engine(square_scenario)
     engine._apply_player_damage(torch.tensor([10.0, 25.0]))
@@ -1125,7 +1152,7 @@ def test_monster_hitscan_uses_independent_reference_pellets(square_scenario) -> 
         + (engine.y[:, None] - engine.enemy_y) ** 2
     ).clamp_min(1e-4)
 
-    damage = engine._enemy_hitscan_damage(
+    damage, _actual_player_damage = engine._enemy_hitscan_damage(
         engine.enemy_type.clamp_min(0),
         fires,
         distance,
@@ -1189,12 +1216,13 @@ def test_monster_spread_pellet_traces_its_own_blocking_linedef(
             torch.full_like(engine.z[:, None], 56.0),
         )
         assert torch.all(visible[:, 0])
-        return engine._enemy_hitscan_damage(
+        damage, _actual_player_damage = engine._enemy_hitscan_damage(
             engine.enemy_type.clamp_min(0),
             fires,
             distance,
             visible,
-        )[:, 0]
+        )
+        return damage[:, 0]
 
     clear_damage = shotgun_damage(square_scenario)
     blocked_damage = shotgun_damage(blocked_scenario)

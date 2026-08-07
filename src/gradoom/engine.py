@@ -5325,7 +5325,7 @@ class TorchDeathmatchEngine:
         )
         direct_attack &= distance < self._enemy_attack_range[enemy_type]
         hitscan_type = (enemy_type == 0) | (enemy_type == 1) | (enemy_type == 3)
-        hitscan_damage = self._enemy_hitscan_damage(
+        hitscan_damage, hitscan_actual_player_damage = self._enemy_hitscan_damage(
             enemy_type,
             direct_attack & hitscan_type,
             distance,
@@ -5348,7 +5348,7 @@ class TorchDeathmatchEngine:
             self.enemy_y,
         )
         hitscan_thrust_x, hitscan_thrust_y = self._player_damage_thrust_components(
-            hitscan_damage,
+            hitscan_actual_player_damage,
             self.enemy_x[:, :, None],
             self.enemy_y[:, :, None],
         )
