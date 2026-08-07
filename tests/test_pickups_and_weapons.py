@@ -529,11 +529,97 @@ def test_rocket_uses_delayed_projectile_impact_and_splash(square_scenario) -> No
         engine._projectile_tick(active)
 
     assert torch.all(engine.enemy_health[:, 0] < 500)
-    assert engine.health.tolist() == [36.0, 36.0]
+    assert engine.health.tolist() == [20.0, 20.0]
+    assert torch.equal(engine.momentum_x, torch.full((2,), -10.403167724609375))
+    assert torch.equal(engine.momentum_y, torch.zeros(2))
     assert torch.allclose(engine.projectile_x[:, 0], torch.full((2,), 190.0 / 3.0))
     assert not torch.any(engine.projectile_alive)
     assert engine.projectile_impact_type[:, 0].tolist() == [0, 0]
     assert engine.projectile_impact_tics[:, 0].tolist() == [18, 18]
+
+
+def test_rocket_radius_damage_uses_square_actor_bounds_and_height(square_scenario) -> None:
+    engine = _engine(square_scenario)
+
+    damage, points_fixed = engine._rocket_radius_damage(
+        torch.tensor([0.0, 0.0]),
+        torch.tensor([0.0, 0.0]),
+        torch.tensor([32.0, 100.0]),
+        torch.tensor([100.0, 0.0]),
+        torch.tensor([100.0, 0.0]),
+        torch.tensor([0.0, 0.0]),
+        torch.tensor([16.0, 16.0]),
+        torch.tensor([56.0, 56.0]),
+    )
+
+    # Doom uses max(abs(dx), abs(dy)) and subtracts the target radius, so the
+    # diagonal target takes the same 44 damage as an axial target at x=100.
+    # Above the target, distance begins at the top of its actor box (z=56).
+    assert damage.tolist() == [44.0, 84.0]
+    assert points_fixed.tolist() == [44 * 65536, 84 * 65536]
+
+
+def test_close_rocket_self_knockback_matches_vizdoom_oracle(square_scenario) -> None:
+    scenario = replace(
+        square_scenario,
+        blocking_segments=np.asarray([(-128.0, 10.0, 128.0, 10.0)], dtype=np.float32),
+    )
+    engine = _engine(scenario)
+    engine.enemy_alive.zero_()
+    engine.x.fill_(2.1013336181640625)
+    engine.y.fill_(-9.7767333984375)
+    engine.z.zero_()
+    engine.momentum_x.fill_(-0.4010772705078125)
+    engine.momentum_y.zero_()
+    engine.armor.fill_(200)
+    engine.armor_save_fraction.fill_(0.5)
+    engine.projectile_x[:, 0] = 0
+    engine.projectile_y[:, 0] = 0
+    engine.projectile_z[:, 0] = 32
+    engine.projectile_velocity_x[:, 0] = 0
+    engine.projectile_velocity_y[:, 0] = 20
+    engine.projectile_type[:, 0] = 0
+    engine.projectile_alive[:, 0] = True
+
+    engine._projectile_tick(torch.ones(2, dtype=torch.bool))
+
+    assert engine.health.tolist() == [36.0, 36.0]
+    assert engine.armor.tolist() == [136.0, 136.0]
+    assert torch.equal(engine.momentum_x, torch.full((2,), 3.0825042724609375))
+    assert torch.equal(engine.momentum_y, torch.full((2,), -16.268524169921875))
+    assert torch.equal(engine.velocity_z, torch.zeros(2))
+
+    engine.reaction_time.zero_()
+    engine._move_player(torch.zeros((2, 20), dtype=torch.bool))
+
+    assert torch.equal(engine.x, torch.full((2,), 5.183837890625))
+    assert torch.equal(engine.y, torch.full((2,), -26.045257568359375))
+    assert torch.equal(engine.momentum_x, torch.full((2,), 2.79351806640625))
+    assert torch.equal(engine.momentum_y, torch.full((2,), -14.743362426757812))
+
+
+def test_rocket_radius_thrust_can_launch_player_upward(square_scenario) -> None:
+    scenario = replace(
+        square_scenario,
+        blocking_segments=np.asarray([(-128.0, 10.0, 128.0, 10.0)], dtype=np.float32),
+    )
+    engine = _engine(scenario)
+    engine.enemy_alive.zero_()
+    engine.health.fill_(1000)
+    engine.x.fill_(2.1013336181640625)
+    engine.y.fill_(-9.7767333984375)
+    engine.z.zero_()
+    engine.projectile_x[:, 0] = 0
+    engine.projectile_y[:, 0] = 0
+    engine.projectile_z[:, 0] = 0
+    engine.projectile_velocity_x[:, 0] = 0
+    engine.projectile_velocity_y[:, 0] = 20
+    engine.projectile_type[:, 0] = 0
+    engine.projectile_alive[:, 0] = True
+
+    engine._projectile_tick(torch.ones(2, dtype=torch.bool))
+
+    assert torch.equal(engine.velocity_z, torch.full((2,), 14.33599853515625))
 
 
 def test_plasma_uses_delayed_projectile_without_splash(square_scenario) -> None:

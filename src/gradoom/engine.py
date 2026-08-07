@@ -19,12 +19,19 @@ _UINT32_MASK = (1 << 32) - 1
 _FIXED_UNIT = 1 << 16
 _FINE_ANGLES = 8192
 _FINE_ANGLE_SCALE = _FINE_ANGLES / (2.0 * math.pi)
+_ANGLE_45 = 1 << 29
+_ANGLE_90 = 1 << 30
+_ANGLE_180 = 1 << 31
+_ANGLE_270 = 3 << 30
+_ANGLE_TO_FINE_SHIFT = 19
+_SLOPE_RANGE = 2048
 _ENEMY_HEALTH = (20.0, 30.0, 100.0, 70.0, 150.0, 500.0)
 _ENEMY_STRIDE = (8.0, 8.0, 8.0, 8.0, 10.0, 8.0)
 _ENEMY_MOVE_INTERVAL = (4, 3, 4, 3, 2, 3)
 _ENEMY_WALK_FRAME_TICS = (8, 6, 4, 6, 4, 6)
 _ENEMY_RADIUS = (20.0, 20.0, 20.0, 20.0, 30.0, 24.0)
 _ENEMY_HEIGHT = (56.0, 56.0, 56.0, 56.0, 56.0, 64.0)
+_ENEMY_MASS = (100.0, 100.0, 100.0, 100.0, 400.0, 1000.0)
 _ENEMY_ATTACK_RANGE = (2048.0, 2048.0, 64.0, 2048.0, 64.0, 2048.0)
 _ENEMY_ATTACK_PREFIRE = (10, 10, 4, 10, 16, 16)
 _ENEMY_ATTACK_RECOVERY = (16, 20, 4, 4, 8, 8)
@@ -41,12 +48,18 @@ _PLAYER_RUN_FORWARD_ACCELERATION_FIXED = 50 << 11
 _PLAYER_SIDE_ACCELERATION_FIXED = 24 << 11
 _PLAYER_RUN_SIDE_ACCELERATION_FIXED = 40 << 11
 _PLAYER_FRICTION_FIXED = 0xE800
+_ACTOR_STOP_SPEED_FIXED = _FIXED_UNIT // 16
 _PLAYER_AIR_CONTROL_FIXED = 0x0100
 _PLAYER_AIR_FRICTION_FIXED = _FIXED_UNIT
 _PLAYER_TURN_DEGREES = 3.515625
 _PLAYER_MOVE_BOB_FIXED = _FIXED_UNIT // 4
 _PLAYER_MAX_BOB_FIXED = 16 * _FIXED_UNIT
 _PLAYER_VIEW_BOB_PERIOD_TICS = 20
+_PLAYER_DAMAGE_THRUST_PER_POINT_FIXED = _FIXED_UNIT // 8
+_PLAYER_MAX_DAMAGE_THRUST_FIXED = 32 * _FIXED_UNIT
+_PLAYER_RADIUS_THRUST_DENOMINATOR_FIXED = 200 * _FIXED_UNIT
+_PLAYER_SELF_RADIUS_VERTICAL_THRUST_DENOMINATOR_FIXED = 1000 * _FIXED_UNIT
+_ROCKET_SPLASH_DAMAGE = 128.0
 _WEAPON_LOWER_TICS = 16
 _WEAPON_RAISE_TICS = 16
 _WEAPON_SPAWN_RAISE_TICS = 14
@@ -214,7 +227,15 @@ def _build_fine_sine_fixed() -> np.ndarray:
     return table
 
 
+def _build_tangent_to_angle() -> np.ndarray:
+    """Reproduce the unsigned angle table used by Doom's R_PointToAngle2."""
+    slope = np.arange(_SLOPE_RANGE + 1, dtype=np.float64) / _SLOPE_RANGE
+    fraction = np.arctan(slope) / (2.0 * math.pi)
+    return np.trunc(((1 << 32) - 1) * fraction).astype(np.int64)
+
+
 _FINE_SINE_FIXED = _build_fine_sine_fixed()
+_TANGENT_TO_ANGLE = _build_tangent_to_angle()
 _ITEM_SPRITE_INDEX = {
     2011: 6,
     2012: 7,
@@ -853,6 +874,18 @@ class TorchDeathmatchEngine:
         self.enemy_y = torch.zeros((n, self.enemy_slots), device=device)
         self.enemy_z = torch.zeros((n, self.enemy_slots), device=device)
         self.enemy_angle = torch.zeros((n, self.enemy_slots), device=device)
+        self._enemy_x_fixed = torch.zeros(
+            (n, self.enemy_slots), device=device, dtype=torch.int64
+        )
+        self._enemy_y_fixed = torch.zeros(
+            (n, self.enemy_slots), device=device, dtype=torch.int64
+        )
+        self._enemy_momentum_x_fixed = torch.zeros(
+            (n, self.enemy_slots), device=device, dtype=torch.int64
+        )
+        self._enemy_momentum_y_fixed = torch.zeros(
+            (n, self.enemy_slots), device=device, dtype=torch.int64
+        )
         self.enemy_type = torch.full((n, self.enemy_slots), -1, device=device, dtype=torch.int64)
         self.enemy_health = torch.zeros((n, self.enemy_slots), device=device)
         self.enemy_alive = torch.zeros((n, self.enemy_slots), device=device, dtype=torch.bool)
@@ -936,6 +969,7 @@ class TorchDeathmatchEngine:
         )
         self._enemy_radius = torch.tensor(_ENEMY_RADIUS, device=device)
         self._enemy_height = torch.tensor(_ENEMY_HEIGHT, device=device)
+        self._enemy_mass = torch.tensor(_ENEMY_MASS, device=device)
         self._enemy_attack_range = torch.tensor(_ENEMY_ATTACK_RANGE, device=device)
         self._enemy_attack_prefire = torch.tensor(
             _ENEMY_ATTACK_PREFIRE, device=device, dtype=torch.int32
@@ -977,6 +1011,11 @@ class TorchDeathmatchEngine:
         )
         self._fine_sine_fixed = torch.as_tensor(
             _FINE_SINE_FIXED,
+            device=device,
+            dtype=torch.int64,
+        )
+        self._tangent_to_angle = torch.as_tensor(
+            _TANGENT_TO_ANGLE,
             device=device,
             dtype=torch.int64,
         )
@@ -1028,6 +1067,71 @@ class TorchDeathmatchEngine:
     @staticmethod
     def _wrap_angle(angle: torch.Tensor) -> torch.Tensor:
         return torch.remainder(angle + math.pi, 2 * math.pi) - math.pi
+
+    def _doom_fine_angle(
+        self,
+        delta_x_fixed: torch.Tensor,
+        delta_y_fixed: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return R_PointToAngle2's 13-bit fine-angle result on device."""
+
+        def slope_div(numerator: torch.Tensor, denominator: torch.Tensor) -> torch.Tensor:
+            use_lookup = denominator >= 512
+            divisor = torch.where(
+                use_lookup,
+                denominator >> 8,
+                torch.ones_like(denominator),
+            )
+            index = torch.div(
+                numerator << 3,
+                divisor,
+                rounding_mode="trunc",
+            ).clamp_max(_SLOPE_RANGE)
+            return torch.where(
+                use_lookup,
+                self._tangent_to_angle[index],
+                torch.full_like(index, _ANGLE_45 - 1),
+            )
+
+        x_positive = delta_x_fixed >= 0
+        y_positive = delta_y_fixed >= 0
+        absolute_x = delta_x_fixed.abs()
+        absolute_y = delta_y_fixed.abs()
+        x_dominant = absolute_x > absolute_y
+        shallow = slope_div(absolute_y, absolute_x)
+        steep = slope_div(absolute_x, absolute_y)
+
+        first_quadrant = torch.where(
+            x_dominant,
+            shallow,
+            _ANGLE_90 - 1 - steep,
+        )
+        fourth_quadrant = torch.where(
+            x_dominant,
+            -shallow,
+            _ANGLE_270 + steep,
+        )
+        second_quadrant = torch.where(
+            x_dominant,
+            _ANGLE_180 - 1 - shallow,
+            _ANGLE_90 + steep,
+        )
+        third_quadrant = torch.where(
+            x_dominant,
+            _ANGLE_180 + shallow,
+            _ANGLE_270 - 1 - steep,
+        )
+        angle = torch.where(
+            x_positive,
+            torch.where(y_positive, first_quadrant, fourth_quadrant),
+            torch.where(y_positive, second_quadrant, third_quadrant),
+        )
+        angle = torch.where(
+            (delta_x_fixed == 0) & (delta_y_fixed == 0),
+            torch.zeros_like(angle),
+            angle,
+        )
+        return (angle & _UINT32_MASK) >> _ANGLE_TO_FINE_SHIFT
 
     def reset(self, mask: torch.Tensor, seeds: torch.Tensor) -> torch.Tensor:
         if mask.dtype != torch.bool or mask.shape != (self.num_envs,):
@@ -1137,6 +1241,10 @@ class TorchDeathmatchEngine:
         self.enemy_y[mask] = 0
         self.enemy_z[mask] = 0
         self.enemy_angle[mask] = 0
+        self._enemy_x_fixed[mask] = 0
+        self._enemy_y_fixed[mask] = 0
+        self._enemy_momentum_x_fixed[mask] = 0
+        self._enemy_momentum_y_fixed[mask] = 0
         self.enemy_type[mask] = -1
         self.enemy_health[mask] = 0
         self.enemy_alive[mask] = False
@@ -1789,6 +1897,16 @@ class TorchDeathmatchEngine:
         old_animation_tics = self.enemy_animation_tics[row, slot]
         self.enemy_x[row, slot] = torch.where(spawn, x, old_x)
         self.enemy_y[row, slot] = torch.where(spawn, y, old_y)
+        self._enemy_x_fixed[row, slot] = torch.where(
+            spawn,
+            torch.round(x * _FIXED_UNIT).to(torch.int64),
+            self._enemy_x_fixed[row, slot],
+        )
+        self._enemy_y_fixed[row, slot] = torch.where(
+            spawn,
+            torch.round(y * _FIXED_UNIT).to(torch.int64),
+            self._enemy_y_fixed[row, slot],
+        )
         spawn_sector = self._sector_at(x, y)
         spawn_z = self.map.sector_heights[spawn_sector, 0]
         self.enemy_z[row, slot] = torch.where(spawn, spawn_z, old_z)
@@ -1814,6 +1932,16 @@ class TorchDeathmatchEngine:
             spawn,
             torch.zeros_like(old_animation_tics),
             old_animation_tics,
+        )
+        self._enemy_momentum_x_fixed[row, slot] = torch.where(
+            spawn,
+            torch.zeros_like(self._enemy_momentum_x_fixed[row, slot]),
+            self._enemy_momentum_x_fixed[row, slot],
+        )
+        self._enemy_momentum_y_fixed[row, slot] = torch.where(
+            spawn,
+            torch.zeros_like(self._enemy_momentum_y_fixed[row, slot]),
+            self._enemy_momentum_y_fixed[row, slot],
         )
         self.enemy_death_type[row, slot] = torch.where(
             spawn,
@@ -1848,14 +1976,93 @@ class TorchDeathmatchEngine:
             requested = check & (roll <= self._enemy_spawn_threshold[enemy_type])
             self._spawn_enemy_type(enemy_type, requested)
 
+    def _add_player_thrust_fixed(
+        self,
+        thrust_x_fixed: torch.Tensor,
+        thrust_y_fixed: torch.Tensor,
+    ) -> None:
+        # Tests and advanced callers can alter the public tensors directly.
+        # Retain invisible low bits whenever the visible mirrors still match.
+        visible_momentum_x = self._momentum_x_fixed.to(torch.float32) / _FIXED_UNIT
+        visible_momentum_y = self._momentum_y_fixed.to(torch.float32) / _FIXED_UNIT
+        self._momentum_x_fixed.copy_(
+            torch.where(
+                self.momentum_x != visible_momentum_x,
+                torch.round(self.momentum_x * _FIXED_UNIT).to(torch.int64),
+                self._momentum_x_fixed,
+            )
+        )
+        self._momentum_y_fixed.copy_(
+            torch.where(
+                self.momentum_y != visible_momentum_y,
+                torch.round(self.momentum_y * _FIXED_UNIT).to(torch.int64),
+                self._momentum_y_fixed,
+            )
+        )
+        self._momentum_x_fixed.add_(thrust_x_fixed)
+        self._momentum_y_fixed.add_(thrust_y_fixed)
+        self.momentum_x.copy_(self._momentum_x_fixed.to(torch.float32) / _FIXED_UNIT)
+        self.momentum_y.copy_(self._momentum_y_fixed.to(torch.float32) / _FIXED_UNIT)
+
+    def _player_damage_thrust_components(
+        self,
+        incoming: torch.Tensor,
+        attacker_x: torch.Tensor,
+        attacker_y: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        player_shape = (self.num_envs,) + (1,) * (incoming.ndim - 1)
+        player_x = self.x.reshape(player_shape)
+        player_y = self.y.reshape(player_shape)
+        fine_angle = self._doom_fine_angle(
+            torch.round((player_x - attacker_x) * _FIXED_UNIT).to(torch.int64),
+            torch.round((player_y - attacker_y) * _FIXED_UNIT).to(torch.int64),
+        )
+        sine_fixed = self._fine_sine_fixed[fine_angle]
+        cosine_fixed = self._fine_sine_fixed[
+            (fine_angle + _FINE_ANGLES // 4) & (_FINE_ANGLES - 1)
+        ]
+        thrust_fixed = (
+            torch.floor(incoming).to(torch.int64)
+            * _PLAYER_DAMAGE_THRUST_PER_POINT_FIXED
+        ).clamp(0, _PLAYER_MAX_DAMAGE_THRUST_FIXED)
+        return (
+            thrust_fixed * cosine_fixed >> 16,
+            thrust_fixed * sine_fixed >> 16,
+        )
+
     def _apply_player_damage(
         self,
         incoming: torch.Tensor,
         attacker_x: torch.Tensor | None = None,
         attacker_y: torch.Tensor | None = None,
+        *,
+        thrust_x_fixed: torch.Tensor | None = None,
+        thrust_y_fixed: torch.Tensor | None = None,
+        armor_absorb_request: torch.Tensor | None = None,
     ) -> None:
         incoming = torch.floor(incoming)
-        absorbed = torch.floor(incoming * self.armor_save_fraction)
+        if attacker_x is not None and attacker_y is not None:
+            # P_DamageMobj applies thrust before armor absorption. DoomPlayer's
+            # mass and Doom's default monster kickback are both 100, reducing
+            # the reference formula to one eighth of a map unit per damage
+            # point, capped at 32 units/tic.
+            attacker_bearing = torch.atan2(attacker_y - self.y, attacker_x - self.x)
+            if thrust_x_fixed is None or thrust_y_fixed is None:
+                thrust_x_fixed, thrust_y_fixed = self._player_damage_thrust_components(
+                    incoming,
+                    attacker_x,
+                    attacker_y,
+                )
+            self._add_player_thrust_fixed(
+                thrust_x_fixed,
+                thrust_y_fixed,
+            )
+
+        absorbed = (
+            torch.floor(incoming * self.armor_save_fraction)
+            if armor_absorb_request is None
+            else armor_absorb_request
+        )
         absorbed = torch.minimum(self.armor, absorbed)
         self.armor.sub_(absorbed)
         self.armor_save_fraction.copy_(
@@ -1873,7 +2080,7 @@ class TorchDeathmatchEngine:
             direction = torch.ones_like(self.mugshot_pain_direction)
         else:
             relative = self._wrap_angle(
-                torch.atan2(attacker_y - self.y, attacker_x - self.x) - self.angle
+                attacker_bearing - self.angle
             )
             direction = torch.where(
                 relative > math.pi / 4,
@@ -2296,8 +2503,72 @@ class TorchDeathmatchEngine:
         add_dice(7, 1, 8, 5.0)
         return damage
 
-    def _apply_enemy_damage(self, damage: torch.Tensor) -> torch.Tensor:
+    def _enemy_damage_thrust_components(
+        self,
+        damage: torch.Tensor,
+        attacker_x: torch.Tensor,
+        attacker_y: torch.Tensor,
+        kickback: torch.Tensor | float = 100.0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        enemy_type = self.enemy_type.clamp_min(0)
+        fine_angle = self._doom_fine_angle(
+            torch.round((self.enemy_x - attacker_x) * _FIXED_UNIT).to(torch.int64),
+            torch.round((self.enemy_y - attacker_y) * _FIXED_UNIT).to(torch.int64),
+        )
+        sine_fixed = self._fine_sine_fixed[fine_angle]
+        cosine_fixed = self._fine_sine_fixed[
+            (fine_angle + _FINE_ANGLES // 4) & (_FINE_ANGLES - 1)
+        ]
+        kickback_tensor = torch.as_tensor(
+            kickback,
+            device=self.device,
+            dtype=damage.dtype,
+        )
+        thrust_fixed = torch.round(
+            damage
+            * (0.125 * _FIXED_UNIT)
+            * kickback_tensor
+            / self._enemy_mass[enemy_type]
+        ).to(torch.int64)
+        thrust_fixed.clamp_(0, _PLAYER_MAX_DAMAGE_THRUST_FIXED)
+        return (
+            thrust_fixed * cosine_fixed >> 16,
+            thrust_fixed * sine_fixed >> 16,
+        )
+
+    def _apply_enemy_damage(
+        self,
+        damage: torch.Tensor,
+        attacker_x: torch.Tensor | None = None,
+        attacker_y: torch.Tensor | None = None,
+        *,
+        kickback: torch.Tensor | float = 100.0,
+        thrust_x_fixed: torch.Tensor | None = None,
+        thrust_y_fixed: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         applied = torch.where(self.enemy_alive, damage, torch.zeros_like(damage))
+        if attacker_x is not None and attacker_y is not None:
+            if thrust_x_fixed is None or thrust_y_fixed is None:
+                thrust_x_fixed, thrust_y_fixed = self._enemy_damage_thrust_components(
+                    applied,
+                    attacker_x,
+                    attacker_y,
+                    kickback,
+                )
+            self._enemy_momentum_x_fixed.add_(
+                torch.where(
+                    self.enemy_alive,
+                    thrust_x_fixed,
+                    torch.zeros_like(thrust_x_fixed),
+                )
+            )
+            self._enemy_momentum_y_fixed.add_(
+                torch.where(
+                    self.enemy_alive,
+                    thrust_y_fixed,
+                    torch.zeros_like(thrust_y_fixed),
+                )
+            )
         previous = self.enemy_health.clone()
         updated = torch.clamp_min(previous - applied, 0)
         self.enemy_health.copy_(torch.where(self.enemy_alive, updated, previous))
@@ -2424,6 +2695,52 @@ class TorchDeathmatchEngine:
         )
         self.projectile_alive[row, slot] |= spawn
 
+    @staticmethod
+    def _rocket_radius_damage(
+        bomb_x: torch.Tensor,
+        bomb_y: torch.Tensor,
+        bomb_z: torch.Tensor,
+        target_x: torch.Tensor,
+        target_y: torch.Tensor,
+        target_z: torch.Tensor,
+        target_radius: torch.Tensor,
+        target_height: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return Doom radius damage and 16.16 pre-truncation points."""
+        delta_x = (bomb_x - target_x).abs()
+        delta_y = (bomb_y - target_y).abs()
+        horizontal = torch.maximum(delta_x, delta_y)
+        horizontal_from_box = torch.clamp_min(horizontal - target_radius, 0)
+        target_top = target_z + target_height
+        inside_target_height = (bomb_z >= target_z) & (bomb_z < target_top)
+        vertical_distance = torch.where(
+            bomb_z > target_z,
+            bomb_z - target_top,
+            target_z - bomb_z,
+        ).clamp_min(0)
+        outside_distance = torch.where(
+            horizontal <= target_radius,
+            vertical_distance,
+            torch.sqrt(
+                horizontal_from_box * horizontal_from_box
+                + vertical_distance * vertical_distance
+            ),
+        )
+        distance = torch.where(
+            inside_target_height,
+            horizontal_from_box,
+            outside_distance,
+        )
+        points = torch.clamp(
+            _ROCKET_SPLASH_DAMAGE - distance,
+            0,
+            _ROCKET_SPLASH_DAMAGE,
+        )
+        return (
+            torch.floor(points),
+            torch.round(points * _FIXED_UNIT).to(torch.int64),
+        )
+
     def _projectile_tick(self, active: torch.Tensor) -> torch.Tensor:
         self.projectile_impact_tics.copy_(
             torch.where(
@@ -2543,21 +2860,104 @@ class TorchDeathmatchEngine:
         damage_by_enemy = torch.zeros_like(self.enemy_health)
         damage_by_enemy.scatter_add_(1, nearest_enemy, direct_damage)
 
-        dx = current_x[:, :, None] - self.enemy_x[:, None, :]
-        dy = current_y[:, :, None] - self.enemy_y[:, None, :]
-        enemy_distance = torch.sqrt(dx * dx + dy * dy)
         rocket_impact = impact & (self.projectile_type == 0)
-        splash = torch.clamp_min(128.0 - enemy_distance, 0)
-        splash *= rocket_impact[:, :, None].to(torch.float32)
-        damage_by_enemy.add_(torch.sum(splash, dim=1))
-        player_distance = torch.sqrt(
-            (current_x - self.x[:, None]) ** 2 + (current_y - self.y[:, None]) ** 2
+        splash_damage, _enemy_splash_points_fixed = self._rocket_radius_damage(
+            current_x[:, :, None],
+            current_y[:, :, None],
+            current_z[:, :, None],
+            self.enemy_x[:, None, :],
+            self.enemy_y[:, None, :],
+            self.enemy_z[:, None, :],
+            self._enemy_radius[enemy_type][:, None, :],
+            self._enemy_height[enemy_type][:, None, :],
         )
-        self_damage = torch.sum(
-            torch.clamp_min(128.0 - player_distance, 0) * rocket_impact.to(torch.float32),
+        splash_damage *= (
+            rocket_impact[:, :, None] & self.enemy_alive[:, None, :]
+        ).to(torch.float32)
+        damage_by_enemy.add_(torch.sum(splash_damage, dim=1))
+
+        player_splash_damage, player_splash_points_fixed = self._rocket_radius_damage(
+            current_x,
+            current_y,
+            current_z,
+            self.x[:, None],
+            self.y[:, None],
+            self.z[:, None],
+            torch.full_like(current_x, _PLAYER_RADIUS),
+            torch.full_like(current_x, _PLAYER_HEIGHT),
+        )
+        visible_to_player = ~self._line_blocked(
+            current_x,
+            current_y,
+            self.x[:, None],
+            self.y[:, None],
+        )
+        player_splash = rocket_impact & visible_to_player
+        player_splash_damage *= player_splash.to(torch.float32)
+        player_splash_points_fixed *= player_splash.to(torch.int64)
+        self_damage = torch.sum(player_splash_damage, dim=1)
+
+        player_fine_angle = self._doom_fine_angle(
+            torch.round((self.x[:, None] - current_x) * _FIXED_UNIT).to(torch.int64),
+            torch.round((self.y[:, None] - current_y) * _FIXED_UNIT).to(torch.int64),
+        )
+        player_sine_fixed = self._fine_sine_fixed[player_fine_angle]
+        player_cosine_fixed = self._fine_sine_fixed[
+            (player_fine_angle + _FINE_ANGLES // 4) & (_FINE_ANGLES - 1)
+        ]
+        direct_thrust_fixed = (
+            player_splash_damage.to(torch.int64) * _PLAYER_DAMAGE_THRUST_PER_POINT_FIXED
+        ).clamp(0, _PLAYER_MAX_DAMAGE_THRUST_FIXED)
+        radius_thrust_x_fixed = torch.div(
+            player_cosine_fixed * player_splash_points_fixed,
+            _PLAYER_RADIUS_THRUST_DENOMINATOR_FIXED,
+            rounding_mode="trunc",
+        )
+        radius_thrust_y_fixed = torch.div(
+            player_sine_fixed * player_splash_points_fixed,
+            _PLAYER_RADIUS_THRUST_DENOMINATOR_FIXED,
+            rounding_mode="trunc",
+        )
+        player_center_delta_z_fixed = torch.round(
+            (self.z[:, None] + _PLAYER_HEIGHT * 0.5 - current_z) * _FIXED_UNIT
+        ).to(torch.int64)
+        radius_thrust_z_fixed = torch.div(
+            player_center_delta_z_fixed * player_splash_points_fixed * 4,
+            _PLAYER_SELF_RADIUS_VERTICAL_THRUST_DENOMINATOR_FIXED,
+            rounding_mode="trunc",
+        )
+        self._add_player_thrust_fixed(
+            torch.sum(
+                (direct_thrust_fixed * player_cosine_fixed >> 16)
+                + radius_thrust_x_fixed,
+                dim=1,
+            ),
+            torch.sum(
+                (direct_thrust_fixed * player_sine_fixed >> 16)
+                + radius_thrust_y_fixed,
+                dim=1,
+            ),
+        )
+        next_velocity_z = self.velocity_z + torch.sum(
+            radius_thrust_z_fixed,
             dim=1,
+        ).to(torch.float32) / _FIXED_UNIT
+        self.velocity_z.copy_(
+            torch.where(
+                (self.z <= self.player_floor_z) & (next_velocity_z < 0),
+                torch.zeros_like(next_velocity_z),
+                next_velocity_z,
+            )
         )
-        self._apply_player_damage(self_damage)
+        self._apply_player_damage(
+            self_damage,
+            armor_absorb_request=torch.sum(
+                torch.floor(
+                    player_splash_damage * self.armor_save_fraction[:, None]
+                ),
+                dim=1,
+            ),
+        )
         reward = self._apply_enemy_damage(damage_by_enemy)
 
         self.projectile_x.copy_(torch.where(alive, current_x, self.projectile_x))
@@ -2778,7 +3178,17 @@ class TorchDeathmatchEngine:
             torch.where(hits_enemy, damage, torch.zeros_like(damage))[:, None],
         )
         self._apply_player_damage(torch.where(hits_doll, damage, torch.zeros_like(damage)))
-        return self._apply_enemy_damage(damage_by_enemy)
+        weapon_kickback = torch.where(
+            weapon == 1,
+            torch.zeros_like(damage),
+            torch.full_like(damage, 100.0),
+        )
+        return self._apply_enemy_damage(
+            damage_by_enemy,
+            self.x[:, None],
+            self.y[:, None],
+            kickback=weapon_kickback[:, None],
+        )
 
     def _enemy_damage_roll(
         self,
@@ -2972,18 +3382,37 @@ class TorchDeathmatchEngine:
         mixed = random_bits ^ (slot_bits * _HASH_GOLDEN_RATIO_SIGNED)
         mixed ^= mixed >> 16
         damage = (torch.remainder(mixed, 8).to(torch.float32) + 1) * 8.0
-        incoming = torch.sum(
-            torch.where(player_impact, damage, torch.zeros_like(damage)),
+        damage_by_projectile = torch.where(
+            player_impact,
+            damage,
+            torch.zeros_like(damage),
+        )
+        incoming = torch.sum(damage_by_projectile, dim=1)
+        damaging_slot = torch.argmax(
+            damage_by_projectile,
             dim=1,
         )
-        damaging_slot = torch.argmax(
-            torch.where(player_impact, damage, torch.zeros_like(damage)), dim=1
+        thrust_x_by_projectile, thrust_y_by_projectile = (
+            self._player_damage_thrust_components(
+                damage_by_projectile,
+                current_x,
+                current_y,
+            )
+        )
+        armor_absorb_request = torch.sum(
+            torch.floor(
+                damage_by_projectile * self.armor_save_fraction[:, None]
+            ),
+            dim=1,
         )
         row = torch.arange(self.num_envs, device=self.device)
         self._apply_player_damage(
             incoming,
             current_x[row, damaging_slot],
             current_y[row, damaging_slot],
+            thrust_x_fixed=torch.sum(thrust_x_by_projectile, dim=1),
+            thrust_y_fixed=torch.sum(thrust_y_by_projectile, dim=1),
+            armor_absorb_request=armor_absorb_request,
         )
         self.enemy_projectile_x.copy_(
             torch.where(alive, current_x, self.enemy_projectile_x)
@@ -3004,9 +3433,108 @@ class TorchDeathmatchEngine:
         )
         self.enemy_projectile_alive &= ~impact
 
+    def _move_enemy_thrust(self, active: torch.Tensor) -> None:
+        visible_x = self._enemy_x_fixed.to(torch.float32) / _FIXED_UNIT
+        visible_y = self._enemy_y_fixed.to(torch.float32) / _FIXED_UNIT
+        self._enemy_x_fixed.copy_(
+            torch.where(
+                self.enemy_x != visible_x,
+                torch.round(self.enemy_x * _FIXED_UNIT).to(torch.int64),
+                self._enemy_x_fixed,
+            )
+        )
+        self._enemy_y_fixed.copy_(
+            torch.where(
+                self.enemy_y != visible_y,
+                torch.round(self.enemy_y * _FIXED_UNIT).to(torch.int64),
+                self._enemy_y_fixed,
+            )
+        )
+        actor_exists = active[:, None] & (
+            self.enemy_alive
+            | ((self.enemy_death_type >= 0) & (self.enemy_death_tics > 0))
+        )
+        actor_type = torch.where(
+            self.enemy_type >= 0,
+            self.enemy_type,
+            self.enemy_death_type,
+        ).clamp_min(0)
+        proposed_x_fixed = self._enemy_x_fixed + torch.where(
+            actor_exists,
+            self._enemy_momentum_x_fixed,
+            torch.zeros_like(self._enemy_momentum_x_fixed),
+        )
+        proposed_y_fixed = self._enemy_y_fixed + torch.where(
+            actor_exists,
+            self._enemy_momentum_y_fixed,
+            torch.zeros_like(self._enemy_momentum_y_fixed),
+        )
+        proposed_x = proposed_x_fixed.to(torch.float32) / _FIXED_UNIT
+        proposed_y = proposed_y_fixed.to(torch.float32) / _FIXED_UNIT
+        proposed_sector = self._sector_at(
+            proposed_x.reshape(-1),
+            proposed_y.reshape(-1),
+        ).reshape_as(proposed_x)
+        collision = actor_exists & self._enemy_collides(
+            proposed_x,
+            proposed_y,
+            actor_type,
+            proposed_sector,
+        )
+        moved = actor_exists & ~collision
+        self._enemy_x_fixed.copy_(
+            torch.where(moved, proposed_x_fixed, self._enemy_x_fixed)
+        )
+        self._enemy_y_fixed.copy_(
+            torch.where(moved, proposed_y_fixed, self._enemy_y_fixed)
+        )
+        self.enemy_x.copy_(self._enemy_x_fixed.to(torch.float32) / _FIXED_UNIT)
+        self.enemy_y.copy_(self._enemy_y_fixed.to(torch.float32) / _FIXED_UNIT)
+        self.enemy_z.copy_(
+            torch.where(
+                moved,
+                self.map.sector_heights[proposed_sector, 0],
+                self.enemy_z,
+            )
+        )
+
+        retained_x = torch.where(
+            moved,
+            self._enemy_momentum_x_fixed,
+            torch.zeros_like(self._enemy_momentum_x_fixed),
+        )
+        retained_y = torch.where(
+            moved,
+            self._enemy_momentum_y_fixed,
+            torch.zeros_like(self._enemy_momentum_y_fixed),
+        )
+        stopped = (
+            (retained_x > -_ACTOR_STOP_SPEED_FIXED)
+            & (retained_x < _ACTOR_STOP_SPEED_FIXED)
+            & (retained_y > -_ACTOR_STOP_SPEED_FIXED)
+            & (retained_y < _ACTOR_STOP_SPEED_FIXED)
+        )
+        next_x = torch.where(
+            stopped,
+            torch.zeros_like(retained_x),
+            retained_x * _PLAYER_FRICTION_FIXED >> 16,
+        )
+        next_y = torch.where(
+            stopped,
+            torch.zeros_like(retained_y),
+            retained_y * _PLAYER_FRICTION_FIXED >> 16,
+        )
+        self._enemy_momentum_x_fixed.copy_(
+            torch.where(actor_exists, next_x, torch.zeros_like(next_x))
+        )
+        self._enemy_momentum_y_fixed.copy_(
+            torch.where(actor_exists, next_y, torch.zeros_like(next_y))
+        )
+
     def _enemy_tick(self, active: torch.Tensor | None = None) -> None:
         if active is None:
             active = torch.ones(self.num_envs, device=self.device, dtype=torch.bool)
+        self._move_enemy_thrust(active)
         in_pain = self.enemy_alive & active[:, None] & (self.enemy_pain_tics > 0)
         self.enemy_pain_tics.copy_(
             torch.where(
@@ -3064,11 +3592,23 @@ class TorchDeathmatchEngine:
         damage_by_attacker = self._enemy_damage_roll(enemy_type, direct_attack, distance)
         incoming = torch.sum(damage_by_attacker, dim=1)
         damaging_slot = torch.argmax(damage_by_attacker, dim=1)
+        thrust_x_by_attacker, thrust_y_by_attacker = self._player_damage_thrust_components(
+            damage_by_attacker,
+            self.enemy_x,
+            self.enemy_y,
+        )
+        armor_absorb_request = torch.sum(
+            torch.floor(damage_by_attacker * self.armor_save_fraction[:, None]),
+            dim=1,
+        )
         row = torch.arange(self.num_envs, device=self.device)
         self._apply_player_damage(
             incoming,
             self.enemy_x[row, damaging_slot],
             self.enemy_y[row, damaging_slot],
+            thrust_x_fixed=torch.sum(thrust_x_by_attacker, dim=1),
+            thrust_y_fixed=torch.sum(thrust_y_by_attacker, dim=1),
+            armor_absorb_request=armor_absorb_request,
         )
 
         next_cooldown = torch.where(
@@ -3207,11 +3747,40 @@ class TorchDeathmatchEngine:
         )
         self.enemy_x.copy_(torch.where(collision, self.enemy_x, proposed_x))
         self.enemy_y.copy_(torch.where(collision, self.enemy_y, proposed_y))
+        ai_moved = moving & ~collision
+        self._enemy_x_fixed.copy_(
+            torch.where(
+                ai_moved,
+                torch.round(self.enemy_x * _FIXED_UNIT).to(torch.int64),
+                self._enemy_x_fixed,
+            )
+        )
+        self._enemy_y_fixed.copy_(
+            torch.where(
+                ai_moved,
+                torch.round(self.enemy_y * _FIXED_UNIT).to(torch.int64),
+                self._enemy_y_fixed,
+            )
+        )
+        self.enemy_x.copy_(
+            torch.where(
+                ai_moved,
+                self._enemy_x_fixed.to(torch.float32) / _FIXED_UNIT,
+                self.enemy_x,
+            )
+        )
+        self.enemy_y.copy_(
+            torch.where(
+                ai_moved,
+                self._enemy_y_fixed.to(torch.float32) / _FIXED_UNIT,
+                self.enemy_y,
+            )
+        )
         proposed_z = self.map.sector_heights[proposed_sector, 0]
-        self.enemy_z.copy_(torch.where(moving & ~collision, proposed_z, self.enemy_z))
+        self.enemy_z.copy_(torch.where(ai_moved, proposed_z, self.enemy_z))
         self.enemy_angle.copy_(
             torch.where(
-                moving & ~collision,
+                ai_moved,
                 torch.atan2(direction_y, direction_x),
                 self.enemy_angle,
             )

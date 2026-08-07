@@ -184,6 +184,85 @@ def test_reference_damage_and_pickup_flash_counters(square_scenario) -> None:
     assert pickup_engine.bonus_count.tolist() == [6, 6]
 
 
+def test_player_damage_thrust_matches_vizdoom_fixed_point_oracle(square_scenario) -> None:
+    engine = _engine(square_scenario)
+    engine.x.zero_()
+    engine.y.zero_()
+    engine.momentum_x.zero_()
+    engine.momentum_y.zero_()
+    engine.armor[1] = 200
+    engine.armor_save_fraction[1] = 0.5
+    attacker_x = torch.full((2,), -58.794921875)
+    attacker_y = torch.full((2,), 37.7698974609375)
+
+    engine._apply_player_damage(
+        torch.full((2,), 12.0),
+        attacker_x,
+        attacker_y,
+    )
+
+    assert engine.health.tolist() == [88.0, 94.0]
+    assert engine.armor.tolist() == [0.0, 194.0]
+    assert torch.equal(engine.momentum_x, torch.full((2,), 1.261688232421875))
+    assert torch.equal(engine.momentum_y, torch.full((2,), -0.81024169921875))
+
+    engine.reaction_time.zero_()
+    engine._move_player(torch.zeros((2, 20), dtype=torch.bool))
+
+    assert torch.equal(engine.x, torch.full((2,), 1.261688232421875))
+    assert torch.equal(engine.y, torch.full((2,), -0.81024169921875))
+    assert torch.equal(engine.momentum_x, torch.full((2,), 1.143402099609375))
+    assert torch.equal(engine.momentum_y, torch.full((2,), -0.734283447265625))
+
+
+def test_damage_thrust_uses_doom_integer_angle_lookup(square_scenario) -> None:
+    engine = _engine(square_scenario)
+
+    fine_angle = engine._doom_fine_angle(
+        torch.full((2,), 137713, dtype=torch.int64),
+        torch.full((2,), -640728, dtype=torch.int64),
+    )
+
+    # This matched rocket-blast vector is the boundary case where atan2
+    # selects fine-angle bin 6420 instead of R_PointToAngle2's bin 6419.
+    assert fine_angle.tolist() == [6419, 6419]
+
+
+def test_simultaneous_hits_preserve_each_thrust_and_armor_rounding(square_scenario) -> None:
+    engine = _engine(square_scenario)
+    engine.x.zero_()
+    engine.y.zero_()
+    engine.momentum_x.zero_()
+    engine.momentum_y.zero_()
+    engine.armor.fill_(10)
+    engine.armor_save_fraction.fill_(0.5)
+    damage_by_source = torch.tensor([[3.0, 3.0], [3.0, 3.0]])
+    attacker_x = torch.tensor([[-64.0, 0.0], [-64.0, 0.0]])
+    attacker_y = torch.tensor([[0.0, -64.0], [0.0, -64.0]])
+    thrust_x, thrust_y = engine._player_damage_thrust_components(
+        damage_by_source,
+        attacker_x,
+        attacker_y,
+    )
+
+    engine._apply_player_damage(
+        torch.sum(damage_by_source, dim=1),
+        attacker_x[:, 0],
+        attacker_y[:, 0],
+        thrust_x_fixed=torch.sum(thrust_x, dim=1),
+        thrust_y_fixed=torch.sum(thrust_y, dim=1),
+        armor_absorb_request=torch.sum(
+            torch.floor(damage_by_source * engine.armor_save_fraction[:, None]),
+            dim=1,
+        ),
+    )
+
+    assert engine.health.tolist() == [96.0, 96.0]
+    assert engine.armor.tolist() == [8.0, 8.0]
+    assert torch.equal(engine.momentum_x, torch.full((2,), 0.375))
+    assert torch.equal(engine.momentum_y, torch.full((2,), 0.3749847412109375))
+
+
 def test_pistol_and_chaingun_views_share_bullet_ammo(square_scenario) -> None:
     engine = _engine(square_scenario)
     engine.selected_weapon.fill_(2)
@@ -670,6 +749,53 @@ def test_zombieman_chase_uses_eight_unit_four_tic_cadence(square_scenario) -> No
     engine._enemy_tick()
     assert torch.all(engine.enemy_x[:, 0] < first_x)
     assert torch.all(engine.enemy_y[:, 0] < first_y)
+
+
+def test_zombieman_damage_thrust_matches_vizdoom_fixed_point_oracle(
+    square_scenario,
+) -> None:
+    engine = _engine(square_scenario)
+    engine.x.fill_(2.794921875)
+    engine.y.fill_(-37.7698974609375)
+    engine.enemy_x[:, 0].zero_()
+    engine.enemy_y[:, 0].zero_()
+    engine.enemy_type[:, 0] = 0
+    engine.enemy_health[:, 0] = 20
+    engine.enemy_alive[:, 0] = True
+
+    engine._apply_enemy_damage(
+        torch.nn.functional.pad(torch.full((2, 1), 15.0), (0, engine.enemy_slots - 1)),
+        engine.x[:, None],
+        engine.y[:, None],
+    )
+
+    assert torch.equal(
+        engine._enemy_momentum_x_fixed[:, 0],
+        torch.full((2,), -8944, dtype=torch.int64),
+    )
+    assert torch.equal(
+        engine._enemy_momentum_y_fixed[:, 0],
+        torch.full((2,), 122546, dtype=torch.int64),
+    )
+
+    engine._move_enemy_thrust(torch.ones(2, dtype=torch.bool))
+
+    assert torch.equal(
+        engine._enemy_x_fixed[:, 0],
+        torch.full((2,), -8944, dtype=torch.int64),
+    )
+    assert torch.equal(
+        engine._enemy_y_fixed[:, 0],
+        torch.full((2,), 122546, dtype=torch.int64),
+    )
+    assert torch.equal(
+        engine._enemy_momentum_x_fixed[:, 0],
+        torch.full((2,), -8106, dtype=torch.int64),
+    )
+    assert torch.equal(
+        engine._enemy_momentum_y_fixed[:, 0],
+        torch.full((2,), 111057, dtype=torch.int64),
+    )
 
 
 def test_reference_missile_distance_thresholds(square_scenario) -> None:
