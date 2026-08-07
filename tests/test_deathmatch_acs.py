@@ -1446,6 +1446,62 @@ def test_hell_knight_ranged_attack_travels_before_damage(square_scenario) -> Non
     assert torch.all(engine.enemy_projectile_impact_tics[:, 0] <= 18)
 
 
+def test_hell_knight_projectile_quantizes_velocity_before_half_step(
+    square_scenario,
+) -> None:
+    engine = _engine(square_scenario)
+    engine.enemy_alive.zero_()
+    engine.enemy_x[:, 0] = 100
+    engine.enemy_y[:, 0] = 50
+    engine.enemy_z[:, 0] = 0
+    engine.enemy_type[:, 0] = 5
+    engine.enemy_health[:, 0] = 500
+    engine.enemy_alive[:, 0] = True
+    engine.x.copy_(torch.tensor([0.0, 160.0]))
+    engine.y.copy_(torch.tensor([0.0, -10.0]))
+    engine.z.copy_(torch.tensor([40.0, -24.0]))
+    dx = engine.x[:, None] - engine.enemy_x
+    dy = engine.y[:, None] - engine.enemy_y
+    requested = torch.zeros_like(engine.enemy_alive)
+    requested[:, 0] = True
+
+    engine._spawn_enemy_projectiles(requested, dx, dy)
+
+    velocity_fixed = torch.round(
+        torch.stack(
+            (
+                engine.enemy_projectile_velocity_x[:, 0],
+                engine.enemy_projectile_velocity_y[:, 0],
+                engine.enemy_projectile_velocity_z[:, 0],
+            ),
+            dim=1,
+        )
+        * 65536
+    ).to(torch.int64)
+    position_fixed = torch.round(
+        torch.stack(
+            (
+                engine.enemy_projectile_x[:, 0],
+                engine.enemy_projectile_y[:, 0],
+                engine.enemy_projectile_z[:, 0],
+            ),
+            dim=1,
+        )
+        * 65536
+    ).to(torch.int64)
+
+    assert velocity_fixed.tolist() == [
+        [-827869, -413934, 331147],
+        [668873, -668873, -267549],
+    ]
+    # P_CheckMissileSpawn advances each signed fixed-point component by >> 1;
+    # notably, negative odd velocities round down rather than toward zero.
+    assert position_fixed.tolist() == [
+        [6139665, 3069833, 2262725],
+        [6888036, 2942363, 1963377],
+    ]
+
+
 def test_hell_knight_melee_attack_fires_after_reference_prefire(square_scenario) -> None:
     engine = _engine(square_scenario)
     engine.x.zero_()

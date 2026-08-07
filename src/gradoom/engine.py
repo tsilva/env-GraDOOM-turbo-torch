@@ -4782,18 +4782,50 @@ class TorchDeathmatchEngine:
         )
         spawn_z = self.enemy_z + 32.0
         dz = self.z[:, None] - self.enemy_z
-        aim_norm = torch.sqrt(dx * dx + dy * dy + dz * dz).clamp_min_(1e-4)
-        velocity_x = dx / aim_norm * _ENEMY_PROJECTILE_SPEED
-        velocity_y = dy / aim_norm * _ENEMY_PROJECTILE_SPEED
-        velocity_z = dz / aim_norm * _ENEMY_PROJECTILE_SPEED
+        dx_fixed = torch.round(dx * _FIXED_UNIT).to(torch.int64)
+        dy_fixed = torch.round(dy * _FIXED_UNIT).to(torch.int64)
+        dz_fixed = torch.round(dz * _FIXED_UNIT).to(torch.int64)
+        aim_norm = torch.sqrt(
+            dx_fixed.to(torch.float32) * dx_fixed.to(torch.float32)
+            + dy_fixed.to(torch.float32) * dy_fixed.to(torch.float32)
+            + dz_fixed.to(torch.float32) * dz_fixed.to(torch.float32)
+        ).clamp_min_(1.0)
+        speed_fixed = _ENEMY_PROJECTILE_SPEED * _FIXED_UNIT
+        velocity_x_fixed = torch.trunc(
+            dx_fixed.to(torch.float32) / aim_norm * speed_fixed
+        ).to(torch.int64)
+        velocity_y_fixed = torch.trunc(
+            dy_fixed.to(torch.float32) / aim_norm * speed_fixed
+        ).to(torch.int64)
+        velocity_z_fixed = torch.trunc(
+            dz_fixed.to(torch.float32) / aim_norm * speed_fixed
+        ).to(torch.int64)
+        velocity_x = velocity_x_fixed.to(torch.float32) / _FIXED_UNIT
+        velocity_y = velocity_y_fixed.to(torch.float32) / _FIXED_UNIT
+        velocity_z = velocity_z_fixed.to(torch.float32) / _FIXED_UNIT
         self.enemy_projectile_x.copy_(
-            torch.where(spawn, self.enemy_x + velocity_x * 0.5, self.enemy_projectile_x)
+            torch.where(
+                spawn,
+                self.enemy_x
+                + (velocity_x_fixed >> 1).to(torch.float32) / _FIXED_UNIT,
+                self.enemy_projectile_x,
+            )
         )
         self.enemy_projectile_y.copy_(
-            torch.where(spawn, self.enemy_y + velocity_y * 0.5, self.enemy_projectile_y)
+            torch.where(
+                spawn,
+                self.enemy_y
+                + (velocity_y_fixed >> 1).to(torch.float32) / _FIXED_UNIT,
+                self.enemy_projectile_y,
+            )
         )
         self.enemy_projectile_z.copy_(
-            torch.where(spawn, spawn_z + velocity_z * 0.5, self.enemy_projectile_z)
+            torch.where(
+                spawn,
+                spawn_z
+                + (velocity_z_fixed >> 1).to(torch.float32) / _FIXED_UNIT,
+                self.enemy_projectile_z,
+            )
         )
         self.enemy_projectile_velocity_x.copy_(
             torch.where(
