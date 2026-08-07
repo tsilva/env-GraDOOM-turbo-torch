@@ -15,15 +15,15 @@ SCENARIO = Path("/Users/tsilva/repos/tsilva/ViZDoom-turbo/scenarios/deathmatch.w
 DOOM2 = Path("/Users/tsilva/roms/vizdoom/doom2.wad")
 
 
-def test_native_transparent_sprite_reveals_farther_actor(square_scenario) -> None:
+def test_native_transparent_sprites_reveal_fifth_farther_actor(square_scenario) -> None:
     atlas = np.zeros((2, 3, 3), dtype=np.uint8)
     atlas[0] = 10
     atlas[1] = 20
     opaque = np.ones_like(atlas, dtype=np.bool_)
-    opaque[0, 1, 1] = False
+    opaque[0] = False
     enemy_ids = np.empty((6, 4, 8), dtype=np.int32)
-    enemy_ids[0].fill(0)
-    enemy_ids[1:].fill(1)
+    enemy_ids[:4].fill(0)
+    enemy_ids[4:].fill(1)
     scenario = replace(
         square_scenario,
         player_starts=np.asarray([(0, 128, 270)], dtype=np.float32),
@@ -46,11 +46,11 @@ def test_native_transparent_sprite_reveals_farther_actor(square_scenario) -> Non
     engine.view_z.fill_(41)
     engine.angle.zero_()
     engine.item_available.zero_()
-    engine.enemy_x[0, :2] = torch.tensor([64.0, 96.0])
-    engine.enemy_y[0, :2] = 0
-    engine.enemy_z[0, :2] = 0
-    engine.enemy_type[0, :2] = torch.tensor([0, 1])
-    engine.enemy_alive[0, :2] = True
+    engine.enemy_x[0, :5] = torch.tensor([64.0, 72.0, 80.0, 88.0, 96.0])
+    engine.enemy_y[0, :5] = 0
+    engine.enemy_z[0, :5] = 0
+    engine.enemy_type[0, :5] = torch.arange(5)
+    engine.enemy_alive[0, :5] = True
     frame = torch.zeros((1, 208, 320), dtype=torch.uint8)
 
     rendered = engine._native_render_sprites(
@@ -61,7 +61,6 @@ def test_native_transparent_sprite_reveals_farther_actor(square_scenario) -> Non
     )
 
     assert rendered[0, 103, 160].item() == 20
-    assert rendered[0, 103, 158].item() == 10
 
 
 @pytest.mark.skipif(not SCENARIO.is_file() or not DOOM2.is_file(), reason="operator WADs absent")

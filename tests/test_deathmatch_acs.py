@@ -224,6 +224,105 @@ def test_rocket_radius_damage_reaches_voodoo_doll_without_moving_player(
     assert torch.equal(engine.momentum_y, torch.zeros(2))
 
 
+def test_enemy_projectile_hits_voodoo_doll_without_moving_player(
+    square_scenario,
+) -> None:
+    engine = _engine(square_scenario)
+    first_doll = engine.map.player_starts[0]
+    engine.enemy_alive.zero_()
+    engine.x.fill_(200)
+    engine.y.fill_(200)
+    engine.z.zero_()
+    engine.enemy_projectile_x[:, 0] = float(first_doll[0]) - 42.0
+    engine.enemy_projectile_y[:, 0] = float(first_doll[1])
+    engine.enemy_projectile_z[:, 0] = float(engine._player_start_z[0]) + 32.0
+    engine.enemy_projectile_velocity_x[:, 0] = 15
+    engine.enemy_projectile_velocity_y[:, 0] = 0
+    engine.enemy_projectile_velocity_z[:, 0] = 0
+    engine.enemy_projectile_alive[:, 0] = True
+    active = torch.ones(2, dtype=torch.bool)
+
+    engine._enemy_projectile_tick(active)
+    engine._enemy_projectile_tick(active)
+
+    assert engine.health.tolist() == [52.0, 76.0]
+    assert not torch.any(engine.enemy_projectile_alive[:, 0])
+    assert engine.enemy_projectile_impact_tics[:, 0].tolist() == [18, 18]
+    assert torch.equal(engine.momentum_x, torch.zeros(2))
+    assert torch.equal(engine.momentum_y, torch.zeros(2))
+
+
+def test_enemy_projectile_hits_monsters_without_player_kill_credit(
+    square_scenario,
+) -> None:
+    engine = _engine(square_scenario)
+    engine.x.fill_(200)
+    engine.y.fill_(200)
+    engine.z.zero_()
+    engine.enemy_alive.zero_()
+    engine.enemy_x[:, 0] = -100
+    engine.enemy_y[:, 0] = 0
+    engine.enemy_z[:, 0] = 0
+    engine.enemy_type[:, 0] = 5
+    engine.enemy_health[:, 0] = 500
+    engine.enemy_alive[:, 0] = True
+    engine.enemy_x[:, 1] = 0
+    engine.enemy_y[:, 1] = 0
+    engine.enemy_z[:, 1] = 0
+    engine.enemy_type[:, 1] = torch.tensor([0, 5])
+    engine.enemy_health[:, 1] = torch.tensor([20.0, 500.0])
+    engine.enemy_alive[:, 1] = True
+    engine.enemy_projectile_x[:, 0] = -42
+    engine.enemy_projectile_y[:, 0] = 0
+    engine.enemy_projectile_z[:, 0] = 32
+    engine.enemy_projectile_velocity_x[:, 0] = 15
+    engine.enemy_projectile_alive[:, 0] = True
+    active = torch.ones(2, dtype=torch.bool)
+
+    engine._enemy_projectile_tick(active)
+    engine._enemy_projectile_tick(active)
+
+    assert not torch.any(engine.enemy_projectile_alive[:, 0])
+    assert engine.enemy_health[:, 1].tolist() == [0.0, 500.0]
+    assert engine.enemy_alive[:, 1].tolist() == [False, True]
+    assert engine.enemy_death_type[:, 1].tolist() == [0, -1]
+    assert engine.drop_type[:, 1].tolist() == [2007, -1]
+    # Hell Knight species absorb their own Baron balls without damage, and
+    # an infighting kill never belongs to the controlled player's counters.
+    assert engine.enemy_health[:, 0].tolist() == [500.0, 500.0]
+    assert engine.killcount.tolist() == [0, 0]
+
+
+def test_enemy_projectile_only_passes_corpse_after_no_block_frame(
+    square_scenario,
+) -> None:
+    engine = _engine(square_scenario)
+    engine.x.fill_(200)
+    engine.y.fill_(200)
+    engine.z.zero_()
+    engine.enemy_alive.zero_()
+    engine.enemy_type.fill_(-1)
+    engine.enemy_x[:, 1] = 0
+    engine.enemy_y[:, 1] = 0
+    engine.enemy_z[:, 1] = 0
+    engine.enemy_death_type[:, 1] = 0
+    engine.enemy_death_tics[:, 1] = 21
+    engine.enemy_death_elapsed[:, 1] = torch.tensor([0, 10])
+    engine.enemy_projectile_x[:, 0] = -42
+    engine.enemy_projectile_y[:, 0] = 0
+    engine.enemy_projectile_z[:, 0] = 32
+    engine.enemy_projectile_velocity_x[:, 0] = 15
+    engine.enemy_projectile_alive[:, 0] = True
+    active = torch.ones(2, dtype=torch.bool)
+
+    engine._enemy_projectile_tick(active)
+    engine._enemy_projectile_tick(active)
+
+    assert engine.enemy_projectile_alive[:, 0].tolist() == [False, True]
+    assert engine.enemy_projectile_impact_tics[:, 0].tolist() == [18, 0]
+    assert engine.enemy_projectile_x[:, 0].tolist() == [-27.0, -12.0]
+
+
 def test_reference_damage_and_pickup_flash_counters(square_scenario) -> None:
     engine = _engine(square_scenario)
     engine._apply_player_damage(torch.tensor([10.0, 25.0]))
@@ -1037,6 +1136,79 @@ def test_monster_hitscan_uses_independent_reference_pellets(square_scenario) -> 
     # The shotgun guy rolls three distinct pellets; the wide third pellet
     # misses the player's Doom-compatible diagonal at this distance.
     assert damage[1, 0].tolist() == [6.0, 3.0, 0.0]
+
+
+def test_monster_spread_pellet_traces_its_own_blocking_linedef(
+    square_scenario,
+) -> None:
+    off_axis_wall = np.asarray([(50.0, 1.0, 50.0, 6.0)], dtype=np.float32)
+    walls = np.concatenate((square_scenario.wall_segments, off_axis_wall), axis=0)
+    blocked_scenario = replace(
+        square_scenario,
+        wall_segments=walls,
+        blocking_segments=walls.copy(),
+        blocking_wall_indices=np.arange(5, dtype=np.int32),
+        wall_texture_ids=np.zeros(5, dtype=np.int32),
+        wall_texture_offsets=np.zeros((5, 2), dtype=np.float32),
+        wall_side_texture_ids=np.concatenate(
+            (
+                np.zeros((5, 1, 1), dtype=np.int32),
+                np.full((5, 1, 1), -1, dtype=np.int32),
+            ),
+            axis=1,
+        ).repeat(3, axis=2),
+        wall_side_texture_offsets=np.zeros((5, 2, 2), dtype=np.float32),
+        wall_sectors=np.zeros((5, 2), dtype=np.int32),
+        sector_edge_mask=np.ones((1, 5), dtype=np.bool_),
+    )
+
+    def shotgun_damage(scenario) -> torch.Tensor:
+        engine = _engine(scenario)
+        engine.x.zero_()
+        engine.y.zero_()
+        engine.z.zero_()
+        engine.enemy_alive.zero_()
+        engine.enemy_x[:, 0] = 100
+        engine.enemy_y[:, 0] = 0
+        engine.enemy_z[:, 0] = 0
+        engine.enemy_type[:, 0] = 1
+        engine.enemy_alive[:, 0] = True
+        fires = torch.zeros_like(engine.enemy_alive)
+        fires[:, 0] = True
+        distance = torch.sqrt(
+            (engine.x[:, None] - engine.enemy_x) ** 2
+            + (engine.y[:, None] - engine.enemy_y) ** 2
+        ).clamp_min(1e-4)
+        visible = ~engine._sight_blocked(
+            engine.enemy_x,
+            engine.enemy_y,
+            engine.enemy_z + 42.0,
+            engine.x[:, None],
+            engine.y[:, None],
+            engine.z[:, None],
+            torch.full_like(engine.z[:, None], 56.0),
+        )
+        assert torch.all(visible[:, 0])
+        return engine._enemy_hitscan_damage(
+            engine.enemy_type.clamp_min(0),
+            fires,
+            distance,
+            visible,
+        )[:, 0]
+
+    clear_damage = shotgun_damage(square_scenario)
+    blocked_damage = shotgun_damage(blocked_scenario)
+
+    assert clear_damage.tolist() == [
+        [9.0, 0.0, 15.0],
+        [6.0, 3.0, 12.0],
+    ]
+    # The first pellet crosses the short off-axis wall in both lanes while
+    # the center aim ray and the other player-bound pellets remain clear.
+    assert blocked_damage.tolist() == [
+        [0.0, 0.0, 15.0],
+        [0.0, 3.0, 12.0],
+    ]
 
 
 def test_blocking_linedef_occludes_hitscan_and_monster_attacks(square_scenario) -> None:

@@ -55,6 +55,8 @@ uv run pytest                                             # run the test suite
 uv run ruff check .                                      # lint the repository
 uv run python -m gradoom.inspect_scenario \
   --scenario /path/to/deathmatch.wad --iwad /path/to/doom2.wad  # inspect assets
+uv run python play.py --scenario /path/to/deathmatch.wad \
+  --iwad /path/to/doom2.wad                              # play with keyboard controls
 uv run python tools/cuda_correctness_smoke.py --compile-engine   # check CUDA residency
 ```
 
