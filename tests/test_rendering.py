@@ -65,6 +65,26 @@ def test_native_transparent_sprite_reveals_farther_actor(square_scenario) -> Non
 
 
 @pytest.mark.skipif(not SCENARIO.is_file() or not DOOM2.is_file(), reason="operator WADs absent")
+def test_player_floor_uses_full_box_across_pit_steps() -> None:
+    scenario = compile_deathmatch_scenario(SCENARIO, DOOM2)
+    engine = TorchDeathmatchEngine(scenario, 1, device=torch.device("cpu"))
+    engine.x.fill_(569.3977813720703)
+    engine.y.fill_(515.9373168945312)
+    engine.z.fill_(-45.0)
+    engine.velocity_z.fill_(-10.0)
+
+    center_sector = engine._sector_at(engine.x, engine.y)
+    floor, _ = engine._player_opening_at(engine.x, engine.y)
+    engine.player_floor_z.copy_(floor)
+    engine._vertical_player_tick(torch.ones(1, dtype=torch.bool))
+
+    assert scenario.sector_heights[int(center_sector[0]), 0] == -64.0
+    assert floor.item() == -48.0
+    assert engine.z.item() == -48.0
+    assert engine.velocity_z.item() == 0.0
+
+
+@pytest.mark.skipif(not SCENARIO.is_file() or not DOOM2.is_file(), reason="operator WADs absent")
 def test_native_renderer_preserves_rgb_hud_and_enemy_animation() -> None:
     scenario = compile_deathmatch_scenario(SCENARIO, DOOM2)
     engine = TorchDeathmatchEngine(scenario, 1, device=torch.device("cpu"))
@@ -186,11 +206,13 @@ def test_native_renderer_preserves_rgb_hud_and_enemy_animation() -> None:
     assert engine.mugshot_ouch.tolist() == [True]
     assert engine._native_mugshot_patch_index(0, 75) == 60
     engine.mugshot_grin.fill_(True)
+    engine.mugshot_grin_tics.fill_(6)
     engine.bonus_count.fill_(6)
     assert engine._native_mugshot_patch_index(0, 75) == 65
     engine.health.zero_()
     assert engine._native_mugshot_patch_index(0, 0) == 69
     engine.mugshot_grin.zero_()
+    engine.mugshot_grin_tics.zero_()
     engine.mugshot_pain_tics.zero_()
     engine.mugshot_ouch.zero_()
     engine.health.fill_(100)

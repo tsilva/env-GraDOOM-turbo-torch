@@ -16,6 +16,9 @@ import torch
 from .scenario import CompiledScenario
 
 _UINT32_MASK = (1 << 32) - 1
+_FIXED_UNIT = 1 << 16
+_FINE_ANGLES = 8192
+_FINE_ANGLE_SCALE = _FINE_ANGLES / (2.0 * math.pi)
 _ENEMY_HEALTH = (20.0, 30.0, 100.0, 70.0, 150.0, 500.0)
 _ENEMY_STRIDE = (8.0, 8.0, 8.0, 8.0, 10.0, 8.0)
 _ENEMY_MOVE_INTERVAL = (4, 3, 4, 3, 2, 3)
@@ -33,9 +36,13 @@ _ENEMY_SPAWN_THRESHOLD = (2621, 2621, 1310, 1310, 655, 655)
 _ENEMY_SPAWN_DELAY = 105
 _ENEMY_SPAWN_PERIOD = 10
 _PLAYER_TELEPORT_LOCK_TICS = 7
-_PLAYER_ACCELERATION = 0.78125
-_PLAYER_FRICTION = 0.90625
-_PLAYER_SLIDE_FRACTION = 31.0 / 32.0
+_PLAYER_FORWARD_ACCELERATION_FIXED = 25 << 11
+_PLAYER_RUN_FORWARD_ACCELERATION_FIXED = 50 << 11
+_PLAYER_SIDE_ACCELERATION_FIXED = 24 << 11
+_PLAYER_RUN_SIDE_ACCELERATION_FIXED = 40 << 11
+_PLAYER_FRICTION_FIXED = 0xE800
+_PLAYER_AIR_CONTROL_FIXED = 0x0100
+_PLAYER_AIR_FRICTION_FIXED = _FIXED_UNIT
 _PLAYER_TURN_DEGREES = 3.515625
 _WEAPON_LOWER_TICS = 16
 _WEAPON_RAISE_TICS = 16
@@ -65,6 +72,7 @@ _VIEW_HEIGHT = 41.0
 _MUGSHOT_STATE_TICS = 35
 _MUGSHOT_RAMPAGE_DELAY = 70
 _MUGSHOT_NORMAL_FRAME_TICS = 18
+_MUGSHOT_GRIN_TICS = 71
 _PROJECTION_FOCAL_LENGTH = 42.0
 _PORTAL_LAYERS = 8
 _HASH_GOLDEN_RATIO_SIGNED = -1640531527
@@ -187,6 +195,23 @@ _DAMAGE_TO_ALPHA = (
     236,
     237,
 )
+
+
+def _build_fine_sine_fixed() -> np.ndarray:
+    """Reproduce ZDoom's R_InitTables 16.16 finesine table exactly."""
+    quarter = _FINE_ANGLES // 4
+    table = np.empty(_FINE_ANGLES, dtype=np.int64)
+    phase = np.arange(quarter, dtype=np.float64) * (2.0 * math.pi / _FINE_ANGLES)
+    first_quarter = np.trunc(np.sin(phase) * _FIXED_UNIT).astype(np.int64)
+    table[:quarter] = first_quarter
+    table[quarter : 2 * quarter] = first_quarter[::-1]
+    table[2 * quarter :] = -table[: 2 * quarter]
+    table[quarter] = _FIXED_UNIT
+    table[3 * quarter] = -_FIXED_UNIT
+    return table
+
+
+_FINE_SINE_FIXED = _build_fine_sine_fixed()
 _ITEM_SPRITE_INDEX = {
     2011: 6,
     2012: 7,
@@ -764,12 +789,22 @@ class TorchDeathmatchEngine:
         self.x = torch.zeros(n, device=device)
         self.y = torch.zeros(n, device=device)
         self.z = torch.zeros(n, device=device)
+        self.player_floor_z = torch.zeros(n, device=device)
+        self.previous_player_floor_z = torch.zeros(n, device=device)
+        self.player_ceiling_z = torch.zeros(n, device=device)
         self.view_z = torch.zeros(n, device=device)
         self.view_height = torch.full((n,), _VIEW_HEIGHT, device=device)
         self.delta_view_height = torch.zeros(n, device=device)
         self.angle = torch.zeros(n, device=device)
         self.momentum_x = torch.zeros(n, device=device)
         self.momentum_y = torch.zeros(n, device=device)
+        # Doom keeps actor position and momentum in signed 16.16 fixed point.
+        # Public float tensors retain the established API; these tensors preserve
+        # the low bits that float32 cannot represent at map-scale coordinates.
+        self._x_fixed = torch.zeros(n, device=device, dtype=torch.int64)
+        self._y_fixed = torch.zeros(n, device=device, dtype=torch.int64)
+        self._momentum_x_fixed = torch.zeros(n, device=device, dtype=torch.int64)
+        self._momentum_y_fixed = torch.zeros(n, device=device, dtype=torch.int64)
         self.velocity_z = torch.zeros(n, device=device)
         self.health = torch.full((n,), 100.0, device=device)
         self.armor = torch.zeros(n, device=device)
@@ -802,6 +837,7 @@ class TorchDeathmatchEngine:
         self.mugshot_pain_direction = torch.ones(n, device=device, dtype=torch.int64)
         self.mugshot_ouch = torch.zeros(n, device=device, dtype=torch.bool)
         self.mugshot_grin = torch.zeros(n, device=device, dtype=torch.bool)
+        self.mugshot_grin_tics = torch.zeros(n, device=device, dtype=torch.int32)
         self.mugshot_face_index = torch.ones(n, device=device, dtype=torch.int64)
         self.mugshot_face_tics = torch.full(
             (n,), _MUGSHOT_NORMAL_FRAME_TICS, device=device, dtype=torch.int32
@@ -935,6 +971,14 @@ class TorchDeathmatchEngine:
             device=device,
             dtype=torch.float32,
         )
+        self._fine_sine_fixed = torch.as_tensor(
+            _FINE_SINE_FIXED,
+            device=device,
+            dtype=torch.int64,
+        )
+        self._blocking_walls_fixed = torch.round(
+            self.map.blocking_walls * _FIXED_UNIT
+        ).to(torch.int64)
         self._slot_base_weapon = torch.tensor(
             (0, 0, 2, 3, 5, 6, 7), device=device, dtype=torch.int64
         )
@@ -1006,6 +1050,22 @@ class TorchDeathmatchEngine:
         self.x.copy_(torch.where(mask, spawn_x, self.x))
         self.y.copy_(torch.where(mask, spawn_y, self.y))
         self.angle.copy_(torch.where(mask, spawn_angle, self.angle))
+        spawn_x_fixed = torch.round(spawn_x * _FIXED_UNIT).to(torch.int64)
+        spawn_y_fixed = torch.round(spawn_y * _FIXED_UNIT).to(torch.int64)
+        self._x_fixed.copy_(torch.where(mask, spawn_x_fixed, self._x_fixed))
+        self._y_fixed.copy_(torch.where(mask, spawn_y_fixed, self._y_fixed))
+        self.x.copy_(self._x_fixed.to(torch.float32) / _FIXED_UNIT)
+        self.y.copy_(self._y_fixed.to(torch.float32) / _FIXED_UNIT)
+        spawn_floor, spawn_ceiling = self._player_opening_at(self.x, self.y)
+        self.player_floor_z.copy_(
+            torch.where(mask, spawn_floor, self.player_floor_z)
+        )
+        self.previous_player_floor_z.copy_(
+            torch.where(mask, spawn_floor, self.previous_player_floor_z)
+        )
+        self.player_ceiling_z.copy_(
+            torch.where(mask, spawn_ceiling, self.player_ceiling_z)
+        )
         spawn_sector = self._sector_at(spawn_x, spawn_y)
         spawn_z = self.map.sector_heights[spawn_sector, 0]
         self.z.copy_(torch.where(mask, spawn_z, self.z))
@@ -1021,6 +1081,8 @@ class TorchDeathmatchEngine:
             self.episode_return,
         ):
             tensor.masked_fill_(mask, 0)
+        self._momentum_x_fixed.masked_fill_(mask, 0)
+        self._momentum_y_fixed.masked_fill_(mask, 0)
         self.health.masked_fill_(mask, 100)
         self.killcount.masked_fill_(mask, 0)
         self.episode_time.masked_fill_(mask, 1)
@@ -1042,6 +1104,7 @@ class TorchDeathmatchEngine:
         self.mugshot_pain_direction.masked_fill_(mask, 1)
         self.mugshot_ouch.masked_fill_(mask, False)
         self.mugshot_grin.masked_fill_(mask, False)
+        self.mugshot_grin_tics.masked_fill_(mask, 0)
         self.mugshot_face_index.masked_fill_(mask, 1)
         self.mugshot_face_tics.masked_fill_(mask, _MUGSHOT_NORMAL_FRAME_TICS)
         self.attack_held_tics.masked_fill_(mask, 0)
@@ -1113,16 +1176,101 @@ class TorchDeathmatchEngine:
         walls = self.map.blocking_walls
         if not len(walls):
             return torch.zeros_like(x, dtype=torch.bool)
-        point = torch.stack((x, y), dim=-1)[..., None, :]
-        start = walls[:, :2]
-        delta = walls[:, 2:] - start
-        length_sq = torch.sum(delta * delta, dim=-1).clamp_min_(1e-6)
-        along = torch.sum((point - start) * delta, dim=-1) / length_sq
-        along = along.clamp(0, 1)
-        closest = start + along[..., None] * delta
-        distance_sq = torch.sum((point - closest) ** 2, dim=-1)
         collision_radius = torch.as_tensor(radius, device=self.device, dtype=x.dtype)
-        return torch.any(distance_sq < collision_radius[..., None] ** 2, dim=-1)
+        left = x[..., None] - collision_radius[..., None]
+        right = x[..., None] + collision_radius[..., None]
+        bottom = y[..., None] - collision_radius[..., None]
+        top = y[..., None] + collision_radius[..., None]
+        x1 = walls[:, 0]
+        y1 = walls[:, 1]
+        x2 = walls[:, 2]
+        y2 = walls[:, 3]
+        bounds_overlap = (
+            (right > torch.minimum(x1, x2))
+            & (left < torch.maximum(x1, x2))
+            & (top > torch.minimum(y1, y2))
+            & (bottom < torch.maximum(y1, y2))
+        )
+        delta_x = x2 - x1
+        delta_y = y2 - y1
+        side_bottom_left = delta_x * (bottom - y1) - delta_y * (left - x1)
+        side_bottom_right = delta_x * (bottom - y1) - delta_y * (right - x1)
+        side_top_left = delta_x * (top - y1) - delta_y * (left - x1)
+        side_top_right = delta_x * (top - y1) - delta_y * (right - x1)
+        minimum_side = torch.minimum(
+            torch.minimum(side_bottom_left, side_bottom_right),
+            torch.minimum(side_top_left, side_top_right),
+        )
+        maximum_side = torch.maximum(
+            torch.maximum(side_bottom_left, side_bottom_right),
+            torch.maximum(side_top_left, side_top_right),
+        )
+        crosses_line = (minimum_side <= 0) & (maximum_side >= 0)
+        return torch.any(bounds_overlap & crosses_line, dim=-1)
+
+    def _player_opening_at(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return Doom's highest floor and lowest ceiling under the actor box."""
+
+        center_sector = self._sector_at(x, y)
+        floor = self.map.sector_heights[center_sector, 0]
+        ceiling = self.map.sector_heights[center_sector, 1]
+        walls = self.map.portal_walls
+        if not len(walls):
+            return floor, ceiling
+
+        left = x[:, None] - _PLAYER_RADIUS
+        right = x[:, None] + _PLAYER_RADIUS
+        bottom = y[:, None] - _PLAYER_RADIUS
+        top = y[:, None] + _PLAYER_RADIUS
+        x1 = walls[:, 0]
+        y1 = walls[:, 1]
+        x2 = walls[:, 2]
+        y2 = walls[:, 3]
+        bounds_overlap = (
+            (right > torch.minimum(x1, x2))
+            & (left < torch.maximum(x1, x2))
+            & (top > torch.minimum(y1, y2))
+            & (bottom < torch.maximum(y1, y2))
+        )
+        delta_x = x2 - x1
+        delta_y = y2 - y1
+        side_bottom_left = delta_x * (bottom - y1) - delta_y * (left - x1)
+        side_bottom_right = delta_x * (bottom - y1) - delta_y * (right - x1)
+        side_top_left = delta_x * (top - y1) - delta_y * (left - x1)
+        side_top_right = delta_x * (top - y1) - delta_y * (right - x1)
+        minimum_side = torch.minimum(
+            torch.minimum(side_bottom_left, side_bottom_right),
+            torch.minimum(side_top_left, side_top_right),
+        )
+        maximum_side = torch.maximum(
+            torch.maximum(side_bottom_left, side_bottom_right),
+            torch.maximum(side_top_left, side_top_right),
+        )
+        touches_line = bounds_overlap & (minimum_side <= 0) & (maximum_side >= 0)
+
+        wall_sectors = self.map.portal_wall_sectors
+        valid_sector = wall_sectors >= 0
+        safe_sectors = wall_sectors.clamp_min(0)
+        wall_floors = self.map.sector_heights[safe_sectors, 0]
+        wall_ceilings = self.map.sector_heights[safe_sectors, 1]
+        touched_side = touches_line[:, :, None] & valid_sector[None, :, :]
+        touched_floors = torch.where(
+            touched_side,
+            wall_floors[None, :, :],
+            torch.full_like(wall_floors[None, :, :], -torch.inf),
+        )
+        touched_ceilings = torch.where(
+            touched_side,
+            wall_ceilings[None, :, :],
+            torch.full_like(wall_ceilings[None, :, :], torch.inf),
+        )
+        floor = torch.maximum(floor, torch.amax(touched_floors, dim=(1, 2)))
+        ceiling = torch.minimum(ceiling, torch.amin(touched_ceilings, dim=(1, 2)))
+        return floor, ceiling
 
     def _random_spawn_positions(
         self,
@@ -1145,18 +1293,22 @@ class TorchDeathmatchEngine:
             doll_dx = candidate_x[..., None] - dolls[None, None, :, 0]
             doll_dy = candidate_y[..., None] - dolls[None, None, :, 1]
             valid &= torch.all(
-                doll_dx * doll_dx + doll_dy * doll_dy >= (radius + _PLAYER_RADIUS) ** 2,
+                (doll_dx.abs() >= radius + _PLAYER_RADIUS)
+                | (doll_dy.abs() >= radius + _PLAYER_RADIUS),
                 dim=-1,
             )
         if avoid_player:
             player_dx = candidate_x - self.x[:, None]
             player_dy = candidate_y - self.y[:, None]
-            valid &= player_dx * player_dx + player_dy * player_dy >= (radius + _PLAYER_RADIUS) ** 2
+            valid &= (player_dx.abs() >= radius + _PLAYER_RADIUS) | (
+                player_dy.abs() >= radius + _PLAYER_RADIUS
+            )
             enemy_dx = candidate_x[..., None] - self.enemy_x[:, None, :]
             enemy_dy = candidate_y[..., None] - self.enemy_y[:, None, :]
             enemy_radius = self._enemy_radius[self.enemy_type.clamp_min(0)]
             overlaps_enemy = self._enemy_solid_mask()[:, None, :] & (
-                enemy_dx * enemy_dx + enemy_dy * enemy_dy < (radius + enemy_radius[:, None, :]) ** 2
+                (enemy_dx.abs() < radius + enemy_radius[:, None, :])
+                & (enemy_dy.abs() < radius + enemy_radius[:, None, :])
             )
             valid &= ~torch.any(overlaps_enemy, dim=-1)
 
@@ -1190,11 +1342,16 @@ class TorchDeathmatchEngine:
         )
         return self.enemy_alive | dying_solid
 
-    def _player_collides(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    def _player_collides(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        floor: torch.Tensor | None = None,
+        ceiling: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         collision = self._collides(x, y)
-        sector = self._sector_at(x, y)
-        floor = self.map.sector_heights[sector, 0]
-        ceiling = self.map.sector_heights[sector, 1]
+        if floor is None or ceiling is None:
+            floor, ceiling = self._player_opening_at(x, y)
         collision |= floor > self.z + 24.0
         collision |= ceiling - torch.maximum(self.z, floor) < 56.0
         enemy_type = self.enemy_type.clamp_min(0)
@@ -1210,7 +1367,8 @@ class TorchDeathmatchEngine:
         collision |= torch.any(
             self._enemy_solid_mask()
             & enemy_vertical_overlap
-            & (enemy_dx * enemy_dx + enemy_dy * enemy_dy < (_PLAYER_RADIUS + enemy_radius) ** 2),
+            & (enemy_dx.abs() < _PLAYER_RADIUS + enemy_radius)
+            & (enemy_dy.abs() < _PLAYER_RADIUS + enemy_radius),
             dim=1,
         )
         doll_count = max(len(self.map.player_starts) - 1, 0)
@@ -1225,7 +1383,9 @@ class TorchDeathmatchEngine:
                 _PLAYER_HEIGHT,
             )
             collision |= torch.any(
-                doll_overlap & (doll_dx * doll_dx + doll_dy * doll_dy < (2 * _PLAYER_RADIUS) ** 2),
+                doll_overlap
+                & (doll_dx.abs() < 2 * _PLAYER_RADIUS)
+                & (doll_dy.abs() < 2 * _PLAYER_RADIUS),
                 dim=1,
             )
         return collision
@@ -1262,7 +1422,8 @@ class TorchDeathmatchEngine:
         collision |= torch.any(
             solid_enemy
             & vertical_overlap
-            & (dx * dx + dy * dy < (radius[:, :, None] + other_radius[:, None, :]) ** 2),
+            & (dx.abs() < radius[:, :, None] + other_radius[:, None, :])
+            & (dy.abs() < radius[:, :, None] + other_radius[:, None, :]),
             dim=2,
         )
         player_dx = x - self.x[:, None]
@@ -1276,7 +1437,8 @@ class TorchDeathmatchEngine:
         collision |= (
             ~self.player_dead[:, None]
             & player_overlap
-            & (player_dx * player_dx + player_dy * player_dy < (radius + _PLAYER_RADIUS) ** 2)
+            & (player_dx.abs() < radius + _PLAYER_RADIUS)
+            & (player_dy.abs() < radius + _PLAYER_RADIUS)
         )
         doll_count = max(len(self.map.player_starts) - 1, 0)
         if doll_count:
@@ -1291,10 +1453,8 @@ class TorchDeathmatchEngine:
             )
             collision |= torch.any(
                 doll_overlap
-                & (
-                    doll_dx * doll_dx + doll_dy * doll_dy
-                    < (radius[:, :, None] + _PLAYER_RADIUS) ** 2
-                ),
+                & (doll_dx.abs() < radius[:, :, None] + _PLAYER_RADIUS)
+                & (doll_dy.abs() < radius[:, :, None] + _PLAYER_RADIUS),
                 dim=2,
             )
         return collision
@@ -1360,6 +1520,205 @@ class TorchDeathmatchEngine:
             fraction,
             torch.full_like(fraction, 1.0 / 32.0),
         ).clamp(0, 1)
+
+    @staticmethod
+    def _trunc_divide(numerator: torch.Tensor, denominator: torch.Tensor) -> torch.Tensor:
+        """Signed integer division with the C/C++ truncation used by ZDoom."""
+
+        return torch.div(numerator, denominator, rounding_mode="trunc")
+
+    def _axis_slide_contact_fixed(
+        self,
+        position_x: torch.Tensor,
+        position_y: torch.Tensor,
+        move_x: torch.Tensor,
+        move_y: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Find Doom's leading-box contact fraction for axis-aligned walls."""
+
+        walls = self._blocking_walls_fixed
+        x1 = walls[:, 0][None, :]
+        y1 = walls[:, 1][None, :]
+        x2 = walls[:, 2][None, :]
+        y2 = walls[:, 3][None, :]
+        horizontal = y1 == y2
+        vertical = x1 == x2
+        radius = int(_PLAYER_RADIUS * _FIXED_UNIT)
+        sentinel = torch.full(
+            (self.num_envs, len(walls)),
+            _FIXED_UNIT + 1,
+            device=self.device,
+            dtype=torch.int64,
+        )
+
+        safe_move_y = torch.where(move_y == 0, torch.ones_like(move_y), move_y)
+        horizontal_target = y1 - torch.sign(move_y[:, None]) * radius
+        horizontal_fraction = torch.round(
+            (horizontal_target - position_y[:, None]).to(torch.float64)
+            * _FIXED_UNIT
+            / safe_move_y[:, None].to(torch.float64)
+        ).to(torch.int64)
+        horizontal_x = position_x[:, None] + (
+            move_x[:, None] * horizontal_fraction >> 16
+        )
+        horizontal_valid = (
+            horizontal
+            & (move_y[:, None] != 0)
+            & (horizontal_fraction >= 0)
+            & (horizontal_fraction <= _FIXED_UNIT)
+            & (horizontal_x >= torch.minimum(x1, x2) - radius)
+            & (horizontal_x <= torch.maximum(x1, x2) + radius)
+        )
+        horizontal_candidates = torch.where(
+            horizontal_valid,
+            horizontal_fraction,
+            sentinel,
+        )
+
+        safe_move_x = torch.where(move_x == 0, torch.ones_like(move_x), move_x)
+        vertical_target = x1 - torch.sign(move_x[:, None]) * radius
+        vertical_fraction = torch.round(
+            (vertical_target - position_x[:, None]).to(torch.float64)
+            * _FIXED_UNIT
+            / safe_move_x[:, None].to(torch.float64)
+        ).to(torch.int64)
+        vertical_y = position_y[:, None] + (
+            move_y[:, None] * vertical_fraction >> 16
+        )
+        vertical_valid = (
+            vertical
+            & (move_x[:, None] != 0)
+            & (vertical_fraction >= 0)
+            & (vertical_fraction <= _FIXED_UNIT)
+            & (vertical_y >= torch.minimum(y1, y2) - radius)
+            & (vertical_y <= torch.maximum(y1, y2) + radius)
+        )
+        vertical_candidates = torch.where(
+            vertical_valid,
+            vertical_fraction,
+            sentinel,
+        )
+
+        horizontal_best = torch.min(horizontal_candidates, dim=1).values
+        vertical_best = torch.min(vertical_candidates, dim=1).values
+        best = torch.minimum(horizontal_best, vertical_best)
+        return best, horizontal_best <= vertical_best, best <= _FIXED_UNIT
+
+    def _doom_axis_slide_move(
+        self,
+        playing: torch.Tensor,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """Integrate ZDoom's common one-contact axis-wall slide in one pass."""
+
+        start_x = self._x_fixed
+        start_y = self._y_fixed
+        move_x = self._momentum_x_fixed
+        move_y = self._momentum_y_fixed
+        dominant_speed = torch.maximum(move_x.abs(), move_y.abs())
+        max_step = int((_PLAYER_RADIUS - 1.0) * _FIXED_UNIT)
+        steps = torch.where(
+            dominant_speed > max_step,
+            1 + torch.div(dominant_speed, max_step, rounding_mode="floor"),
+            torch.ones_like(dominant_speed),
+        ).clamp_max(3)
+        proposed_x = start_x + move_x
+        proposed_y = start_y + move_y
+        proposed_x_float = proposed_x.to(torch.float32) / _FIXED_UNIT
+        proposed_y_float = proposed_y.to(torch.float32) / _FIXED_UNIT
+        proposed_floor, proposed_ceiling = self._player_opening_at(
+            proposed_x_float,
+            proposed_y_float,
+        )
+        blocked = playing & self._player_collides(
+            proposed_x_float,
+            proposed_y_float,
+            proposed_floor,
+            proposed_ceiling,
+        )
+        wall_blocked = blocked & self._points_collide(proposed_x_float, proposed_y_float)
+
+        full_fraction, _, full_contact = self._axis_slide_contact_fixed(
+            start_x,
+            start_y,
+            move_x,
+            move_y,
+        )
+        collision_step = torch.div(
+            full_fraction * steps,
+            _FIXED_UNIT,
+            rounding_mode="floor",
+        ) + 1
+        collision_step = torch.minimum(collision_step, steps)
+        prior_x = start_x + self._trunc_divide(
+            move_x * (collision_step - 1),
+            steps,
+        )
+        prior_y = start_y + self._trunc_divide(
+            move_y * (collision_step - 1),
+            steps,
+        )
+        one_step_x = self._trunc_divide(move_x, steps)
+        one_step_y = self._trunc_divide(move_y, steps)
+        fraction, hit_horizontal, step_contact = self._axis_slide_contact_fixed(
+            prior_x,
+            prior_y,
+            one_step_x,
+            one_step_y,
+        )
+        slide = wall_blocked & full_contact & step_contact
+        approach_fraction = torch.clamp_min(fraction - (_FIXED_UNIT // 32), 0)
+        approach_x = one_step_x * approach_fraction >> 16
+        approach_y = one_step_y * approach_fraction >> 16
+        remainder = (_FIXED_UNIT - fraction).clamp(0, _FIXED_UNIT)
+        slide_x = one_step_x * remainder >> 16
+        slide_y = one_step_y * remainder >> 16
+        slide_x = torch.where(hit_horizontal, slide_x, torch.zeros_like(slide_x))
+        slide_y = torch.where(hit_horizontal, torch.zeros_like(slide_y), slide_y)
+        remaining_moves = 1 + steps - collision_step
+        slide_target_x = prior_x + approach_x + slide_x * remaining_moves
+        slide_target_y = prior_y + approach_y + slide_y * remaining_moves
+        corner_blocked = slide & self._points_collide(
+            slide_target_x.to(torch.float32) / _FIXED_UNIT,
+            slide_target_y.to(torch.float32) / _FIXED_UNIT,
+        )
+        accepted_slide = slide & ~corner_blocked
+        stalled_slide = slide & corner_blocked
+        position_x = torch.where(
+            accepted_slide,
+            slide_target_x,
+            torch.where(stalled_slide, prior_x + approach_x, proposed_x),
+        )
+        position_y = torch.where(
+            accepted_slide,
+            slide_target_y,
+            torch.where(stalled_slide, prior_y + approach_y, proposed_y),
+        )
+        clipped_x = slide_x * steps
+        clipped_y = slide_y * steps
+        result_move_x = torch.where(slide, clipped_x, move_x)
+        result_move_y = torch.where(slide, clipped_y, move_y)
+        position_x = torch.where(playing, position_x, start_x)
+        position_y = torch.where(playing, position_y, start_y)
+        fallback = blocked & ~slide
+        result_floor = torch.where(blocked, self.player_floor_z, proposed_floor)
+        result_ceiling = torch.where(blocked, self.player_ceiling_z, proposed_ceiling)
+        return (
+            position_x,
+            position_y,
+            result_move_x,
+            result_move_y,
+            fallback,
+            result_floor,
+            result_ceiling,
+        )
 
     def _line_blocked(
         self,
@@ -1530,9 +1889,53 @@ class TorchDeathmatchEngine:
         )
 
     def _move_player(self, buttons: torch.Tensor) -> None:
+        # Tests and advanced callers may directly set the public state tensors.
+        # Resynchronize only lanes whose visible value no longer represents the
+        # retained fixed-point value, preserving otherwise invisible low bits.
+        visible_x = self._x_fixed.to(torch.float32) / _FIXED_UNIT
+        visible_y = self._y_fixed.to(torch.float32) / _FIXED_UNIT
+        visible_momentum_x = self._momentum_x_fixed.to(torch.float32) / _FIXED_UNIT
+        visible_momentum_y = self._momentum_y_fixed.to(torch.float32) / _FIXED_UNIT
+        position_resynchronized = (self.x != visible_x) | (self.y != visible_y)
+        self._x_fixed.copy_(
+            torch.where(
+                self.x != visible_x,
+                torch.round(self.x * _FIXED_UNIT).to(torch.int64),
+                self._x_fixed,
+            )
+        )
+        self._y_fixed.copy_(
+            torch.where(
+                self.y != visible_y,
+                torch.round(self.y * _FIXED_UNIT).to(torch.int64),
+                self._y_fixed,
+            )
+        )
+        self._momentum_x_fixed.copy_(
+            torch.where(
+                self.momentum_x != visible_momentum_x,
+                torch.round(self.momentum_x * _FIXED_UNIT).to(torch.int64),
+                self._momentum_x_fixed,
+            )
+        )
+        self._momentum_y_fixed.copy_(
+            torch.where(
+                self.momentum_y != visible_momentum_y,
+                torch.round(self.momentum_y * _FIXED_UNIT).to(torch.int64),
+                self._momentum_y_fixed,
+            )
+        )
+        if self.debug_checks and torch.any(position_resynchronized):
+            current_floor, current_ceiling = self._player_opening_at(self.x, self.y)
+            self.player_floor_z.copy_(current_floor)
+            self.player_ceiling_z.copy_(current_ceiling)
+
         playing = ~self.player_dead & (self.episode_time < self.episode_timeout)
         active = (self.reaction_time <= 0) & playing
         self.reaction_time.sub_(1).clamp_min_(0)
+        current_floor = self.player_floor_z
+        self.previous_player_floor_z.copy_(current_floor)
+        on_ground = self.z <= current_floor
         speed = torch.where(buttons[:, 1], 2.0, 1.0)
         turn = (buttons[:, 8].to(torch.float32) - buttons[:, 7].to(torch.float32)) * active.to(
             torch.float32
@@ -1545,59 +1948,86 @@ class TorchDeathmatchEngine:
         side = (buttons[:, 3].to(torch.float32) - buttons[:, 4].to(torch.float32)) * active.to(
             torch.float32
         )
-        acceleration = _PLAYER_ACCELERATION * speed
-        cosine = torch.cos(self.angle)
-        sine = torch.sin(self.angle)
-        self.momentum_x.add_((forward * cosine + side * sine) * acceleration)
-        self.momentum_y.add_((forward * sine - side * cosine) * acceleration)
-        proposed_x = self.x + self.momentum_x
-        proposed_y = self.y + self.momentum_y
-        collision = self._player_collides(proposed_x, proposed_y)
-        x_only_collision = self._player_collides(proposed_x, self.y)
-        y_only_collision = self._player_collides(self.x, proposed_y)
-        move_x = playing & (~collision | ~x_only_collision)
-        move_y = playing & (~collision | ~y_only_collision)
-        corner_collision = collision & move_x & move_y
-        move_x &= ~corner_collision
-        slide_x = collision & move_x & ~move_y
-        slide_y = collision & move_y & ~move_x
-        impact_fraction = self._axis_collision_fraction(self.momentum_x, self.momentum_y)
-        approach_fraction = torch.clamp_min(impact_fraction - 1.0 / 32.0, 0)
-        residual_fraction = 1.0 - impact_fraction
-        x_position_fraction = torch.where(slide_x, _PLAYER_SLIDE_FRACTION, approach_fraction)
-        y_position_fraction = torch.where(slide_y, _PLAYER_SLIDE_FRACTION, approach_fraction)
-        x_position_fraction = torch.where(collision, x_position_fraction, 1.0)
-        y_position_fraction = torch.where(collision, y_position_fraction, 1.0)
-        self.x.copy_(
+        forward_acceleration_fixed = torch.where(
+            buttons[:, 1],
+            torch.full_like(self._momentum_x_fixed, _PLAYER_RUN_FORWARD_ACCELERATION_FIXED),
+            torch.full_like(self._momentum_x_fixed, _PLAYER_FORWARD_ACCELERATION_FIXED),
+        )
+        side_acceleration_fixed = torch.where(
+            buttons[:, 1],
+            torch.full_like(self._momentum_x_fixed, _PLAYER_RUN_SIDE_ACCELERATION_FIXED),
+            torch.full_like(self._momentum_x_fixed, _PLAYER_SIDE_ACCELERATION_FIXED),
+        )
+        forward_acceleration_fixed = torch.where(
+            on_ground,
+            forward_acceleration_fixed,
+            forward_acceleration_fixed * _PLAYER_AIR_CONTROL_FIXED >> 16,
+        )
+        side_acceleration_fixed = torch.where(
+            on_ground,
+            side_acceleration_fixed,
+            side_acceleration_fixed * _PLAYER_AIR_CONTROL_FIXED >> 16,
+        )
+        fine_angle = torch.floor(self.angle * _FINE_ANGLE_SCALE).to(torch.int64)
+        fine_angle &= _FINE_ANGLES - 1
+        sine_fixed = self._fine_sine_fixed[fine_angle]
+        cosine_fixed = self._fine_sine_fixed[(fine_angle + _FINE_ANGLES // 4) & (_FINE_ANGLES - 1)]
+        forward_move_fixed = forward.to(torch.int64) * forward_acceleration_fixed
+        side_move_fixed = side.to(torch.int64) * side_acceleration_fixed
+        self._momentum_x_fixed.add_(
+            (forward_move_fixed * cosine_fixed >> 16)
+            + (side_move_fixed * sine_fixed >> 16)
+        )
+        self._momentum_y_fixed.add_(
+            (forward_move_fixed * sine_fixed >> 16)
+            + (side_move_fixed * -cosine_fixed >> 16)
+        )
+        (
+            doom_position_x_fixed,
+            doom_position_y_fixed,
+            doom_momentum_x_fixed,
+            doom_momentum_y_fixed,
+            doom_slide_fallback,
+            doom_floor,
+            doom_ceiling,
+        ) = self._doom_axis_slide_move(playing)
+        self._x_fixed.copy_(
             torch.where(
-                move_x | slide_y,
-                self.x + self.momentum_x * x_position_fraction,
-                self.x,
+                doom_slide_fallback,
+                self._x_fixed,
+                doom_position_x_fixed,
             )
         )
-        self.y.copy_(
+        self._y_fixed.copy_(
             torch.where(
-                move_y | slide_x,
-                self.y + self.momentum_y * y_position_fraction,
-                self.y,
+                doom_slide_fallback,
+                self._y_fixed,
+                doom_position_y_fixed,
             )
         )
-        self.momentum_x.copy_(
-            torch.where(
-                slide_x,
-                self.momentum_x * residual_fraction,
-                torch.where(move_x, self.momentum_x, torch.zeros_like(self.momentum_x)),
-            )
+        next_momentum_x_fixed = torch.where(
+            doom_slide_fallback,
+            torch.zeros_like(doom_momentum_x_fixed),
+            doom_momentum_x_fixed,
         )
-        self.momentum_y.copy_(
-            torch.where(
-                slide_y,
-                self.momentum_y * residual_fraction,
-                torch.where(move_y, self.momentum_y, torch.zeros_like(self.momentum_y)),
-            )
+        next_momentum_y_fixed = torch.where(
+            doom_slide_fallback,
+            torch.zeros_like(doom_momentum_y_fixed),
+            doom_momentum_y_fixed,
         )
-        self.momentum_x.mul_(_PLAYER_FRICTION)
-        self.momentum_y.mul_(_PLAYER_FRICTION)
+        self.player_floor_z.copy_(doom_floor)
+        self.player_ceiling_z.copy_(doom_ceiling)
+        friction_fixed = torch.where(
+            self.z <= doom_floor,
+            torch.full_like(next_momentum_x_fixed, _PLAYER_FRICTION_FIXED),
+            torch.full_like(next_momentum_x_fixed, _PLAYER_AIR_FRICTION_FIXED),
+        )
+        self._momentum_x_fixed.copy_(next_momentum_x_fixed * friction_fixed >> 16)
+        self._momentum_y_fixed.copy_(next_momentum_y_fixed * friction_fixed >> 16)
+        self.x.copy_(self._x_fixed.to(torch.float32) / _FIXED_UNIT)
+        self.y.copy_(self._y_fixed.to(torch.float32) / _FIXED_UNIT)
+        self.momentum_x.copy_(self._momentum_x_fixed.to(torch.float32) / _FIXED_UNIT)
+        self.momentum_y.copy_(self._momentum_y_fixed.to(torch.float32) / _FIXED_UNIT)
 
     def _vertical_player_tick(self, active: torch.Tensor) -> None:
         next_view_height = self.view_height + self.delta_view_height
@@ -1631,13 +2061,22 @@ class TorchDeathmatchEngine:
         self.view_height.copy_(torch.where(active, next_view_height, self.view_height))
         self.view_z.copy_(torch.where(active, self.z + next_view_height, self.view_z))
 
-        sector = self._current_sector()
-        floor = self.map.sector_heights[sector, 0]
+        floor = self.player_floor_z
         proposed_z = self.z + self.velocity_z
         airborne = (self.z > floor) | (self.velocity_z < 0)
+        walked_off_ledge = (
+            (self.velocity_z == 0)
+            & (self.previous_player_floor_z > floor)
+            & (proposed_z == self.previous_player_floor_z)
+        )
+        gravity_step = torch.where(
+            walked_off_ledge,
+            torch.full_like(self.velocity_z, 2.0),
+            torch.ones_like(self.velocity_z),
+        )
         next_velocity = torch.where(
             airborne,
-            self.velocity_z - 1.0,
+            self.velocity_z - gravity_step,
             torch.zeros_like(self.velocity_z),
         )
         landed = proposed_z <= floor
@@ -2016,7 +2455,12 @@ class TorchDeathmatchEngine:
                 & self.enemy_alive[:, None, :]
                 & enemy_overlap
                 & (
-                    enemy_distance
+                    dx.abs()
+                    < projectile_radius[:, :, None]
+                    + self._enemy_radius[enemy_type][:, None, :]
+                )
+                & (
+                    dy.abs()
                     < projectile_radius[:, :, None]
                     + self._enemy_radius[enemy_type][:, None, :]
                 )
@@ -2454,10 +2898,8 @@ class TorchDeathmatchEngine:
             floor = self.map.sector_heights[sector, 0]
             ceiling = self.map.sector_heights[sector, 1]
             opening_impact = enabled & ((current_z < floor) | (current_z + 16.0 > ceiling))
-            player_distance = torch.sqrt(
-                (candidate_x - self.x[:, None]) ** 2
-                + (candidate_y - self.y[:, None]) ** 2
-            )
+            player_dx = candidate_x - self.x[:, None]
+            player_dy = candidate_y - self.y[:, None]
             player_vertical_overlap = self._vertical_overlap(
                 current_z,
                 16.0,
@@ -2465,7 +2907,10 @@ class TorchDeathmatchEngine:
                 _PLAYER_HEIGHT,
             )
             step_player_impact = (
-                enabled & player_vertical_overlap & (player_distance < 22.0)
+                enabled
+                & player_vertical_overlap
+                & (player_dx.abs() < 22.0)
+                & (player_dy.abs() < 22.0)
             )
             step_impact = enabled & (wall_impact | opening_impact | step_player_impact)
             successful = enabled & ~step_impact
@@ -2856,6 +3301,13 @@ class TorchDeathmatchEngine:
         acquired = torch.any(successful, dim=1)
         newly_owned = acquired & ~previously_owned
         self.mugshot_grin |= newly_owned
+        self.mugshot_grin_tics.copy_(
+            torch.where(
+                newly_owned,
+                torch.full_like(self.mugshot_grin_tics, _MUGSHOT_GRIN_TICS),
+                self.mugshot_grin_tics,
+            )
+        )
         self._grant_weapon_code(code, acquired)
         if ammo_slot >= 0:
             count = torch.sum(successful, dim=1).to(torch.float32)
@@ -3036,6 +3488,9 @@ class TorchDeathmatchEngine:
         for _ in range(self.frame_skip):
             self.player_dead |= self.health <= 0
             active = ~self.player_dead & (self.episode_time < self.episode_timeout)
+            previous_mugshot_override = (self.mugshot_pain_tics > 0) | (
+                self.mugshot_grin_tics > 0
+            )
             self.damage_count.copy_(
                 torch.where(active, torch.clamp_min(self.damage_count - 1, 0), self.damage_count)
             )
@@ -3051,9 +3506,23 @@ class TorchDeathmatchEngine:
                 )
             )
             self.mugshot_ouch &= self.mugshot_pain_tics > 0
-            self.mugshot_grin &= self.bonus_count > 0
+            self.mugshot_grin_tics.copy_(
+                torch.where(
+                    active,
+                    torch.clamp_min(self.mugshot_grin_tics - 1, 0),
+                    self.mugshot_grin_tics,
+                )
+            )
+            self.mugshot_grin.copy_(self.mugshot_grin_tics > 0)
+            mugshot_override = (self.mugshot_pain_tics > 0) | (
+                self.mugshot_grin_tics > 0
+            )
+            resumed_normal_face = active & previous_mugshot_override & ~mugshot_override
             next_face_tics = torch.clamp_min(self.mugshot_face_tics - 1, 0)
-            change_face = active & (next_face_tics <= 0)
+            neutral_face = active & ~mugshot_override
+            change_face = neutral_face & (
+                (next_face_tics <= 0) | resumed_normal_face
+            )
             mugshot_random = self.mugshot_rng_state
             next_mugshot_random = torch.bitwise_xor(
                 mugshot_random,
@@ -3085,7 +3554,7 @@ class TorchDeathmatchEngine:
                 torch.where(
                     change_face,
                     torch.full_like(next_face_tics, _MUGSHOT_NORMAL_FRAME_TICS),
-                    torch.where(active, next_face_tics, self.mugshot_face_tics),
+                    torch.where(neutral_face, next_face_tics, self.mugshot_face_tics),
                 )
             )
             active_buttons = buttons & active[:, None]
@@ -4573,7 +5042,7 @@ class TorchDeathmatchEngine:
         pain = max(0, min((100 - health) // 20, 4))
         straight = int(self.mugshot_face_index[lane].item())
         face_patch = 13 + pain * 3 + straight
-        if bool(self.mugshot_grin[lane]) and bool(self.bonus_count[lane] > 0):
+        if bool(self.mugshot_grin_tics[lane] > 0):
             face_patch = 64 + pain
         elif bool(self.mugshot_pain_tics[lane] > 0):
             if bool(self.mugshot_ouch[lane]):

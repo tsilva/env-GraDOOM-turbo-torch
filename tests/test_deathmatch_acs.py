@@ -229,7 +229,57 @@ def test_reference_forward_acceleration_and_right_strafe_basis(square_scenario) 
     right = torch.zeros((2, 20), dtype=torch.bool)
     right[:, 3] = True
     engine._move_player(right)
-    assert torch.all(engine.y < before_y)
+    assert torch.allclose(engine.y - before_y, torch.full((2,), -0.75))
+    assert torch.allclose(engine.momentum_y, torch.full((2,), -0.6796875))
+
+
+def test_reference_air_control_and_air_friction(square_scenario) -> None:
+    engine = _engine(square_scenario)
+    engine.reaction_time.zero_()
+    engine.x.zero_()
+    engine.y.zero_()
+    engine.z.fill_(1.0)
+    engine.angle.zero_()
+    engine.momentum_x.zero_()
+    engine.momentum_y.zero_()
+    buttons = torch.zeros((2, 20), dtype=torch.bool)
+    buttons[:, 1] = True
+    buttons[:, 6] = True
+
+    engine._move_player(buttons)
+
+    expected = torch.full((2,), 400.0 / 65536.0)
+    assert torch.equal(engine.x, expected)
+    assert torch.equal(engine.momentum_x, expected)
+    assert torch.equal(engine.y, torch.zeros(2))
+    assert torch.equal(engine.momentum_y, torch.zeros(2))
+
+
+def test_player_wall_collision_uses_doom_square_corner(square_scenario) -> None:
+    scenario = replace(
+        square_scenario,
+        blocking_segments=np.asarray([(32.0, -64.0, 32.0, 0.0)], dtype=np.float32),
+    )
+    engine = _engine(scenario)
+
+    assert torch.all(engine._points_collide(torch.full((2,), 16.1), torch.full((2,), 8.0)))
+    assert not torch.any(
+        engine._points_collide(torch.full((2,), 16.1), torch.full((2,), 16.0))
+    )
+
+
+def test_player_actor_collision_uses_doom_square_corner(square_scenario) -> None:
+    engine = _engine(square_scenario)
+    engine.x.zero_()
+    engine.y.zero_()
+    engine.z.zero_()
+    engine.enemy_x[:, 0] = 32.0
+    engine.enemy_y[:, 0] = 32.0
+    engine.enemy_z[:, 0] = 0.0
+    engine.enemy_type[:, 0] = 0
+    engine.enemy_alive[:, 0] = True
+
+    assert torch.all(engine._player_collides(engine.x, engine.y))
 
 
 def test_reference_gravity_trace_lands_on_lowered_floor(square_scenario) -> None:
@@ -309,6 +359,19 @@ def test_reference_gravity_trace_lands_on_lowered_floor(square_scenario) -> None
         -24.375,
         -23.0,
     ]
+
+
+def test_reference_double_gravity_when_walking_off_ledge(square_scenario) -> None:
+    engine = _engine(square_scenario)
+    engine.z.zero_()
+    engine.velocity_z.zero_()
+    engine.previous_player_floor_z.zero_()
+    engine.player_floor_z.fill_(-64.0)
+
+    engine._vertical_player_tick(torch.ones(2, dtype=torch.bool))
+
+    assert torch.equal(engine.z, torch.zeros(2))
+    assert torch.equal(engine.velocity_z, torch.full((2,), -2.0))
 
 
 def test_player_step_height_limit_is_twenty_four_units(square_scenario) -> None:
@@ -405,10 +468,10 @@ def test_forward_trace_matches_vizdoom_fixed_point_oracle(square_scenario) -> No
     for _ in range(10):
         engine._move_player(buttons)
 
-    assert torch.allclose(engine.x, torch.full((2,), 835.0191955566406), atol=2e-4)
-    assert torch.allclose(engine.y, torch.full((2,), 395.65065002441406), atol=2e-4)
-    assert torch.allclose(engine.momentum_x, torch.full((2,), -0.4057769775390625), atol=2e-3)
-    assert torch.allclose(engine.momentum_y, torch.full((2,), 1.8876495361328125), atol=2e-3)
+    assert torch.equal(engine.x, torch.full((2,), 835.0191955566406))
+    assert torch.equal(engine.y, torch.full((2,), 395.65065002441406))
+    assert torch.equal(engine.momentum_x, torch.full((2,), -0.4057769775390625))
+    assert torch.equal(engine.momentum_y, torch.full((2,), 1.8876495361328125))
 
 
 def test_wall_contact_uses_reference_slide_residual(square_scenario) -> None:
@@ -424,10 +487,34 @@ def test_wall_contact_uses_reference_slide_residual(square_scenario) -> None:
     engine._move_player(buttons)
 
     assert fraction.tolist() == [0.5, 0.5]
-    assert torch.allclose(engine.x, torch.full((2,), 3.875))
-    assert torch.allclose(engine.y, torch.full((2,), 239.375))
-    assert torch.allclose(engine.momentum_x, torch.full((2,), 1.8125))
+    assert torch.equal(engine.x, torch.full((2,), 4.0))
+    assert torch.equal(engine.y, torch.full((2,), 240.0))
+    assert torch.equal(engine.momentum_x, torch.full((2,), 3.625))
     assert torch.equal(engine.momentum_y, torch.zeros(2))
+
+
+def test_axis_slide_contact_uses_reference_nearest_fixed_rounding(square_scenario) -> None:
+    engine = _engine(square_scenario)
+    fixed_unit = 1 << 16
+    position_x = torch.zeros(2, dtype=torch.int64)
+    position_y = torch.full(
+        (2,),
+        256 * fixed_unit - 16 * fixed_unit - 2,
+        dtype=torch.int64,
+    )
+    move_x = torch.zeros(2, dtype=torch.int64)
+    move_y = torch.full((2,), 3, dtype=torch.int64)
+
+    fraction, horizontal, valid = engine._axis_slide_contact_fixed(
+        position_x,
+        position_y,
+        move_x,
+        move_y,
+    )
+
+    assert fraction.tolist() == [43691, 43691]
+    assert torch.all(horizontal)
+    assert torch.all(valid)
 
 
 def test_player_cannot_move_through_solid_monster(square_scenario) -> None:

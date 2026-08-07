@@ -127,6 +127,7 @@ def test_weapon_slot_counts_preserve_chainsaw_and_shotgun_variants(square_scenar
     assert engine.shotgun_owned.tolist() == [False, False]
     assert engine.ammo[:, 2].tolist() == [8.0, 8.0]
     assert engine.pending_weapon.tolist() == [4, 4]
+    assert engine.mugshot_grin_tics.tolist() == [71, 71]
     _advance_weapon_switch(engine)
     assert engine._active_weapon().tolist() == [4, 4]
 
@@ -145,6 +146,20 @@ def test_weapon_slot_counts_preserve_chainsaw_and_shotgun_variants(square_scenar
     engine._select_weapons(buttons)
     _advance_weapon_switch(engine)
     assert engine._active_weapon().tolist() == [3, 3]
+
+
+def test_new_weapon_grin_matches_reference_state_duration(square_scenario) -> None:
+    engine = _engine(_item_scenario(square_scenario, 2005))
+
+    engine._collect_items()
+
+    assert engine.mugshot_grin_tics.tolist() == [71, 71]
+    noop = torch.zeros((2, 20), dtype=torch.bool)
+    for _ in range(70):
+        engine.step(noop)
+    assert engine.mugshot_grin_tics.tolist() == [1, 1]
+    engine.step(noop)
+    assert engine.mugshot_grin_tics.tolist() == [0, 0]
 
 
 def test_weapon_cycle_is_edge_triggered_across_frame_skip(square_scenario) -> None:
