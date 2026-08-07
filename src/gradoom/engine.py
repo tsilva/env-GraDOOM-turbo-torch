@@ -1175,6 +1175,24 @@ class TorchDeathmatchEngine:
     def _wrap_angle(angle: torch.Tensor) -> torch.Tensor:
         return torch.remainder(angle + math.pi, 2 * math.pi) - math.pi
 
+    @staticmethod
+    def _fine_angle_index(angle: torch.Tensor) -> torch.Tensor:
+        """Quantize radians to the lookup-table index used by Doom traces."""
+        return torch.floor(
+            torch.remainder(angle, 2.0 * math.pi) * _FINE_ANGLE_SCALE
+        ).to(torch.int64) & (_FINE_ANGLES - 1)
+
+    def _fine_direction(
+        self,
+        angle: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        fine_angle = self._fine_angle_index(angle)
+        sine = self._fine_sine_fixed[fine_angle].to(torch.float32) / _FIXED_UNIT
+        cosine = self._fine_sine_fixed[
+            (fine_angle + _FINE_ANGLES // 4) & (_FINE_ANGLES - 1)
+        ].to(torch.float32) / _FIXED_UNIT
+        return cosine, sine
+
     def _doom_fine_angle(
         self,
         delta_x_fixed: torch.Tensor,
@@ -2056,8 +2074,9 @@ class TorchDeathmatchEngine:
         target_radius: torch.Tensor,
     ) -> torch.Tensor:
         """Return Doom-compatible XY trace intercepts for player rays."""
-        cosine = torch.cos(ray_angle)[..., None]
-        sine = torch.sin(ray_angle)[..., None]
+        cosine, sine = self._fine_direction(ray_angle)
+        cosine = cosine[..., None]
+        sine = sine[..., None]
         radius = target_radius[:, None, :]
         target_x = target_x[:, None, :]
         target_y = target_y[:, None, :]
@@ -2094,8 +2113,9 @@ class TorchDeathmatchEngine:
 
     def _player_ray_wall_distance(self, ray_angle: torch.Tensor) -> torch.Tensor:
         """Return horizontal distances to every linedef crossed by each ray."""
-        cosine = torch.cos(ray_angle)[..., None]
-        sine = torch.sin(ray_angle)[..., None]
+        cosine, sine = self._fine_direction(ray_angle)
+        cosine = cosine[..., None]
+        sine = sine[..., None]
         walls = self.map.portal_walls
         start_x = walls[:, 0]
         start_y = walls[:, 1]
@@ -3098,11 +3118,8 @@ class TorchDeathmatchEngine:
         self,
         weapon: torch.Tensor,
         fires: torch.Tensor,
-        target_x: torch.Tensor,
-        target_y: torch.Tensor,
-        target_z: torch.Tensor,
-        target_height: torch.Tensor,
-        has_target: torch.Tensor,
+        aim_angle: torch.Tensor,
+        aim_pitch: torch.Tensor,
     ) -> None:
         requested = fires & ((weapon == 6) | (weapon == 7))
         free = ~self.projectile_alive & (self.projectile_impact_tics <= 0)
@@ -3112,20 +3129,35 @@ class TorchDeathmatchEngine:
         row = torch.arange(self.num_envs, device=self.device)
         projectile_type = (weapon - 6).clamp(0, 1)
         speed = self._player_projectile_speed[projectile_type]
-        cosine = torch.cos(self.angle)
-        sine = torch.sin(self.angle)
         spawn_z = self.z + 32.0
-        aim_dx = torch.where(has_target, target_x - self.x, cosine)
-        aim_dy = torch.where(has_target, target_y - self.y, sine)
-        aim_dz = torch.where(
-            has_target,
-            target_z + target_height * 0.5 - spawn_z,
-            torch.zeros_like(spawn_z),
-        )
-        aim_norm = torch.sqrt(aim_dx * aim_dx + aim_dy * aim_dy + aim_dz * aim_dz).clamp_min_(1e-4)
-        velocity_x = aim_dx / aim_norm * speed
-        velocity_y = aim_dy / aim_norm * speed
-        velocity_z = aim_dz / aim_norm * speed
+
+        fine_angle = self._fine_angle_index(aim_angle)
+        fine_pitch = self._fine_angle_index(aim_pitch)
+        sine_angle_fixed = self._fine_sine_fixed[fine_angle]
+        cosine_angle_fixed = self._fine_sine_fixed[
+            (fine_angle + _FINE_ANGLES // 4) & (_FINE_ANGLES - 1)
+        ]
+        sine_pitch_fixed = self._fine_sine_fixed[fine_pitch]
+        cosine_pitch_fixed = self._fine_sine_fixed[
+            (fine_pitch + _FINE_ANGLES // 4) & (_FINE_ANGLES - 1)
+        ]
+        aim_x_fixed = cosine_pitch_fixed * cosine_angle_fixed >> 16
+        aim_y_fixed = cosine_pitch_fixed * sine_angle_fixed >> 16
+        aim_z_fixed = -sine_pitch_fixed
+        aim_norm = torch.sqrt(
+            aim_x_fixed.to(torch.float32) * aim_x_fixed.to(torch.float32)
+            + aim_y_fixed.to(torch.float32) * aim_y_fixed.to(torch.float32)
+            + aim_z_fixed.to(torch.float32) * aim_z_fixed.to(torch.float32)
+        ).clamp_min_(1.0)
+        velocity_x = torch.trunc(
+            aim_x_fixed.to(torch.float32) / aim_norm * speed * _FIXED_UNIT
+        ) / _FIXED_UNIT
+        velocity_y = torch.trunc(
+            aim_y_fixed.to(torch.float32) / aim_norm * speed * _FIXED_UNIT
+        ) / _FIXED_UNIT
+        velocity_z = torch.trunc(
+            aim_z_fixed.to(torch.float32) / aim_norm * speed * _FIXED_UNIT
+        ) / _FIXED_UNIT
         self.projectile_x[row, slot] = torch.where(
             spawn,
             self.x + velocity_x * 0.5,
@@ -3245,8 +3277,14 @@ class TorchDeathmatchEngine:
         moving = alive.clone()
         impact = torch.zeros_like(alive)
         enemy_impact = torch.zeros_like(alive)
+        doll_impact = torch.zeros_like(alive)
         nearest_enemy = torch.zeros_like(self.projectile_age, dtype=torch.int64)
         enemy_type = self.enemy_type.clamp_min(0)
+        doll_count = max(len(self.map.player_starts) - 1, 0)
+        if doll_count:
+            doll_x = self.map.player_starts[:-1, 0]
+            doll_y = self.map.player_starts[:-1, 1]
+            doll_z = self._player_start_z[:-1]
         # Rocket and plasma definitions require at most three P_XYMovement
         # subdivisions. Keeping this bound static avoids a device sync per tic.
         for step in range(1, 4):
@@ -3298,7 +3336,45 @@ class TorchDeathmatchEngine:
             )
             nearest_distance, step_nearest_enemy = torch.min(candidate_distance, dim=2)
             step_enemy_impact = torch.isfinite(nearest_distance)
-            step_impact = enabled & (wall_impact | opening_impact | step_enemy_impact)
+            if doll_count:
+                doll_dx = candidate_x[:, :, None] - doll_x[None, None, :]
+                doll_dy = candidate_y[:, :, None] - doll_y[None, None, :]
+                doll_distance = torch.sqrt(doll_dx * doll_dx + doll_dy * doll_dy)
+                doll_overlap = self._vertical_overlap(
+                    current_z[:, :, None],
+                    projectile_height[:, :, None],
+                    doll_z[None, None, :],
+                    _PLAYER_HEIGHT,
+                )
+                doll_candidate = (
+                    enabled[:, :, None]
+                    & ~self.player_dead[:, None, None]
+                    & doll_overlap
+                    & (
+                        doll_dx.abs()
+                        < projectile_radius[:, :, None] + _PLAYER_RADIUS
+                    )
+                    & (
+                        doll_dy.abs()
+                        < projectile_radius[:, :, None] + _PLAYER_RADIUS
+                    )
+                )
+                nearest_doll_distance, _ = torch.min(
+                    torch.where(
+                        doll_candidate,
+                        doll_distance,
+                        torch.full_like(doll_distance, torch.inf),
+                    ),
+                    dim=2,
+                )
+                step_doll_impact = torch.isfinite(nearest_doll_distance) & (
+                    nearest_doll_distance < nearest_distance
+                )
+                step_enemy_impact &= ~step_doll_impact
+            else:
+                step_doll_impact = torch.zeros_like(step_enemy_impact)
+            step_actor_impact = step_enemy_impact | step_doll_impact
+            step_impact = enabled & (wall_impact | opening_impact | step_actor_impact)
             successful = enabled & ~step_impact
             current_x.copy_(torch.where(successful, candidate_x, current_x))
             current_y.copy_(torch.where(successful, candidate_y, current_y))
@@ -3306,6 +3382,7 @@ class TorchDeathmatchEngine:
                 torch.where(step_impact & step_enemy_impact, step_nearest_enemy, nearest_enemy)
             )
             enemy_impact |= step_impact & step_enemy_impact
+            doll_impact |= step_impact & step_doll_impact
             impact |= step_impact
             moving &= ~step_impact
 
@@ -3337,8 +3414,13 @@ class TorchDeathmatchEngine:
         mixed = random_bits ^ (slot_bits * _HASH_GOLDEN_RATIO_SIGNED)
         mixed ^= mixed >> 16
         die = torch.remainder(mixed, 8).to(torch.float32) + 1
-        direct_damage = torch.where(self.projectile_type == 0, die * 20.0, die * 5.0)
-        direct_damage *= (impact & enemy_impact).to(torch.float32)
+        rolled_direct_damage = torch.where(
+            self.projectile_type == 0,
+            die * 20.0,
+            die * 5.0,
+        )
+        direct_damage = rolled_direct_damage * (impact & enemy_impact).to(torch.float32)
+        direct_doll_damage = rolled_direct_damage * (impact & doll_impact).to(torch.float32)
         direct_damage_by_enemy = torch.zeros(
             (
                 self.num_envs,
@@ -3481,10 +3563,68 @@ class TorchDeathmatchEngine:
             self.z[:, None],
             torch.full((self.num_envs, 1), _PLAYER_HEIGHT, device=self.device),
         )[:, :, 0]
-        player_splash = rocket_impact & visible_to_player
+        direct_doll_total = torch.sum(direct_doll_damage, dim=1)
+        player_survives_direct = direct_doll_total < self.health
+        player_splash = (
+            rocket_impact
+            & visible_to_player
+            & player_survives_direct[:, None]
+        )
         player_splash_damage *= player_splash.to(torch.float32)
         player_splash_points_fixed *= player_splash.to(torch.int64)
-        self_damage = torch.sum(player_splash_damage, dim=1)
+        if doll_count:
+            doll_splash_damage, _ = self._rocket_radius_damage(
+                current_x[:, :, None],
+                current_y[:, :, None],
+                current_z[:, :, None],
+                doll_x[None, None, :],
+                doll_y[None, None, :],
+                doll_z[None, None, :],
+                torch.full(
+                    (1, 1, doll_count),
+                    _PLAYER_RADIUS,
+                    device=self.device,
+                ),
+                torch.full(
+                    (1, 1, doll_count),
+                    _PLAYER_HEIGHT,
+                    device=self.device,
+                ),
+            )
+            visible_to_doll = ~self._rocket_splash_blocked(
+                current_x,
+                current_y,
+                current_z,
+                doll_x[None, :].expand(self.num_envs, -1),
+                doll_y[None, :].expand(self.num_envs, -1),
+                doll_z[None, :].expand(self.num_envs, -1),
+                torch.full(
+                    (self.num_envs, doll_count),
+                    _PLAYER_HEIGHT,
+                    device=self.device,
+                ),
+            )
+            doll_splash = (
+                rocket_impact[:, :, None]
+                & visible_to_doll
+                & player_survives_direct[:, None, None]
+            )
+            doll_splash_damage *= doll_splash.to(torch.float32)
+            total_doll_splash_damage = torch.sum(doll_splash_damage, dim=(1, 2))
+            doll_armor_absorb_request = torch.sum(
+                torch.floor(
+                    doll_splash_damage * self.armor_save_fraction[:, None, None]
+                ),
+                dim=(1, 2),
+            )
+        else:
+            total_doll_splash_damage = torch.zeros_like(self.health)
+            doll_armor_absorb_request = torch.zeros_like(self.health)
+        self_damage = (
+            torch.sum(player_splash_damage, dim=1)
+            + direct_doll_total
+            + total_doll_splash_damage
+        )
 
         player_fine_angle = self._doom_fine_angle(
             torch.round((self.x[:, None] - current_x) * _FIXED_UNIT).to(torch.int64),
@@ -3540,11 +3680,20 @@ class TorchDeathmatchEngine:
         )
         self._apply_player_damage(
             self_damage,
-            armor_absorb_request=torch.sum(
-                torch.floor(
-                    player_splash_damage * self.armor_save_fraction[:, None]
-                ),
-                dim=1,
+            armor_absorb_request=(
+                torch.sum(
+                    torch.floor(
+                        player_splash_damage * self.armor_save_fraction[:, None]
+                    ),
+                    dim=1,
+                )
+                + torch.sum(
+                    torch.floor(
+                        direct_doll_damage * self.armor_save_fraction[:, None]
+                    ),
+                    dim=1,
+                )
+                + doll_armor_absorb_request
             ),
         )
         reward = self._apply_enemy_damage(
@@ -3698,11 +3847,8 @@ class TorchDeathmatchEngine:
         self.chainsaw_pull |= chainsaw_hit
         return reward
 
-    def _apply_player_hitscan(
+    def _player_autoaim(
         self,
-        weapon: torch.Tensor,
-        fires: torch.Tensor,
-        accurate: torch.Tensor,
         target_x: torch.Tensor,
         target_y: torch.Tensor,
         target_z: torch.Tensor,
@@ -3712,27 +3858,30 @@ class TorchDeathmatchEngine:
         solid_sight: torch.Tensor,
         opening_bottom: torch.Tensor,
         opening_top: torch.Tensor,
-    ) -> torch.Tensor:
-        """Trace and apply every Doom bullet pellet independently."""
-        hitscan_fires = fires & (weapon >= 2) & (weapon <= 5)
-        shoot_z = self.z + 36.0
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return P_AimLineAttack's selected probe angle, pitch, and target flag."""
+        shoot_z = self.z[:, None] + 36.0
         center_dx = target_x - self.x[:, None]
         center_dy = target_y - self.y[:, None]
-        center_distance = torch.sqrt(center_dx * center_dx + center_dy * center_dy).clamp_min_(1e-4)
-        bottom_slope = torch.maximum(
+        center_distance = torch.sqrt(
+            center_dx * center_dx + center_dy * center_dy
+        ).clamp_min_(1e-4)
+        target_bottom_delta = target_z - shoot_z
+        target_top_delta = target_z + target_height - shoot_z
+        portal_bottom_slope = torch.where(
+            opening_bottom > target_bottom_delta,
             opening_bottom / center_distance,
-            torch.full_like(center_distance, -_BULLET_AUTOAIM_MAX_SLOPE),
+            torch.full_like(center_distance, -torch.inf),
         )
-        top_slope = torch.minimum(
+        portal_top_slope = torch.where(
+            opening_top < target_top_delta,
             opening_top / center_distance,
-            torch.full_like(center_distance, _BULLET_AUTOAIM_MAX_SLOPE),
+            torch.full_like(center_distance, torch.inf),
         )
-        target_visible = target_alive & ~solid_sight & (top_slope > bottom_slope)
-        target_pitch = -torch.atan((bottom_slope + top_slope) * 0.5)
 
-        # P_BulletSlope probes center, +5.625 degrees, then -5.625 degrees.
-        # The selected probe contributes only pitch: P_LineAttack still uses
-        # the weapon's independently spread horizontal angle.
+        # P_BulletSlope and P_SpawnPlayerMissile both probe center,
+        # +5.625 degrees, then -5.625 degrees, stopping at the first probe
+        # that crosses a shootable actor within 16 map blocks.
         aim_angles = torch.stack(
             (
                 self.angle,
@@ -3746,6 +3895,27 @@ class TorchDeathmatchEngine:
             target_x,
             target_y,
             target_radius,
+        )
+        safe_aim_distance = torch.where(
+            torch.isfinite(aim_distance),
+            aim_distance.clamp_min(1e-4),
+            torch.ones_like(aim_distance),
+        )
+        bottom_slope = torch.maximum(
+            target_bottom_delta[:, None, :] / safe_aim_distance,
+            portal_bottom_slope[:, None, :],
+        )
+        bottom_slope = torch.maximum(
+            bottom_slope,
+            torch.full_like(bottom_slope, -_BULLET_AUTOAIM_MAX_SLOPE),
+        )
+        top_slope = torch.minimum(
+            target_top_delta[:, None, :] / safe_aim_distance,
+            portal_top_slope[:, None, :],
+        )
+        top_slope = torch.minimum(
+            top_slope,
+            torch.full_like(top_slope, _BULLET_AUTOAIM_MAX_SLOPE),
         )
         aim_wall_distance = self._player_ray_wall_distance(aim_angles)
         wall_sectors = self.map.portal_wall_sectors
@@ -3762,7 +3932,9 @@ class TorchDeathmatchEngine:
             dim=2,
         )
         aim_valid = (
-            target_visible[:, None, :]
+            target_alive[:, None, :]
+            & ~solid_sight[:, None, :]
+            & (top_slope > bottom_slope)
             & (aim_distance <= _BULLET_AUTOAIM_RANGE)
             & (aim_distance < nearest_solid_wall[:, :, None])
         )
@@ -3775,23 +3947,53 @@ class TorchDeathmatchEngine:
         aim_exists = torch.isfinite(
             aim_target_distance.gather(2, aim_target[:, :, None]).squeeze(2)
         )
+        selected_top_slope = top_slope.gather(
+            2,
+            aim_target[:, :, None],
+        ).squeeze(2)
+        selected_bottom_slope = bottom_slope.gather(
+            2,
+            aim_target[:, :, None],
+        ).squeeze(2)
+        # PTR_AimTraverse averages the top and bottom pitch angles, not their
+        # slopes. The distinction is visible for close actors straddling the
+        # player's 36-unit hitscan origin. Only three selected actors need the
+        # comparatively expensive inverse tangent operation.
         pitch_by_aim = (
-            target_pitch[:, None, :]
-            .expand(-1, 3, -1)
-            .gather(
-                2,
-                aim_target[:, :, None],
-            )
-            .squeeze(2)
-        )
-        selected_aim = torch.argmax(aim_exists.to(torch.int32), dim=1)
+            -torch.atan(selected_top_slope)
+            - torch.atan(selected_bottom_slope)
+        ) * 0.5
+        selected_probe = torch.argmax(aim_exists.to(torch.int32), dim=1)
         row = torch.arange(self.num_envs, device=self.device)
         has_autoaim = torch.any(aim_exists, dim=1)
-        base_pitch = torch.where(
+        selected_angle = torch.where(
             has_autoaim,
-            pitch_by_aim[row, selected_aim],
+            aim_angles[row, selected_probe],
+            self.angle,
+        )
+        selected_pitch = torch.where(
+            has_autoaim,
+            pitch_by_aim[row, selected_probe],
             torch.zeros_like(self.angle),
         )
+        return selected_angle, selected_pitch, has_autoaim
+
+    def _apply_player_hitscan(
+        self,
+        weapon: torch.Tensor,
+        fires: torch.Tensor,
+        accurate: torch.Tensor,
+        base_pitch: torch.Tensor,
+        target_x: torch.Tensor,
+        target_y: torch.Tensor,
+        target_z: torch.Tensor,
+        target_radius: torch.Tensor,
+        target_height: torch.Tensor,
+        target_alive: torch.Tensor,
+    ) -> torch.Tensor:
+        """Trace and apply every Doom bullet pellet independently."""
+        hitscan_fires = fires & (weapon >= 2) & (weapon <= 5)
+        shoot_z = self.z + 36.0
 
         pellet_damage, horizontal_spread, vertical_spread = self._hitscan_pellet_rolls(
             weapon, hitscan_fires, accurate
@@ -3810,7 +4012,8 @@ class TorchDeathmatchEngine:
             actor_distance,
             torch.zeros_like(actor_distance),
         )
-        vertical_slope = -torch.tan(pellet_pitch)
+        cosine_pitch, sine_pitch = self._fine_direction(pellet_pitch)
+        vertical_slope = -sine_pitch / cosine_pitch.clamp_min_(1.0 / _FIXED_UNIT)
         intercept_z = shoot_z[:, None, None] + vertical_slope[:, :, None] * safe_actor_distance
         target_bottom = target_z[:, None, :]
         target_top = target_bottom + target_height[:, None, :]
@@ -3827,8 +4030,9 @@ class TorchDeathmatchEngine:
         bottom_plane_distance = (target_bottom - shoot_z[:, None, None]) / safe_vertical_slope[
             :, :, None
         ]
-        ray_cosine = torch.cos(pellet_angle)[:, :, None]
-        ray_sine = torch.sin(pellet_angle)[:, :, None]
+        ray_cosine, ray_sine = self._fine_direction(pellet_angle)
+        ray_cosine = ray_cosine[:, :, None]
+        ray_sine = ray_sine[:, :, None]
 
         def inside_target_box(distance: torch.Tensor) -> torch.Tensor:
             hit_x = self.x[:, None, None] + ray_cosine * distance
@@ -3862,7 +4066,6 @@ class TorchDeathmatchEngine:
         )
         actor_hit = enters_actor_side | enters_actor_top | enters_actor_bottom
 
-        cosine_pitch = torch.cos(pellet_pitch).clamp_min_(1e-4)
         maximum_horizontal_distance = _PLAYER_HITSCAN_RANGE * cosine_pitch
         actor_hit &= hit_distance <= maximum_horizontal_distance[:, :, None]
 
@@ -3874,6 +4077,7 @@ class TorchDeathmatchEngine:
             torch.zeros_like(pellet_wall_distance),
         )
         wall_hit_z = shoot_z[:, None, None] + vertical_slope[:, :, None] * safe_wall_distance
+        wall_sectors = self.map.portal_wall_sectors
         valid_portal = torch.all(wall_sectors >= 0, dim=1)
         safe_sectors = wall_sectors.clamp_min(0)
         portal_bottom = torch.amax(
@@ -4182,20 +4386,7 @@ class TorchDeathmatchEngine:
             target_height = self._enemy_height[self.enemy_type.clamp_min(0)]
             target_radius = self._enemy_radius[self.enemy_type.clamp_min(0)]
             target_alive = self.enemy_alive
-        dx = target_x - self.x[:, None]
-        dy = target_y - self.y[:, None]
-        distance = torch.sqrt(dx * dx + dy * dy).clamp_min_(1e-4)
-        bearing = self._wrap_angle(torch.atan2(dy, dx) - self.angle[:, None]).abs()
-        valid = (
-            target_alive
-            & (bearing < (8.0 * math.pi / 180.0))
-            & (distance < 2048.0)
-        )
         shoot_z = self.z[:, None] + 36.0
-        max_autoaim_slope = math.tan(35.0 * math.pi / 180.0)
-        bottom_slope = (target_z - shoot_z) / distance
-        top_slope = (target_z + target_height - shoot_z) / distance
-        valid &= (top_slope >= -max_autoaim_slope) & (bottom_slope <= max_autoaim_slope)
         solid_sight, opening_bottom, opening_top = self._sight_opening(
             self.x[:, None],
             self.y[:, None],
@@ -4205,19 +4396,22 @@ class TorchDeathmatchEngine:
             target_z,
             target_height,
         )
-        valid &= ~solid_sight & (opening_top > opening_bottom)
-        target_distance = torch.where(valid, distance, torch.full_like(distance, torch.inf))
-        target = torch.argmin(target_distance, dim=1)
-        row = torch.arange(self.num_envs, device=self.device)
-        selected_target_exists = torch.isfinite(target_distance[row, target])
+        autoaim_angle, autoaim_pitch, _ = self._player_autoaim(
+            target_x,
+            target_y,
+            target_z,
+            target_radius,
+            target_height,
+            target_alive,
+            solid_sight,
+            opening_bottom,
+            opening_top,
+        )
         self._spawn_player_projectile(
             weapon,
             fires,
-            target_x[row, target],
-            target_y[row, target],
-            target_z[row, target],
-            target_height[row, target],
-            selected_target_exists,
+            autoaim_angle,
+            autoaim_pitch,
         )
         melee_reward = self._apply_player_melee(
             weapon,
@@ -4236,15 +4430,13 @@ class TorchDeathmatchEngine:
             weapon,
             fires,
             accurate,
+            autoaim_pitch,
             target_x,
             target_y,
             target_z,
             target_radius,
             target_height,
             target_alive,
-            solid_sight,
-            opening_bottom,
-            opening_top,
         )
         return hitscan_reward + melee_reward
 
@@ -4272,6 +4464,126 @@ class TorchDeathmatchEngine:
         knight_multiplier = torch.where(distance < 64, 10.0, 8.0)
         damage = torch.where(enemy_type == 5, die(0, 8) * knight_multiplier, damage)
         return torch.where(attacks, damage, torch.zeros_like(damage))
+
+    def _enemy_hitscan_rolls(
+        self,
+        enemy_type: torch.Tensor,
+        fires: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Roll Doom's per-pellet monster bullet spread and damage."""
+        pellet_count = torch.where(
+            enemy_type == 1,
+            torch.full_like(enemy_type, 3),
+            ((enemy_type == 0) | (enemy_type == 3)).to(enemy_type.dtype),
+        )
+        pellet = torch.arange(3, device=self.device, dtype=torch.int64)[None, None, :]
+        active = fires[:, :, None] & (pellet < pellet_count[:, :, None])
+        draw_mask = torch.any(active, dim=(1, 2))
+        enemy_slot = torch.arange(
+            self.enemy_slots,
+            device=self.device,
+            dtype=torch.int64,
+        )[None, :, None]
+
+        def mixed_draw(draw: int) -> torch.Tensor:
+            bits = self._random_u32(draw_mask)[:, None, None]
+            mixed = (
+                bits
+                ^ (enemy_slot * _HASH_GOLDEN_RATIO_SIGNED)
+                ^ (draw * 0x27D4EB2D)
+            )
+            mixed ^= mixed >> 16
+            return torch.bitwise_right_shift(mixed, pellet * 8)
+
+        first = torch.bitwise_and(mixed_draw(0), 255).to(torch.float32)
+        second = torch.bitwise_and(mixed_draw(1), 255).to(torch.float32)
+        damage_roll = torch.remainder(mixed_draw(2), 5).to(torch.float32) + 1.0
+        spread = (first - second) * float(1 << 20) * _BAM_TO_RADIANS
+        return (
+            torch.where(active, damage_roll * 3.0, 0.0),
+            torch.where(active, spread, 0.0),
+        )
+
+    def _enemy_ray_player_distance(self, ray_angle: torch.Tensor) -> torch.Tensor:
+        """Return PT_COMPATIBLE player intercepts for monster bullet rays."""
+        cosine, sine = self._fine_direction(ray_angle)
+        same_sign = (cosine >= 0) == (sine >= 0)
+        diagonal_x = self.x[:, None, None] - _PLAYER_RADIUS
+        diagonal_y = self.y[:, None, None] + torch.where(
+            same_sign,
+            torch.full_like(cosine, _PLAYER_RADIUS),
+            torch.full_like(cosine, -_PLAYER_RADIUS),
+        )
+        diagonal_dx = torch.full_like(cosine, _PLAYER_RADIUS * 2.0)
+        diagonal_dy = torch.where(
+            same_sign,
+            torch.full_like(cosine, -_PLAYER_RADIUS * 2.0),
+            torch.full_like(cosine, _PLAYER_RADIUS * 2.0),
+        )
+        offset_x = diagonal_x - self.enemy_x[:, :, None]
+        offset_y = diagonal_y - self.enemy_y[:, :, None]
+        denominator = cosine * diagonal_dy - sine * diagonal_dx
+        safe = torch.where(
+            denominator.abs() < 1e-6,
+            torch.ones_like(denominator),
+            denominator,
+        )
+        along_ray = (offset_x * diagonal_dy - offset_y * diagonal_dx) / safe
+        along_diagonal = (offset_x * sine - offset_y * cosine) / safe
+        intersects = (
+            (denominator.abs() >= 1e-6)
+            & (along_ray >= 0)
+            & (along_diagonal >= 0)
+            & (along_diagonal <= 1)
+        )
+        return torch.where(
+            intersects,
+            along_ray,
+            torch.full_like(along_ray, torch.inf),
+        )
+
+    def _enemy_hitscan_damage(
+        self,
+        enemy_type: torch.Tensor,
+        fires: torch.Tensor,
+        distance: torch.Tensor,
+        visible: torch.Tensor,
+    ) -> torch.Tensor:
+        """Trace zombieman, shotgun-guy, and chaingunner pellets."""
+        pellet_damage, spread = self._enemy_hitscan_rolls(enemy_type, fires)
+        base_angle = torch.atan2(
+            self.y[:, None] - self.enemy_y,
+            self.x[:, None] - self.enemy_x,
+        )
+        pellet_angle = base_angle[:, :, None] + spread
+        player_distance = self._enemy_ray_player_distance(pellet_angle)
+
+        shoot_z = self.enemy_z + 36.0
+        bottom_slope = torch.maximum(
+            (self.z[:, None] - shoot_z) / distance,
+            torch.full_like(distance, -_BULLET_AUTOAIM_MAX_SLOPE),
+        )
+        top_slope = torch.minimum(
+            (self.z[:, None] + _PLAYER_HEIGHT - shoot_z) / distance,
+            torch.full_like(distance, _BULLET_AUTOAIM_MAX_SLOPE),
+        )
+        pitch = (-torch.atan(top_slope) - torch.atan(bottom_slope)) * 0.5
+        cosine_pitch, sine_pitch = self._fine_direction(pitch)
+        vertical_slope = -sine_pitch / cosine_pitch.clamp_min_(1.0 / _FIXED_UNIT)
+        intercept_z = shoot_z[:, :, None] + vertical_slope[:, :, None] * torch.where(
+            torch.isfinite(player_distance),
+            player_distance,
+            torch.zeros_like(player_distance),
+        )
+        hits = (
+            fires[:, :, None]
+            & visible[:, :, None]
+            & torch.isfinite(player_distance)
+            & (player_distance <= 2048.0 * cosine_pitch[:, :, None])
+            & (intercept_z >= self.z[:, None, None])
+            & (intercept_z <= self.z[:, None, None] + _PLAYER_HEIGHT)
+        )
+        return torch.where(hits, pellet_damage, torch.zeros_like(pellet_damage))
 
     @staticmethod
     def _enemy_missile_threshold(
@@ -4708,25 +5020,55 @@ class TorchDeathmatchEngine:
             melee_vertical_overlap | (distance >= 64.0)
         )
         direct_attack &= distance < self._enemy_attack_range[enemy_type]
-        damage_by_attacker = self._enemy_damage_roll(enemy_type, direct_attack, distance)
-        incoming = torch.sum(damage_by_attacker, dim=1)
-        damaging_slot = torch.argmax(damage_by_attacker, dim=1)
-        thrust_x_by_attacker, thrust_y_by_attacker = self._player_damage_thrust_components(
+        hitscan_type = (enemy_type == 0) | (enemy_type == 1) | (enemy_type == 3)
+        hitscan_damage = self._enemy_hitscan_damage(
+            enemy_type,
+            direct_attack & hitscan_type,
+            distance,
+            visible,
+        )
+        damage_by_attacker = self._enemy_damage_roll(
+            enemy_type,
+            direct_attack & ~hitscan_type,
+            distance,
+        )
+        incoming = torch.sum(damage_by_attacker, dim=1) + torch.sum(
+            hitscan_damage,
+            dim=(1, 2),
+        )
+        total_damage_by_attacker = damage_by_attacker + torch.sum(hitscan_damage, dim=2)
+        damaging_slot = torch.argmax(total_damage_by_attacker, dim=1)
+        melee_thrust_x, melee_thrust_y = self._player_damage_thrust_components(
             damage_by_attacker,
             self.enemy_x,
             self.enemy_y,
         )
-        armor_absorb_request = torch.sum(
-            torch.floor(damage_by_attacker * self.armor_save_fraction[:, None]),
-            dim=1,
+        hitscan_thrust_x, hitscan_thrust_y = self._player_damage_thrust_components(
+            hitscan_damage,
+            self.enemy_x[:, :, None],
+            self.enemy_y[:, :, None],
+        )
+        armor_absorb_request = (
+            torch.sum(
+                torch.floor(damage_by_attacker * self.armor_save_fraction[:, None]),
+                dim=1,
+            )
+            + torch.sum(
+                torch.floor(
+                    hitscan_damage * self.armor_save_fraction[:, None, None]
+                ),
+                dim=(1, 2),
+            )
         )
         row = torch.arange(self.num_envs, device=self.device)
         self._apply_player_damage(
             incoming,
             self.enemy_x[row, damaging_slot],
             self.enemy_y[row, damaging_slot],
-            thrust_x_fixed=torch.sum(thrust_x_by_attacker, dim=1),
-            thrust_y_fixed=torch.sum(thrust_y_by_attacker, dim=1),
+            thrust_x_fixed=torch.sum(melee_thrust_x, dim=1)
+            + torch.sum(hitscan_thrust_x, dim=(1, 2)),
+            thrust_y_fixed=torch.sum(melee_thrust_y, dim=1)
+            + torch.sum(hitscan_thrust_y, dim=(1, 2)),
             armor_absorb_request=armor_absorb_request,
         )
 
@@ -4895,13 +5237,7 @@ class TorchDeathmatchEngine:
                 self.enemy_y,
             )
         )
-        self.enemy_angle.copy_(
-            torch.where(
-                ai_moved,
-                torch.atan2(direction_y, direction_x),
-                self.enemy_angle,
-            )
-        )
+        movement_angle = torch.atan2(direction_y, direction_x)
         decremented_move = torch.clamp_min(self.enemy_move_cooldown - 1, 0)
         self.enemy_move_cooldown.copy_(
             torch.where(active[:, None], decremented_move, self.enemy_move_cooldown)
@@ -4922,6 +5258,14 @@ class TorchDeathmatchEngine:
             can_attack,
             self._enemy_attack_prefire[enemy_type],
             next_cooldown,
+        )
+        face_target = can_attack | (fire_event & hitscan_type)
+        self.enemy_angle.copy_(
+            torch.where(
+                face_target,
+                torch.atan2(dy, dx),
+                torch.where(ai_moved, movement_angle, self.enemy_angle),
+            )
         )
         returning_to_walk = alive & (attack_phase > 0) & (next_phase == 0)
         walking = alive & (next_phase == 0)

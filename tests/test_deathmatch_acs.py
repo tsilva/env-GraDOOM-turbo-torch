@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import replace
 
 import numpy as np
@@ -162,6 +163,65 @@ def test_voodoo_doll_hits_damage_shared_player_health(square_scenario) -> None:
 
     assert reward.tolist() == [0.0, 0.0]
     assert torch.all(engine.health < 100)
+
+
+def test_projectile_hit_damages_shared_health_through_voodoo_doll(
+    square_scenario,
+) -> None:
+    engine = _engine(square_scenario)
+    first_doll = engine.map.player_starts[0]
+    engine.x.fill_(float(first_doll[0]) - 64)
+    engine.y.fill_(float(first_doll[1]))
+    engine.z.fill_(float(engine._player_start_z[0]))
+    engine.angle.zero_()
+    engine.enemy_alive.zero_()
+
+    engine._execute_player_attack(
+        torch.full((2,), 7),
+        torch.ones(2, dtype=torch.bool),
+        torch.ones(2, dtype=torch.bool),
+    )
+    engine._projectile_tick(torch.ones(2, dtype=torch.bool))
+
+    assert engine.health.tolist() == [70.0, 85.0]
+    assert not torch.any(engine.projectile_alive[:, 0])
+    assert engine.projectile_impact_tics[:, 0].tolist() == [20, 20]
+    # Voodoo dolls share health and armor, but not the camera body's momentum.
+    assert torch.equal(engine.momentum_x, torch.zeros(2))
+    assert torch.equal(engine.momentum_y, torch.zeros(2))
+
+
+def test_rocket_radius_damage_reaches_voodoo_doll_without_moving_player(
+    square_scenario,
+) -> None:
+    scenario = replace(
+        square_scenario,
+        blocking_segments=np.asarray(
+            [(-28.0, -200.0, -28.0, 0.0)],
+            dtype=np.float32,
+        ),
+    )
+    engine = _engine(scenario)
+    engine.enemy_alive.zero_()
+    engine.x.fill_(200)
+    engine.y.fill_(200)
+    engine.z.zero_()
+    engine.projectile_x[:, 0] = -40
+    engine.projectile_y[:, 0] = -128
+    engine.projectile_z[:, 0] = 32
+    engine.projectile_velocity_x[:, 0] = 20
+    engine.projectile_velocity_y[:, 0] = 0
+    engine.projectile_velocity_z[:, 0] = 0
+    engine.projectile_type[:, 0] = 0
+    engine.projectile_alive[:, 0] = True
+
+    engine._projectile_tick(torch.ones(2, dtype=torch.bool))
+
+    assert engine.health.tolist() == [44.0, 44.0]
+    assert not torch.any(engine.projectile_alive[:, 0])
+    assert engine.projectile_impact_tics[:, 0].tolist() == [18, 18]
+    assert torch.equal(engine.momentum_x, torch.zeros(2))
+    assert torch.equal(engine.momentum_y, torch.zeros(2))
 
 
 def test_reference_damage_and_pickup_flash_counters(square_scenario) -> None:
@@ -861,6 +921,35 @@ def test_monster_attacks_instead_of_moving_on_chase_tic(square_scenario) -> None
     assert engine.enemy_cooldown[:, 0].tolist() == [16, 16]
 
 
+def test_monster_faces_target_at_prefire_and_hitscan_action(square_scenario) -> None:
+    engine = _engine(square_scenario)
+    engine.x.zero_()
+    engine.y.zero_()
+    engine.enemy_x[:, 0] = 100
+    engine.enemy_y[:, 0] = 0
+    engine.enemy_angle[:, 0] = math.pi / 2
+    engine.enemy_type[:, 0] = 0
+    engine.enemy_health[:, 0] = 20
+    engine.enemy_alive[:, 0] = True
+    engine.enemy_cooldown[:, 0] = 0
+
+    engine._enemy_tick()
+
+    assert torch.allclose(
+        engine.enemy_angle[:, 0],
+        torch.full((2,), math.pi),
+    )
+
+    engine.y.fill_(100)
+    engine.enemy_cooldown[:, 0] = 1
+    engine._enemy_tick()
+
+    assert torch.allclose(
+        engine.enemy_angle[:, 0],
+        torch.full((2,), 3.0 * math.pi / 4.0),
+    )
+
+
 def test_chainsaw_marine_repeats_four_tic_attack_cycle(square_scenario) -> None:
     engine = _engine(square_scenario)
     engine.x.zero_()
@@ -912,7 +1001,42 @@ def test_chaingunner_uses_prefire_and_alternating_burst_gaps(square_scenario) ->
     assert torch.all(after_second_shot < after_first_shot)
     for _ in range(5):
         engine._enemy_tick()
-    assert torch.all(engine.health < after_second_shot)
+    # The third action occurs on schedule but its spread bullet can miss.
+    assert torch.all(engine.health <= after_second_shot)
+    assert engine.enemy_attack_phase[:, 0].tolist() == [2, 2]
+    assert engine.enemy_cooldown[:, 0].tolist() == [4, 4]
+
+
+def test_monster_hitscan_uses_independent_reference_pellets(square_scenario) -> None:
+    engine = _engine(square_scenario)
+    engine.x.zero_()
+    engine.y.zero_()
+    engine.z.zero_()
+    engine.enemy_alive.zero_()
+    engine.enemy_x[:, 0] = 100
+    engine.enemy_y[:, 0] = 0
+    engine.enemy_z[:, 0] = 0
+    engine.enemy_type[:, 0] = torch.tensor([0, 1])
+    engine.enemy_alive[:, 0] = True
+    engine.rng_state.copy_(torch.tensor([12345, 67890]))
+    fires = torch.zeros_like(engine.enemy_alive)
+    fires[:, 0] = True
+    distance = torch.sqrt(
+        (engine.x[:, None] - engine.enemy_x) ** 2
+        + (engine.y[:, None] - engine.enemy_y) ** 2
+    ).clamp_min(1e-4)
+
+    damage = engine._enemy_hitscan_damage(
+        engine.enemy_type.clamp_min(0),
+        fires,
+        distance,
+        torch.ones_like(engine.enemy_alive),
+    )
+
+    assert torch.count_nonzero(damage[0, 0]).item() == 1
+    # The shotgun guy rolls three distinct pellets; the wide third pellet
+    # misses the player's Doom-compatible diagonal at this distance.
+    assert damage[1, 0].tolist() == [6.0, 3.0, 0.0]
 
 
 def test_blocking_linedef_occludes_hitscan_and_monster_attacks(square_scenario) -> None:
@@ -937,10 +1061,10 @@ def test_blocking_linedef_occludes_hitscan_and_monster_attacks(square_scenario) 
         sector_edge_mask=np.ones((1, 5), dtype=np.bool_),
     )
     engine = _engine(divided)
-    engine.x.fill_(-64)
+    engine.x.fill_(-32)
     engine.y.zero_()
     engine.angle.zero_()
-    engine.enemy_x[:, 0] = 64
+    engine.enemy_x[:, 0] = 32
     engine.enemy_y[:, 0] = 0
     engine.enemy_type[:, 0] = 0
     engine.enemy_health[:, 0] = 20
@@ -977,10 +1101,10 @@ def test_two_sided_portal_does_not_occlude_hitscan_or_monster_sight(square_scena
         sector_edge_mask=np.ones((1, 5), dtype=np.bool_),
     )
     engine = _engine(scenario)
-    engine.x.fill_(-64)
+    engine.x.fill_(-32)
     engine.y.zero_()
     engine.angle.zero_()
-    engine.enemy_x[:, 0] = 64
+    engine.enemy_x[:, 0] = 32
     engine.enemy_y[:, 0] = 0
     engine.enemy_type[:, 0] = 0
     engine.enemy_health[:, 0] = 20

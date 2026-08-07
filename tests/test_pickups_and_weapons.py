@@ -782,7 +782,12 @@ def test_empty_weapon_falls_back_to_chainsaw_then_fist(square_scenario) -> None:
 
 
 def test_rocket_uses_delayed_projectile_impact_and_splash(square_scenario) -> None:
-    engine = _engine(square_scenario)
+    engine = _engine(
+        replace(
+            square_scenario,
+            player_starts=square_scenario.player_starts[-1:],
+        )
+    )
     engine.angle.zero_()
     engine.weapons[:, 4].fill_(1)
     engine.ammo[:, 4].fill_(50)
@@ -802,19 +807,100 @@ def test_rocket_uses_delayed_projectile_impact_and_splash(square_scenario) -> No
     assert delayed_reward.tolist() == [0.0, 0.0]
     assert engine.enemy_health[:, 0].tolist() == [500.0, 500.0]
     assert torch.sum(engine.projectile_alive, dim=1).tolist() == [1, 1]
-    assert engine.projectile_x[:, 0].tolist() == [10.0, 10.0]
+    assert torch.allclose(
+        engine.projectile_x[:, 0],
+        torch.full((2,), 9.993507385253906),
+    )
+    assert torch.allclose(
+        engine.projectile_z[:, 0],
+        torch.full((2,), 31.639732360839844),
+    )
     active = torch.ones(2, dtype=torch.bool)
     for _ in range(3):
         engine._projectile_tick(active)
 
     assert torch.all(engine.enemy_health[:, 0] < 500)
-    assert engine.health.tolist() == [20.0, 20.0]
-    assert torch.equal(engine.momentum_x, torch.full((2,), -10.403167724609375))
+    assert engine.health.tolist() == [16.0, 16.0]
+    assert torch.equal(engine.momentum_x, torch.full((2,), -10.920028686523438))
     assert torch.equal(engine.momentum_y, torch.zeros(2))
-    assert torch.allclose(engine.projectile_x[:, 0], torch.full((2,), 190.0 / 3.0))
+    assert torch.allclose(
+        engine.projectile_x[:, 0],
+        torch.full((2,), 59.96104431152344),
+    )
     assert not torch.any(engine.projectile_alive)
     assert engine.projectile_impact_type[:, 0].tolist() == [0, 0]
     assert engine.projectile_impact_tics[:, 0].tolist() == [18, 18]
+
+
+def test_player_missile_uses_reference_side_probe_and_fine_angles(square_scenario) -> None:
+    engine = _engine(_large_arena_scenario(square_scenario))
+    engine.enemy_alive.zero_()
+    engine.z.zero_()
+    engine.angle.zero_()
+    target_angle = torch.deg2rad(torch.tensor([5.0, -5.0]))
+    engine.enemy_x[:, 0] = torch.cos(target_angle) * 512.0
+    engine.enemy_y[:, 0] = torch.sin(target_angle) * 512.0
+    engine.enemy_z[:, 0] = 100
+    engine.enemy_type[:, 0] = 0
+    engine.enemy_health[:, 0] = 100
+    engine.enemy_alive[:, 0] = True
+
+    engine._execute_player_attack(
+        torch.full((2,), 6),
+        torch.ones(2, dtype=torch.bool),
+        torch.ones(2, dtype=torch.bool),
+    )
+
+    heading = torch.rad2deg(
+        torch.atan2(
+            engine.projectile_velocity_y[:, 0],
+            engine.projectile_velocity_x[:, 0],
+        )
+    )
+    # The negative lookup is intentionally asymmetric in ZDoom's generated
+    # finesine table. Neither result points directly at the target's +/-5°.
+    assert torch.allclose(
+        heading,
+        torch.tensor([5.624368667602539, -5.581620693206787]),
+        atol=5e-4,
+    )
+    assert torch.all(engine.projectile_velocity_z[:, 0] > 0)
+    speed = torch.sqrt(
+        engine.projectile_velocity_x[:, 0] ** 2
+        + engine.projectile_velocity_y[:, 0] ** 2
+        + engine.projectile_velocity_z[:, 0] ** 2
+    )
+    assert torch.allclose(speed, torch.full((2,), 20.0), atol=2e-5)
+
+
+def test_player_missile_autoaim_stops_at_reference_range(square_scenario) -> None:
+    engine = _engine(_large_arena_scenario(square_scenario))
+    engine.enemy_alive.zero_()
+    engine.z.zero_()
+    engine.angle.zero_()
+    engine.enemy_x[:, 0] = torch.tensor([1000.0, 1500.0])
+    engine.enemy_y[:, 0] = 0
+    engine.enemy_z[:, 0] = 100
+    engine.enemy_type[:, 0] = 0
+    engine.enemy_health[:, 0] = 100
+    engine.enemy_alive[:, 0] = True
+
+    engine._execute_player_attack(
+        torch.tensor([6, 7]),
+        torch.ones(2, dtype=torch.bool),
+        torch.ones(2, dtype=torch.bool),
+    )
+
+    assert engine.projectile_velocity_z[0, 0] > 0
+    assert engine.projectile_velocity_z[1, 0] == 0
+    speed = torch.sqrt(
+        engine.projectile_velocity_x[:, 0] ** 2
+        + engine.projectile_velocity_y[:, 0] ** 2
+        + engine.projectile_velocity_z[:, 0] ** 2
+    )
+    assert torch.allclose(speed, torch.tensor([20.0, 25.0]), atol=2e-5)
+    assert engine.projectile_x[1, 0] == 12.5
+    assert engine.projectile_z[1, 0] == 32.0
 
 
 def test_rocket_radius_damage_uses_square_actor_bounds_and_height(square_scenario) -> None:
@@ -842,6 +928,7 @@ def test_close_rocket_self_knockback_matches_vizdoom_oracle(square_scenario) -> 
     scenario = replace(
         square_scenario,
         blocking_segments=np.asarray([(-128.0, 10.0, 128.0, 10.0)], dtype=np.float32),
+        player_starts=square_scenario.player_starts[-1:],
     )
     engine = _engine(scenario)
     engine.enemy_alive.zero_()
