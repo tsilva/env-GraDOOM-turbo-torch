@@ -8436,6 +8436,84 @@ class TorchDeathmatchEngine:
             ray_distance = torch.where(nearer, candidate_distance, ray_distance)
 
         unresolved = ~torch.isfinite(ray_distance)
+        # Doom emits horizontal floor spans from vertically continuous
+        # visplane columns. Preserve exact ray hits, but let the next resolved
+        # floor below own cracks where plane intersections fall between the
+        # nested sector polygons.
+        unresolved_row = torch.full_like(
+            self._native_pixel_y,
+            self.native_view_height,
+            dtype=torch.int64,
+        )
+        resolved_row = torch.where(
+            ~unresolved,
+            self._native_pixel_y.to(torch.int64),
+            unresolved_row,
+        )
+        next_resolved_row = torch.flip(
+            torch.cummin(
+                torch.flip(resolved_row, dims=(1,)),
+                dim=1,
+            ).values,
+            dims=(1,),
+        )
+        has_resolved_floor_below = next_resolved_row < self.native_view_height
+        floor_span_sector = sectors.gather(
+            1,
+            next_resolved_row.clamp_max(self.native_view_height - 1),
+        )
+        vertical_floor_span = unresolved & floor_pixels & has_resolved_floor_below
+        sectors = torch.where(
+            vertical_floor_span,
+            floor_span_sector,
+            sectors,
+        )
+        vertical_span_anchor = vertical_floor_span & (
+            floor_span_sector != current_sector[:, None, None]
+        )
+        horizontal_span_anchor = ~unresolved | vertical_span_anchor
+        screen_column = self._native_pixel_x.to(torch.int64)
+        left_anchor_column = torch.cummax(
+            torch.where(
+                horizontal_span_anchor,
+                screen_column,
+                torch.full_like(screen_column, -1),
+            ),
+            dim=2,
+        ).values
+        right_anchor_column = torch.flip(
+            torch.cummin(
+                torch.flip(
+                    torch.where(
+                        horizontal_span_anchor,
+                        screen_column,
+                        torch.full_like(screen_column, self.native_screen_width),
+                    ),
+                    dims=(2,),
+                ),
+                dim=2,
+            ).values,
+            dims=(2,),
+        )
+        has_left_anchor = left_anchor_column >= 0
+        has_right_anchor = right_anchor_column < self.native_screen_width
+        left_span_sector = sectors.gather(2, left_anchor_column.clamp_min(0))
+        right_span_sector = sectors.gather(
+            2,
+            right_anchor_column.clamp_max(self.native_screen_width - 1),
+        )
+        horizontal_floor_span = (
+            unresolved
+            & floor_pixels
+            & has_left_anchor
+            & has_right_anchor
+            & (left_span_sector == right_span_sector)
+        )
+        sectors = torch.where(
+            horizontal_floor_span,
+            left_span_sector,
+            sectors,
+        )
         surface_depth = torch.where(
             unresolved,
             torch.full_like(ray_distance, torch.inf),

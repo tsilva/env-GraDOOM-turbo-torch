@@ -167,6 +167,9 @@ def test_native_walls_use_reference_fine_angle_rays(
     # lookup uses a half-pixel yslope. Reusing the sampling distance chooses
     # the next brighter colormap and produces [83, 63, 47] here.
     assert rgb[0, 119, 10].tolist() == [79, 59, 43]
+    # The same floor visplane stays horizontally continuous where independent
+    # plane rays fall between the nested pit polygons near the screen edge.
+    assert rgb[0, 135, 10].tolist() == [79, 0, 0]
 
 
 def test_native_portal_clips_bound_solid_wall_against_planes(
@@ -211,6 +214,11 @@ def test_native_portal_clips_bound_solid_wall_against_planes(
     # front-sector flat, matching the inverse operation at the ceiling edge.
     assert flat_rgb[0, 122, 260].tolist() == [83, 63, 47]
     assert rgb[0, 122, 260].tolist() == [83, 63, 47]
+    # Doom marks floor visplanes as continuous screen-space spans. Independent
+    # plane rays fall between every nested pit polygon on this row, but the
+    # surrounding span anchors still assign sector 10's BLOOD1 floor.
+    assert flat_rgb[0, 124, 290].tolist() == [79, 0, 0]
+    assert rgb[0, 124, 290].tolist() == [79, 0, 0]
 
 
 def test_native_walls_use_reference_fixed_vertical_sampling(
