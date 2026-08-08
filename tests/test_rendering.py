@@ -114,6 +114,14 @@ def test_native_walls_use_reference_rounded_texel_length(
     engine.angle.fill_(math.radians(348.81591804996503))
     engine.episode_time.fill_(17)
 
+    (
+        wall_distance,
+        _wall_along,
+        geometric_intersections,
+        projected_intersections,
+        projected_left_edges,
+        _wall_visibility,
+    ) = engine._native_portal_intersections()
     frame, surface_depth, scene_surface_depth = engine._native_render_flats(
         engine._current_sector(),
         engine.view_z,
@@ -129,6 +137,19 @@ def test_native_walls_use_reference_rounded_texel_length(
     # P_FinishLoadingLineDef rounds this diagonal wall's TexelLength. Keeping
     # its exact Euclidean length selects the neighboring red-rock column.
     assert rgb[0, 0, 2].tolist() == [127, 0, 0]
+    # At these nested-pit vertices, the integer column ray still intersects the
+    # seg whose half-open range just ended. BSP rasterization instead gives the
+    # column to the adjacent projected seg with the same sector pair.
+    assert geometric_intersections[0, 145, 92]
+    assert not projected_intersections[0, 145, 92]
+    assert projected_left_edges[0, 145, 100]
+    assert torch.isfinite(wall_distance[0, 145, 100])
+    assert geometric_intersections[0, 156, 81]
+    assert not projected_intersections[0, 156, 81]
+    assert projected_left_edges[0, 156, 116]
+    assert torch.isfinite(wall_distance[0, 156, 116])
+    assert rgb[0, 50, 145].tolist() == [79, 0, 0]
+    assert rgb[0, 100, 156].tolist() == [91, 0, 0]
 
 
 def test_native_walls_use_reference_fine_angle_rays(
@@ -166,6 +187,10 @@ def test_native_walls_use_reference_fine_angle_rays(
     # endpoint depths. A direct floating-point 1280/distance lookup selects
     # the next brighter colormap at this threshold.
     assert rgb[0, 20, 255].tolist() == [87, 67, 51]
+    # Endpoint ownership applies only while the adjacent projected seg remains
+    # ahead of the current portal depth. Reusing an owner from an earlier BSP
+    # layer incorrectly paints the left edge with the pit's blue ceiling.
+    assert rgb[0, 35, 5].tolist() == [119, 95, 75]
     # R_MapPlane lights against the integer row edge even though its texture
     # lookup uses a half-pixel yslope. Reusing the sampling distance chooses
     # the next brighter colormap and produces [83, 63, 47] here.
@@ -195,9 +220,14 @@ def test_native_portal_clips_bound_solid_wall_against_planes(
         engine._current_sector(),
         engine.view_z,
     )
-    wall_distance, _wall_along, _geometric_intersections, _wall_visibility = (
-        engine._native_portal_intersections()
-    )
+    (
+        wall_distance,
+        _wall_along,
+        _geometric_intersections,
+        _projected_intersections,
+        _projected_left_edges,
+        _wall_visibility,
+    ) = engine._native_portal_intersections()
     frame, scene_depth = engine._native_render_portal_walls(
         flat_frame.clone(),
         engine.view_z,
@@ -344,9 +374,14 @@ def test_native_walls_use_reference_half_open_screen_bounds(
     engine.angle.fill_(math.radians(165.67382816357394))
     engine.episode_time.fill_(17)
 
-    wall_distance, _wall_along, geometric_intersections, _wall_visibility = (
-        engine._native_portal_intersections()
-    )
+    (
+        wall_distance,
+        _wall_along,
+        geometric_intersections,
+        projected_intersections,
+        projected_left_edges,
+        _wall_visibility,
+    ) = engine._native_portal_intersections()
     frame, surface_depth, scene_surface_depth = engine._native_render_flats(
         engine._current_sector(),
         engine.view_z,
@@ -370,8 +405,11 @@ def test_native_walls_use_reference_half_open_screen_bounds(
     # span. The adjacent wall 185 owns [107, 110) even though this column ray
     # misses it, preserving the continuous BFALL1 seam and its x offset.
     assert geometric_intersections[0, 107, 184]
+    assert not projected_intersections[0, 107, 184]
     assert torch.isinf(wall_distance[0, 107, 184])
     assert not geometric_intersections[0, 107, 185]
+    assert projected_intersections[0, 107, 185]
+    assert projected_left_edges[0, 107, 185]
     assert torch.isfinite(wall_distance[0, 107, 185])
     assert rgb[0, 45, 107].tolist() == [107, 15, 15]
     # R_AddLine rejects this one-sided linedef's back face. Sector 0 is

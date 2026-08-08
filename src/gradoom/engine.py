@@ -123,6 +123,10 @@ _NATIVE_WALL_VISIBILITY_FIXED = (
     * (8 * _FIXED_UNIT)
 ) >> 16
 _NATIVE_SPRITE_MIN_DEPTH_FIXED = 2048 * 4
+# Adjacent segs that project the same map vertex can differ slightly when
+# sampled through an integer column ray. Larger gaps identify another BSP
+# branch rather than the half-open endpoint owner of the selected seg.
+_NATIVE_SHARED_ENDPOINT_DEPTH_TOLERANCE = 1.0 / 16.0
 _FIST_RANGE = 64.0
 _CHAINSAW_RANGE = 65.0
 _CHAINSAW_SPREAD_RADIANS = 2.8125 * math.pi / 180.0
@@ -413,6 +417,9 @@ class DeviceScenario:
     texture_animation_counts: torch.Tensor
     portal_walls: torch.Tensor
     portal_wall_sectors: torch.Tensor
+    portal_endpoint_neighbors: torch.Tensor
+    portal_endpoint_neighbor_starts: torch.Tensor
+    portal_endpoint_neighbor_ends: torch.Tensor
     portal_wall_blocks_sight: torch.Tensor
     portal_wall_lights: torch.Tensor
     portal_texture_ids: torch.Tensor
@@ -508,6 +515,47 @@ class DeviceScenario:
             )
             + 0.5
         ).astype(np.float32)
+        portal_walls = scenario.wall_segments
+        portal_sectors = scenario.wall_sectors
+        same_sector_pair = (
+            (portal_sectors[:, None, 0] == portal_sectors[None, :, 0])
+            & (portal_sectors[:, None, 1] == portal_sectors[None, :, 1])
+        ) | (
+            (portal_sectors[:, None, 0] == portal_sectors[None, :, 1])
+            & (portal_sectors[:, None, 1] == portal_sectors[None, :, 0])
+        )
+        shares_start = (
+            np.all(portal_walls[:, None, :2] == portal_walls[None, :, :2], axis=2)
+            | np.all(portal_walls[:, None, :2] == portal_walls[None, :, 2:], axis=2)
+        )
+        shares_end = (
+            np.all(portal_walls[:, None, 2:] == portal_walls[None, :, :2], axis=2)
+            | np.all(portal_walls[:, None, 2:] == portal_walls[None, :, 2:], axis=2)
+        )
+        endpoint_neighbor_mask = (
+            same_sector_pair
+            & (shares_start | shares_end)
+            & ~np.eye(len(portal_walls), dtype=np.bool_)
+        )
+        endpoint_neighbor_count = endpoint_neighbor_mask.sum(axis=1)
+        max_endpoint_neighbors = max(1, int(endpoint_neighbor_count.max(initial=0)))
+        endpoint_neighbors = np.broadcast_to(
+            np.arange(len(portal_walls), dtype=np.int64)[:, None],
+            (len(portal_walls), max_endpoint_neighbors),
+        ).copy()
+        endpoint_neighbor_starts = np.zeros_like(endpoint_neighbors, dtype=np.bool_)
+        endpoint_neighbor_ends = np.zeros_like(endpoint_neighbors, dtype=np.bool_)
+        for wall_index, count in enumerate(endpoint_neighbor_count):
+            neighbor_indices = np.flatnonzero(endpoint_neighbor_mask[wall_index])
+            endpoint_neighbors[wall_index, :count] = neighbor_indices
+            endpoint_neighbor_starts[wall_index, :count] = shares_start[
+                wall_index,
+                neighbor_indices,
+            ]
+            endpoint_neighbor_ends[wall_index, :count] = shares_end[
+                wall_index,
+                neighbor_indices,
+            ]
         bounds = scenario.bounds
         if scenario.scenario_sha256 == (
             "1d06c2113f2c1546062635ad599f49cd852287a08b7b07b26d30b8f4c362a42d"
@@ -791,6 +839,19 @@ class DeviceScenario:
             portal_walls=torch.as_tensor(scenario.wall_segments, device=device),
             portal_wall_sectors=torch.as_tensor(
                 scenario.wall_sectors, device=device, dtype=torch.int64
+            ),
+            portal_endpoint_neighbors=torch.as_tensor(
+                endpoint_neighbors,
+                device=device,
+                dtype=torch.int64,
+            ),
+            portal_endpoint_neighbor_starts=torch.as_tensor(
+                endpoint_neighbor_starts,
+                device=device,
+            ),
+            portal_endpoint_neighbor_ends=torch.as_tensor(
+                endpoint_neighbor_ends,
+                device=device,
             ),
             portal_wall_blocks_sight=torch.as_tensor(
                 wall_blocks_sight,
@@ -8670,7 +8731,14 @@ class TorchDeathmatchEngine:
 
     def _native_portal_intersections(
         self,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         direction = self._native_wall_ray_directions()
         origin = torch.stack((self.x, self.y), dim=-1)[:, None, None, :]
         start = self.map.portal_walls[None, None, :, :2]
@@ -8857,10 +8925,9 @@ class TorchDeathmatchEngine:
             screen_left = torch.where(visible & owns_left, column, screen_left)
             screen_right = torch.where(visible & ~owns_left, column, screen_right)
 
-        # A fully visible one-sided seg uses FWallCoords' exact fixed-point
-        # [sx1, sx2) bounds. Do not let the geometric ray fallback shift that
-        # solid range across a shared endpoint; the adjacent seg owns the next
-        # integer column.
+        # A fully visible seg uses FWallCoords' exact fixed-point [sx1, sx2)
+        # bounds. Do not let the geometric ray fallback shift that range across
+        # a shared endpoint; the adjacent seg owns the next integer column.
         front_facing_by_wall = front_facing.squeeze(1)
         ordered_endpoint_columns = torch.where(
             front_facing_by_wall[..., None],
@@ -8873,23 +8940,19 @@ class TorchDeathmatchEngine:
             torch.flip(endpoint_visible, dims=(2,)),
         )
         one_sided = self.map.portal_wall_sectors[:, 1] < 0
-        exact_solid_bounds = (
-            one_sided[None, :]
-            & front_facing_by_wall
-            & torch.all(ordered_endpoint_visible, dim=2)
-        )
+        exact_wall_bounds = torch.all(ordered_endpoint_visible, dim=2)
         screen_left = torch.where(
-            exact_solid_bounds,
+            exact_wall_bounds,
             ordered_endpoint_columns[..., 0],
             screen_left,
         )
         screen_right = torch.where(
-            exact_solid_bounds,
+            exact_wall_bounds,
             ordered_endpoint_columns[..., 1],
             screen_right,
         )
         has_columns = torch.where(
-            exact_solid_bounds,
+            exact_wall_bounds,
             screen_right > screen_left,
             has_columns,
         )
@@ -8911,7 +8974,14 @@ class TorchDeathmatchEngine:
             geometric_valid | projected_valid,
         )
         distance = torch.where(valid, distance, torch.full_like(distance, torch.inf))
-        return distance, along.clamp(0, 1), geometric_valid, wall_visibility
+        return (
+            distance,
+            along.clamp(0, 1),
+            geometric_valid,
+            projected_valid,
+            pixel_x == screen_left[:, None, :],
+            wall_visibility,
+        )
 
     def _native_render_portal_walls(
         self,
@@ -8925,9 +8995,14 @@ class TorchDeathmatchEngine:
             focal_length
         )
         flat_center = center + 0.5
-        distances, wall_along, geometric_intersections, wall_visibility = (
-            self._native_portal_intersections()
-        )
+        (
+            distances,
+            wall_along,
+            geometric_intersections,
+            projected_intersections,
+            projected_left_edges,
+            wall_visibility,
+        ) = self._native_portal_intersections()
         wall_vertical_steps = self._native_wall_vertical_steps()
         filled = torch.zeros_like(frame, dtype=torch.bool)
         scene_depth = (
@@ -8946,6 +9021,59 @@ class TorchDeathmatchEngine:
         )
         previous_distance = torch.zeros_like(current_sector, dtype=torch.float32)
         all_sectors = self.map.portal_wall_sectors
+        all_wall_starts = self.map.portal_walls[None, None, :, :2]
+        all_wall_ends = self.map.portal_walls[None, None, :, 2:]
+        endpoint_neighbors = self.map.portal_endpoint_neighbors
+        neighbor_distances = distances[:, :, endpoint_neighbors]
+        neighbor_projected = projected_intersections[:, :, endpoint_neighbors]
+        neighbor_left_edges = projected_left_edges[:, :, endpoint_neighbors]
+        selected_endpoint_neighbors = torch.where(
+            (wall_along <= 0.5)[:, :, :, None],
+            self.map.portal_endpoint_neighbor_starts[None, None, :, :],
+            self.map.portal_endpoint_neighbor_ends[None, None, :, :],
+        )
+        endpoint_owner_distance, endpoint_owner_slot = torch.min(
+            torch.where(
+                neighbor_projected
+                & neighbor_left_edges
+                & selected_endpoint_neighbors,
+                neighbor_distances,
+                torch.full_like(neighbor_distances, torch.inf),
+            ),
+            dim=3,
+        )
+        endpoint_owner_index = torch.gather(
+            endpoint_neighbors[None, None, :, :].expand(
+                self.num_envs,
+                self.native_screen_width,
+                -1,
+                -1,
+            ),
+            3,
+            endpoint_owner_slot[:, :, :, None],
+        ).squeeze(3)
+        has_endpoint_owner = (
+            ~projected_intersections
+            & torch.isfinite(endpoint_owner_distance)
+            & (
+                endpoint_owner_distance
+                <= distances + _NATIVE_SHARED_ENDPOINT_DEPTH_TOLERANCE
+            )
+        )
+        endpoint_owner_index = torch.where(
+            has_endpoint_owner,
+            endpoint_owner_index,
+            torch.arange(
+                distances.shape[2],
+                device=self.device,
+                dtype=torch.int64,
+            )[None, None, :],
+        )
+        endpoint_owner_distance = torch.where(
+            has_endpoint_owner,
+            endpoint_owner_distance,
+            distances,
+        )
         for _ in range(32):
             current = current_sector.clamp_min(0)
             incident = (all_sectors[None, None, :, 0] == current[:, :, None]) | (
@@ -8987,6 +9115,33 @@ class TorchDeathmatchEngine:
             wall_index = torch.where(
                 has_equal_depth_solid,
                 solid_wall_index,
+                wall_index,
+            )
+            # BSP rasterization assigns a shared endpoint column to the seg
+            # whose projected [sx1, sx2) range contains it. A mathematical ray
+            # can still hit the excluded neighbor slightly sooner. The static
+            # same-sector endpoint graph keeps this correction out of the hot
+            # portal loop; each selected wall needs only two gathers.
+            selected_endpoint_owner = endpoint_owner_index.gather(
+                2,
+                wall_index[:, :, None],
+            ).squeeze(2)
+            selected_endpoint_distance = endpoint_owner_distance.gather(
+                2,
+                wall_index[:, :, None],
+            ).squeeze(2)
+            replace_with_endpoint_owner = (
+                (selected_endpoint_owner != wall_index)
+                & (selected_endpoint_distance > previous_distance + 1e-3)
+            )
+            distance = torch.where(
+                replace_with_endpoint_owner,
+                selected_endpoint_distance,
+                distance,
+            )
+            wall_index = torch.where(
+                replace_with_endpoint_owner,
+                selected_endpoint_owner,
                 wall_index,
             )
             valid = torch.isfinite(distance)
@@ -9278,8 +9433,6 @@ class TorchDeathmatchEngine:
             # Rewind only for a terminal solid on the other side; allowing a
             # second portal here would re-route shared-vertex traversal.
             selected_wall = self.map.portal_walls[wall_index]
-            all_wall_starts = self.map.portal_walls[None, None, :, :2]
-            all_wall_ends = self.map.portal_walls[None, None, :, 2:]
             selected_start = selected_wall[:, :, None, :2]
             selected_end = selected_wall[:, :, None, 2:]
             shares_endpoint = (
