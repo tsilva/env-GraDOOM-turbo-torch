@@ -270,6 +270,9 @@ def test_native_solid_walls_use_reference_half_open_screen_bounds(
     assert torch.isfinite(wall_distance[0, 67, 60])
     assert torch.isinf(wall_distance[0, 90, 168])
     assert torch.isfinite(wall_distance[0, 90, 59])
+    # R_AddLine rejects this one-sided linedef's back face. Sector 0 is
+    # non-convex, so incidence alone would incorrectly expose BIGBRIK1 here.
+    assert torch.isinf(wall_distance[0, 76, 8])
     assert rgb[0, 40, 67].tolist() == [0, 0, 71]
     assert rgb[0, 40, 90].tolist() == [95, 75, 55]
 

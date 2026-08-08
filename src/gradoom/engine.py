@@ -8502,9 +8502,17 @@ class TorchDeathmatchEngine:
             & (pixel_x < screen_right[:, None, :])
         )
         one_sided = self.map.portal_wall_sectors[:, 1] < 0
+        viewer_from_start = origin - start
+        front_facing = (
+            segment[..., 0] * viewer_from_start[..., 1]
+            - segment[..., 1] * viewer_from_start[..., 0]
+        ) < 0
         valid = torch.where(
             one_sided[None, None, :],
-            (denominator.abs() >= 1e-6) & (distance > 0) & screen_valid,
+            (denominator.abs() >= 1e-6)
+            & (distance > 0)
+            & screen_valid
+            & front_facing,
             geometric_valid,
         )
         distance = torch.where(valid, distance, torch.full_like(distance, torch.inf))
