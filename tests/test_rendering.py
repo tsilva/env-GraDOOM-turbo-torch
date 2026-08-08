@@ -61,7 +61,7 @@ def test_pitch_view_pan_uses_reference_fixed_tangent_projection(
     assert not torch.equal(baseline_training, engine.render_frame())
 
 
-def test_native_flats_sample_reference_pixel_centers(
+def test_native_flats_match_reference_span_sampling(
     pinned_deathmatch_scenario,
 ) -> None:
     engine = TorchDeathmatchEngine(
@@ -88,9 +88,13 @@ def test_native_flats_sample_reference_pixel_centers(
     )
     rgb = engine.map.playpal[frame.to(torch.int64)]
 
-    # ViZDoom's R_SetupFreelook intersects planes through y + 0.5. Sampling
-    # the integer row instead selects the neighboring FLAT5_3 brown here.
+    # R_SetupFreelook intersects planes through y + 0.5.
     assert rgb[0, 127, 136].tolist() == [79, 59, 39]
+    # R_DrawNormalPlane anchors spans at centerx - 1, independently of walls.
+    assert rgb[0, 127, 135].tolist() == [79, 59, 39]
+    # Its 16.16/32-bit stepping selects the adjacent texel here; continuous
+    # floating-point ray mapping produces [79, 59, 39] instead.
+    assert rgb[0, 127, 141].tolist() == [79, 59, 43]
 
 
 def test_enemy_fullbright_matches_actor_attack_states() -> None:

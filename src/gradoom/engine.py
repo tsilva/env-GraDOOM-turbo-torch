@@ -106,6 +106,10 @@ _PLAYER_HITSCAN_RANGE = 8192.0
 _BULLET_AUTOAIM_OFFSET = 2.0 * math.pi / 64.0
 _BULLET_AUTOAIM_MAX_SLOPE = math.tan(35.0 * math.pi / 180.0)
 _BAM_TO_RADIANS = 2.0 * math.pi / float(1 << 32)
+_NATIVE_FOCAL_X_FIXED = 160 * _FIXED_UNIT
+# R_ExecuteSetViewSize derives 320x240's y aspect as integer 16.16.
+_NATIVE_Y_ASPECT_FIXED = (320 * _FIXED_UNIT * 240) // (200 * 320)
+_NATIVE_FOCAL_Y_FIXED = 160 * _NATIVE_Y_ASPECT_FIXED
 _FIST_RANGE = 64.0
 _CHAINSAW_RANGE = 65.0
 _CHAINSAW_SPREAD_RADIANS = 2.8125 * math.pi / 180.0
@@ -1341,6 +1345,10 @@ class TorchDeathmatchEngine:
             - self.native_screen_width / 2.0
         )
         self._native_ray_offsets = -torch.atan(native_columns / (self.native_screen_width / 2.0))
+        self._native_flat_columns = (
+            torch.arange(self.native_screen_width, device=device, dtype=torch.int64)
+            - (self.native_screen_width // 2 - 1)
+        )
         self._native_pixel_x = torch.arange(self.native_screen_width, device=device).view(1, 1, -1)
         self._native_pixel_y = torch.arange(self.native_view_height, device=device).view(1, -1, 1)
         player_start_sectors = self._sector_at(
@@ -8102,6 +8110,94 @@ class TorchDeathmatchEngine:
         # tics. Preserve that observable behavior in the raw-fidelity path.
         return texture_ids
 
+    def _native_flat_texture_coordinates(
+        self,
+        texture_ids: torch.Tensor,
+        plane_height: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Map flat texels with R_DrawNormalPlane's fixed-point span math."""
+
+        texture_width = self.map.texture_widths[texture_ids]
+        texture_height = self.map.texture_heights[texture_ids]
+        width_bits = torch.floor(torch.log2(texture_width.to(torch.float32))).to(torch.int64)
+        height_bits = torch.floor(torch.log2(texture_height.to(torch.float32))).to(torch.int64)
+        xscale = torch.bitwise_left_shift(torch.ones_like(width_bits), 32 - width_bits)
+        yscale = torch.bitwise_left_shift(torch.ones_like(height_bits), 32 - height_bits)
+
+        visible_angle = self._angle_bam.to(torch.float32) * _BAM_TO_RADIANS
+        public_angle_bam = torch.bitwise_and(
+            torch.round(torch.remainder(self.angle, 2.0 * math.pi) / _BAM_TO_RADIANS).to(
+                torch.int64
+            ),
+            _UINT32_MASK,
+        )
+        angle_bam = torch.where(self.angle != visible_angle, public_angle_bam, self._angle_bam)
+        fine_angle = torch.bitwise_right_shift(angle_bam, _ANGLE_TO_FINE_SHIFT) & (
+            _FINE_ANGLES - 1
+        )
+        fine_sine = self._fine_sine_fixed[fine_angle][:, None, None]
+        fine_cosine = self._fine_sine_fixed[
+            (fine_angle + _FINE_ANGLES // 4) & (_FINE_ANGLES - 1)
+        ][:, None, None]
+
+        xstep_scale = self._trunc_divide(
+            xscale * fine_sine,
+            torch.full_like(xscale, _NATIVE_FOCAL_X_FIXED),
+        )
+        ystep_scale = self._trunc_divide(
+            yscale * fine_cosine,
+            torch.full_like(yscale, _NATIVE_FOCAL_X_FIXED),
+        )
+        flat_columns = self._native_flat_columns[None, None, :]
+        basexfrac = ((xscale * fine_cosine) >> 16) + flat_columns * xstep_scale
+        baseyfrac = ((yscale * -fine_sine) >> 16) + flat_columns * ystep_scale
+
+        visible_x_fixed = self._x_fixed.to(torch.float32) / _FIXED_UNIT
+        visible_y_fixed = self._y_fixed.to(torch.float32) / _FIXED_UNIT
+        view_x_fixed = torch.where(
+            self.x != visible_x_fixed,
+            torch.round(self.x * _FIXED_UNIT).to(torch.int64),
+            self._x_fixed,
+        )[:, None, None]
+        view_y_fixed = torch.where(
+            self.y != visible_y_fixed,
+            torch.round(self.y * _FIXED_UNIT).to(torch.int64),
+            self._y_fixed,
+        )[:, None, None]
+        pviewx = (xscale * view_x_fixed) >> 16
+        pviewy = (yscale * -view_y_fixed) >> 16
+
+        tangent_index = torch.bitwise_right_shift(
+            _ANGLE_90 - self._pitch_bam,
+            _ANGLE_TO_FINE_SHIFT,
+        ).clamp(0, _FINE_ANGLES // 2 - 1)
+        pitch_offset_fixed = (
+            _NATIVE_FOCAL_Y_FIXED * self._fine_tangent_fixed[tangent_index]
+        ) >> 16
+        center_fixed = (self.native_view_height // 2) * _FIXED_UNIT + pitch_offset_fixed
+        center_row = center_fixed >> 16
+        pixel_y = self._native_pixel_y.to(torch.int64)
+        pixel_y_fixed = pixel_y * _FIXED_UNIT
+        denominator = torch.where(
+            pixel_y < center_row[:, None, None],
+            center_fixed[:, None, None] - pixel_y_fixed - _FIXED_UNIT // 2,
+            pixel_y_fixed - center_fixed[:, None, None] + _FIXED_UNIT // 2,
+        ).clamp_min(1)
+        slope_overflow = denominator <= (_NATIVE_FOCAL_Y_FIXED >> 15)
+        yslope = self._trunc_divide(
+            torch.full_like(denominator, _NATIVE_FOCAL_Y_FIXED << 16),
+            denominator,
+        )
+        yslope = torch.where(slope_overflow, torch.full_like(yslope, (1 << 31) - 1), yslope)
+        plane_height_fixed = torch.round(plane_height * _FIXED_UNIT).to(torch.int64)
+        distance = (plane_height_fixed * yslope) >> 16
+        xfrac = (((distance * basexfrac) >> 16) + pviewx) & _UINT32_MASK
+        yfrac = (((distance * baseyfrac) >> 16) + pviewy) & _UINT32_MASK
+
+        texture_u = torch.bitwise_right_shift(xfrac, 32 - width_bits)
+        texture_v = torch.bitwise_right_shift(yfrac, 32 - height_bits)
+        return texture_u, texture_v
+
     def _native_render_flats(
         self,
         current_sector: torch.Tensor,
@@ -8121,8 +8217,6 @@ class TorchDeathmatchEngine:
         shape = (self.num_envs, self.native_view_height, self.native_screen_width)
         sectors = current_sector[:, None, None].expand(shape).clone()
         ray_distance = torch.full(shape, torch.inf, device=self.device)
-        world_x = torch.zeros(shape, device=self.device)
-        world_y = torch.zeros(shape, device=self.device)
         ray_cos = torch.cos(ray_angles)[:, None, :]
         ray_sin = torch.sin(ray_angles)[:, None, :]
         denominator = pixel_delta.abs().clamp_min(0.5)
@@ -8175,38 +8269,32 @@ class TorchDeathmatchEngine:
             )
             sectors = torch.where(nearer, sector_index, sectors)
             ray_distance = torch.where(nearer, candidate_distance, ray_distance)
-            world_x = torch.where(nearer, candidate_x, world_x)
-            world_y = torch.where(nearer, candidate_y, world_y)
 
         unresolved = ~torch.isfinite(ray_distance)
-        fallback_floor_height = view_z[:, None, None] - self.map.sector_heights[sectors, 0]
-        fallback_ceiling_height = self.map.sector_heights[sectors, 1] - view_z[:, None, None]
-        fallback_plane_height = torch.where(
-            floor_pixels,
-            fallback_floor_height,
-            fallback_ceiling_height,
-        )
-        fallback_distance = (
-            fallback_plane_height * focal_length / denominator / cosine_correction
-        ).clamp(1, 4096)
-        fallback_x = self.x[:, None, None] + ray_cos * fallback_distance
-        fallback_y = self.y[:, None, None] + ray_sin * fallback_distance
         surface_depth = torch.where(
             unresolved,
             torch.full_like(ray_distance, torch.inf),
             ray_distance * cosine_correction,
         )
-        ray_distance = torch.where(unresolved, fallback_distance, ray_distance)
-        world_x = torch.where(unresolved, fallback_x, world_x)
-        world_y = torch.where(unresolved, fallback_y, world_y)
+
+        # R_DrawNormalPlane anchors span coordinates at x - halfviewwidth,
+        # where halfviewwidth is centerx - 1. Keep surface selection on the
+        # wall projection rays, but sample flats with that plane-only origin.
+        selected_floor_height = view_z[:, None, None] - self.map.sector_heights[sectors, 0]
+        selected_ceiling_height = self.map.sector_heights[sectors, 1] - view_z[:, None, None]
+        selected_plane_height = torch.where(
+            floor_pixels,
+            selected_floor_height,
+            selected_ceiling_height,
+        )
         floor_texture = self.map.sector_floor_texture_ids[sectors]
         ceiling_texture = self.map.sector_ceiling_texture_ids[sectors]
         texture_id = torch.where(floor_pixels, floor_texture, ceiling_texture)
         texture_id = self._native_animated_texture_ids(texture_id)
-        texture_width = self.map.texture_widths[texture_id]
-        texture_height = self.map.texture_heights[texture_id]
-        texture_u = torch.remainder(torch.floor(world_x).to(torch.int64), texture_width)
-        texture_v = torch.remainder(torch.floor(-world_y).to(torch.int64), texture_height)
+        texture_u, texture_v = self._native_flat_texture_coordinates(
+            texture_id,
+            selected_plane_height,
+        )
         indices = self.map.texture_index_atlas[texture_id, texture_v, texture_u]
         _weapon_frame, _weapon_flash, flash_light = self._native_weapon_frame_selection()
         light = self.map.sector_lights[sectors] + flash_light[:, None, None] * 16
