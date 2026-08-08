@@ -40,6 +40,26 @@ def test_device_api_is_deterministic_and_resident(square_scenario) -> None:
         second.close()
 
 
+def test_vizdoom_screen_flash_option_is_static_and_validated(square_scenario) -> None:
+    default_env = _env(square_scenario)
+    flash_env = _env(
+        square_scenario,
+        vizdoom_config={"render_screen_flashes": True},
+    )
+    try:
+        assert default_env._engine.render_screen_flashes is False
+        assert flash_env._engine.render_screen_flashes is True
+    finally:
+        default_env.close()
+        flash_env.close()
+
+    with pytest.raises(ValueError, match="render_screen_flashes must be a boolean"):
+        _env(
+            square_scenario,
+            vizdoom_config={"render_screen_flashes": 1},
+        )
+
+
 def test_turbo_shaped_api_contract_and_numpy_transport(square_scenario) -> None:
     env = _env(square_scenario, transport="numpy", obs_copy="safe_view")
     try:

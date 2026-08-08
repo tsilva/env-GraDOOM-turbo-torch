@@ -1033,6 +1033,7 @@ class TorchDeathmatchEngine:
         frame_stack: int = 4,
         episode_timeout: int = 4200,
         mask_hud: bool = True,
+        render_screen_flashes: bool = False,
         debug_checks: bool | None = None,
     ) -> None:
         self.device = device
@@ -1041,6 +1042,7 @@ class TorchDeathmatchEngine:
         self.frame_stack = frame_stack
         self.episode_timeout = episode_timeout
         self.mask_hud = mask_hud
+        self.render_screen_flashes = render_screen_flashes
         self.debug_checks = device.type == "cpu" if debug_checks is None else debug_checks
         self.map = DeviceScenario.from_host(scenario, device)
         (
@@ -8272,14 +8274,18 @@ class TorchDeathmatchEngine:
         sprite_value = self.map.sprite_atlas[sprite_type, sprite_v, sprite_u].to(torch.float32)
         frame = torch.where(inside_sprite & sprite_opaque, sprite_value, frame)
         frame = self._render_weapon(frame)
-        flash = self._damage_to_alpha[self.damage_count.clamp(0, 113).to(torch.int64)] / 255.0
-        bonus = torch.minimum(
-            self.bonus_count.to(torch.float32) * 8.0, torch.full_like(self.health, 128.0)
-        )
-        bonus = (bonus / 255.0)[:, None, None]
-        frame = frame * (1 - bonus) + 184.89 * bonus
-        flash = flash[:, None, None]
-        frame = frame * (1 - flash) + 53.55 * flash
+        if self.render_screen_flashes:
+            flash = (
+                self._damage_to_alpha[self.damage_count.clamp(0, 113).to(torch.int64)] / 255.0
+            )
+            bonus = torch.minimum(
+                self.bonus_count.to(torch.float32) * 8.0,
+                torch.full_like(self.health, 128.0),
+            )
+            bonus = (bonus / 255.0)[:, None, None]
+            frame = frame * (1 - bonus) + 184.89 * bonus
+            flash = flash[:, None, None]
+            frame = frame * (1 - flash) + 53.55 * flash
         if self.mask_hud:
             frame[:, -11:, :] = 0
         return frame.clamp(0, 255).to(torch.uint8)
@@ -10480,17 +10486,22 @@ class TorchDeathmatchEngine:
         if include_hud:
             frame = torch.cat((frame, self._native_render_hud()), dim=1)
         rgb = self.map.playpal[frame.to(torch.int64)]
-        bonus = torch.minimum(
-            self.bonus_count.to(torch.float32) * 8.0, torch.full_like(self.health, 128.0)
-        )
-        bonus = (bonus / 255.0)[:, None, None, None]
-        gold = torch.tensor((215.0, 186.0, 69.0), device=self.device)
-        rgb = rgb.to(torch.float32) * (1 - bonus) + gold * bonus
-        flash = self._damage_to_alpha[self.damage_count.clamp(0, 113).to(torch.int64)] / 255.0
-        flash = flash[:, None, None, None]
-        red = torch.tensor((255.0, 0.0, 0.0), device=self.device)
-        rgb = rgb * (1 - flash) + red * flash
-        return rgb.clamp(0, 255).to(torch.uint8)
+        if self.render_screen_flashes:
+            bonus = torch.minimum(
+                self.bonus_count.to(torch.float32) * 8.0,
+                torch.full_like(self.health, 128.0),
+            )
+            bonus = (bonus / 255.0)[:, None, None, None]
+            gold = torch.tensor((215.0, 186.0, 69.0), device=self.device)
+            rgb = rgb.to(torch.float32) * (1 - bonus) + gold * bonus
+            flash = (
+                self._damage_to_alpha[self.damage_count.clamp(0, 113).to(torch.int64)] / 255.0
+            )
+            flash = flash[:, None, None, None]
+            red = torch.tensor((255.0, 0.0, 0.0), device=self.device)
+            rgb = rgb * (1 - flash) + red * flash
+            rgb = rgb.clamp(0, 255).to(torch.uint8)
+        return rgb
 
     def _update_signal_buffer(self) -> None:
         weapon_index = (self.selected_weapon - 1)[:, None]

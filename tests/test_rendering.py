@@ -61,6 +61,47 @@ def test_pitch_view_pan_uses_reference_fixed_tangent_projection(
     assert not torch.equal(baseline_training, engine.render_frame())
 
 
+def test_screen_flashes_follow_vizdoom_render_option(
+    pinned_deathmatch_scenario,
+) -> None:
+    default_engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    default_engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([123]))
+    native_without_counters = default_engine.render_native_frame(include_hud=True)
+    training_without_counters = default_engine.render_frame()
+    default_engine.bonus_count.fill_(6)
+    default_engine.damage_count.fill_(13)
+
+    assert torch.equal(
+        default_engine.render_native_frame(include_hud=True),
+        native_without_counters,
+    )
+    assert torch.equal(default_engine.render_frame(), training_without_counters)
+    assert default_engine.bonus_count.item() == 6
+    assert default_engine.damage_count.item() == 13
+
+    flash_engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+        render_screen_flashes=True,
+    )
+    flash_engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([123]))
+    native_without_flash = flash_engine.render_native_frame(include_hud=True)
+    training_without_flash = flash_engine.render_frame()
+    flash_engine.bonus_count.fill_(6)
+    flash_engine.damage_count.fill_(13)
+
+    assert not torch.equal(
+        flash_engine.render_native_frame(include_hud=True),
+        native_without_flash,
+    )
+    assert not torch.equal(flash_engine.render_frame(), training_without_flash)
+
+
 def test_native_flats_match_reference_span_sampling(
     pinned_deathmatch_scenario,
 ) -> None:

@@ -293,7 +293,11 @@ class GraDoomVecEnv(VectorEnv):
         self.compiled_scenario = compiled_scenario
         self.scenario_sha256 = compiled_scenario.scenario_sha256
         self.iwad_sha256 = compiled_scenario.iwad_sha256
-        episode_timeout = int((vizdoom_config or {}).get("episode_timeout", 4200))
+        vizdoom_options = vizdoom_config or {}
+        episode_timeout = int(vizdoom_options.get("episode_timeout", 4200))
+        render_screen_flashes = vizdoom_options.get("render_screen_flashes", False)
+        if not isinstance(render_screen_flashes, bool):
+            raise ValueError("render_screen_flashes must be a boolean")
         self._engine = TorchDeathmatchEngine(
             compiled_scenario,
             self.num_envs,
@@ -302,6 +306,7 @@ class GraDoomVecEnv(VectorEnv):
             frame_stack=self.frame_stack,
             episode_timeout=episode_timeout,
             mask_hud=obs_crop is not None,
+            render_screen_flashes=render_screen_flashes,
         )
         signal_indices = {name: index for index, name in enumerate(DEVICE_SIGNAL_NAMES)}
         self._info_history_indices = torch.tensor(
