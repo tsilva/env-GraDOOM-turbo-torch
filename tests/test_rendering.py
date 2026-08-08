@@ -22,6 +22,63 @@ def pinned_deathmatch_scenario():
     return compile_deathmatch_scenario(SCENARIO, DOOM2)
 
 
+def test_doom_sprite_rotation_uses_actor_to_viewer_angle() -> None:
+    viewer_angle = torch.tensor((0.0, math.pi / 2, math.pi, -math.pi / 2))
+    actor_angle = torch.zeros_like(viewer_angle)
+
+    rotation = TorchDeathmatchEngine._doom_sprite_rotation(
+        viewer_angle,
+        actor_angle,
+    )
+
+    assert rotation.tolist() == [0, 2, 4, 6]
+
+
+def test_enemy_fullbright_matches_actor_attack_states() -> None:
+    enemy_type = torch.tensor((0, 1, 1, 3, 3, 3))
+    attack_phase = torch.tensor((2, 2, 2, 2, 3, 3))
+    cooldown = torch.tensor((16, 20, 10, 4, 5, 1))
+    attack_recovery = torch.tensor((16, 20, 20, 4, 4, 4))
+
+    fullbright = TorchDeathmatchEngine._native_enemy_fullbright(
+        enemy_type,
+        attack_phase,
+        cooldown,
+        attack_recovery,
+    )
+
+    # Zombieman's POSS F state is not BRIGHT. ShotgunGuy's SPOS F and
+    # ChaingunGuy's CPOS F/E firing states are; their recovery/refire states
+    # are not.
+    assert fullbright.tolist() == [False, True, False, True, True, False]
+
+
+def test_native_enemy_rotation_matches_vizdoom_summoned_pose(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([123]))
+    engine.x.fill_(835.9440307617188)
+    engine.y.fill_(391.3482971191406)
+    engine.enemy_x[:, 0] = 824.1785278320312
+    engine.enemy_y[:, 0] = 446.0887756347656
+    engine.enemy_z[:, 0] = 0
+    engine.enemy_angle[:, 0] = 0
+    engine.enemy_type[:, 0] = 0
+    engine.enemy_health[:, 0] = 20
+    engine.enemy_alive[:, 0] = True
+    engine.enemy_target_slot[:, 0] = -2
+    engine.enemy_animation_tics[:, 0] = 0
+
+    sprite = engine._native_enemy_sprite_ids()[0, 0]
+
+    assert sprite == engine.map.enemy_walk_sprite_ids[0, 0, 6]
+
+
 def test_native_transparent_sprites_reveal_fifth_farther_actor(square_scenario) -> None:
     atlas = np.zeros((2, 3, 3), dtype=np.uint8)
     atlas[0] = 10
@@ -175,7 +232,8 @@ def test_awakened_zombieman_matches_reference_discrete_chase_steps(
     engine.enemy_alive[0, 0] = True
     engine.enemy_target_slot[0, 0] = -2
     engine.enemy_move_cooldown[0, 0] = 8
-    engine.enemy_cooldown[0, 0] = 18
+    engine.enemy_cooldown[0, 0] = 0
+    engine.enemy_reaction_time[0, 0] = 8
 
     attack = torch.zeros((1, 20), dtype=torch.bool)
     attack[:, 0] = True

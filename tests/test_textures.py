@@ -9,6 +9,7 @@ import pytest
 from gradoom.textures import (
     TextureCatalog,
     compile_grayscale_atlas,
+    compile_indexed_sprite_atlas,
     compile_sprite_atlas,
     decode_patch,
     grayscale_palette,
@@ -49,6 +50,21 @@ def test_grayscale_palette_matches_vizdoom_gray8_coefficients() -> None:
 
     assert grayscale.dtype == np.uint8
     assert int(grayscale[0]) == 168
+
+
+@pytest.mark.skipif(not DOOM2.is_file(), reason="operator Doom2 IWAD absent")
+def test_combined_sprite_mirror_uses_doom_left_offset_origin() -> None:
+    wad = WadArchive.from_path(DOOM2)
+
+    names, sprites, opaque, widths, _heights, left_offsets, _top_offsets = (
+        compile_indexed_sprite_atlas(wad, ("POSSA3", "POSSA7"))
+    )
+
+    assert names == ("POSSA3A7", "POSSA3A7:FLIPPED")
+    assert widths.tolist() == [43, 43]
+    assert left_offsets.tolist() == [21, 21]
+    np.testing.assert_array_equal(sprites[1], np.fliplr(sprites[0]))
+    np.testing.assert_array_equal(opaque[1], np.fliplr(opaque[0]))
 
 
 @pytest.mark.parametrize("iwad", (DOOM2, FREEDOOM2))

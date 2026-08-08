@@ -90,6 +90,8 @@ def test_spawn_check_attempts_each_acs_actor_class(square_scenario) -> None:
     )
     assert torch.all(engine.enemy_target_slot[engine.enemy_alive] == -2)
     spawned_type = engine.enemy_type[engine.enemy_alive]
+    assert torch.all(engine.enemy_cooldown[engine.enemy_alive] == 0)
+    assert torch.all(engine.enemy_reaction_time[engine.enemy_alive] == 8)
     assert torch.equal(
         engine.enemy_move_cooldown[engine.enemy_alive],
         engine._enemy_look_interval[spawned_type] - 2,
@@ -114,6 +116,8 @@ def test_unaware_monster_waits_for_front_facing_sight_check(
     engine = _engine(square_scenario)
     engine.x.fill_(-100)
     engine.y.zero_()
+    engine._x_fixed.fill_(-100 * 65536)
+    engine._y_fixed.zero_()
     engine.enemy_alive.zero_()
     engine.enemy_x[:, 0] = 0
     engine.enemy_y[:, 0] = 0
@@ -144,12 +148,44 @@ def test_unaware_monster_waits_for_front_facing_sight_check(
     assert torch.all(engine.enemy_x[:, 0] > 0)
 
 
+def test_unaware_monster_uses_doom_approximate_distance_behind_it(
+    square_scenario,
+) -> None:
+    engine = _engine(square_scenario)
+    engine.x.copy_(torch.tensor((-45.0, -42.0)))
+    engine.y.copy_(torch.tensor((-45.0, -42.0)))
+    engine._x_fixed.copy_(torch.round(engine.x * 65536).to(torch.int64))
+    engine._y_fixed.copy_(torch.round(engine.y * 65536).to(torch.int64))
+    engine.enemy_alive.zero_()
+    engine.enemy_x[:, 0].zero_()
+    engine.enemy_y[:, 0].zero_()
+    engine._enemy_x_fixed[:, 0].zero_()
+    engine._enemy_y_fixed[:, 0].zero_()
+    engine.enemy_z[:, 0].zero_()
+    engine.enemy_angle[:, 0].zero_()
+    engine.enemy_type[:, 0] = 0
+    engine.enemy_health[:, 0] = 20
+    engine.enemy_alive[:, 0] = True
+    engine.enemy_target_slot[:, 0] = -2
+    engine.enemy_move_cooldown[:, 0] = 0
+    engine.enemy_cooldown[:, 0] = 999
+
+    engine._enemy_tick()
+
+    # Both players are behind the east-facing monster and Euclidean-close.
+    # Doom's P_AproxDistance is 67.5 at (-45,-45), outside MELEERANGE, but
+    # 63 at (-42,-42), which is close enough to be noticed from behind.
+    assert engine.enemy_target_slot[:, 0].tolist() == [-2, -1]
+
+
 def test_player_weapon_noise_wakes_monster_outside_field_of_view(
     square_scenario,
 ) -> None:
     engine = _engine(square_scenario)
     engine.x.fill_(-100)
     engine.y.zero_()
+    engine._x_fixed.fill_(-100 * 65536)
+    engine._y_fixed.zero_()
     engine.enemy_alive.zero_()
     engine.enemy_x[:, 0] = 0
     engine.enemy_y[:, 0] = 0
@@ -479,6 +515,34 @@ def test_retaliating_monster_pursues_its_attacker_instead_of_player(
     assert torch.all(engine.enemy_x[:, 1] > 0)
     assert engine.enemy_target_slot[:, 1].tolist() == [0, 0]
     assert engine.enemy_target_threshold[:, 1].tolist() == [99, 99]
+
+
+def test_player_retaliation_threshold_decrements_on_chase_actions(
+    square_scenario,
+) -> None:
+    engine = _engine(square_scenario)
+    engine.x.fill_(200)
+    engine.y.zero_()
+    engine._x_fixed.fill_(200 * 65536)
+    engine._y_fixed.zero_()
+    engine.enemy_alive.zero_()
+    engine.enemy_x[:, 0].zero_()
+    engine.enemy_y[:, 0].zero_()
+    engine._enemy_x_fixed[:, 0].zero_()
+    engine._enemy_y_fixed[:, 0].zero_()
+    engine.enemy_type[:, 0] = 0
+    engine.enemy_health[:, 0] = 20
+    engine.enemy_alive[:, 0] = True
+    engine.enemy_target_slot[:, 0] = -1
+    engine.enemy_target_threshold[:, 0] = 100
+    engine.enemy_cooldown[:, 0] = 999
+    engine.enemy_move_cooldown[:, 0] = 0
+
+    engine._enemy_tick()
+    assert engine.enemy_target_threshold[:, 0].tolist() == [99, 99]
+
+    engine._enemy_tick()
+    assert engine.enemy_target_threshold[:, 0].tolist() == [99, 99]
 
 
 def test_monster_chase_uses_doom_discrete_direction_and_gradual_turn(
@@ -1419,6 +1483,83 @@ def test_monster_attacks_instead_of_moving_on_chase_tic(square_scenario) -> None
     assert engine.enemy_cooldown[:, 0].tolist() == [16, 16]
 
 
+def test_spawn_reaction_time_counts_chase_actions_and_only_blocks_missiles(
+    square_scenario,
+) -> None:
+    engine = _engine(square_scenario)
+    engine.x.zero_()
+    engine.y.zero_()
+    engine._x_fixed.zero_()
+    engine._y_fixed.zero_()
+    engine.enemy_alive.zero_()
+    engine.enemy_x[:, 0] = torch.tensor([100.0, 32.0])
+    engine.enemy_y[:, 0].zero_()
+    engine._enemy_x_fixed[:, 0] = torch.round(
+        engine.enemy_x[:, 0] * 65536
+    ).to(torch.int64)
+    engine._enemy_y_fixed[:, 0].zero_()
+    engine.enemy_type[:, 0] = torch.tensor([0, 4])
+    engine.enemy_health[:, 0] = torch.tensor([20.0, 150.0])
+    engine.enemy_alive[:, 0] = True
+    engine.enemy_reaction_time[:, 0] = 8
+    engine.enemy_cooldown[:, 0] = 0
+    engine.enemy_move_cooldown[:, 0] = 0
+
+    engine._enemy_tick()
+
+    assert engine.enemy_reaction_time[:, 0].tolist() == [7, 7]
+    assert engine.enemy_attack_phase[:, 0].tolist() == [0, 1]
+    for _ in range(3):
+        engine._enemy_tick()
+    assert engine.enemy_reaction_time[0, 0].item() == 7
+    engine._enemy_tick()
+    assert engine.enemy_reaction_time[0, 0].item() == 6
+
+
+def test_pain_wakes_spawned_monster_and_forces_next_eligible_retaliation(
+    square_scenario,
+) -> None:
+    engine = _engine(square_scenario)
+    engine.x.fill_(200)
+    engine.y.zero_()
+    engine._x_fixed.fill_(200 * 65536)
+    engine._y_fixed.zero_()
+    engine.enemy_alive.zero_()
+    engine.enemy_x[:, 0].zero_()
+    engine.enemy_y[:, 0].zero_()
+    engine._enemy_x_fixed[:, 0].zero_()
+    engine._enemy_y_fixed[:, 0].zero_()
+    engine.enemy_type[:, 0] = 0
+    engine.enemy_health[:, 0] = 20
+    engine.enemy_alive[:, 0] = True
+    engine.enemy_reaction_time[:, 0] = 8
+    engine.enemy_move_count[:, 0] = 0
+    engine.enemy_move_cooldown[:, 0] = 0
+    engine.enemy_animation_tics[:, 0] = 7
+    engine.rng_state.zero_()
+
+    damage = torch.zeros_like(engine.enemy_health)
+    damage[:, 0] = 1
+    pain = torch.zeros_like(engine.enemy_alive)
+    pain[:, 0] = True
+    engine._apply_enemy_damage(damage, pain_override=pain)
+
+    assert engine.enemy_reaction_time[:, 0].tolist() == [0, 0]
+    assert engine.enemy_just_hit[:, 0].tolist() == [True, True]
+    assert engine.enemy_pain_tics[:, 0].tolist() == [6, 6]
+    assert engine.enemy_animation_tics[:, 0].tolist() == [0, 0]
+
+    # Skip to the first A_Chase action after pain. At 200 units the seeded
+    # missile roll is below P_CheckMissileRange's threshold, so only Doom's
+    # MF_JUSTHIT path can select the attack.
+    engine.enemy_pain_tics[:, 0] = 0
+    engine._enemy_tick()
+
+    assert engine.enemy_attack_phase[:, 0].tolist() == [1, 1]
+    assert engine.enemy_just_attacked[:, 0].tolist() == [True, True]
+    assert engine.enemy_just_hit[:, 0].tolist() == [False, False]
+
+
 def test_monster_forces_new_chase_direction_after_ranged_attack(
     square_scenario,
 ) -> None:
@@ -1482,8 +1623,12 @@ def test_chainsaw_marine_repeats_four_tic_attack_cycle(square_scenario) -> None:
     engine = _engine(square_scenario)
     engine.x.zero_()
     engine.y.zero_()
+    engine._x_fixed.zero_()
+    engine._y_fixed.zero_()
     engine.enemy_x[:, 0] = 32
     engine.enemy_y[:, 0] = 0
+    engine._enemy_x_fixed[:, 0] = 32 * 65536
+    engine._enemy_y_fixed[:, 0] = 0
     engine.enemy_type[:, 0] = 2
     engine.enemy_health[:, 0] = 100
     engine.enemy_alive[:, 0] = True
@@ -1502,6 +1647,117 @@ def test_chainsaw_marine_repeats_four_tic_attack_cycle(square_scenario) -> None:
     for _ in range(4):
         engine._enemy_tick()
     assert torch.all(engine.health < after_first_hit)
+
+
+def test_monster_melee_range_uses_target_radius_and_approximate_distance(
+    square_scenario,
+) -> None:
+    engine = _engine(square_scenario)
+    engine.x.copy_(torch.tensor([0.0, 200.0]))
+    engine.y.zero_()
+    engine._x_fixed.copy_(torch.round(engine.x * 65536).to(torch.int64))
+    engine._y_fixed.zero_()
+    engine.enemy_alive.zero_()
+    engine.enemy_x[:, 0] = torch.tensor([42.0, 70.0])
+    engine.enemy_y[:, 0] = torch.tensor([42.0, 0.0])
+    engine._enemy_x_fixed[:, 0] = torch.round(
+        engine.enemy_x[:, 0] * 65536
+    ).to(torch.int64)
+    engine._enemy_y_fixed[:, 0] = torch.round(
+        engine.enemy_y[:, 0] * 65536
+    ).to(torch.int64)
+    engine.enemy_type[:, 0] = 2
+    engine.enemy_health[:, 0] = 100
+    engine.enemy_alive[:, 0] = True
+    engine.enemy_target_slot[:, 0] = torch.tensor([-1, 1])
+    engine.enemy_cooldown[:, 0] = 0
+    engine.enemy_move_cooldown[:, 0] = 0
+    engine.enemy_move_count[:, 0] = 1
+
+    engine.enemy_x[1, 1] = 0
+    engine.enemy_y[1, 1] = 0
+    engine._enemy_x_fixed[1, 1] = 0
+    engine._enemy_y_fixed[1, 1] = 0
+    engine.enemy_type[1, 1] = 4
+    engine.enemy_health[1, 1] = 150
+    engine.enemy_alive[1, 1] = True
+    engine.enemy_pain_tics[1, 1] = 99
+
+    engine._enemy_tick()
+
+    # The first target is only 59.4 Euclidean units away, but Doom's
+    # AproxDistance is 63 and outside the player's 44+16 limit. A demon
+    # target's 30-unit radius extends the second lane's limit to 74.
+    assert engine.enemy_attack_phase[:, 0].tolist() == [0, 1]
+    assert engine.enemy_x[0, 0].item() != 42.0
+    assert engine.enemy_x[1, 0].item() == 70.0
+
+    engine.enemy_cooldown[:, 0] = 1
+    engine._enemy_tick()
+
+    # CheckMeleeRange has no additional center-distance cap: the demon's
+    # 30-unit radius keeps the target hittable at this 70-unit separation.
+    assert engine.enemy_health[1, 1].item() < 150.0
+
+
+def test_hell_knight_uses_projectile_when_close_target_is_above_melee_reach(
+    square_scenario,
+) -> None:
+    engine = _engine(square_scenario)
+    engine.x.zero_()
+    engine.y.zero_()
+    engine.z.fill_(65)
+    engine._x_fixed.zero_()
+    engine._y_fixed.zero_()
+    engine.enemy_alive.zero_()
+    engine.enemy_x[:, 0] = 59
+    engine.enemy_y[:, 0].zero_()
+    engine.enemy_z[:, 0].zero_()
+    engine._enemy_x_fixed[:, 0] = 59 * 65536
+    engine._enemy_y_fixed[:, 0].zero_()
+    engine.enemy_type[:, 0] = 5
+    engine.enemy_health[:, 0] = 500
+    engine.enemy_alive[:, 0] = True
+    engine.enemy_cooldown[:, 0] = 0
+    engine.enemy_move_cooldown[:, 0] = 0
+    engine.enemy_move_count[:, 0] = 0
+
+    engine._enemy_tick()
+
+    # The horizontal distance is inside 44 + player radius, but the player's
+    # feet are one unit above the knight's top. Doom therefore selects Missile.
+    assert engine.enemy_attack_phase[:, 0].tolist() == [1, 1]
+    assert engine.enemy_just_attacked[:, 0].tolist() == [True, True]
+    engine.enemy_cooldown[:, 0] = 1
+
+    engine._enemy_tick()
+
+    assert torch.sum(engine.enemy_projectile_alive, dim=1).tolist() == [1, 1]
+    assert torch.all(engine.enemy_projectile_velocity_z[:, 0] > 0)
+    assert engine.health.tolist() == [100.0, 100.0]
+
+
+def test_demon_melee_action_whiffs_after_target_retreats(square_scenario) -> None:
+    engine = _engine(square_scenario)
+    engine.x.fill_(100)
+    engine.y.zero_()
+    engine._x_fixed.fill_(100 * 65536)
+    engine._y_fixed.zero_()
+    engine.enemy_alive.zero_()
+    engine.enemy_x[:, 0].zero_()
+    engine.enemy_y[:, 0].zero_()
+    engine._enemy_x_fixed[:, 0].zero_()
+    engine._enemy_y_fixed[:, 0].zero_()
+    engine.enemy_type[:, 0] = 4
+    engine.enemy_health[:, 0] = 150
+    engine.enemy_alive[:, 0] = True
+    engine.enemy_attack_phase[:, 0] = 1
+    engine.enemy_cooldown[:, 0] = 1
+
+    engine._enemy_tick()
+
+    assert engine.health.tolist() == [100.0, 100.0]
+    assert engine.enemy_attack_phase[:, 0].tolist() == [2, 2]
 
 
 def test_chaingunner_uses_prefire_and_alternating_burst_gaps(square_scenario) -> None:
@@ -1804,7 +2060,7 @@ def test_reference_monster_damage_distributions(square_scenario) -> None:
     damage = engine._enemy_damage_roll(
         padded_types,
         padded_attacks,
-        padded_distance,
+        padded_distance < 64.0,
     )[:, :6]
 
     lower = torch.tensor((3, 9, 2, 3, 4, 8))
@@ -1908,8 +2164,12 @@ def test_hell_knight_melee_attack_fires_after_reference_prefire(square_scenario)
     engine = _engine(square_scenario)
     engine.x.zero_()
     engine.y.zero_()
+    engine._x_fixed.zero_()
+    engine._y_fixed.zero_()
     engine.enemy_x[:, 0] = 32
     engine.enemy_y[:, 0] = 0
+    engine._enemy_x_fixed[:, 0] = 32 * 65536
+    engine._enemy_y_fixed[:, 0] = 0
     engine.enemy_type[:, 0] = 5
     engine.enemy_health[:, 0] = 500
     engine.enemy_alive[:, 0] = True

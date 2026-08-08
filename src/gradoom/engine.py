@@ -45,6 +45,7 @@ _ENEMY_SPAWN_THRESHOLD = (2621, 2621, 1310, 1310, 655, 655)
 _ENEMY_SPAWN_DELAY = 105
 _ENEMY_SPAWN_PERIOD = 10
 _ENEMY_RETALIATION_THRESHOLD = 100
+_ENEMY_SPAWN_REACTION_TIME = 8
 _ENEMY_CHASE_X_SPEED_FIXED = (_FIXED_UNIT, 46341, 0, -46341, -_FIXED_UNIT, -46341, 0, 46341)
 _ENEMY_CHASE_Y_SPEED_FIXED = (0, 46341, _FIXED_UNIT, 46341, 0, -46341, -_FIXED_UNIT, -46341)
 _ENEMY_OPPOSITE_DIRECTION = (4, 5, 6, 7, 0, 1, 2, 3, 8)
@@ -1017,6 +1018,12 @@ class TorchDeathmatchEngine:
         self.enemy_just_attacked = torch.zeros(
             (n, self.enemy_slots), device=device, dtype=torch.bool
         )
+        self.enemy_just_hit = torch.zeros(
+            (n, self.enemy_slots), device=device, dtype=torch.bool
+        )
+        self.enemy_reaction_time = torch.zeros(
+            (n, self.enemy_slots), device=device, dtype=torch.int32
+        )
         # -1 denotes the controlled player; non-negative values are monster
         # slots. Doom's target pointer changes when a shootable attacker hurts
         # a monster and its retaliation threshold permits a switch.
@@ -1466,6 +1473,8 @@ class TorchDeathmatchEngine:
         self.enemy_cooldown[mask] = 0
         self.enemy_attack_phase[mask] = 0
         self.enemy_just_attacked[mask] = False
+        self.enemy_just_hit[mask] = False
+        self.enemy_reaction_time[mask] = 0
         self.enemy_target_slot[mask] = -1
         self.enemy_target_threshold[mask] = 0
         self.enemy_heard_player[mask] = False
@@ -2426,6 +2435,8 @@ class TorchDeathmatchEngine:
         old_cooldown = self.enemy_cooldown[row, slot]
         old_attack_phase = self.enemy_attack_phase[row, slot]
         old_just_attacked = self.enemy_just_attacked[row, slot]
+        old_just_hit = self.enemy_just_hit[row, slot]
+        old_reaction_time = self.enemy_reaction_time[row, slot]
         old_target_slot = self.enemy_target_slot[row, slot]
         old_target_threshold = self.enemy_target_threshold[row, slot]
         old_heard_player = self.enemy_heard_player[row, slot]
@@ -2461,13 +2472,21 @@ class TorchDeathmatchEngine:
             spawn, self._enemy_base_health[enemy_type], old_health
         )
         self.enemy_cooldown[row, slot] = torch.where(
-            spawn, torch.full_like(old_cooldown, 18), old_cooldown
+            spawn, torch.zeros_like(old_cooldown), old_cooldown
         )
         self.enemy_attack_phase[row, slot] = torch.where(
             spawn, torch.zeros_like(old_attack_phase), old_attack_phase
         )
         self.enemy_just_attacked[row, slot] = torch.where(
             spawn, torch.zeros_like(old_just_attacked), old_just_attacked
+        )
+        self.enemy_just_hit[row, slot] = torch.where(
+            spawn, torch.zeros_like(old_just_hit), old_just_hit
+        )
+        self.enemy_reaction_time[row, slot] = torch.where(
+            spawn,
+            torch.full_like(old_reaction_time, _ENEMY_SPAWN_REACTION_TIME),
+            old_reaction_time,
         )
         self.enemy_target_slot[row, slot] = torch.where(
             spawn,
@@ -3336,6 +3355,10 @@ class TorchDeathmatchEngine:
         killed = self.enemy_alive & (previous > 0) & (updated <= 0)
         killed_type = self.enemy_type.clamp_min(0)
         hurt = self.enemy_alive & (applied > 0) & ~killed
+        # P_DamageMobj wakes the target regardless of whether the hit enters
+        # its Pain state. Explicitly spawned monsters must not retain their
+        # initial missile-attack delay after taking damage.
+        self.enemy_reaction_time.masked_fill_(hurt, 0)
         if pain_override is None:
             random_bits = self._random_u32(torch.any(hurt, dim=1))[:, None]
             slot = torch.arange(self.enemy_slots, device=self.device, dtype=torch.int64)[None, :]
@@ -3348,9 +3371,13 @@ class TorchDeathmatchEngine:
         self.enemy_pain_tics.copy_(
             torch.where(pain, self._enemy_pain_duration[killed_type], self.enemy_pain_tics)
         )
+        # A successful pain reaction sets MF_JUSTHIT. P_CheckMissileRange
+        # consumes it to force the next eligible retaliation shot.
+        self.enemy_just_hit |= pain
         self.enemy_attack_phase.masked_fill_(pain, 0)
         self.enemy_cooldown.masked_fill_(pain, 0)
         self.enemy_move_cooldown.masked_fill_(pain, 0)
+        self.enemy_animation_tics.masked_fill_(pain, 0)
         death_duration = self.map.enemy_death_total_tics[killed_type]
         self.enemy_death_type.copy_(torch.where(killed, killed_type, self.enemy_death_type))
         self.enemy_death_tics.copy_(
@@ -3373,6 +3400,8 @@ class TorchDeathmatchEngine:
         self.enemy_cooldown.masked_fill_(killed, 0)
         self.enemy_attack_phase.masked_fill_(killed, 0)
         self.enemy_just_attacked.masked_fill_(killed, False)
+        self.enemy_just_hit.masked_fill_(killed, False)
+        self.enemy_reaction_time.masked_fill_(killed, 0)
         self.enemy_target_slot.masked_fill_(killed, -1)
         self.enemy_target_threshold.masked_fill_(killed, 0)
         self.enemy_heard_player.masked_fill_(killed, False)
@@ -4730,7 +4759,7 @@ class TorchDeathmatchEngine:
         self,
         enemy_type: torch.Tensor,
         attacks: torch.Tensor,
-        distance: torch.Tensor,
+        in_melee_range: torch.Tensor,
     ) -> torch.Tensor:
         random_bits = self._random_u32(torch.any(attacks, dim=1))[:, None]
         slot = torch.arange(self.enemy_slots, device=self.device, dtype=torch.int64)[None, :]
@@ -4740,14 +4769,14 @@ class TorchDeathmatchEngine:
             mixed ^= mixed >> 16
             return torch.remainder(mixed, sides).to(torch.float32) + 1
 
-        damage = torch.zeros_like(distance)
+        damage = torch.zeros_like(in_melee_range, dtype=torch.float32)
         damage = torch.where(enemy_type == 0, die(0, 5) * 3, damage)
         shotgun = (die(0, 5) + die(1, 5) + die(2, 5)) * 3
         damage = torch.where(enemy_type == 1, shotgun, damage)
         damage = torch.where(enemy_type == 2, die(0, 10) * 2, damage)
         damage = torch.where(enemy_type == 3, die(0, 5) * 3, damage)
         damage = torch.where(enemy_type == 4, die(0, 10) * 4, damage)
-        knight_multiplier = torch.where(distance < 64, 10.0, 8.0)
+        knight_multiplier = torch.where(in_melee_range, 10.0, 8.0)
         damage = torch.where(enemy_type == 5, die(0, 8) * knight_multiplier, damage)
         return torch.where(attacks, damage, torch.zeros_like(damage))
 
@@ -5912,15 +5941,19 @@ class TorchDeathmatchEngine:
         look_ready = idle & (self.enemy_move_cooldown <= 0)
         player_dx = self.x[:, None] - self.enemy_x
         player_dy = self.y[:, None] - self.enemy_y
-        player_distance = torch.sqrt(
-            player_dx * player_dx + player_dy * player_dy
+        player_dx_fixed = (self._x_fixed[:, None] - self._enemy_x_fixed).abs()
+        player_dy_fixed = (self._y_fixed[:, None] - self._enemy_y_fixed).abs()
+        player_approximate_distance_fixed = (
+            player_dx_fixed
+            + player_dy_fixed
+            - (torch.minimum(player_dx_fixed, player_dy_fixed) >> 1)
         )
         player_direction = torch.atan2(player_dy, player_dx)
         relative_player_direction = self._wrap_angle(
             player_direction - self.enemy_angle
         )
         in_front = (relative_player_direction.abs() <= math.pi / 2.0) | (
-            player_distance <= 64.0
+            player_approximate_distance_fixed <= 64 * _FIXED_UNIT
         )
         sees_player = (
             ~self.player_dead[:, None]
@@ -5968,14 +6001,34 @@ class TorchDeathmatchEngine:
             target_y,
             target_z,
             target_height,
-            _target_radius,
+            target_radius,
             target_is_monster,
             target_alive,
         ) = self._enemy_target_geometry()
         dx = target_x - self.enemy_x
         dy = target_y - self.enemy_y
         distance = torch.sqrt(dx * dx + dy * dy).clamp_min_(1e-4)
-        visible = ~self._sight_blocked(
+        target_x_fixed = torch.where(
+            target_is_monster,
+            self._enemy_x_fixed.gather(1, safe_target),
+            self._x_fixed[:, None],
+        )
+        target_y_fixed = torch.where(
+            target_is_monster,
+            self._enemy_y_fixed.gather(1, safe_target),
+            self._y_fixed[:, None],
+        )
+        melee_dx_fixed = (target_x_fixed - self._enemy_x_fixed).abs()
+        melee_dy_fixed = (target_y_fixed - self._enemy_y_fixed).abs()
+        melee_minimum_fixed = torch.minimum(melee_dx_fixed, melee_dy_fixed)
+        approximate_distance_fixed = (
+            melee_dx_fixed + melee_dy_fixed - (melee_minimum_fixed >> 1)
+        )
+        melee_limit_fixed = torch.round(
+            (44.0 + target_radius) * _FIXED_UNIT
+        ).to(torch.int64)
+        in_melee_range = approximate_distance_fixed < melee_limit_fixed
+        line_of_sight = ~self._sight_blocked(
             self.enemy_x,
             self.enemy_y,
             self.enemy_z + self._enemy_height[enemy_type] * 0.75,
@@ -5984,11 +6037,12 @@ class TorchDeathmatchEngine:
             target_z,
             target_height,
         )
+        line_of_sight &= target_alive
         shoot_z = self.enemy_z + 36.0
         target_bottom_slope = (target_z - shoot_z) / distance
         target_top_slope = (target_z + target_height - shoot_z) / distance
         max_autoaim_slope = math.tan(35.0 * math.pi / 180.0)
-        visible &= target_alive & (target_top_slope >= -max_autoaim_slope) & (
+        visible = line_of_sight & (target_top_slope >= -max_autoaim_slope) & (
             target_bottom_slope <= max_autoaim_slope
         )
         melee_vertical_overlap = self._vertical_overlap(
@@ -5997,6 +6051,7 @@ class TorchDeathmatchEngine:
             target_z,
             target_height,
         )
+        melee_target = line_of_sight & melee_vertical_overlap & in_melee_range
 
         attack_phase = self.enemy_attack_phase
         phase_due = alive & (attack_phase > 0) & (self.enemy_cooldown <= 1)
@@ -6004,22 +6059,24 @@ class TorchDeathmatchEngine:
         phase_two_due = phase_due & (attack_phase == 2)
         phase_three_due = phase_due & (attack_phase == 3)
         finite_type = (enemy_type == 0) | (enemy_type == 1) | (enemy_type == 4) | (enemy_type == 5)
-        chainsaw_target = visible & melee_vertical_overlap & (distance < 64.0)
-        chaingun_target = visible & (distance < self._enemy_attack_range[enemy_type])
+        chainsaw_target = melee_target
+        chaingun_target = line_of_sight & (
+            distance < self._enemy_attack_range[enemy_type]
+        )
         finite_fire = phase_one_due & finite_type
         chainsaw_fire = phase_one_due & (enemy_type == 2) & chainsaw_target
         chaingun_fire = (enemy_type == 3) & (
             phase_one_due | phase_two_due | (phase_three_due & chaingun_target)
         )
         fire_event = finite_fire | chainsaw_fire | chaingun_fire
-        knight_projectile = fire_event & (enemy_type == 5) & (distance >= 64.0)
+        knight_projectile = fire_event & (enemy_type == 5) & ~melee_target
         self._spawn_enemy_projectiles(knight_projectile, dx, dy)
-        direct_attack = fire_event & ~knight_projectile & visible
-        direct_attack &= ~((enemy_type == 2) | (enemy_type == 4) | (enemy_type == 5)) | (
-            melee_vertical_overlap | (distance >= 64.0)
-        )
-        direct_attack &= distance < self._enemy_attack_range[enemy_type]
         hitscan_type = (enemy_type == 0) | (enemy_type == 1) | (enemy_type == 3)
+        direct_attack = fire_event & ~knight_projectile
+        direct_attack &= torch.where(hitscan_type, visible, melee_target)
+        direct_attack &= ~hitscan_type | (
+            distance < self._enemy_attack_range[enemy_type]
+        )
         (
             hitscan_player_damage,
             hitscan_actual_player_damage,
@@ -6033,7 +6090,7 @@ class TorchDeathmatchEngine:
         direct_damage_by_attacker = self._enemy_damage_roll(
             enemy_type,
             direct_attack & ~hitscan_type,
-            distance,
+            in_melee_range,
         )
         direct_player_damage = torch.where(
             target_is_monster,
@@ -6216,6 +6273,12 @@ class TorchDeathmatchEngine:
         # first A_Chase after that state completes must choose and attempt a
         # fresh chase direction instead of checking for another attack.
         post_attack_chase = move_ready & self.enemy_just_attacked
+        next_reaction_time = torch.where(
+            move_ready,
+            torch.clamp_min(self.enemy_reaction_time - 1, 0),
+            self.enemy_reaction_time,
+        )
+        self.enemy_reaction_time.copy_(next_reaction_time)
         attack_ready = move_ready & (next_cooldown <= 0) & ~self.enemy_just_attacked
         turning = move_ready & (self.enemy_move_direction < 8)
         quantized_angle = torch.floor(
@@ -6238,24 +6301,27 @@ class TorchDeathmatchEngine:
             torch.where(turning, self._wrap_angle(turned_angle), self.enemy_angle)
         )
         melee_type = (enemy_type == 2) | (enemy_type == 4) | (enemy_type == 5)
-        melee_attack = (
-            attack_ready & visible & melee_vertical_overlap & melee_type & (distance < 64.0)
-        )
+        melee_attack = attack_ready & melee_type & melee_target
         ranged_type = (enemy_type == 0) | (enemy_type == 1) | (enemy_type == 3) | (enemy_type == 5)
-        ranged_candidate = (
+        ranged_check = (
             attack_ready
-            & visible
+            & line_of_sight
             & ranged_type
             & (self.enemy_move_count <= 0)
             & (distance < self._enemy_attack_range[enemy_type])
-            & ~((enemy_type == 5) & (distance < 64.0))
+            & ~((enemy_type == 5) & melee_vertical_overlap & in_melee_range)
         )
-        ranged_attack = self._enemy_missile_decision(
+        forced_retaliation = ranged_check & self.enemy_just_hit
+        ranged_candidate = (
+            ranged_check & (next_reaction_time <= 0) & ~self.enemy_just_hit
+        )
+        ranged_attack = forced_retaliation | self._enemy_missile_decision(
             enemy_type,
             ranged_candidate,
             dx,
             dy,
         )
+        self.enemy_just_hit.masked_fill_(forced_retaliation, False)
         can_attack = melee_attack | ranged_attack
         moving = move_ready & ~post_attack_chase & ~can_attack & target_alive
         forced_post_attack_move = post_attack_chase & target_alive
@@ -6277,7 +6343,7 @@ class TorchDeathmatchEngine:
                 self.enemy_move_cooldown,
             )
         )
-        decrement_target_threshold = move_ready & target_is_monster
+        decrement_target_threshold = move_ready & (self.enemy_target_threshold > 0)
         self.enemy_target_threshold.copy_(
             torch.where(
                 decrement_target_threshold,
@@ -7466,17 +7532,25 @@ class TorchDeathmatchEngine:
             )
         return frame, scene_depth
 
+    @staticmethod
+    def _doom_sprite_rotation(
+        viewer_angle: torch.Tensor,
+        actor_angle: torch.Tensor,
+    ) -> torch.Tensor:
+        """Select Doom's clockwise 1..8 sprite rotation as a zero-based index."""
+        relative = torch.remainder(
+            viewer_angle - actor_angle + math.pi / 8,
+            2 * math.pi,
+        )
+        return torch.floor(relative / (math.pi / 4)).to(torch.int64)
+
     def _native_enemy_sprite_ids(self) -> torch.Tensor:
         enemy_type = self.enemy_type.clamp(0, 5)
         viewer_angle = torch.atan2(
             self.y[:, None] - self.enemy_y,
             self.x[:, None] - self.enemy_x,
         )
-        relative = torch.remainder(
-            viewer_angle - self.enemy_angle + math.pi + math.pi / 8,
-            2 * math.pi,
-        )
-        rotation = torch.floor(relative / (math.pi / 4)).to(torch.int64)
+        rotation = self._doom_sprite_rotation(viewer_angle, self.enemy_angle)
         walk_frame = torch.remainder(
             self.enemy_animation_tics // self._enemy_walk_frame_tics[enemy_type],
             4,
@@ -7553,6 +7627,23 @@ class TorchDeathmatchEngine:
         )
         return self.map.raw_projectile_explosion_sprite_ids[safe_type, frame]
 
+    @staticmethod
+    def _native_enemy_fullbright(
+        enemy_type: torch.Tensor,
+        attack_phase: torch.Tensor,
+        cooldown: torch.Tensor,
+        attack_recovery: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return the BRIGHT flag from the certified actors' current states."""
+        shotgun_muzzle = (enemy_type == 1) & (attack_phase == 2) & (
+            cooldown > (attack_recovery // 2)
+        )
+        chaingun_muzzle = (enemy_type == 3) & (
+            (attack_phase == 2)
+            | ((attack_phase == 3) & (cooldown > 1))
+        )
+        return shotgun_muzzle | chaingun_muzzle
+
     def _native_render_sprites(
         self,
         frame: torch.Tensor,
@@ -7572,22 +7663,12 @@ class TorchDeathmatchEngine:
         actor_alive = self.enemy_alive[:, enemy_slots]
         actor_sprite = enemy_sprite[:, enemy_slots]
         enemy_type = self.enemy_type[:, enemy_slots].clamp(0, 5)
-        ranged_muzzle = (
-            ((enemy_type == 0) | (enemy_type == 1))
-            & (self.enemy_attack_phase[:, enemy_slots] == 2)
-            & (
-                self.enemy_cooldown[:, enemy_slots]
-                > (self._enemy_attack_recovery[enemy_type] // 2)
-            )
+        actor_fullbright = self._native_enemy_fullbright(
+            enemy_type,
+            self.enemy_attack_phase[:, enemy_slots],
+            self.enemy_cooldown[:, enemy_slots],
+            self._enemy_attack_recovery[enemy_type],
         )
-        chaingun_muzzle = (enemy_type == 3) & (
-            (self.enemy_attack_phase[:, enemy_slots] == 2)
-            | (
-                (self.enemy_attack_phase[:, enemy_slots] == 3)
-                & (self.enemy_cooldown[:, enemy_slots] > 1)
-            )
-        )
-        actor_fullbright = ranged_muzzle | chaingun_muzzle
         actor_additive_style = torch.full_like(actor_sprite, -1, dtype=torch.int64)
 
         doll_count = max(len(self.map.player_starts) - 1, 0)
@@ -7600,11 +7681,7 @@ class TorchDeathmatchEngine:
                 self.y[:, None] - doll_y,
                 self.x[:, None] - doll_x,
             )
-            relative_doll_angle = torch.remainder(
-                viewer_angle - doll_angle + math.pi + math.pi / 8,
-                2 * math.pi,
-            )
-            doll_rotation = torch.floor(relative_doll_angle / (math.pi / 4)).to(torch.int64)
+            doll_rotation = self._doom_sprite_rotation(viewer_angle, doll_angle)
             doll_sprite = self.map.enemy_walk_sprite_ids[2, 0, doll_rotation]
             actor_x = torch.cat((actor_x, doll_x), dim=1)
             actor_y = torch.cat((actor_y, doll_y), dim=1)
@@ -7681,16 +7758,10 @@ class TorchDeathmatchEngine:
             self.y[:, None] - self.projectile_y,
             self.x[:, None] - self.projectile_x,
         )
-        player_projectile_relative = torch.remainder(
-            player_projectile_viewer_angle
-            - player_projectile_angle
-            + math.pi
-            + math.pi / 8,
-            2 * math.pi,
+        player_projectile_rotation = self._doom_sprite_rotation(
+            player_projectile_viewer_angle,
+            player_projectile_angle,
         )
-        player_projectile_rotation = torch.floor(
-            player_projectile_relative / (math.pi / 4)
-        ).to(torch.int64)
         player_projectile_frame = torch.where(
             player_projectile_type == 1,
             torch.remainder(self.projectile_age // 6, 2).to(torch.int64),
@@ -7736,16 +7807,10 @@ class TorchDeathmatchEngine:
             self.y[:, None] - self.enemy_projectile_y,
             self.x[:, None] - self.enemy_projectile_x,
         )
-        enemy_projectile_relative = torch.remainder(
-            enemy_projectile_viewer_angle
-            - enemy_projectile_angle
-            + math.pi
-            + math.pi / 8,
-            2 * math.pi,
+        enemy_projectile_rotation = self._doom_sprite_rotation(
+            enemy_projectile_viewer_angle,
+            enemy_projectile_angle,
         )
-        enemy_projectile_rotation = torch.floor(
-            enemy_projectile_relative / (math.pi / 4)
-        ).to(torch.int64)
         enemy_projectile_frame = torch.remainder(self.enemy_projectile_age // 4, 2).to(
             torch.int64
         )

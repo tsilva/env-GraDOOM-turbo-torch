@@ -282,7 +282,7 @@ def compile_indexed_sprite_atlas(
                 name=f"{resolved}:FLIPPED",
                 pixels=np.ascontiguousarray(np.fliplr(sprite.pixels)),
                 opaque=np.ascontiguousarray(np.fliplr(sprite.opaque)),
-                left_offset=sprite.width - sprite.left_offset,
+                left_offset=sprite.width - sprite.left_offset - 1,
                 top_offset=sprite.top_offset,
             )
         resolved_names.append(sprite.name)
