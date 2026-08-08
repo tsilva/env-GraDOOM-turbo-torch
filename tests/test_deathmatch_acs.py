@@ -1449,6 +1449,33 @@ def test_wall_contact_uses_reference_slide_residual(square_scenario) -> None:
     assert torch.equal(engine.momentum_y, torch.zeros(2))
 
 
+def test_corner_slide_retries_with_unclipped_reference_motion(square_scenario) -> None:
+    engine = _engine(square_scenario)
+    fixed_unit = 1 << 16
+    # Translate two certified-map oracle contacts onto the fixture's matching
+    # bottom-right and top-right corners without changing their fixed geometry.
+    engine._x_fixed[:] = torch.tensor(
+        [65741189 - 768 * fixed_unit, 66018892 - 768 * fixed_unit]
+    )
+    engine._y_fixed[:] = torch.tensor(
+        [1048970 - 256 * fixed_unit, 66058833 - 768 * fixed_unit]
+    )
+    engine._momentum_x_fixed[:] = torch.tensor([397773, 99394])
+    engine._momentum_y_fixed[:] = torch.tensor([-12631, 46551])
+    engine.x.copy_(engine._x_fixed.to(torch.float32) / fixed_unit)
+    engine.y.copy_(engine._y_fixed.to(torch.float32) / fixed_unit)
+
+    position_x, position_y, momentum_x, momentum_y, fallback, _floor, _ceiling = (
+        engine._doom_axis_slide_move(torch.ones(2, dtype=torch.bool))
+    )
+
+    assert position_x.tolist() == [65741553 - 768 * fixed_unit, 66018988 - 768 * fixed_unit]
+    assert position_y.tolist() == [1048958 - 256 * fixed_unit, 66058878 - 768 * fixed_unit]
+    assert momentum_x.tolist() == [372958, 93181]
+    assert momentum_y.tolist() == [0, 0]
+    assert not torch.any(fallback)
+
+
 def test_axis_slide_contact_uses_reference_nearest_fixed_rounding(square_scenario) -> None:
     engine = _engine(square_scenario)
     fixed_unit = 1 << 16
@@ -1461,7 +1488,7 @@ def test_axis_slide_contact_uses_reference_nearest_fixed_rounding(square_scenari
     move_x = torch.zeros(2, dtype=torch.int64)
     move_y = torch.full((2,), 3, dtype=torch.int64)
 
-    fraction, horizontal, valid = engine._axis_slide_contact_fixed(
+    fraction, horizontal, valid, _contact_axis = engine._axis_slide_contact_fixed(
         position_x,
         position_y,
         move_x,

@@ -2225,8 +2225,8 @@ class TorchDeathmatchEngine:
         position_y: torch.Tensor,
         move_x: torch.Tensor,
         move_y: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Find Doom's leading-box contact fraction for axis-aligned walls."""
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Find Doom's leading-box contact and contacted axis coordinate."""
 
         walls = self._blocking_walls_fixed
         x1 = walls[:, 0][None, :]
@@ -2291,10 +2291,24 @@ class TorchDeathmatchEngine:
             sentinel,
         )
 
-        horizontal_best = torch.min(horizontal_candidates, dim=1).values
-        vertical_best = torch.min(vertical_candidates, dim=1).values
+        horizontal_minimum = torch.min(horizontal_candidates, dim=1)
+        vertical_minimum = torch.min(vertical_candidates, dim=1)
+        horizontal_best = horizontal_minimum.values
+        vertical_best = vertical_minimum.values
+        horizontal_axis = torch.gather(
+            horizontal_target,
+            1,
+            horizontal_minimum.indices[:, None],
+        ).squeeze(1)
+        vertical_axis = torch.gather(
+            vertical_target,
+            1,
+            vertical_minimum.indices[:, None],
+        ).squeeze(1)
         best = torch.minimum(horizontal_best, vertical_best)
-        return best, horizontal_best <= vertical_best, best <= _FIXED_UNIT
+        hit_horizontal = horizontal_best <= vertical_best
+        contact_axis = torch.where(hit_horizontal, horizontal_axis, vertical_axis)
+        return best, hit_horizontal, best <= _FIXED_UNIT, contact_axis
 
     def _doom_axis_slide_move(
         self,
@@ -2338,7 +2352,7 @@ class TorchDeathmatchEngine:
         )
         wall_blocked = blocked & self._points_collide(proposed_x_float, proposed_y_float)
 
-        full_fraction, _, full_contact = self._axis_slide_contact_fixed(
+        full_fraction, _, full_contact, _ = self._axis_slide_contact_fixed(
             start_x,
             start_y,
             move_x,
@@ -2360,42 +2374,125 @@ class TorchDeathmatchEngine:
         )
         one_step_x = self._trunc_divide(move_x, steps)
         one_step_y = self._trunc_divide(move_y, steps)
-        fraction, hit_horizontal, step_contact = self._axis_slide_contact_fixed(
-            prior_x,
-            prior_y,
-            one_step_x,
-            one_step_y,
+        fraction, hit_horizontal, step_contact, contact_axis = (
+            self._axis_slide_contact_fixed(
+                prior_x,
+                prior_y,
+                one_step_x,
+                one_step_y,
+            )
         )
         slide = wall_blocked & full_contact & step_contact
         approach_fraction = torch.clamp_min(fraction - (_FIXED_UNIT // 32), 0)
         approach_x = one_step_x * approach_fraction >> 16
         approach_y = one_step_y * approach_fraction >> 16
         remainder = (_FIXED_UNIT - fraction).clamp(0, _FIXED_UNIT)
-        slide_x = one_step_x * remainder >> 16
-        slide_y = one_step_y * remainder >> 16
-        slide_x = torch.where(hit_horizontal, slide_x, torch.zeros_like(slide_x))
-        slide_y = torch.where(hit_horizontal, torch.zeros_like(slide_y), slide_y)
+        remaining_try_x = one_step_x * remainder >> 16
+        remaining_try_y = one_step_y * remainder >> 16
+        slide_x = torch.where(
+            hit_horizontal,
+            remaining_try_x,
+            torch.zeros_like(remaining_try_x),
+        )
+        slide_y = torch.where(
+            hit_horizontal,
+            torch.zeros_like(remaining_try_y),
+            remaining_try_y,
+        )
         remaining_moves = 1 + steps - collision_step
         slide_target_x = prior_x + approach_x + slide_x * remaining_moves
         slide_target_y = prior_y + approach_y + slide_y * remaining_moves
-        corner_blocked = slide & self._points_collide(
-            slide_target_x.to(torch.float32) / _FIXED_UNIT,
-            slide_target_y.to(torch.float32) / _FIXED_UNIT,
+
+        # FSlide::SlideMove retries a blocked continuation with the remaining
+        # *unclipped* motion.  Keeping the into-wall component is observable at
+        # tight corners: it changes the second intercept fraction and therefore
+        # both Doom's 1/32 approach fudge and the residual velocity.
+        retry_start_x = prior_x + approach_x
+        retry_start_y = prior_y + approach_y
+        retry_axis_position = torch.where(
+            hit_horizontal,
+            retry_start_y,
+            retry_start_x,
         )
+        retry_axis_move = torch.where(
+            hit_horizontal,
+            remaining_try_y,
+            remaining_try_x,
+        )
+        safe_retry_axis_move = torch.where(
+            retry_axis_move == 0,
+            torch.ones_like(retry_axis_move),
+            retry_axis_move,
+        )
+        retry_fraction = torch.round(
+            (contact_axis - retry_axis_position).to(torch.float64)
+            * _FIXED_UNIT
+            / safe_retry_axis_move.to(torch.float64)
+        ).to(torch.int64)
+        retry_contact = (
+            (retry_axis_move != 0)
+            & (retry_fraction >= 0)
+            & (retry_fraction <= _FIXED_UNIT)
+        )
+        retry_approach_fraction = torch.clamp_min(
+            retry_fraction - (_FIXED_UNIT // 32),
+            0,
+        )
+        retry_approach_x = remaining_try_x * retry_approach_fraction >> 16
+        retry_approach_y = remaining_try_y * retry_approach_fraction >> 16
+        retry_remainder = (_FIXED_UNIT - retry_fraction).clamp(0, _FIXED_UNIT)
+        retry_remaining_x = remaining_try_x * retry_remainder >> 16
+        retry_remaining_y = remaining_try_y * retry_remainder >> 16
+        retry_slide_x = torch.where(
+            hit_horizontal,
+            retry_remaining_x,
+            torch.zeros_like(retry_remaining_x),
+        )
+        retry_slide_y = torch.where(
+            hit_horizontal,
+            torch.zeros_like(retry_remaining_y),
+            retry_remaining_y,
+        )
+        retry_target_x = (
+            retry_start_x + retry_approach_x + retry_slide_x * remaining_moves
+        )
+        retry_target_y = (
+            retry_start_y + retry_approach_y + retry_slide_y * remaining_moves
+        )
+        target_x = torch.stack((slide_target_x, retry_target_x), dim=1)
+        target_y = torch.stack((slide_target_y, retry_target_y), dim=1)
+        target_blocked = self._points_collide(
+            target_x.to(torch.float32) / _FIXED_UNIT,
+            target_y.to(torch.float32) / _FIXED_UNIT,
+        )
+        corner_blocked = slide & target_blocked[:, 0]
         accepted_slide = slide & ~corner_blocked
-        stalled_slide = slide & corner_blocked
+        retry_slide = corner_blocked & retry_contact
+        retry_blocked = retry_slide & target_blocked[:, 1]
+        accepted_retry = retry_slide & ~retry_blocked
+        stalled_retry_x = retry_start_x + retry_approach_x
+        stalled_retry_y = retry_start_y + retry_approach_y
+        stalled_retry = corner_blocked & (~retry_slide | retry_blocked)
         position_x = torch.where(
             accepted_slide,
             slide_target_x,
-            torch.where(stalled_slide, prior_x + approach_x, proposed_x),
+            torch.where(
+                accepted_retry,
+                retry_target_x,
+                torch.where(stalled_retry, stalled_retry_x, proposed_x),
+            ),
         )
         position_y = torch.where(
             accepted_slide,
             slide_target_y,
-            torch.where(stalled_slide, prior_y + approach_y, proposed_y),
+            torch.where(
+                accepted_retry,
+                retry_target_y,
+                torch.where(stalled_retry, stalled_retry_y, proposed_y),
+            ),
         )
-        clipped_x = slide_x * steps
-        clipped_y = slide_y * steps
+        clipped_x = torch.where(retry_slide, retry_slide_x, slide_x) * steps
+        clipped_y = torch.where(retry_slide, retry_slide_y, slide_y) * steps
         result_move_x = torch.where(slide, clipped_x, move_x)
         result_move_y = torch.where(slide, clipped_y, move_y)
         position_x = torch.where(playing, position_x, start_x)
