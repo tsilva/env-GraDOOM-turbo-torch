@@ -8108,7 +8108,10 @@ class TorchDeathmatchEngine:
         view_z: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         focal_length = self.native_screen_width / 2.0 * self.native_vertical_aspect
-        center = self.native_view_height / 2.0 - 1.0 + self._pitch_projection_offset(
+        # R_SetupFreelook builds yslope through pixel centers, subtracting or
+        # adding FRACUNIT/2 around centeryfrac. Walls and sprites retain their
+        # integer-edge projection convention, so this half pixel is plane-only.
+        center = self.native_view_height / 2.0 - 0.5 + self._pitch_projection_offset(
             focal_length
         )
         ray_angles = self.angle[:, None] + self._native_ray_offsets[None, :]

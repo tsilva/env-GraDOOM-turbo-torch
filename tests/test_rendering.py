@@ -61,6 +61,38 @@ def test_pitch_view_pan_uses_reference_fixed_tangent_projection(
     assert not torch.equal(baseline_training, engine.render_frame())
 
 
+def test_native_flats_sample_reference_pixel_centers(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([1337]))
+    engine.x.fill_(940.9204254150391)
+    engine.y.fill_(826.7186584472656)
+    engine.z.zero_()
+    engine.view_z.fill_(41)
+    engine.angle.fill_(math.radians(341.29028328258784))
+    engine.episode_time.fill_(17)
+
+    frame, surface_depth = engine._native_render_flats(
+        engine._current_sector(),
+        engine.view_z,
+    )
+    frame, _scene_depth = engine._native_render_portal_walls(
+        frame,
+        engine.view_z,
+        surface_depth,
+    )
+    rgb = engine.map.playpal[frame.to(torch.int64)]
+
+    # ViZDoom's R_SetupFreelook intersects planes through y + 0.5. Sampling
+    # the integer row instead selects the neighboring FLAT5_3 brown here.
+    assert rgb[0, 127, 136].tolist() == [79, 59, 39]
+
+
 def test_enemy_fullbright_matches_actor_attack_states() -> None:
     enemy_type = torch.tensor((0, 1, 1, 3, 3, 3, 3, 3, 3))
     attack_phase = torch.tensor((2, 2, 2, 2, 3, 3, 4, 1, 1))
