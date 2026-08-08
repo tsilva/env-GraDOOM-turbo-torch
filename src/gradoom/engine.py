@@ -40,6 +40,8 @@ _ENEMY_ATTACK_RECOVERY = (16, 20, 4, 4, 8, 8)
 _ENEMY_PAIN_CHANCE = (200, 170, 160, 170, 180, 50)
 _ENEMY_PAIN_TICS = (6, 6, 8, 6, 4, 4)
 _ENEMY_NO_BLOCK_DELAY = (10, 10, 20, 10, 20, 24)
+_ENEMY_XDEATH_NO_BLOCK_DELAY = (10, 10, 10, 10, 20, 24)
+_ENEMY_HAS_XDEATH = (True, True, True, True, False, False)
 _ENEMY_KILL_REWARD = (1.0, 3.0, 3.0, 4.0, 3.0, 10.0)
 _ENEMY_SPAWN_THRESHOLD = (2621, 2621, 1310, 1310, 655, 655)
 _ENEMY_SPAWN_DELAY = 105
@@ -414,6 +416,10 @@ class DeviceScenario:
     enemy_death_frame_counts: torch.Tensor
     enemy_death_frame_durations: torch.Tensor
     enemy_death_total_tics: torch.Tensor
+    enemy_xdeath_sprite_ids: torch.Tensor
+    enemy_xdeath_frame_counts: torch.Tensor
+    enemy_xdeath_frame_durations: torch.Tensor
+    enemy_xdeath_total_tics: torch.Tensor
     enemy_pain_sprite_ids: torch.Tensor
     raw_projectile_flight_sprite_ids: torch.Tensor
     raw_projectile_explosion_sprite_ids: torch.Tensor
@@ -559,6 +565,26 @@ class DeviceScenario:
             enemy_death_frame_durations.sum(axis=1, dtype=np.int32)
             if scenario.enemy_death_total_tics is None
             else scenario.enemy_death_total_tics
+        )
+        enemy_xdeath_sprite_ids = (
+            enemy_death_sprite_ids
+            if scenario.enemy_xdeath_sprite_ids is None
+            else scenario.enemy_xdeath_sprite_ids
+        )
+        enemy_xdeath_frame_counts = (
+            enemy_death_frame_counts
+            if scenario.enemy_xdeath_frame_counts is None
+            else scenario.enemy_xdeath_frame_counts
+        )
+        enemy_xdeath_frame_durations = (
+            enemy_death_frame_durations
+            if scenario.enemy_xdeath_frame_durations is None
+            else scenario.enemy_xdeath_frame_durations
+        )
+        enemy_xdeath_total_tics = (
+            enemy_xdeath_frame_durations.sum(axis=1, dtype=np.int32)
+            if scenario.enemy_xdeath_total_tics is None
+            else scenario.enemy_xdeath_total_tics
         )
         enemy_pain_sprite_ids = (
             fallback_enemy_ids[:, 0]
@@ -809,6 +835,18 @@ class DeviceScenario:
             enemy_death_total_tics=torch.as_tensor(
                 enemy_death_total_tics, device=device, dtype=torch.int64
             ),
+            enemy_xdeath_sprite_ids=torch.as_tensor(
+                enemy_xdeath_sprite_ids, device=device, dtype=torch.int64
+            ),
+            enemy_xdeath_frame_counts=torch.as_tensor(
+                enemy_xdeath_frame_counts, device=device, dtype=torch.int64
+            ),
+            enemy_xdeath_frame_durations=torch.as_tensor(
+                enemy_xdeath_frame_durations, device=device, dtype=torch.int64
+            ),
+            enemy_xdeath_total_tics=torch.as_tensor(
+                enemy_xdeath_total_tics, device=device, dtype=torch.int64
+            ),
             enemy_pain_sprite_ids=torch.as_tensor(
                 enemy_pain_sprite_ids, device=device, dtype=torch.int64
             ),
@@ -1054,6 +1092,9 @@ class TorchDeathmatchEngine:
         self.enemy_death_type = torch.full(
             (n, self.enemy_slots), -1, device=device, dtype=torch.int64
         )
+        self.enemy_death_extreme = torch.zeros(
+            (n, self.enemy_slots), device=device, dtype=torch.bool
+        )
         self.enemy_death_tics = torch.zeros((n, self.enemy_slots), device=device, dtype=torch.int32)
         self.enemy_death_elapsed = torch.zeros(
             (n, self.enemy_slots), device=device, dtype=torch.int32
@@ -1146,6 +1187,12 @@ class TorchDeathmatchEngine:
         )
         self._enemy_no_block_delay = torch.tensor(
             _ENEMY_NO_BLOCK_DELAY, device=device, dtype=torch.int32
+        )
+        self._enemy_xdeath_no_block_delay = torch.tensor(
+            _ENEMY_XDEATH_NO_BLOCK_DELAY, device=device, dtype=torch.int32
+        )
+        self._enemy_has_xdeath = torch.tensor(
+            _ENEMY_HAS_XDEATH, device=device, dtype=torch.bool
         )
         self._enemy_kill_reward = torch.tensor(_ENEMY_KILL_REWARD, device=device)
         self._enemy_spawn_threshold = torch.tensor(
@@ -1484,6 +1531,7 @@ class TorchDeathmatchEngine:
         self.enemy_animation_tics[mask] = 0
         self.enemy_pain_tics[mask] = 0
         self.enemy_death_type[mask] = -1
+        self.enemy_death_extreme[mask] = False
         self.enemy_death_tics[mask] = 0
         self.enemy_death_elapsed[mask] = 0
         self.teleport_fog_x[mask] = 0
@@ -1729,10 +1777,15 @@ class TorchDeathmatchEngine:
 
     def _enemy_solid_mask(self) -> torch.Tensor:
         death_type = self.enemy_death_type.clamp(0, 5)
+        no_block_delay = torch.where(
+            self.enemy_death_extreme,
+            self._enemy_xdeath_no_block_delay[death_type],
+            self._enemy_no_block_delay[death_type],
+        )
         dying_solid = (
             (self.enemy_death_type >= 0)
             & (self.enemy_death_tics > 0)
-            & (self.enemy_death_elapsed < self._enemy_no_block_delay[death_type])
+            & (self.enemy_death_elapsed < no_block_delay)
         )
         return self.enemy_alive | dying_solid
 
@@ -2543,6 +2596,11 @@ class TorchDeathmatchEngine:
             torch.full_like(self.enemy_death_type[row, slot], -1),
             self.enemy_death_type[row, slot],
         )
+        self.enemy_death_extreme[row, slot] = torch.where(
+            spawn,
+            torch.zeros_like(self.enemy_death_extreme[row, slot]),
+            self.enemy_death_extreme[row, slot],
+        )
         self.enemy_death_tics[row, slot] = torch.where(
             spawn,
             torch.zeros_like(self.enemy_death_tics[row, slot]),
@@ -3350,10 +3408,16 @@ class TorchDeathmatchEngine:
                 )
             )
         previous = self.enemy_health.clone()
-        updated = torch.clamp_min(previous - applied, 0)
+        raw_updated = previous - applied
+        updated = torch.clamp_min(raw_updated, 0)
         self.enemy_health.copy_(torch.where(self.enemy_alive, updated, previous))
         killed = self.enemy_alive & (previous > 0) & (updated <= 0)
         killed_type = self.enemy_type.clamp_min(0)
+        extreme_death = (
+            killed
+            & self._enemy_has_xdeath[killed_type]
+            & (raw_updated < -self._enemy_base_health[killed_type])
+        )
         hurt = self.enemy_alive & (applied > 0) & ~killed
         # P_DamageMobj wakes the target regardless of whether the hit enters
         # its Pain state. Explicitly spawned monsters must not retain their
@@ -3378,8 +3442,15 @@ class TorchDeathmatchEngine:
         self.enemy_cooldown.masked_fill_(pain, 0)
         self.enemy_move_cooldown.masked_fill_(pain, 0)
         self.enemy_animation_tics.masked_fill_(pain, 0)
-        death_duration = self.map.enemy_death_total_tics[killed_type]
+        death_duration = torch.where(
+            extreme_death,
+            self.map.enemy_xdeath_total_tics[killed_type],
+            self.map.enemy_death_total_tics[killed_type],
+        )
         self.enemy_death_type.copy_(torch.where(killed, killed_type, self.enemy_death_type))
+        self.enemy_death_extreme.copy_(
+            torch.where(killed, extreme_death, self.enemy_death_extreme)
+        )
         self.enemy_death_tics.copy_(
             torch.where(killed, death_duration.to(torch.int32), self.enemy_death_tics)
         )
@@ -3413,7 +3484,11 @@ class TorchDeathmatchEngine:
         self.drop_delay.copy_(
             torch.where(
                 has_drop,
-                self._enemy_no_block_delay[killed_type],
+                torch.where(
+                    extreme_death,
+                    self._enemy_xdeath_no_block_delay[killed_type],
+                    self._enemy_no_block_delay[killed_type],
+                ),
                 self.drop_delay,
             )
         )
@@ -7609,6 +7684,33 @@ class TorchDeathmatchEngine:
         animated = torch.where(phase > 0, attack, walk)
         return torch.where(self.enemy_pain_tics > 0, pain, animated)
 
+    def _native_enemy_death_sprite_ids(self) -> torch.Tensor:
+        death_type = self.enemy_death_type.clamp(0, 5)
+        death_elapsed = self.enemy_death_elapsed.to(torch.int64)
+        death_count = self.map.enemy_death_frame_counts[death_type]
+        death_durations = self.map.enemy_death_frame_durations[death_type]
+        death_frame_ends = torch.cumsum(death_durations, dim=2)
+        death_frame = torch.sum(
+            death_elapsed[:, :, None] >= death_frame_ends,
+            dim=2,
+        )
+        death_frame = torch.minimum(death_frame, death_count - 1)
+        death_sprite = self.map.enemy_death_sprite_ids[death_type, death_frame]
+        xdeath_count = self.map.enemy_xdeath_frame_counts[death_type]
+        xdeath_durations = self.map.enemy_xdeath_frame_durations[death_type]
+        xdeath_frame_ends = torch.cumsum(xdeath_durations, dim=2)
+        xdeath_frame = torch.sum(
+            death_elapsed[:, :, None] >= xdeath_frame_ends,
+            dim=2,
+        )
+        xdeath_frame = torch.minimum(xdeath_frame, xdeath_count - 1)
+        xdeath_sprite = self.map.enemy_xdeath_sprite_ids[death_type, xdeath_frame]
+        return torch.where(
+            self.enemy_death_extreme,
+            xdeath_sprite,
+            death_sprite,
+        )
+
     def _native_projectile_explosion_sprite_ids(
         self,
         projectile_type: torch.Tensor,
@@ -7709,20 +7811,7 @@ class TorchDeathmatchEngine:
                 dim=1,
             )
 
-        death_type = self.enemy_death_type.clamp(0, 5)
-        death_count = self.map.enemy_death_frame_counts[death_type]
-        death_elapsed = self.enemy_death_elapsed.to(torch.int64)
-        death_durations = self.map.enemy_death_frame_durations[death_type]
-        death_frame_ends = torch.cumsum(death_durations, dim=2)
-        death_frame = torch.sum(
-            death_elapsed[:, :, None] >= death_frame_ends,
-            dim=2,
-        )
-        death_frame = torch.minimum(
-            death_frame,
-            death_count - 1,
-        )
-        death_sprite = self.map.enemy_death_sprite_ids[death_type, death_frame]
+        death_sprite = self._native_enemy_death_sprite_ids()
         death_slots = torch.nonzero(torch.any(self.enemy_death_tics > 0, dim=0)).flatten()
         if death_slots.numel():
             visible_death_sprite = death_sprite[:, death_slots]

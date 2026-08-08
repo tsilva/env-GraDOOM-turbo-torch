@@ -115,6 +115,22 @@ DEATHMATCH_ENEMY_DEATH_DURATIONS = (
     (8, 8, 4, 4, 4, 1),
     (8, 8, 8, 8, 8, 8, 1),
 )
+DEATHMATCH_ENEMY_XDEATH_FRAMES = (
+    tuple("MNOPQRSTU"),
+    tuple("MNOPQRSTU"),
+    tuple("OPQRSTUVW"),
+    tuple("OPQRST"),
+    DEATHMATCH_ENEMY_DEATH_FRAMES[4],
+    DEATHMATCH_ENEMY_DEATH_FRAMES[5],
+)
+DEATHMATCH_ENEMY_XDEATH_DURATIONS = (
+    (5, 5, 5, 5, 5, 5, 5, 5, 1),
+    (5, 5, 5, 5, 5, 5, 5, 5, 1),
+    (5, 5, 5, 5, 5, 5, 5, 5, 1),
+    (5, 5, 5, 5, 5, 1),
+    DEATHMATCH_ENEMY_DEATH_DURATIONS[4],
+    DEATHMATCH_ENEMY_DEATH_DURATIONS[5],
+)
 DEATHMATCH_ENEMY_PAIN_FRAMES = ("G", "G", "G", "G", "H", "H")
 DEATHMATCH_PROJECTILE_EXPLOSION_FRAMES = (
     ("MISLB0", "MISLC0", "MISLD0"),
@@ -257,6 +273,10 @@ class CompiledScenario:
     enemy_death_frame_counts: np.ndarray | None = None
     enemy_death_frame_durations: np.ndarray | None = None
     enemy_death_total_tics: np.ndarray | None = None
+    enemy_xdeath_sprite_ids: np.ndarray | None = None
+    enemy_xdeath_frame_counts: np.ndarray | None = None
+    enemy_xdeath_frame_durations: np.ndarray | None = None
+    enemy_xdeath_total_tics: np.ndarray | None = None
     enemy_pain_sprite_ids: np.ndarray | None = None
     raw_projectile_flight_sprite_ids: np.ndarray | None = None
     raw_projectile_explosion_sprite_ids: np.ndarray | None = None
@@ -468,6 +488,23 @@ def compile_deathmatch_scenario(
         for frame_index in range(max_death_frames):
             frame = frames[min(frame_index, len(frames) - 1)]
             enemy_death_sprite_ids[enemy_type, frame_index] = request_raw_sprite(
+                f"{prefix}{frame}0"
+            )
+    max_xdeath_frames = max(len(frames) for frames in DEATHMATCH_ENEMY_XDEATH_FRAMES)
+    enemy_xdeath_sprite_ids = np.empty((6, max_xdeath_frames), dtype=np.int32)
+    enemy_xdeath_frame_counts = np.asarray(
+        [len(frames) for frames in DEATHMATCH_ENEMY_XDEATH_FRAMES],
+        dtype=np.int32,
+    )
+    enemy_xdeath_frame_durations = np.zeros((6, max_xdeath_frames), dtype=np.int32)
+    for enemy_type, durations in enumerate(DEATHMATCH_ENEMY_XDEATH_DURATIONS):
+        enemy_xdeath_frame_durations[enemy_type, : len(durations)] = durations
+    enemy_xdeath_total_tics = enemy_xdeath_frame_durations.sum(axis=1, dtype=np.int32)
+    for enemy_type, prefix in enumerate(DEATHMATCH_ENEMY_PREFIXES):
+        frames = DEATHMATCH_ENEMY_XDEATH_FRAMES[enemy_type]
+        for frame_index in range(max_xdeath_frames):
+            frame = frames[min(frame_index, len(frames) - 1)]
+            enemy_xdeath_sprite_ids[enemy_type, frame_index] = request_raw_sprite(
                 f"{prefix}{frame}0"
             )
     enemy_pain_sprite_ids = np.empty((6, 8), dtype=np.int32)
@@ -817,6 +854,10 @@ def compile_deathmatch_scenario(
         enemy_death_frame_counts=enemy_death_frame_counts,
         enemy_death_frame_durations=enemy_death_frame_durations,
         enemy_death_total_tics=enemy_death_total_tics,
+        enemy_xdeath_sprite_ids=enemy_xdeath_sprite_ids,
+        enemy_xdeath_frame_counts=enemy_xdeath_frame_counts,
+        enemy_xdeath_frame_durations=enemy_xdeath_frame_durations,
+        enemy_xdeath_total_tics=enemy_xdeath_total_tics,
         enemy_pain_sprite_ids=enemy_pain_sprite_ids,
         raw_projectile_flight_sprite_ids=raw_projectile_flight_sprite_ids,
         raw_projectile_explosion_sprite_ids=raw_projectile_explosion_sprite_ids,

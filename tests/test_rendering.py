@@ -491,6 +491,42 @@ def test_native_renderer_preserves_rgb_hud_and_enemy_animation(
 
 
 @pytest.mark.skipif(not SCENARIO.is_file() or not DOOM2.is_file(), reason="operator WADs absent")
+def test_enemy_overkill_uses_reference_extreme_death_states(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        4,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(4, dtype=torch.bool), torch.arange(4))
+    engine.enemy_alive.zero_()
+    engine.enemy_type[:, 0] = torch.tensor([0, 0, 2, 4])
+    engine.enemy_health[:, 0] = torch.tensor([20.0, 20.0, 100.0, 150.0])
+    engine.enemy_alive[:, 0] = True
+    damage = torch.zeros_like(engine.enemy_health)
+    damage[:, 0] = torch.tensor([40.0, 41.0, 201.0, 301.0])
+
+    engine._apply_enemy_damage(damage)
+
+    # P_DamageMobj selects Death.Extreme only when health is strictly below
+    # -SpawnHealth and the actor defines that state. Equality is a normal
+    # death, and the Demon falls back to Death despite crossing the threshold.
+    assert engine.enemy_death_extreme[:, 0].tolist() == [False, True, True, False]
+    assert engine.enemy_death_tics[:, 0].tolist() == [21, 41, 41, 29]
+    death_sprites = engine._native_enemy_death_sprite_ids()[:, 0]
+    assert death_sprites.tolist() == [
+        engine.map.enemy_death_sprite_ids[0, 0].item(),
+        engine.map.enemy_xdeath_sprite_ids[0, 0].item(),
+        engine.map.enemy_xdeath_sprite_ids[2, 0].item(),
+        engine.map.enemy_death_sprite_ids[4, 0].item(),
+    ]
+
+    engine.enemy_death_elapsed[:, 0] = 10
+    assert engine._enemy_solid_mask()[:, 0].tolist() == [False, False, False, True]
+
+
+@pytest.mark.skipif(not SCENARIO.is_file() or not DOOM2.is_file(), reason="operator WADs absent")
 def test_native_pit_depth_occludes_map_items(pinned_deathmatch_scenario) -> None:
     scenario = pinned_deathmatch_scenario
     engine = TorchDeathmatchEngine(scenario, 1, device=torch.device("cpu"))

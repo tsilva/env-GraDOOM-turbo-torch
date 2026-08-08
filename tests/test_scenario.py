@@ -124,6 +124,20 @@ def test_pinned_deathmatch_compiles_external_doom2_data() -> None:
     assert scenario.enemy_death_frame_durations.shape == (6, 7)
     assert scenario.enemy_death_total_tics is not None
     assert scenario.enemy_death_total_tics.tolist() == [21, 21, 61, 31, 29, 49]
+    assert scenario.enemy_xdeath_sprite_ids is not None
+    assert scenario.enemy_xdeath_sprite_ids.shape == (6, 9)
+    assert scenario.enemy_xdeath_frame_counts is not None
+    assert scenario.enemy_xdeath_frame_counts.tolist() == [9, 9, 9, 6, 6, 7]
+    assert scenario.enemy_xdeath_frame_durations is not None
+    assert scenario.enemy_xdeath_frame_durations.shape == (6, 9)
+    assert scenario.enemy_xdeath_total_tics is not None
+    assert scenario.enemy_xdeath_total_tics.tolist() == [41, 41, 41, 26, 29, 49]
+    assert scenario.raw_sprite_names[
+        scenario.enemy_xdeath_sprite_ids[0, 0]
+    ].startswith("POSSM0")
+    assert scenario.raw_sprite_names[
+        scenario.enemy_xdeath_sprite_ids[2, -1]
+    ].startswith("PLAYW0")
     assert scenario.enemy_pain_sprite_ids is not None
     assert scenario.enemy_pain_sprite_ids.shape == (6, 8)
     assert scenario.raw_projectile_flight_sprite_ids is not None
