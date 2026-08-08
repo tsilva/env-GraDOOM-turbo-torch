@@ -129,6 +129,38 @@ def test_native_walls_use_reference_rounded_texel_length(
     assert rgb[0, 0, 2].tolist() == [127, 0, 0]
 
 
+def test_native_walls_use_reference_fine_angle_rays(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([123]))
+    engine.x.fill_(835.9440307617188)
+    engine.y.fill_(391.3482971191406)
+    engine.z.zero_()
+    engine.view_z.fill_(41)
+    engine.angle.fill_(math.radians(102.16735842222519))
+    engine.episode_time.fill_(17)
+
+    frame, surface_depth = engine._native_render_flats(
+        engine._current_sector(),
+        engine.view_z,
+    )
+    frame, _scene_depth = engine._native_render_portal_walls(
+        frame,
+        engine.view_z,
+        surface_depth,
+    )
+    rgb = engine.map.playpal[frame.to(torch.int64)]
+
+    # R_RenderBSPNode transforms walls through the 8192-entry fine-angle
+    # basis. Continuous sin/cos intersects the neighboring stone column.
+    assert rgb[0, 0, 272].tolist() == [43, 35, 15]
+
+
 def test_enemy_fullbright_matches_actor_attack_states() -> None:
     enemy_type = torch.tensor((0, 1, 1, 3, 3, 3, 3, 3, 3))
     attack_phase = torch.tensor((2, 2, 2, 2, 3, 3, 4, 1, 1))

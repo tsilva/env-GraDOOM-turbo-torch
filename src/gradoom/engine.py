@@ -8063,8 +8063,7 @@ class TorchDeathmatchEngine:
         return frame.clamp(0, 255).to(torch.uint8)
 
     def _native_raycast(self) -> torch.Tensor:
-        ray_angles = self.angle[:, None] + self._native_ray_offsets[None, :]
-        direction = torch.stack((torch.cos(ray_angles), torch.sin(ray_angles)), dim=-1)
+        direction = self._native_wall_ray_directions()
         origin = torch.stack((self.x, self.y), dim=-1)[:, None, None, :]
         start = self.map.walls[None, None, :, :2]
         segment = self.map.walls[None, None, :, 2:] - start
@@ -8081,8 +8080,7 @@ class TorchDeathmatchEngine:
         valid = (denominator.abs() >= 1e-6) & (distance > 0) & (along >= 0) & (along <= 1)
         distance = torch.where(valid, distance, torch.full_like(distance, torch.inf))
         nearest_distance = torch.min(distance, dim=2).values
-        corrected = nearest_distance * torch.cos(self._native_ray_offsets)[None, :]
-        return corrected.clamp(1, 4096)
+        return nearest_distance.clamp(1, 4096)
 
     def _native_sector_grid(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         flat_x = x.reshape(-1)
@@ -8115,6 +8113,30 @@ class TorchDeathmatchEngine:
         # tics. Preserve that observable behavior in the raw-fidelity path.
         return texture_ids
 
+    def _native_view_angle_bam(self) -> torch.Tensor:
+        """Return the retained or externally overridden unsigned view BAM."""
+
+        visible_angle = self._angle_bam.to(torch.float32) * _BAM_TO_RADIANS
+        public_angle_bam = torch.bitwise_and(
+            torch.round(torch.remainder(self.angle, 2.0 * math.pi) / _BAM_TO_RADIANS).to(
+                torch.int64
+            ),
+            _UINT32_MASK,
+        )
+        return torch.where(self.angle != visible_angle, public_angle_bam, self._angle_bam)
+
+    def _native_wall_ray_directions(self) -> torch.Tensor:
+        """Build wall rays from the software renderer's fine-angle view basis."""
+
+        fine_angle = self._native_view_angle_bam() >> _ANGLE_TO_FINE_SHIFT
+        view_cosine, view_sine = self._fine_direction_from_index(fine_angle)
+        columns = (
+            self._native_pixel_x[0, 0].to(torch.float32) - self.native_screen_width / 2.0
+        ) / (self.native_screen_width / 2.0)
+        direction_x = view_cosine[:, None] + view_sine[:, None] * columns[None, :]
+        direction_y = view_sine[:, None] - view_cosine[:, None] * columns[None, :]
+        return torch.stack((direction_x, direction_y), dim=-1)
+
     def _native_flat_texture_coordinates(
         self,
         texture_ids: torch.Tensor,
@@ -8129,14 +8151,7 @@ class TorchDeathmatchEngine:
         xscale = torch.bitwise_left_shift(torch.ones_like(width_bits), 32 - width_bits)
         yscale = torch.bitwise_left_shift(torch.ones_like(height_bits), 32 - height_bits)
 
-        visible_angle = self._angle_bam.to(torch.float32) * _BAM_TO_RADIANS
-        public_angle_bam = torch.bitwise_and(
-            torch.round(torch.remainder(self.angle, 2.0 * math.pi) / _BAM_TO_RADIANS).to(
-                torch.int64
-            ),
-            _UINT32_MASK,
-        )
-        angle_bam = torch.where(self.angle != visible_angle, public_angle_bam, self._angle_bam)
+        angle_bam = self._native_view_angle_bam()
         fine_angle = torch.bitwise_right_shift(angle_bam, _ANGLE_TO_FINE_SHIFT) & (
             _FINE_ANGLES - 1
         )
@@ -8309,8 +8324,7 @@ class TorchDeathmatchEngine:
     def _native_portal_intersections(
         self,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        ray_angles = self.angle[:, None] + self._native_ray_offsets[None, :]
-        direction = torch.stack((torch.cos(ray_angles), torch.sin(ray_angles)), dim=-1)
+        direction = self._native_wall_ray_directions()
         origin = torch.stack((self.x, self.y), dim=-1)[:, None, None, :]
         start = self.map.portal_walls[None, None, :, :2]
         segment = self.map.portal_walls[None, None, :, 2:] - start
@@ -8326,7 +8340,6 @@ class TorchDeathmatchEngine:
         along = (offset[..., 0] * ray[..., 1] - offset[..., 1] * ray[..., 0]) / safe
         valid = (denominator.abs() >= 1e-6) & (distance > 0) & (along >= 0) & (along <= 1)
         distance = torch.where(valid, distance, torch.full_like(distance, torch.inf))
-        distance *= torch.cos(self._native_ray_offsets)[None, :, None]
         return distance, along.clamp(0, 1)
 
     def _native_render_portal_walls(
