@@ -30,6 +30,7 @@ VARIABLES = (
     "POSITION_X",
     "POSITION_Y",
     "POSITION_Z",
+    "CAMERA_POSITION_Z",
     "ANGLE",
     "VELOCITY_X",
     "VELOCITY_Y",
@@ -117,7 +118,8 @@ def _align_pose(engine: TorchDeathmatchEngine, values: dict[str, float]) -> None
     engine.x[0] = x_fixed / _FIXED_UNIT
     engine.y[0] = y_fixed / _FIXED_UNIT
     engine.z[0] = values["POSITION_Z"]
-    engine.view_z[0] = values["POSITION_Z"] + 41.0
+    engine.view_z[0] = values["CAMERA_POSITION_Z"]
+    engine.view_height[0] = values["CAMERA_POSITION_Z"] - values["POSITION_Z"]
     engine._angle_bam[0] = angle_bam
     engine.angle[0] = angle_bam * _BAM_TO_RADIANS
     sector = engine._sector_at(engine.x, engine.y)
@@ -155,6 +157,7 @@ def _engine_values(engine: TorchDeathmatchEngine) -> dict[str, float]:
         "POSITION_X": float(engine.x[0]),
         "POSITION_Y": float(engine.y[0]),
         "POSITION_Z": float(engine.z[0]),
+        "CAMERA_POSITION_Z": float(engine.view_z[0]),
         "ANGLE": math.degrees(float(engine.angle[0])) % 360.0,
         "VELOCITY_X": float(engine.momentum_x[0]),
         "VELOCITY_Y": float(engine.momentum_y[0]),

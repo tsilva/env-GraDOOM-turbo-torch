@@ -1278,6 +1278,81 @@ def test_reference_double_gravity_when_walking_off_ledge(square_scenario) -> Non
     assert torch.equal(engine.velocity_z, torch.full((2,), -2.0))
 
 
+def test_reference_smooth_step_lowers_then_recovers_viewheight(square_scenario) -> None:
+    engine = _engine(square_scenario)
+    engine.z.fill_(-48.0)
+    engine.player_floor_z.fill_(-24.0)
+    engine.previous_player_floor_z.fill_(-48.0)
+    engine.view_height.fill_(38.75)
+    engine.delta_view_height.fill_(-0.75)
+    engine._player_bob_fixed.zero_()
+    engine.episode_time.fill_(14)
+    active = torch.ones(2, dtype=torch.bool)
+
+    engine._vertical_player_tick(active)
+
+    # P_CalcHeight renders from the pre-step Z and recovered height for this
+    # tic. P_ZMovement then subtracts the 24-unit step only from the state used
+    # by subsequent tics and starts GetDeltaViewHeight's 1/8 recovery.
+    assert engine.view_z.tolist() == [-10.0, -10.0]
+    assert engine.z.tolist() == [-24.0, -24.0]
+    assert engine.view_height.tolist() == [14.0, 14.0]
+    assert engine.delta_view_height.tolist() == [3.375, 3.375]
+
+    engine._vertical_player_tick(active)
+
+    assert engine.view_z.tolist() == [-3.5, -3.5]
+    assert engine.view_height.tolist() == [20.5, 20.5]
+    assert engine.delta_view_height.tolist() == [3.625, 3.625]
+
+
+def test_reference_viewheight_recovery_crosses_zero_by_one_fixed_unit(
+    square_scenario,
+) -> None:
+    engine = _engine(square_scenario)
+    engine.z.zero_()
+    engine.player_floor_z.zero_()
+    engine.view_height.fill_(37.5)
+    engine.delta_view_height.fill_(-0.25)
+    engine._player_bob_fixed.zero_()
+    active = torch.ones(2, dtype=torch.bool)
+
+    engine._vertical_player_tick(active)
+
+    assert engine.view_height.tolist() == [37.25, 37.25]
+    assert engine.delta_view_height.tolist() == [1.0 / 65536.0] * 2
+
+    engine._vertical_player_tick(active)
+
+    assert engine.view_height.tolist() == [37.25001525878906] * 2
+    assert engine.delta_view_height.tolist() == [0.2500152587890625] * 2
+
+
+def test_reference_soft_landing_does_not_squat_viewheight(square_scenario) -> None:
+    engine = _engine(square_scenario)
+    engine.z.fill_(-62.0)
+    engine.player_floor_z.fill_(-64.0)
+    engine.previous_player_floor_z.fill_(-64.0)
+    engine.velocity_z.fill_(-6.0)
+    engine.view_height.fill_(41.0)
+    engine.delta_view_height.zero_()
+    engine._player_bob_fixed.zero_()
+    active = torch.ones(2, dtype=torch.bool)
+
+    engine._vertical_player_tick(active)
+
+    # P_ZMovement invokes PlayerLandedOnThing only below -8 units/tic.
+    assert engine.view_z.tolist() == [-21.0, -21.0]
+    assert engine.z.tolist() == [-64.0, -64.0]
+    assert engine.velocity_z.tolist() == [0.0, 0.0]
+    assert engine.view_height.tolist() == [41.0, 41.0]
+    assert engine.delta_view_height.tolist() == [0.0, 0.0]
+
+    engine._vertical_player_tick(active)
+
+    assert engine.view_z.tolist() == [-23.0, -23.0]
+
+
 def test_player_step_height_limit_is_twenty_four_units(square_scenario) -> None:
     allowed = _engine(
         replace(

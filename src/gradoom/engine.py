@@ -3493,6 +3493,11 @@ class TorchDeathmatchEngine:
             next_delta_view_height + 0.25,
             next_delta_view_height,
         )
+        next_delta_view_height = torch.where(
+            moving_view & (next_delta_view_height == 0),
+            torch.full_like(next_delta_view_height, 1.0 / _FIXED_UNIT),
+            next_delta_view_height,
+        )
         bob_angle = torch.div(
             self.episode_time.to(torch.int64) * _FINE_ANGLES,
             _PLAYER_VIEW_BOB_PERIOD_TICS,
@@ -3508,10 +3513,25 @@ class TorchDeathmatchEngine:
         )
         next_view_z = torch.minimum(next_view_z, self.player_ceiling_z - 4.0)
         next_view_z = torch.maximum(next_view_z, self.player_floor_z + 4.0)
-        self.view_height.copy_(torch.where(active, next_view_height, self.view_height))
         self.view_z.copy_(torch.where(active, next_view_z, self.view_z))
 
         floor = self.player_floor_z
+        # P_ZMovement applies smooth-step compensation after P_CalcHeight has
+        # already selected this tic's viewz. Preserve that rendered camera,
+        # but lower the stored viewheight by the actor's step-up distance and
+        # recover it through player_t::GetDeltaViewHeight on following tics.
+        smooth_step_up = self.z < floor
+        stepped_view_height = next_view_height - (floor - self.z)
+        next_view_height = torch.where(
+            smooth_step_up,
+            stepped_view_height,
+            next_view_height,
+        )
+        next_delta_view_height = torch.where(
+            smooth_step_up,
+            (_VIEW_HEIGHT - stepped_view_height) / 8.0,
+            next_delta_view_height,
+        )
         proposed_z = self.z + self.velocity_z
         airborne = (self.z > floor) | (self.velocity_z < 0)
         walked_off_ledge = (
@@ -3532,12 +3552,14 @@ class TorchDeathmatchEngine:
         landed = proposed_z <= floor
         next_z = torch.where(landed, floor, proposed_z)
         landed_from_air = landed & airborne
+        hard_landing = landed_from_air & (self.velocity_z < -8.0)
         next_delta_view_height = torch.where(
-            landed_from_air,
+            hard_landing,
             self.velocity_z / 8.0,
             next_delta_view_height,
         )
         next_velocity = torch.where(landed, torch.zeros_like(next_velocity), next_velocity)
+        self.view_height.copy_(torch.where(active, next_view_height, self.view_height))
         self.z.copy_(torch.where(active, next_z, self.z))
         self.velocity_z.copy_(torch.where(active, next_velocity, self.velocity_z))
         self.delta_view_height.copy_(
