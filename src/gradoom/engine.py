@@ -8778,8 +8778,43 @@ class TorchDeathmatchEngine:
             )
             previous_distance = torch.where(valid, distance, previous_distance)
             endpoint_only_portal = valid & ~one_sided & ~geometric_intersection
+            # A projected endpoint can reveal the adjacent sector without the
+            # column ray crossing the portal segment. Continue on the side
+            # whose next real boundary is nearer; keep the current side on a
+            # tie so shared vertices cannot bounce between adjacent portals.
+            future_geometric = (
+                geometric_intersections
+                & torch.isfinite(distances)
+                & (distances > distance[:, :, None] + 1e-3)
+            )
+            other_incident = (
+                all_sectors[None, None, :, 0] == other_sector[:, :, None]
+            ) | (all_sectors[None, None, :, 1] == other_sector[:, :, None])
+            current_next_distance = torch.min(
+                torch.where(
+                    incident & future_geometric,
+                    distances,
+                    torch.full_like(distances, torch.inf),
+                ),
+                dim=2,
+            ).values
+            other_next_distance = torch.min(
+                torch.where(
+                    other_incident & future_geometric,
+                    distances,
+                    torch.full_like(distances, torch.inf),
+                ),
+                dim=2,
+            ).values
+            endpoint_enters_other = (
+                endpoint_only_portal
+                & (other_sector >= 0)
+                & (other_next_distance < current_next_distance)
+            )
             current_sector = torch.where(
-                valid & ~one_sided & geometric_intersection,
+                valid
+                & ~one_sided
+                & (geometric_intersection | endpoint_enters_other),
                 other_sector,
                 torch.where(
                     endpoint_only_portal,
