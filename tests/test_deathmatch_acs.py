@@ -936,11 +936,149 @@ def test_reference_teleport_lock_and_turn_rate(square_scenario) -> None:
     for _ in range(7):
         engine._move_player(buttons)
     assert torch.equal(engine.angle, initial)
+    assert engine.turn_held_tics.tolist() == [7, 7]
 
     engine._move_player(buttons)
 
     expected = torch.remainder(initial + torch.deg2rad(torch.tensor(3.515625)), 2 * torch.pi)
     assert torch.allclose(engine.angle, expected)
+    assert engine.turn_held_tics.tolist() == [8, 8]
+
+
+def test_reference_keyboard_turn_uses_five_tic_slow_start(square_scenario) -> None:
+    engine = _engine(square_scenario)
+    engine.reaction_time.zero_()
+    engine.angle.zero_()
+    buttons = torch.zeros((2, 20), dtype=torch.bool)
+    buttons[:, 8] = True
+    buttons[1, 1] = True
+    actual_angle = []
+    actual_bam = []
+
+    for _ in range(8):
+        engine._move_player(buttons)
+        actual_angle.append(engine.angle.clone())
+        actual_bam.append(engine._angle_bam.clone())
+
+    slow_yaw = 320
+    walk_yaw = 640
+    run_yaw = 1280
+    expected_yaw = torch.tensor(
+        [
+            [slow_yaw * min(tic, 5) + walk_yaw * max(tic - 5, 0) for tic in range(1, 9)],
+            [slow_yaw * min(tic, 5) + run_yaw * max(tic - 5, 0) for tic in range(1, 9)],
+        ],
+        dtype=torch.int64,
+    ).T
+    expected_bam = expected_yaw << 16
+    expected_angle = expected_bam.to(torch.float32) * (2.0 * math.pi / float(1 << 32))
+
+    assert torch.equal(torch.stack(actual_bam), expected_bam)
+    assert torch.equal(torch.stack(actual_angle), expected_angle)
+
+    # Releasing both turn keys clears turnheld, so even a running turn starts
+    # with the same five slow tics on its next press.
+    engine._move_player(torch.zeros_like(buttons))
+    before = engine._angle_bam.clone()
+    engine._move_player(buttons)
+    assert torch.equal(engine._angle_bam - before, torch.full((2,), slow_yaw << 16))
+
+
+def test_strafe_modifier_converts_turn_keys_to_clamped_side_movement(
+    square_scenario,
+) -> None:
+    engine = _engine(square_scenario)
+    engine.reaction_time.zero_()
+    engine.x.zero_()
+    engine.y.zero_()
+    engine._x_fixed.zero_()
+    engine._y_fixed.zero_()
+    engine.angle.zero_()
+    engine.momentum_x.zero_()
+    engine.momentum_y.zero_()
+    engine._momentum_x_fixed.zero_()
+    engine._momentum_y_fixed.zero_()
+    buttons = torch.zeros((2, 20), dtype=torch.bool)
+    buttons[:, 2] = True
+    buttons[:, 8] = True
+    # Running left strafe from both the turn key and the dedicated move key is
+    # clamped to Doom's MAXPLMOVE (50), rather than applying both 40-unit moves.
+    buttons[1, 1] = True
+    buttons[1, 4] = True
+
+    engine._move_player(buttons)
+
+    assert torch.equal(engine.angle, torch.zeros(2))
+    assert engine.turn_held_tics.tolist() == [1, 1]
+    assert torch.equal(engine.x, torch.zeros(2))
+    assert torch.equal(engine.y, torch.tensor([0.75, 1.5625]))
+    assert torch.equal(engine.momentum_x, torch.zeros(2))
+    assert torch.equal(engine.momentum_y, torch.tensor([0.6796875, 1.416015625]))
+
+
+def test_strafe_modifier_still_primes_keyboard_turn_acceleration(square_scenario) -> None:
+    engine = _engine(square_scenario)
+    engine.reaction_time.zero_()
+    engine.angle.zero_()
+    buttons = torch.zeros((2, 20), dtype=torch.bool)
+    buttons[:, 2] = True
+    buttons[:, 8] = True
+
+    for _ in range(5):
+        engine._move_player(buttons)
+    assert torch.equal(engine.angle, torch.zeros(2))
+
+    buttons[:, 2] = False
+    engine._move_player(buttons)
+
+    expected_bam = torch.full((2,), 640 << 16, dtype=torch.int64)
+    assert torch.equal(engine._angle_bam, expected_bam)
+
+
+def test_binary_delta_actions_contribute_reference_yaw_and_side_move(
+    square_scenario,
+) -> None:
+    engine = _engine(square_scenario)
+    engine.reaction_time.zero_()
+    engine.x.zero_()
+    engine.y.zero_()
+    engine._x_fixed.zero_()
+    engine._y_fixed.zero_()
+    engine.angle.zero_()
+    engine.momentum_x.zero_()
+    engine.momentum_y.zero_()
+    engine._momentum_x_fixed.zero_()
+    engine._momentum_y_fixed.zero_()
+    buttons = torch.zeros((2, 20), dtype=torch.bool)
+    buttons[:, 18] = True
+    buttons[:, 19] = True
+    buttons[1, 8] = True
+
+    engine._move_player(buttons)
+
+    # A binary custom action supplies value 1 to ViZDoom's delta axes. The
+    # degree-to-yaw conversion floors to 182, while TURN_LEFT contributes the
+    # first-tic keyboard yaw of 320 in the other direction.
+    expected_bam = torch.tensor(
+        [(-(182 << 16)) & ((1 << 32) - 1), (320 - 182) << 16],
+        dtype=torch.int64,
+    )
+    assert torch.equal(engine._angle_bam, expected_bam)
+    # MOVE_LEFT_RIGHT_DELTA=1 contributes one command unit, or 1/32 map unit
+    # of side thrust at the newly updated angle before Doom's normal friction.
+    sine = torch.sin(engine.angle)
+    cosine = torch.cos(engine.angle)
+    right_displacement = engine.x * sine - engine.y * cosine
+    forward_displacement = engine.x * cosine + engine.y * sine
+    right_momentum = engine.momentum_x * sine - engine.momentum_y * cosine
+    assert torch.allclose(right_displacement, torch.full((2,), 0.03125), rtol=0, atol=2e-5)
+    assert torch.allclose(forward_displacement, torch.zeros(2), rtol=0, atol=2e-5)
+    assert torch.allclose(
+        right_momentum,
+        torch.full((2,), 0.0283203125),
+        rtol=0,
+        atol=2e-5,
+    )
 
 
 def test_reference_forward_acceleration_and_right_strafe_basis(square_scenario) -> None:

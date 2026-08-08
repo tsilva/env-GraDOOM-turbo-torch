@@ -59,12 +59,18 @@ _PLAYER_FORWARD_ACCELERATION_FIXED = 25 << 11
 _PLAYER_RUN_FORWARD_ACCELERATION_FIXED = 50 << 11
 _PLAYER_SIDE_ACCELERATION_FIXED = 24 << 11
 _PLAYER_RUN_SIDE_ACCELERATION_FIXED = 40 << 11
+_PLAYER_MAX_INPUT_ACCELERATION_FIXED = 50 << 11
 _CHAINSAW_PULL_ACCELERATION_FIXED = 100 << 11
 _PLAYER_FRICTION_FIXED = 0xE800
 _ACTOR_STOP_SPEED_FIXED = _FIXED_UNIT // 16
 _PLAYER_AIR_CONTROL_FIXED = 0x0100
 _PLAYER_AIR_FRICTION_FIXED = _FIXED_UNIT
-_PLAYER_TURN_DEGREES = 3.515625
+_PLAYER_SLOW_TURN_TICS = 6
+_PLAYER_SLOW_TURN_YAW = 320
+_PLAYER_WALK_TURN_YAW = 640
+_PLAYER_RUN_TURN_YAW = 1280
+_PLAYER_BINARY_DELTA_TURN_YAW = 182
+_PLAYER_BINARY_DELTA_SIDE_ACCELERATION_FIXED = 1 << 11
 _PLAYER_MOVE_BOB_FIXED = _FIXED_UNIT // 4
 _PLAYER_MAX_BOB_FIXED = 16 * _FIXED_UNIT
 _PLAYER_VIEW_BOB_PERIOD_TICS = 20
@@ -975,6 +981,11 @@ class TorchDeathmatchEngine:
         self.view_height = torch.full((n,), _VIEW_HEIGHT, device=device)
         self.delta_view_height = torch.zeros(n, device=device)
         self.angle = torch.zeros(n, device=device)
+        # Doom applies keyboard yaw in binary angle measurement (BAM) units.
+        # Keep the exact retained angle while exposing radians through the
+        # established public tensor API.
+        self._angle_bam = torch.zeros(n, device=device, dtype=torch.int64)
+        self.turn_held_tics = torch.zeros(n, device=device, dtype=torch.int32)
         self.momentum_x = torch.zeros(n, device=device)
         self.momentum_y = torch.zeros(n, device=device)
         # Doom keeps actor position and momentum in signed 16.16 fixed point.
@@ -1499,7 +1510,20 @@ class TorchDeathmatchEngine:
         spawn_x, spawn_y, spawn_angle, _ = self._random_spawn_positions(mask, avoid_player=False)
         self.x.copy_(torch.where(mask, spawn_x, self.x))
         self.y.copy_(torch.where(mask, spawn_y, self.y))
-        self.angle.copy_(torch.where(mask, spawn_angle, self.angle))
+        spawn_angle_bam = torch.bitwise_and(
+            torch.round(torch.remainder(spawn_angle, 2.0 * math.pi) / _BAM_TO_RADIANS).to(
+                torch.int64
+            ),
+            _UINT32_MASK,
+        )
+        self._angle_bam.copy_(torch.where(mask, spawn_angle_bam, self._angle_bam))
+        self.angle.copy_(
+            torch.where(
+                mask,
+                self._angle_bam.to(torch.float32) * _BAM_TO_RADIANS,
+                self.angle,
+            )
+        )
         spawn_x_fixed = torch.round(spawn_x * _FIXED_UNIT).to(torch.int64)
         spawn_y_fixed = torch.round(spawn_y * _FIXED_UNIT).to(torch.int64)
         self._x_fixed.copy_(torch.where(mask, spawn_x_fixed, self._x_fixed))
@@ -1560,6 +1584,7 @@ class TorchDeathmatchEngine:
         self.mugshot_face_index.masked_fill_(mask, 1)
         self.mugshot_face_tics.masked_fill_(mask, _MUGSHOT_NORMAL_FRAME_TICS)
         self.attack_held_tics.masked_fill_(mask, 0)
+        self.turn_held_tics.masked_fill_(mask, 0)
         self.chainsaw_pull.masked_fill_(mask, False)
         self.reaction_time.masked_fill_(mask, _PLAYER_TELEPORT_LOCK_TICS)
         self.player_dead.masked_fill_(mask, False)
@@ -2970,6 +2995,7 @@ class TorchDeathmatchEngine:
         visible_y = self._y_fixed.to(torch.float32) / _FIXED_UNIT
         visible_momentum_x = self._momentum_x_fixed.to(torch.float32) / _FIXED_UNIT
         visible_momentum_y = self._momentum_y_fixed.to(torch.float32) / _FIXED_UNIT
+        visible_angle = self._angle_bam.to(torch.float32) * _BAM_TO_RADIANS
         position_resynchronized = (self.x != visible_x) | (self.y != visible_y)
         self._x_fixed.copy_(
             torch.where(
@@ -2999,6 +3025,15 @@ class TorchDeathmatchEngine:
                 self._momentum_y_fixed,
             )
         )
+        public_angle_bam = torch.bitwise_and(
+            torch.round(torch.remainder(self.angle, 2.0 * math.pi) / _BAM_TO_RADIANS).to(
+                torch.int64
+            ),
+            _UINT32_MASK,
+        )
+        self._angle_bam.copy_(
+            torch.where(self.angle != visible_angle, public_angle_bam, self._angle_bam)
+        )
         if self.debug_checks and torch.any(position_resynchronized):
             current_floor, current_ceiling = self._player_opening_at(self.x, self.y)
             self.player_floor_z.copy_(current_floor)
@@ -3013,21 +3048,50 @@ class TorchDeathmatchEngine:
         current_floor = self.player_floor_z
         self.previous_player_floor_z.copy_(current_floor)
         on_ground = self.z <= current_floor
-        speed = torch.where(buttons[:, 1], 2.0, 1.0)
-        turn = (buttons[:, 8].to(torch.float32) - buttons[:, 7].to(torch.float32)) * active.to(
-            torch.float32
+        turning = buttons[:, 7] | buttons[:, 8]
+        self.turn_held_tics.copy_(
+            torch.where(
+                turning,
+                self.turn_held_tics + 1,
+                torch.zeros_like(self.turn_held_tics),
+            )
         )
-        turn = torch.where(pull_requested, torch.zeros_like(turn), turn)
-        self.angle.add_(turn * speed * (_PLAYER_TURN_DEGREES * math.pi / 180.0))
-        self.angle.remainder_(2 * math.pi)
+        turn_yaw = torch.where(
+            self.turn_held_tics < _PLAYER_SLOW_TURN_TICS,
+            torch.full_like(self._angle_bam, _PLAYER_SLOW_TURN_YAW),
+            torch.where(
+                buttons[:, 1],
+                torch.full_like(self._angle_bam, _PLAYER_RUN_TURN_YAW),
+                torch.full_like(self._angle_bam, _PLAYER_WALK_TURN_YAW),
+            ),
+        )
+        turn_direction = buttons[:, 8].to(torch.int64) - buttons[:, 7].to(torch.int64)
+        keyboard_turn_active = active & ~pull_requested & ~buttons[:, 2]
+        delta_turn_active = active & ~pull_requested
+        turn_delta_bam = (turn_direction * turn_yaw << 16) * keyboard_turn_active.to(
+            torch.int64
+        )
+        turn_delta_bam -= (
+            buttons[:, 18].to(torch.int64) * _PLAYER_BINARY_DELTA_TURN_YAW << 16
+        ) * delta_turn_active.to(torch.int64)
+        self._angle_bam.copy_(
+            torch.bitwise_and(self._angle_bam + turn_delta_bam, _UINT32_MASK)
+        )
+        self.angle.copy_(self._angle_bam.to(torch.float32) * _BAM_TO_RADIANS)
         forward = (buttons[:, 6].to(torch.float32) - buttons[:, 5].to(torch.float32)) * active.to(
             torch.float32
         )
-        side = (buttons[:, 3].to(torch.float32) - buttons[:, 4].to(torch.float32)) * active.to(
-            torch.float32
+        side_direction = buttons[:, 3].to(torch.int64) - buttons[:, 4].to(torch.int64)
+        side_direction += buttons[:, 2].to(torch.int64) * (
+            buttons[:, 7].to(torch.int64) - buttons[:, 8].to(torch.int64)
         )
+        side_direction *= active.to(torch.int64)
         forward = torch.where(pull_active, torch.ones_like(forward), forward)
-        side = torch.where(pull_requested, torch.zeros_like(side), side)
+        side_direction = torch.where(
+            pull_requested,
+            torch.zeros_like(side_direction),
+            side_direction,
+        )
         forward_acceleration_fixed = torch.where(
             buttons[:, 1],
             torch.full_like(self._momentum_x_fixed, _PLAYER_RUN_FORWARD_ACCELERATION_FIXED),
@@ -3041,7 +3105,7 @@ class TorchDeathmatchEngine:
             ),
             forward_acceleration_fixed,
         )
-        side_acceleration_fixed = torch.where(
+        side_input_acceleration_fixed = torch.where(
             buttons[:, 1],
             torch.full_like(self._momentum_x_fixed, _PLAYER_RUN_SIDE_ACCELERATION_FIXED),
             torch.full_like(self._momentum_x_fixed, _PLAYER_SIDE_ACCELERATION_FIXED),
@@ -3051,17 +3115,31 @@ class TorchDeathmatchEngine:
             forward_acceleration_fixed,
             forward_acceleration_fixed * _PLAYER_AIR_CONTROL_FIXED >> 16,
         )
-        side_acceleration_fixed = torch.where(
-            on_ground,
-            side_acceleration_fixed,
-            side_acceleration_fixed * _PLAYER_AIR_CONTROL_FIXED >> 16,
+        side_move_fixed = side_direction * side_input_acceleration_fixed
+        side_move_fixed += (
+            buttons[:, 19].to(torch.int64)
+            * _PLAYER_BINARY_DELTA_SIDE_ACCELERATION_FIXED
+            * active.to(torch.int64)
         )
-        fine_angle = torch.floor(self.angle * _FINE_ANGLE_SCALE).to(torch.int64)
-        fine_angle &= _FINE_ANGLES - 1
+        side_move_fixed = torch.where(
+            pull_requested,
+            torch.zeros_like(side_move_fixed),
+            side_move_fixed,
+        )
+        side_move_fixed = torch.clamp(
+            side_move_fixed,
+            -_PLAYER_MAX_INPUT_ACCELERATION_FIXED,
+            _PLAYER_MAX_INPUT_ACCELERATION_FIXED,
+        )
+        side_move_fixed = torch.where(
+            on_ground,
+            side_move_fixed,
+            side_move_fixed * _PLAYER_AIR_CONTROL_FIXED >> 16,
+        )
+        fine_angle = self._angle_bam >> _ANGLE_TO_FINE_SHIFT
         sine_fixed = self._fine_sine_fixed[fine_angle]
         cosine_fixed = self._fine_sine_fixed[(fine_angle + _FINE_ANGLES // 4) & (_FINE_ANGLES - 1)]
         forward_move_fixed = forward.to(torch.int64) * forward_acceleration_fixed
-        side_move_fixed = side.to(torch.int64) * side_acceleration_fixed
         self._momentum_x_fixed.add_(
             (forward_move_fixed * cosine_fixed >> 16)
             + (side_move_fixed * sine_fixed >> 16)
