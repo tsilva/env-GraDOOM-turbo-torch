@@ -1580,7 +1580,12 @@ class TorchDeathmatchEngine:
         self._y_fixed.copy_(torch.where(mask, spawn_y_fixed, self._y_fixed))
         self.x.copy_(self._x_fixed.to(torch.float32) / _FIXED_UNIT)
         self.y.copy_(self._y_fixed.to(torch.float32) / _FIXED_UNIT)
-        spawn_floor, spawn_ceiling = self._player_opening_at(self.x, self.y)
+        # SetOrigin establishes a freshly placed actor's opening from its
+        # center subsector. P_XYMovement expands that opening across the
+        # actor box only after actual horizontal movement occurs.
+        spawn_sector = self._sector_at(self.x, self.y)
+        spawn_floor = self.map.sector_heights[spawn_sector, 0]
+        spawn_ceiling = self.map.sector_heights[spawn_sector, 1]
         self.player_floor_z.copy_(
             torch.where(mask, spawn_floor, self.player_floor_z)
         )
@@ -1590,8 +1595,10 @@ class TorchDeathmatchEngine:
         self.player_ceiling_z.copy_(
             torch.where(mask, spawn_ceiling, self.player_ceiling_z)
         )
-        spawn_sector = self._sector_at(spawn_x, spawn_y)
-        spawn_z = self.map.sector_heights[spawn_sector, 0]
+        # The ACS randomizer changes X/Y/angle but passes the player's map
+        # start Z to SetActorPosition. A pit destination therefore starts in
+        # midair and falls instead of teleporting directly onto its floor.
+        spawn_z = self._player_start_z[-1].expand_as(spawn_floor)
         self.z.copy_(torch.where(mask, spawn_z, self.z))
         self.view_z.copy_(torch.where(mask, spawn_z + _VIEW_HEIGHT, self.view_z))
         self.view_height.masked_fill_(mask, _VIEW_HEIGHT)
@@ -2306,6 +2313,7 @@ class TorchDeathmatchEngine:
         start_y = self._y_fixed
         move_x = self._momentum_x_fixed
         move_y = self._momentum_y_fixed
+        moved = playing & ((move_x != 0) | (move_y != 0))
         dominant_speed = torch.maximum(move_x.abs(), move_y.abs())
         max_step = int((_PLAYER_RADIUS - 1.0) * _FIXED_UNIT)
         steps = torch.where(
@@ -2392,8 +2400,17 @@ class TorchDeathmatchEngine:
         position_x = torch.where(playing, position_x, start_x)
         position_y = torch.where(playing, position_y, start_y)
         fallback = blocked & ~slide
-        result_floor = torch.where(blocked, self.player_floor_z, proposed_floor)
-        result_ceiling = torch.where(blocked, self.player_ceiling_z, proposed_ceiling)
+        preserve_opening = blocked | ~moved
+        result_floor = torch.where(
+            preserve_opening,
+            self.player_floor_z,
+            proposed_floor,
+        )
+        result_ceiling = torch.where(
+            preserve_opening,
+            self.player_ceiling_z,
+            proposed_ceiling,
+        )
         return (
             position_x,
             position_y,

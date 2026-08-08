@@ -616,6 +616,45 @@ def test_native_teleport_fog_uses_reference_animation_and_lifetime(square_scenar
 
 
 @pytest.mark.skipif(not SCENARIO.is_file() or not DOOM2.is_file(), reason="operator WADs absent")
+def test_acs_reposition_preserves_start_z_and_idle_pit_floor(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        2,
+        device=torch.device("cpu"),
+    )
+    spawn_x = 569.3474273681641
+    spawn_y = 515.9971313476562
+    engine.map.spawn_bounds.copy_(
+        torch.tensor((spawn_x, spawn_x, spawn_y, spawn_y))
+    )
+    engine.reset(torch.ones(2, dtype=torch.bool), torch.tensor([789, 790]))
+
+    # SetActorPosition keeps the map-start Z while SetOrigin derives floorz
+    # only from the destination's center subsector. The player's box also
+    # touches the -48 ledge, but P_XYMovement does not expand the opening
+    # until the actor actually has horizontal momentum.
+    box_floor, _box_ceiling = engine._player_opening_at(engine.x, engine.y)
+    assert engine.z.tolist() == [0.0, 0.0]
+    assert engine.player_floor_z.tolist() == [-64.0, -64.0]
+    assert box_floor.tolist() == [-48.0, -48.0]
+
+    engine.angle.fill_(math.radians(348.81591804996503))
+    buttons = torch.zeros((2, 20), dtype=torch.bool)
+    buttons[1, 6] = True
+    for _ in range(6):
+        engine.step(buttons)
+
+    # ViZDoom seed 789, episode time 13: the idle player lands at the bottom
+    # while forward movement updates floorz and catches the adjacent ledge.
+    assert engine.z.tolist() == [-64.0, -48.0]
+    assert engine.player_floor_z.tolist() == [-64.0, -48.0]
+    assert engine.x[1].item() == pytest.approx(570.1556396484375)
+    assert engine.y[1].item() == pytest.approx(515.8375854492188)
+
+
+@pytest.mark.skipif(not SCENARIO.is_file() or not DOOM2.is_file(), reason="operator WADs absent")
 def test_player_floor_uses_full_box_across_pit_steps(pinned_deathmatch_scenario) -> None:
     scenario = pinned_deathmatch_scenario
     engine = TorchDeathmatchEngine(scenario, 1, device=torch.device("cpu"))
