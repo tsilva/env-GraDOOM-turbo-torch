@@ -294,6 +294,12 @@ def test_native_walls_use_reference_half_open_screen_bounds(
     assert not geometric_intersections[0, 110, 196]
     assert wall_distance[0, 110, 196] < wall_distance[0, 110, 186]
     assert rgb[0, 82, 110].tolist() == [159, 135, 111]
+    # Solid wall 168 and portal 163 meet at equal depth; the solid owns the
+    # shared column and selects the reference COMPBLUE texture coordinates.
+    assert wall_distance[0, 86, 163] == wall_distance[0, 86, 168]
+    assert geometric_intersections[0, 86, 163]
+    assert not geometric_intersections[0, 86, 168]
+    assert rgb[0, 82, 86].tolist() == [0, 0, 71]
     assert rgb[0, 40, 90].tolist() == [95, 75, 55]
 
 

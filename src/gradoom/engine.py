@@ -8563,6 +8563,36 @@ class TorchDeathmatchEngine:
                 torch.full_like(distances, torch.inf),
             )
             distance, wall_index = torch.min(candidates, dim=2)
+            # At a shared projected endpoint, Doom's solid seg clips the
+            # portal at the same depth. Tensor min otherwise picks whichever
+            # linedef happens to have the lower map index.
+            equal_depth_solid = (
+                (all_sectors[None, None, :, 1] < 0)
+                & torch.isfinite(candidates)
+                & (
+                    torch.abs(candidates - distance[:, :, None])
+                    <= 1e-3
+                )
+            )
+            solid_distance, solid_wall_index = torch.min(
+                torch.where(
+                    equal_depth_solid,
+                    candidates,
+                    torch.full_like(candidates, torch.inf),
+                ),
+                dim=2,
+            )
+            has_equal_depth_solid = torch.isfinite(solid_distance)
+            distance = torch.where(
+                has_equal_depth_solid,
+                solid_distance,
+                distance,
+            )
+            wall_index = torch.where(
+                has_equal_depth_solid,
+                solid_wall_index,
+                wall_index,
+            )
             valid = torch.isfinite(distance)
             along = wall_along.gather(2, wall_index[:, :, None]).squeeze(2)
             geometric_intersection = geometric_intersections.gather(
