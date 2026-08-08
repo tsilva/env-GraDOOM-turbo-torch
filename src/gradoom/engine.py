@@ -104,6 +104,8 @@ _HITSCAN_PELLET_COUNTS = (0, 0, 1, 7, 20, 1, 0, 0)
 _HITSCAN_MAX_PELLETS = 20
 _BULLET_PUFF_TOTAL_TICS = 16
 _BULLET_PUFF_FRAME_TICS = 4
+_BULLET_DECAL_SLOTS = 1024
+_BULLET_DECAL_SCALE = 0.5
 _BULLET_AUTOAIM_RANGE = 1024.0
 _PLAYER_HITSCAN_RANGE = 8192.0
 _BULLET_AUTOAIM_OFFSET = 2.0 * math.pi / 64.0
@@ -478,6 +480,12 @@ class DeviceScenario:
     projectile_additive_luts: torch.Tensor
     sprite_translucent_lut: torch.Tensor
     raw_bullet_puff_sprite_ids: torch.Tensor
+    bullet_decal_atlas: torch.Tensor
+    bullet_decal_heights: torch.Tensor
+    bullet_decal_left_offsets: torch.Tensor
+    bullet_decal_top_offsets: torch.Tensor
+    bullet_decal_opacity_lut: torch.Tensor
+    bullet_decal_black_lut: torch.Tensor
     raw_static_sprite_ids: torch.Tensor
     raw_item_animation_sprite_ids: torch.Tensor
     native_weapon_screen_values: torch.Tensor
@@ -745,6 +753,39 @@ class DeviceScenario:
             if scenario.raw_bullet_puff_sprite_ids is None
             else scenario.raw_bullet_puff_sprite_ids
         )
+        bullet_decal_atlas = (
+            np.zeros((5, 9, 7), dtype=np.uint8)
+            if scenario.bullet_decal_atlas is None
+            else scenario.bullet_decal_atlas
+        )
+        bullet_decal_heights = (
+            np.ones(5, dtype=np.int32)
+            if scenario.bullet_decal_heights is None
+            else scenario.bullet_decal_heights
+        )
+        bullet_decal_left_offsets = (
+            np.zeros(5, dtype=np.int32)
+            if scenario.bullet_decal_left_offsets is None
+            else scenario.bullet_decal_left_offsets
+        )
+        bullet_decal_top_offsets = (
+            np.zeros(5, dtype=np.int32)
+            if scenario.bullet_decal_top_offsets is None
+            else scenario.bullet_decal_top_offsets
+        )
+        bullet_decal_opacity_lut = (
+            np.zeros((32, 256), dtype=np.uint8)
+            if scenario.bullet_decal_opacity_lut is None
+            else scenario.bullet_decal_opacity_lut
+        )
+        bullet_decal_black_lut = (
+            np.broadcast_to(
+                np.arange(256, dtype=np.uint8)[None, :],
+                (65, 256),
+            ).copy()
+            if scenario.bullet_decal_black_lut is None
+            else scenario.bullet_decal_black_lut
+        )
         if scenario.raw_static_sprite_ids is None:
             last_sprite = max(len(raw_sprite_atlas) - 1, 0)
             raw_static_sprite_ids = np.asarray(
@@ -999,6 +1040,24 @@ class DeviceScenario:
             raw_bullet_puff_sprite_ids=torch.as_tensor(
                 raw_bullet_puff_sprite_ids, device=device, dtype=torch.int64
             ),
+            bullet_decal_atlas=torch.as_tensor(
+                bullet_decal_atlas, device=device, dtype=torch.uint8
+            ),
+            bullet_decal_heights=torch.as_tensor(
+                bullet_decal_heights, device=device, dtype=torch.int64
+            ),
+            bullet_decal_left_offsets=torch.as_tensor(
+                bullet_decal_left_offsets, device=device, dtype=torch.int64
+            ),
+            bullet_decal_top_offsets=torch.as_tensor(
+                bullet_decal_top_offsets, device=device, dtype=torch.int64
+            ),
+            bullet_decal_opacity_lut=torch.as_tensor(
+                bullet_decal_opacity_lut, device=device, dtype=torch.uint8
+            ),
+            bullet_decal_black_lut=torch.as_tensor(
+                bullet_decal_black_lut, device=device, dtype=torch.uint8
+            ),
             raw_static_sprite_ids=torch.as_tensor(
                 raw_static_sprite_ids, device=device, dtype=torch.int64
             ),
@@ -1046,6 +1105,7 @@ class TorchDeathmatchEngine:
     enemy_projectile_slots = 64
     player_projectile_slots = 32
     hitscan_puff_slots = _HITSCAN_MAX_PELLETS
+    hitscan_decal_slots = _BULLET_DECAL_SLOTS
 
     def __init__(
         self,
@@ -1091,6 +1151,7 @@ class TorchDeathmatchEngine:
         self.rng_state = torch.ones(n, device=device, dtype=torch.int64)
         self.enemy_chase_rng_state = torch.ones(n, device=device, dtype=torch.int64)
         self.hitscan_puff_rng_state = torch.ones(n, device=device, dtype=torch.int64)
+        self.hitscan_decal_rng_state = torch.ones(n, device=device, dtype=torch.int64)
         self.episode_time = torch.zeros(n, device=device, dtype=torch.int32)
         self.episode_return = torch.zeros(n, device=device)
         self.pending_reset = torch.ones(n, device=device, dtype=torch.bool)
@@ -1309,6 +1370,23 @@ class TorchDeathmatchEngine:
         self.hitscan_puff_tics = torch.zeros(
             (n, self.hitscan_puff_slots), device=device, dtype=torch.int32
         )
+        self.hitscan_decal_wall = torch.zeros(
+            (n, self.hitscan_decal_slots), device=device, dtype=torch.int32
+        )
+        self.hitscan_decal_along = torch.zeros(
+            (n, self.hitscan_decal_slots), device=device
+        )
+        self.hitscan_decal_z = torch.zeros((n, self.hitscan_decal_slots), device=device)
+        self.hitscan_decal_style = torch.zeros(
+            (n, self.hitscan_decal_slots), device=device, dtype=torch.uint8
+        )
+        self.hitscan_decal_serial = torch.full(
+            (n, self.hitscan_decal_slots),
+            -1,
+            device=device,
+            dtype=torch.int32,
+        )
+        self.hitscan_decal_count = torch.zeros(n, device=device, dtype=torch.int64)
         self.enemy_projectile_x = torch.zeros((n, self.enemy_projectile_slots), device=device)
         self.enemy_projectile_y = torch.zeros((n, self.enemy_projectile_slots), device=device)
         self.enemy_projectile_z = torch.zeros((n, self.enemy_projectile_slots), device=device)
@@ -1498,6 +1576,17 @@ class TorchDeathmatchEngine:
         self.hitscan_puff_rng_state.copy_(torch.where(mask, updated, value))
         return self.hitscan_puff_rng_state
 
+    def _hitscan_decal_random_u32(self, mask: torch.Tensor) -> torch.Tensor:
+        """Advance the visual-only BulletChip stream independently of gameplay RNG."""
+
+        value = self.hitscan_decal_rng_state
+        updated = torch.bitwise_xor(value, torch.bitwise_and(value << 13, _UINT32_MASK))
+        updated = torch.bitwise_xor(updated, updated >> 17)
+        updated = torch.bitwise_xor(updated, torch.bitwise_and(updated << 5, _UINT32_MASK))
+        updated = torch.bitwise_and(updated, _UINT32_MASK)
+        self.hitscan_decal_rng_state.copy_(torch.where(mask, updated, value))
+        return self.hitscan_decal_rng_state
+
     @staticmethod
     def _public_or_retained_fixed(
         public: torch.Tensor,
@@ -1660,6 +1749,15 @@ class TorchDeathmatchEngine:
         )
         self.hitscan_puff_rng_state.copy_(
             torch.where(mask, puff_seeds, self.hitscan_puff_rng_state)
+        )
+        decal_seeds = torch.bitwise_and(safe_seeds ^ 0x94D049BB, _UINT32_MASK)
+        decal_seeds = torch.where(
+            decal_seeds == 0,
+            torch.full_like(decal_seeds, 0x369DEA0F),
+            decal_seeds,
+        )
+        self.hitscan_decal_rng_state.copy_(
+            torch.where(mask, decal_seeds, self.hitscan_decal_rng_state)
         )
         self.mugshot_rng_state.copy_(
             torch.where(mask, safe_seeds, self.mugshot_rng_state)
@@ -1852,6 +1950,12 @@ class TorchDeathmatchEngine:
         self.hitscan_puff_y[mask] = 0
         self.hitscan_puff_z[mask] = 0
         self.hitscan_puff_tics[mask] = 0
+        self.hitscan_decal_wall[mask] = 0
+        self.hitscan_decal_along[mask] = 0
+        self.hitscan_decal_z[mask] = 0
+        self.hitscan_decal_style[mask] = 0
+        self.hitscan_decal_serial[mask] = -1
+        self.hitscan_decal_count[mask] = 0
         self.enemy_projectile_x[mask] = 0
         self.enemy_projectile_y[mask] = 0
         self.enemy_projectile_z[mask] = 0
@@ -5093,6 +5197,95 @@ class TorchDeathmatchEngine:
             )
         )
 
+    def _spawn_player_hitscan_decals(
+        self,
+        pellet_damage: torch.Tensor,
+        pellet_angle: torch.Tensor,
+        vertical_slope: torch.Tensor,
+        nearest_blocking_wall: torch.Tensor,
+        nearest_blocking_wall_index: torch.Tensor,
+        hit_actor: torch.Tensor,
+    ) -> None:
+        """Attach persistent ZDoom BulletChip decals to player wall impacts."""
+
+        wall_hit = (pellet_damage > 0) & ~hit_actor & torch.isfinite(nearest_blocking_wall)
+        ray_cosine, ray_sine = self._fine_direction(pellet_angle)
+        impact_x = self.x[:, None] + ray_cosine * nearest_blocking_wall
+        impact_y = self.y[:, None] + ray_sine * nearest_blocking_wall
+        impact_z = self.z[:, None] + 36.0 + vertical_slope * nearest_blocking_wall
+        wall = self.map.portal_walls[nearest_blocking_wall_index]
+        wall_dx = wall[..., 2] - wall[..., 0]
+        wall_dy = wall[..., 3] - wall[..., 1]
+        safe_dx = torch.where(wall_dx == 0, torch.ones_like(wall_dx), wall_dx)
+        safe_dy = torch.where(wall_dy == 0, torch.ones_like(wall_dy), wall_dy)
+        wall_along = torch.where(
+            wall_dx.abs() > wall_dy.abs(),
+            (impact_x - wall[..., 0]) / safe_dx,
+            (impact_y - wall[..., 1]) / safe_dy,
+        ).clamp(0, 1)
+        before_x = impact_x - ray_cosine * (1.0 / _FIXED_UNIT)
+        before_y = impact_y - ray_sine * (1.0 / _FIXED_UNIT)
+        wall_cross = wall_dx * (before_y - wall[..., 1]) - wall_dy * (
+            before_x - wall[..., 0]
+        )
+        side = (wall_cross > 0).to(torch.int64)
+
+        pellet = torch.arange(
+            1,
+            _HITSCAN_MAX_PELLETS + 1,
+            device=self.device,
+            dtype=torch.int64,
+        )[None, :]
+        random_key = self.hitscan_decal_rng_state[:, None] ^ (
+            pellet * _HASH_GOLDEN_RATIO_SIGNED
+        )
+
+        def mix_u32(value: torch.Tensor) -> torch.Tensor:
+            value ^= value >> 16
+            value = torch.bitwise_and(value * 0x7FEB352D, _UINT32_MASK)
+            value ^= value >> 15
+            value = torch.bitwise_and(value * 0x846CA68B, _UINT32_MASK)
+            return torch.bitwise_and(value ^ (value >> 16), _UINT32_MASK)
+
+        choice_random = torch.bitwise_and(mix_u32(random_key ^ 0xDB4F0B91), 255)
+        variant = torch.bitwise_right_shift(choice_random * 5, 8)
+        flip_random = torch.bitwise_and(mix_u32(random_key ^ 0xBBE05633), 255)
+        flip_x = torch.bitwise_and(flip_random, 1)
+        flip_y = torch.bitwise_and(flip_random >> 1, 1)
+        style = variant + flip_x * 5 + flip_y * 10 + side * 20
+        self._hitscan_decal_random_u32(torch.any(wall_hit, dim=1))
+
+        rank = torch.cumsum(wall_hit.to(torch.int64), dim=1) - 1
+        fallback_slot = torch.remainder(
+            self.hitscan_decal_count[:, None] - 1,
+            self.hitscan_decal_slots,
+        )
+        slot = torch.where(
+            wall_hit,
+            torch.remainder(
+                self.hitscan_decal_count[:, None] + rank,
+                self.hitscan_decal_slots,
+            ),
+            fallback_slot,
+        )
+
+        def masked_scatter(target: torch.Tensor, value: torch.Tensor) -> None:
+            retained = target.gather(1, slot)
+            target.scatter_(1, slot, torch.where(wall_hit, value, retained))
+
+        masked_scatter(
+            self.hitscan_decal_wall,
+            nearest_blocking_wall_index.to(torch.int32),
+        )
+        masked_scatter(self.hitscan_decal_along, wall_along)
+        masked_scatter(self.hitscan_decal_z, impact_z)
+        masked_scatter(self.hitscan_decal_style, style.to(torch.uint8))
+        masked_scatter(
+            self.hitscan_decal_serial,
+            (self.hitscan_decal_count[:, None] + rank).to(torch.int32),
+        )
+        self.hitscan_decal_count.add_(torch.sum(wall_hit.to(torch.int64), dim=1))
+
     def _apply_player_hitscan(
         self,
         weapon: torch.Tensor,
@@ -5210,12 +5403,13 @@ class TorchDeathmatchEngine:
             | (wall_hit_z >= portal_top[None, None, :])
         )
         wall_blocks_pellet &= pellet_wall_distance < maximum_horizontal_distance[:, :, None]
-        nearest_blocking_wall = torch.amin(
-            torch.where(
-                wall_blocks_pellet,
-                pellet_wall_distance,
-                torch.full_like(pellet_wall_distance, torch.inf),
-            ),
+        blocking_wall_distance = torch.where(
+            wall_blocks_pellet,
+            pellet_wall_distance,
+            torch.full_like(pellet_wall_distance, torch.inf),
+        )
+        nearest_blocking_wall, nearest_blocking_wall_index = torch.min(
+            blocking_wall_distance,
             dim=2,
         )
         actor_hit &= hit_distance < nearest_blocking_wall[:, :, None]
@@ -5268,12 +5462,21 @@ class TorchDeathmatchEngine:
         damage_by_enemy = torch.stack(damage_by_enemy_pellet, dim=1)
         damage_by_doll = torch.stack(damage_by_doll_pellet, dim=1)
         hurt_by_enemy = torch.stack(hurt_by_enemy_pellet, dim=1)
+        hit_actor_by_pellet_tensor = torch.stack(hit_actor_by_pellet, dim=1)
         self._spawn_player_hitscan_puffs(
             pellet_damage,
             pellet_angle,
             vertical_slope,
             nearest_blocking_wall,
-            torch.stack(hit_actor_by_pellet, dim=1),
+            hit_actor_by_pellet_tensor,
+        )
+        self._spawn_player_hitscan_decals(
+            pellet_damage,
+            pellet_angle,
+            vertical_slope,
+            nearest_blocking_wall,
+            nearest_blocking_wall_index,
+            hit_actor_by_pellet_tensor,
         )
         self._apply_player_damage(
             torch.sum(damage_by_doll, dim=1),
@@ -8540,14 +8743,23 @@ class TorchDeathmatchEngine:
     ) -> torch.Tensor:
         """Apply wallscan's fixed-point, screen-column light selection."""
 
+        shade = self._native_wall_shade(light, visibility)
+        return self.map.colormap[shade, indices.to(torch.int64)]
+
+    @staticmethod
+    def _native_wall_shade(
+        light: torch.Tensor,
+        visibility: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return GETPALOOKUP's wall colormap row for a screen column."""
+
         wall_shade = (
             64 * _FIXED_UNIT - (light.to(torch.int64) + 12) * (_FIXED_UNIT // 4)
         )
-        shade = torch.bitwise_right_shift(
+        return torch.bitwise_right_shift(
             wall_shade - visibility.to(torch.int64).clamp_max(24 * _FIXED_UNIT),
             16,
         ).clamp(0, 31)
-        return self.map.colormap[shade, indices.to(torch.int64)]
 
     def _native_animated_texture_ids(self, texture_ids: torch.Tensor) -> torch.Tensor:
         # ViZDoom's certified deathmatch runtime never advances texture
@@ -9685,6 +9897,278 @@ class TorchDeathmatchEngine:
             )
         return frame, scene_depth
 
+    def _native_render_hitscan_decals(
+        self,
+        frame: torch.Tensor,
+        view_z: torch.Tensor,
+        scene_depth: torch.Tensor,
+    ) -> torch.Tensor:
+        """Render persistent BulletChip decals on their owning wall surfaces."""
+
+        active_slots = torch.nonzero(
+            torch.any(self.hitscan_decal_serial >= 0, dim=0),
+        ).flatten()
+        if not active_slots.numel():
+            return frame
+
+        active = self.hitscan_decal_serial[:, active_slots] >= 0
+        active_count = torch.sum(active, dim=1)
+        layer_count = int(torch.amax(active_count).item())
+        serial = torch.where(
+            active,
+            self.hitscan_decal_serial[:, active_slots].to(torch.int64),
+            torch.full_like(
+                self.hitscan_decal_serial[:, active_slots],
+                torch.iinfo(torch.int32).max,
+                dtype=torch.int64,
+            ),
+        )
+        order = torch.argsort(serial, dim=1)
+        row = torch.arange(self.num_envs, device=self.device)
+        rays = self._native_wall_ray_directions()
+        origin = torch.stack((self.x, self.y), dim=1)[:, None, :]
+        view_x_fixed = self._public_or_retained_fixed(self.x, self._x_fixed)
+        view_y_fixed = self._public_or_retained_fixed(self.y, self._y_fixed)
+        view_angle = self._native_view_angle_bam() >> _ANGLE_TO_FINE_SHIFT
+        view_sine_fixed = self._fine_sine_fixed[view_angle]
+        view_cosine_fixed = self._fine_sine_fixed[
+            (view_angle + _FINE_ANGLES // 4) & (_FINE_ANGLES - 1)
+        ]
+        focal_length = self.native_screen_width / 2.0 * self.native_vertical_aspect
+        # R_WallSpriteColumn uses centeryfrac directly. Unlike the solid-wall
+        # span bounds (which are inclusive and use centery - 1), its masked
+        # patch origin is exactly viewheight / 2 at zero pitch.
+        center = self.native_view_height / 2.0 + self._pitch_projection_offset(
+            focal_length
+        )
+        pixel_x = self._native_pixel_x[0, 0].to(torch.int64)
+        pixel_y = self._native_pixel_y.to(torch.float32)
+        _weapon_frame, _weapon_flash, flash_light = self._native_weapon_frame_selection()
+        composited = frame
+
+        # AttachedDecals is insertion ordered. Paint old-to-new so a later
+        # impact shades any earlier chip at the same wall texels.
+        for layer in range(layer_count):
+            slot = active_slots[order[:, layer]]
+            alive = self.hitscan_decal_serial[row, slot] >= 0
+            wall_index = self.hitscan_decal_wall[row, slot].to(torch.int64).clamp(
+                0,
+                self.map.portal_walls.shape[0] - 1,
+            )
+            along_wall = self.hitscan_decal_along[row, slot]
+            impact_z = self.hitscan_decal_z[row, slot]
+            style = self.hitscan_decal_style[row, slot].to(torch.int64)
+            variant = torch.remainder(style, 5)
+            flip_x = torch.remainder(style // 5, 2).to(torch.bool)
+            flip_y = torch.remainder(style // 10, 2).to(torch.bool)
+            side = style // 20
+
+            wall = self.map.portal_walls[wall_index]
+            wall_start = wall[:, :2]
+            wall_vector = wall[:, 2:] - wall_start
+            impact = wall_start + along_wall[:, None] * wall_vector
+
+            # curline is reversed for sidedef 1, so its wall-sprite tangent is
+            # reversed as well. R_PointToAngle2 then quantizes that direction
+            # through Doom's fine-angle table before applying patch offsets.
+            oriented_vector = torch.where(
+                (side == 0)[:, None],
+                wall_vector,
+                -wall_vector,
+            )
+            wall_angle = torch.atan2(oriented_vector[:, 1], oriented_vector[:, 0])
+            tangent_x, tangent_y = self._fine_direction(wall_angle)
+            tangent = torch.stack((tangent_x, tangent_y), dim=1)
+            left_offset = self.map.bullet_decal_left_offsets[variant].to(torch.float32)
+            width = self.map.bullet_decal_atlas.shape[2]
+            left = impact - tangent * (left_offset * _BULLET_DECAL_SCALE)[:, None]
+            right = impact + tangent * (
+                (width - left_offset) * _BULLET_DECAL_SCALE
+            )[:, None]
+            segment = right - left
+
+            # FWallCoords::Init projects the two fixed-point endpoints and
+            # owns the resulting half-open [sx1, sx2) range, including clipped
+            # decals that straddle a screen edge.
+            endpoints_fixed = torch.round(
+                torch.stack((left, right), dim=1) * _FIXED_UNIT
+            ).to(torch.int64)
+            relative_x = endpoints_fixed[..., 0] - view_x_fixed[:, None]
+            relative_y = endpoints_fixed[..., 1] - view_y_fixed[:, None]
+            transformed_x = (
+                relative_x * view_sine_fixed[:, None]
+                - relative_y * view_cosine_fixed[:, None]
+            ) >> 20
+            transformed_y = (
+                relative_x * view_cosine_fixed[:, None]
+                + relative_y * view_sine_fixed[:, None]
+            ) >> 20
+            tx1, tx2 = transformed_x[:, 0], transformed_x[:, 1]
+            ty1, ty2 = transformed_y[:, 0], transformed_y[:, 1]
+            center_fixed = (self.native_screen_width // 2) * _FIXED_UNIT
+            safe_ty1 = torch.where(ty1 == 0, torch.ones_like(ty1), ty1)
+            safe_ty2 = torch.where(ty2 == 0, torch.ones_like(ty2), ty2)
+            projected_left = (
+                center_fixed + self._trunc_divide(tx1 * center_fixed, safe_ty1)
+            ) >> 16
+            projected_left += (tx1 >= 0).to(torch.int64)
+            projected_right = (
+                center_fixed + self._trunc_divide(tx2 * center_fixed, safe_ty2)
+            ) >> 16
+            projected_right += (tx2 >= 0).to(torch.int64)
+            left_clip_denominator = tx1 - tx2 - ty2 + ty1
+            right_clip_denominator = ty2 - ty1 - tx2 + tx1
+            left_inside = (tx1 >= -ty1) & (tx1 <= ty1) & (ty1 != 0)
+            right_inside = (tx2 <= ty2) & (tx2 >= -ty2) & (ty2 != 0)
+            left_clipped = (
+                (tx1 < -ty1)
+                & (tx2 >= -ty2)
+                & (left_clip_denominator != 0)
+            )
+            right_clipped = (
+                (tx2 > ty2)
+                & (tx1 <= ty1)
+                & (right_clip_denominator != 0)
+            )
+            screen_left = torch.where(
+                left_inside,
+                projected_left.clamp(0, self.native_screen_width),
+                torch.zeros_like(projected_left),
+            )
+            screen_right = torch.where(
+                right_inside,
+                projected_right.clamp(0, self.native_screen_width),
+                torch.full_like(projected_right, self.native_screen_width),
+            )
+            projected = (
+                alive
+                & (left_inside | left_clipped)
+                & (right_inside | right_clipped)
+                & (screen_right > screen_left)
+            )
+
+            offset = left[:, None, :] - origin
+            denominator = (
+                rays[..., 0] * segment[:, None, 1]
+                - rays[..., 1] * segment[:, None, 0]
+            )
+            safe_denominator = torch.where(
+                denominator.abs() < 1e-6,
+                torch.ones_like(denominator),
+                denominator,
+            )
+            distance = (
+                offset[..., 0] * segment[:, None, 1]
+                - offset[..., 1] * segment[:, None, 0]
+            ) / safe_denominator
+            decal_along = (
+                offset[..., 0] * rays[..., 1]
+                - offset[..., 1] * rays[..., 0]
+            ) / safe_denominator
+            inside_columns = (
+                projected[:, None]
+                & (pixel_x[None, :] >= screen_left[:, None])
+                & (pixel_x[None, :] < screen_right[:, None])
+                & (denominator.abs() >= 1e-6)
+                & (distance > 0)
+            )
+
+            texture_u = torch.floor(decal_along * width).to(torch.int64)
+            texture_u = texture_u.clamp(0, width - 1)
+            texture_u = torch.where(flip_x[:, None], width - 1 - texture_u, texture_u)
+            vertical_scale = (
+                focal_length * _BULLET_DECAL_SCALE / distance.clamp_min(1e-6)
+            )
+            top_offset = self.map.bullet_decal_top_offsets[variant].to(torch.float32)
+            top = center[:, None] - (
+                impact_z[:, None]
+                + top_offset[:, None] * _BULLET_DECAL_SCALE
+                - view_z[:, None]
+            ) * focal_length / distance.clamp_min(1e-6)
+            texture_v = torch.floor(
+                (pixel_y - top[:, None, :]) / vertical_scale[:, None, :]
+            ).to(torch.int64)
+            height = self.map.bullet_decal_heights[variant]
+            inside_rows = (texture_v >= 0) & (texture_v < height[:, None, None])
+            texture_v = texture_v.clamp_min(0)
+            texture_v = torch.minimum(texture_v, height[:, None, None] - 1)
+            texture_v = torch.where(
+                flip_y[:, None, None],
+                height[:, None, None] - 1 - texture_v,
+                texture_v,
+            )
+            atlas_variant = variant[:, None, None].expand(
+                -1,
+                self.native_view_height,
+                self.native_screen_width,
+            )
+            atlas_u = texture_u[:, None, :].expand(
+                -1,
+                self.native_view_height,
+                -1,
+            )
+            source = self.map.bullet_decal_atlas[
+                atlas_variant,
+                texture_v,
+                atlas_u,
+            ]
+
+            viewer_cross = (
+                wall_vector[:, 0] * (self.y - wall_start[:, 1])
+                - wall_vector[:, 1] * (self.x - wall_start[:, 0])
+            )
+            visible_side = (viewer_cross > 0).to(torch.int64)
+            side_visible = visible_side == side
+            # The wall pass records exact surface depth only where a wall tier
+            # was drawn. Matching it both clips upper/lower decals to their
+            # owning tier and prevents chips leaking through nearer geometry.
+            owns_surface = (
+                torch.abs(scene_depth - distance[:, None, :]) <= 1e-3
+            )
+
+            sectors = self.map.portal_wall_sectors[wall_index]
+            sector = sectors.gather(1, side[:, None]).squeeze(1).clamp_min(0)
+            light = self.map.sector_lights[sector].to(torch.float32)
+            horizontal = wall_vector[:, 1].abs() < 1e-6
+            vertical = wall_vector[:, 0].abs() < 1e-6
+            light = light + torch.where(
+                vertical,
+                16.0,
+                torch.where(horizontal, -16.0, 0.0),
+            )
+            light = light + flash_light * 16
+            depth_fixed = torch.round(
+                distance.clamp_min(1e-6) * (1 << 12)
+            ).to(torch.int64)
+            visibility = self._trunc_divide(
+                torch.full_like(
+                    depth_fixed,
+                    _NATIVE_WALL_VISIBILITY_FIXED << 12,
+                ),
+                depth_fixed.clamp_min(1),
+            )
+            shade = self._native_wall_shade(
+                light[:, None],
+                visibility,
+            )
+            opacity = self.map.bullet_decal_opacity_lut[
+                shade[:, None, :],
+                source.to(torch.int64),
+            ]
+            rendered = self.map.bullet_decal_black_lut[
+                opacity.to(torch.int64),
+                composited.to(torch.int64),
+            ]
+            draw = (
+                inside_columns[:, None, :]
+                & inside_rows
+                & owns_surface
+                & side_visible[:, None, None]
+                & (source > 0)
+            )
+            composited = torch.where(draw, rendered, composited)
+        return composited
+
     @staticmethod
     def _doom_sprite_rotation(
         viewer_angle: torch.Tensor,
@@ -10684,6 +11168,7 @@ class TorchDeathmatchEngine:
             surface_depth,
             scene_surface_depth,
         )
+        frame = self._native_render_hitscan_decals(frame, view_z, scene_depth)
         frame = self._native_render_sprites(frame, wall_distance, view_z, scene_depth)
         frame = self._native_render_weapon(frame)
         if include_hud:

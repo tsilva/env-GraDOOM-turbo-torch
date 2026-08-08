@@ -152,6 +152,25 @@ def test_pinned_deathmatch_compiles_external_doom2_data() -> None:
         scenario.raw_sprite_names[index]
         for index in scenario.raw_bullet_puff_sprite_ids
     ) == ("PUFFA0", "PUFFB0", "PUFFC0", "PUFFD0")
+    assert scenario.bullet_decal_atlas is not None
+    assert scenario.bullet_decal_atlas.shape == (5, 9, 7)
+    assert scenario.bullet_decal_heights is not None
+    assert scenario.bullet_decal_heights.tolist() == [9, 6, 7, 5, 8]
+    assert scenario.bullet_decal_left_offsets is not None
+    assert scenario.bullet_decal_left_offsets.tolist() == [4, 4, 4, 4, 4]
+    assert scenario.bullet_decal_top_offsets is not None
+    assert scenario.bullet_decal_top_offsets.tolist() == [4, 3, 4, 2, 4]
+    assert scenario.bullet_decal_atlas[0, 0].tolist() == [0, 114, 176, 176, 114, 0, 0]
+    assert scenario.bullet_decal_atlas[4, 3].tolist() == [178, 0, 243, 232, 254, 232, 115]
+    assert scenario.bullet_decal_opacity_lut is not None
+    assert scenario.bullet_decal_opacity_lut.shape == (32, 256)
+    assert scenario.bullet_decal_opacity_lut[0, 252] == 51
+    assert scenario.bullet_decal_opacity_lut[10, 252] == 35
+    assert scenario.bullet_decal_opacity_lut[31, 252] == 1
+    assert scenario.bullet_decal_black_lut is not None
+    assert scenario.bullet_decal_black_lut.shape == (65, 256)
+    assert scenario.bullet_decal_black_lut[0, 71] == 72
+    assert scenario.bullet_decal_black_lut[52, 71] == 7
     assert scenario.projectile_explosion_frame_counts is not None
     assert scenario.projectile_explosion_frame_counts.tolist() == [3, 5, 3]
     assert scenario.projectile_explosion_frame_durations is not None

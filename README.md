@@ -77,4 +77,6 @@ uv run python tools/cuda_correctness_smoke.py --compile-engine   # check CUDA re
 
 ## License
 
-[MIT](./LICENSE)
+GraDOOM's original source code is [MIT-licensed](./LICENSE). Bundled ZDoom BulletChip
+resources retain their separate [GPL-3.0-only license](./LICENSES/GPL-3.0-only.txt); see
+the [third-party notices](./THIRD_PARTY_NOTICES.md) for exact provenance and redistribution terms.

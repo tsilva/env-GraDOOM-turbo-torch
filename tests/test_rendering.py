@@ -133,6 +133,113 @@ def test_native_hitscan_puff_renders_all_translucent_animation_frames(
     assert torch.equal(engine.render_native_frame(include_hud=False), baseline)
 
 
+def test_native_hitscan_decal_persists_on_its_visible_wall_side(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+        frame_skip=1,
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([1337]))
+    engine.enemy_alive.zero_()
+    engine.item_available.zero_()
+    engine.weapon_raise_cooldown.zero_()
+    engine.angle.zero_()
+    engine._angle_bam.zero_()
+    engine.pitch.zero_()
+    engine._pitch_bam.zero_()
+
+    engine._execute_player_attack(
+        torch.full((1,), 2, dtype=torch.int64),
+        torch.ones(1, dtype=torch.bool),
+        torch.ones(1, dtype=torch.bool),
+    )
+    engine.hitscan_puff_tics.zero_()
+    with_decal = engine.render_native_frame(include_hud=False)
+    stored_serial = engine.hitscan_decal_serial.clone()
+    engine.hitscan_decal_serial.fill_(-1)
+    without_decal = engine.render_native_frame(include_hud=False)
+
+    changed = torch.any(with_decal != without_decal, dim=3)
+    assert torch.count_nonzero(changed) > 0
+    assert engine.hitscan_decal_count.item() == 1
+
+    engine.hitscan_decal_serial.copy_(stored_serial)
+    style = engine.hitscan_decal_style[:, 0].to(torch.int16)
+    engine.hitscan_decal_style[:, 0] = torch.where(
+        style < 20,
+        style + 20,
+        style - 20,
+    ).to(torch.uint8)
+    hidden_reverse_side = engine.render_native_frame(include_hud=False)
+    assert torch.equal(hidden_reverse_side, without_decal)
+
+    # Impact decals outlive the transient puff actor and are cleared only by
+    # the same episode reset that clears the rest of the world state.
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([1337]))
+    assert engine.hitscan_decal_count.item() == 0
+    assert torch.all(engine.hitscan_decal_serial < 0)
+
+
+def test_native_hitscan_decal_matches_aligned_vizdoom_wall_pixels(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([1337]))
+    engine.enemy_alive.zero_()
+    engine.item_available.zero_()
+    engine.x.fill_(1026.3348693847656)
+    engine.y.fill_(797.8362731933594)
+    engine.z.zero_()
+    engine.view_z.fill_(46.904083251953125)
+    angle_degrees = 341.29028328258784
+    engine.angle.fill_(math.radians(angle_degrees))
+    engine._angle_bam.fill_(round(angle_degrees / 360.0 * (1 << 32)))
+    engine.pitch.zero_()
+    engine._pitch_bam.zero_()
+    engine.hitscan_decal_wall[0, 0] = 41
+    engine.hitscan_decal_along[0, 0] = (712.1397325339216 - 992.0) / (32.0 - 992.0)
+    engine.hitscan_decal_z[0, 0] = 36
+    # CHIP5, both flips, front sidedef: one of the reference renderer's
+    # permitted visual-only random styles for this measured impact.
+    engine.hitscan_decal_style[0, 0] = 19
+    engine.hitscan_decal_serial[0, 0] = 0
+    engine.hitscan_decal_count[0] = 1
+
+    with_decal = engine.render_native_frame(include_hud=False)[0]
+    engine.hitscan_decal_serial[0, 0] = -1
+    without_decal = engine.render_native_frame(include_hud=False)[0]
+    changed = torch.any(with_decal != without_decal, dim=2)
+    expected_coordinates = torch.tensor(
+        ((111, 160), (112, 158), (112, 159), (112, 160), (113, 160)),
+        dtype=torch.int64,
+    )
+
+    assert torch.equal(torch.nonzero(changed), expected_coordinates)
+    expected_background = torch.tensor(
+        ((55, 35, 19), (63, 47, 23), (63, 43, 27), (55, 35, 19), (55, 35, 19)),
+        dtype=torch.uint8,
+    )
+    expected_shaded = torch.tensor(
+        ((23, 15, 7), (47, 27, 11), (47, 27, 11), (7, 7, 7), (31, 23, 11)),
+        dtype=torch.uint8,
+    )
+    assert torch.equal(
+        without_decal[expected_coordinates[:, 0], expected_coordinates[:, 1]],
+        expected_background,
+    )
+    assert torch.equal(
+        with_decal[expected_coordinates[:, 0], expected_coordinates[:, 1]],
+        expected_shaded,
+    )
+
+
 def test_native_flats_match_reference_span_sampling(
     pinned_deathmatch_scenario,
 ) -> None:

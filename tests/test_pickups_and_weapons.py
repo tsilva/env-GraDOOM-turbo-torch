@@ -122,7 +122,59 @@ def test_hitscan_wall_puffs_use_separate_randomized_actor_state(square_scenario)
     assert not torch.any(engine.hitscan_puff_tics)
 
 
-def test_player_pistol_wall_hit_spawns_puff(square_scenario) -> None:
+def test_hitscan_wall_decals_use_persistent_visual_only_ring_state(square_scenario) -> None:
+    engine = _engine(square_scenario)
+    pellet_damage = torch.zeros((2, 20))
+    pellet_damage[:, :2] = 5
+    pellet_angle = torch.zeros((2, 20))
+    vertical_slope = torch.zeros((2, 20))
+    wall_distance = torch.full((2, 20), torch.inf)
+    wall_distance[:, :2] = 256
+    wall_index = torch.zeros((2, 20), dtype=torch.int64)
+    wall_index[:, :2] = 1
+    hit_actor = torch.zeros((2, 20), dtype=torch.bool)
+    gameplay_rng = engine.rng_state.clone()
+    decal_rng = engine.hitscan_decal_rng_state.clone()
+    engine.hitscan_decal_count.fill_(engine.hitscan_decal_slots - 1)
+
+    engine._spawn_player_hitscan_decals(
+        pellet_damage,
+        pellet_angle,
+        vertical_slope,
+        wall_distance,
+        wall_index,
+        hit_actor,
+    )
+
+    assert torch.equal(engine.rng_state, gameplay_rng)
+    assert not torch.equal(engine.hitscan_decal_rng_state, decal_rng)
+    assert engine.hitscan_decal_count.tolist() == [1025, 1025]
+    assert engine.hitscan_decal_serial[:, -1].tolist() == [1023, 1023]
+    assert engine.hitscan_decal_serial[:, 0].tolist() == [1024, 1024]
+    assert engine.hitscan_decal_wall[:, [-1, 0]].tolist() == [[1, 1], [1, 1]]
+    assert engine.hitscan_decal_along[:, [-1, 0]].tolist() == [[0.5, 0.5], [0.5, 0.5]]
+    assert engine.hitscan_decal_z[:, [-1, 0]].tolist() == [[36.0, 36.0], [36.0, 36.0]]
+    assert torch.all(
+        (engine.hitscan_decal_style[:, [-1, 0]] >= 20)
+        & (engine.hitscan_decal_style[:, [-1, 0]] < 40)
+    )
+
+    previous_count = engine.hitscan_decal_count.clone()
+    previous_rng = engine.hitscan_decal_rng_state.clone()
+    hit_actor[:, :2] = True
+    engine._spawn_player_hitscan_decals(
+        pellet_damage,
+        pellet_angle,
+        vertical_slope,
+        wall_distance,
+        wall_index,
+        hit_actor,
+    )
+    assert torch.equal(engine.hitscan_decal_count, previous_count)
+    assert torch.equal(engine.hitscan_decal_rng_state, previous_rng)
+
+
+def test_player_pistol_wall_hit_spawns_puff_and_decal(square_scenario) -> None:
     engine = _engine(square_scenario)
     engine.angle.zero_()
     engine._angle_bam.zero_()
@@ -138,6 +190,11 @@ def test_player_pistol_wall_hit_spawns_puff(square_scenario) -> None:
     assert engine.ammo[:, 1].tolist() == [49.0, 49.0]
     assert torch.sum(engine.hitscan_puff_tics > 0, dim=1).tolist() == [1, 1]
     assert engine.hitscan_puff_x[:, 0].tolist() == [252.0, 252.0]
+    assert engine.hitscan_decal_count.tolist() == [1, 1]
+    assert engine.hitscan_decal_serial[:, 0].tolist() == [0, 0]
+    assert engine.hitscan_decal_wall[:, 0].tolist() == [1, 1]
+    assert engine.hitscan_decal_along[:, 0].tolist() == [0.5, 0.5]
+    assert engine.hitscan_decal_z[:, 0].tolist() == [36.0, 36.0]
 
 
 def test_standard_health_stays_when_full_but_bonus_is_always_consumed(square_scenario) -> None:

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from importlib.resources import files
 from pathlib import Path
 
 import numpy as np
@@ -177,8 +179,8 @@ DEATHMATCH_ITEM_ANIMATION_FRAMES = (
 
 def _compile_sprite_blend_luts(
     playpal: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Build ZDoom's indexed additive and half-translucent sprite tables."""
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Build ZDoom's indexed sprite and shaded-decal blend tables."""
 
     palette = playpal.astype(np.int64)
     palette_candidates = palette[1:255]
@@ -223,7 +225,44 @@ def _compile_sprite_blend_luts(
     background = col2rgb8(32)[:, None]
     blended = (foreground + background) | 0x01F07C1F
     translucent = rgb32k[blended & (blended >> 15)]
-    return tables, translucent
+    # BulletChip's `translucent 0.85` is quantized to alpha level 13 by
+    # R_SetPatchStyle. R_InitShadeMaps then combines that level with the wall
+    # colormap and treats each grayscale source texel as opacity in [0, 64].
+    decal_opacity = np.empty((32, 256), dtype=np.uint8)
+    source = np.arange(256, dtype=np.int64)
+    for shade in range(32):
+        alpha = (32 - shade) * 256 // 32 * 13
+        decal_opacity[shade] = np.minimum(
+            (((source + 2) * alpha) + 256) >> 14,
+            64,
+        ).astype(np.uint8)
+    black_shade = np.empty((65, 256), dtype=np.uint8)
+    for opacity in range(65):
+        faded = col2rgb8(64 - opacity) | 0x01F07C1F
+        black_shade[opacity] = rgb32k[faded & (faded >> 15)]
+    return tables, translucent, decal_opacity, black_shade
+
+
+def _load_bullet_decal_assets() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Load the separately licensed ZDoom BulletChip grayscale resources."""
+
+    resource = files("gradoom").joinpath("assets/zdoom_bullet_chips.json")
+    document = json.loads(resource.read_text(encoding="utf-8"))
+    chips = document["chips"]
+    atlas = np.zeros((len(chips), 9, 7), dtype=np.uint8)
+    heights = np.empty(len(chips), dtype=np.int32)
+    left_offsets = np.empty(len(chips), dtype=np.int32)
+    top_offsets = np.empty(len(chips), dtype=np.int32)
+    for chip_index, chip in enumerate(chips):
+        pixels = np.asarray(chip["pixels"], dtype=np.uint8)
+        height, width = pixels.shape
+        if width != 7 or height > atlas.shape[1]:
+            raise ValueError(f"invalid bundled BulletChip dimensions: {width}x{height}")
+        atlas[chip_index, :height] = pixels
+        heights[chip_index] = height
+        left_offsets[chip_index] = int(chip["left_offset"])
+        top_offsets[chip_index] = int(chip["top_offset"])
+    return atlas, heights, left_offsets, top_offsets
 
 
 @dataclass(frozen=True)
@@ -294,6 +333,12 @@ class CompiledScenario:
     projectile_additive_luts: np.ndarray | None = None
     sprite_translucent_lut: np.ndarray | None = None
     raw_bullet_puff_sprite_ids: np.ndarray | None = None
+    bullet_decal_atlas: np.ndarray | None = None
+    bullet_decal_heights: np.ndarray | None = None
+    bullet_decal_left_offsets: np.ndarray | None = None
+    bullet_decal_top_offsets: np.ndarray | None = None
+    bullet_decal_opacity_lut: np.ndarray | None = None
+    bullet_decal_black_lut: np.ndarray | None = None
     raw_static_sprite_ids: np.ndarray | None = None
     raw_item_animation_sprite_ids: np.ndarray | None = None
     native_weapon_screen_values: np.ndarray | None = None
@@ -811,7 +856,18 @@ def compile_deathmatch_scenario(
     if len(playpal_bytes) < 256 * 3:
         raise ValueError("IWAD PLAYPAL lump is too small")
     playpal = np.frombuffer(playpal_bytes[: 256 * 3], dtype=np.uint8).reshape(256, 3).copy()
-    projectile_additive_luts, sprite_translucent_lut = _compile_sprite_blend_luts(playpal)
+    (
+        projectile_additive_luts,
+        sprite_translucent_lut,
+        bullet_decal_opacity_lut,
+        bullet_decal_black_lut,
+    ) = _compile_sprite_blend_luts(playpal)
+    (
+        bullet_decal_atlas,
+        bullet_decal_heights,
+        bullet_decal_left_offsets,
+        bullet_decal_top_offsets,
+    ) = _load_bullet_decal_assets()
     colormap_bytes = game.read("COLORMAP")
     if len(colormap_bytes) < 34 * 256:
         raise ValueError("IWAD COLORMAP lump is too small")
@@ -881,6 +937,12 @@ def compile_deathmatch_scenario(
         projectile_additive_luts=projectile_additive_luts,
         sprite_translucent_lut=sprite_translucent_lut,
         raw_bullet_puff_sprite_ids=raw_bullet_puff_sprite_ids,
+        bullet_decal_atlas=bullet_decal_atlas,
+        bullet_decal_heights=bullet_decal_heights,
+        bullet_decal_left_offsets=bullet_decal_left_offsets,
+        bullet_decal_top_offsets=bullet_decal_top_offsets,
+        bullet_decal_opacity_lut=bullet_decal_opacity_lut,
+        bullet_decal_black_lut=bullet_decal_black_lut,
         raw_static_sprite_ids=raw_static_sprite_ids,
         raw_item_animation_sprite_ids=raw_item_animation_sprite_ids,
         native_weapon_screen_values=native_weapon_screen_values,

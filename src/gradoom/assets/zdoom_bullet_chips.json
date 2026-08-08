@@ -1,0 +1,91 @@
+{
+  "copyright": "Copyright (c) 1998-2025 ZDoom and GZDoom teams and contributors",
+  "license": "GPL-3.0-only",
+  "source_repository": "https://github.com/ZDoom/gzdoom",
+  "source_revision": "092b9c0515c2861270cde175cd8eaa30a253c8b1",
+  "source_paths": [
+    "wadsrc/static/graphics/chip1.png",
+    "wadsrc/static/graphics/chip2.png",
+    "wadsrc/static/graphics/chip3.png",
+    "wadsrc/static/graphics/chip4.png",
+    "wadsrc/static/graphics/chip5.png"
+  ],
+  "modifications": "Decoded the five grayscale PNG pixel planes and grAb offsets into JSON; no source pixels were changed.",
+  "chips": [
+    {
+      "name": "CHIP1",
+      "source_sha256": "dc1df3849655178af86120ed61f8aa86ccdfcd78aa8eeca03af477e427986ee9",
+      "left_offset": 4,
+      "top_offset": 4,
+      "pixels": [
+        [0, 114, 176, 176, 114, 0, 0],
+        [0, 229, 248, 239, 210, 114, 0],
+        [229, 250, 252, 250, 210, 114, 114],
+        [210, 250, 251, 252, 248, 176, 176],
+        [229, 245, 250, 248, 245, 229, 210],
+        [210, 210, 248, 250, 245, 250, 176],
+        [114, 245, 239, 245, 229, 0, 176],
+        [114, 0, 114, 114, 114, 0, 0],
+        [0, 176, 114, 0, 0, 0, 0]
+      ]
+    },
+    {
+      "name": "CHIP2",
+      "source_sha256": "ceafa8e07d1a6022466851c08e8d0d426d97ed3c1928b21ac67dd4cfc81df6ad",
+      "left_offset": 4,
+      "top_offset": 3,
+      "pixels": [
+        [114, 0, 0, 114, 0, 0, 0],
+        [114, 210, 239, 239, 210, 114, 0],
+        [239, 248, 251, 245, 248, 210, 0],
+        [114, 245, 251, 252, 248, 229, 114],
+        [114, 114, 251, 229, 251, 239, 0],
+        [0, 114, 0, 210, 210, 114, 0]
+      ]
+    },
+    {
+      "name": "CHIP3",
+      "source_sha256": "9b976cdc1e1013ecfb63e59636c2bc3b65c625ebb592134fe8b53cd69040cc76",
+      "left_offset": 4,
+      "top_offset": 4,
+      "pixels": [
+        [114, 229, 239, 114, 210, 0, 0],
+        [0, 0, 248, 176, 176, 0, 0],
+        [210, 239, 252, 252, 176, 210, 176],
+        [176, 248, 252, 245, 114, 176, 176],
+        [176, 210, 251, 245, 176, 0, 176],
+        [0, 176, 176, 114, 0, 0, 0],
+        [114, 176, 114, 0, 0, 0, 0]
+      ]
+    },
+    {
+      "name": "CHIP4",
+      "source_sha256": "09eaf3289d0da074ffa208f85292d29169423169ff3bcbb7ad5928955c08a18f",
+      "left_offset": 4,
+      "top_offset": 2,
+      "pixels": [
+        [0, 176, 229, 245, 248, 176, 114],
+        [229, 229, 252, 252, 251, 176, 229],
+        [176, 239, 251, 252, 252, 252, 229],
+        [114, 229, 245, 239, 252, 176, 176],
+        [0, 0, 114, 210, 251, 114, 114]
+      ]
+    },
+    {
+      "name": "CHIP5",
+      "source_sha256": "8f13abe9844dff38a1c994bb222425121412905f25b475165118b29b519e4629",
+      "left_offset": 4,
+      "top_offset": 4,
+      "pixels": [
+        [0, 0, 115, 178, 115, 0, 0],
+        [0, 115, 213, 115, 178, 115, 0],
+        [0, 213, 213, 232, 243, 178, 115],
+        [178, 0, 243, 232, 254, 232, 115],
+        [115, 232, 115, 254, 254, 252, 243],
+        [115, 115, 243, 232, 249, 178, 115],
+        [0, 0, 178, 232, 249, 178, 0],
+        [0, 0, 0, 115, 115, 0, 0]
+      ]
+    }
+  ]
+}
