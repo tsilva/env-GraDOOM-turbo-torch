@@ -159,6 +159,10 @@ def test_native_walls_use_reference_fine_angle_rays(
     # R_RenderBSPNode transforms walls through the 8192-entry fine-angle
     # basis. Continuous sin/cos intersects the neighboring stone column.
     assert rgb[0, 0, 272].tolist() == [43, 35, 15]
+    # R_MapPlane lights against the integer row edge even though its texture
+    # lookup uses a half-pixel yslope. Reusing the sampling distance chooses
+    # the next brighter colormap and produces [83, 63, 47] here.
+    assert rgb[0, 119, 10].tolist() == [79, 59, 43]
 
 
 def test_native_portal_clips_bound_solid_wall_against_planes(

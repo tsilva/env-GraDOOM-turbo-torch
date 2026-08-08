@@ -110,6 +110,11 @@ _NATIVE_FOCAL_X_FIXED = 160 * _FIXED_UNIT
 # R_ExecuteSetViewSize derives 320x240's y aspect as integer 16.16.
 _NATIVE_Y_ASPECT_FIXED = (320 * _FIXED_UNIT * 240) // (200 * 320)
 _NATIVE_FOCAL_Y_FIXED = 160 * _NATIVE_Y_ASPECT_FIXED
+# R_SetVisibility's default r_visibility is 8.0. Planes scale it by the
+# vertical focal length before R_MapPlane applies its row-edge visibility.
+_NATIVE_FLOOR_VISIBILITY_FIXED = (
+    160 * _FIXED_UNIT * (8 * _FIXED_UNIT)
+) // _NATIVE_FOCAL_Y_FIXED
 _NATIVE_SPRITE_MIN_DEPTH_FIXED = 2048 * 4
 _FIST_RANGE = 64.0
 _CHAINSAW_RANGE = 65.0
@@ -8118,6 +8123,41 @@ class TorchDeathmatchEngine:
         shade = shade.clamp(0, 31)
         return self.map.colormap[shade, indices.to(torch.int64)]
 
+    def _native_apply_plane_colormap(
+        self,
+        indices: torch.Tensor,
+        light: torch.Tensor,
+        plane_height: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply R_MapPlane's fixed-point, integer-row light selection."""
+
+        tangent_index = torch.bitwise_right_shift(
+            _ANGLE_90 - self._pitch_bam,
+            _ANGLE_TO_FINE_SHIFT,
+        ).clamp(0, _FINE_ANGLES // 2 - 1)
+        pitch_offset_fixed = (
+            _NATIVE_FOCAL_Y_FIXED * self._fine_tangent_fixed[tangent_index]
+        ) >> 16
+        center_fixed = (self.native_view_height // 2) * _FIXED_UNIT + pitch_offset_fixed
+
+        plane_height_fixed = torch.round(plane_height * _FIXED_UNIT).to(torch.int64)
+        glob_visibility = self._trunc_divide(
+            torch.full_like(plane_height_fixed, _NATIVE_FLOOR_VISIBILITY_FIXED << 16),
+            plane_height_fixed.clamp_min(1),
+        ).clamp_max((1 << 31) - 1)
+        row_distance_fixed = torch.abs(
+            center_fixed[:, None, None]
+            - self._native_pixel_y.to(torch.int64) * _FIXED_UNIT
+        )
+        visibility = (glob_visibility * row_distance_fixed) >> 16
+        visibility = visibility.clamp_max(24 * _FIXED_UNIT)
+
+        plane_shade = (
+            64 * _FIXED_UNIT - (light.to(torch.int64) + 12) * (_FIXED_UNIT // 4)
+        )
+        shade = torch.bitwise_right_shift(plane_shade - visibility, 16).clamp(0, 31)
+        return self.map.colormap[shade, indices.to(torch.int64)]
+
     def _native_animated_texture_ids(self, texture_ids: torch.Tensor) -> torch.Tensor:
         # ViZDoom's certified deathmatch runtime never advances texture
         # translations: BFALL1 remains BFALL1 across consecutive rendered
@@ -8400,7 +8440,7 @@ class TorchDeathmatchEngine:
         indices = self.map.texture_index_atlas[texture_id, texture_v, texture_u]
         _weapon_frame, _weapon_flash, flash_light = self._native_weapon_frame_selection()
         light = self.map.sector_lights[sectors] + flash_light[:, None, None] * 16
-        frame = self._native_apply_colormap(indices, light, surface_depth.clamp(1, 4096))
+        frame = self._native_apply_plane_colormap(indices, light, selected_plane_height)
         return frame, surface_depth
 
     def _native_portal_intersections(
