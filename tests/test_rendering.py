@@ -161,6 +161,43 @@ def test_native_walls_use_reference_fine_angle_rays(
     assert rgb[0, 0, 272].tolist() == [43, 35, 15]
 
 
+def test_native_one_sided_wall_owns_ceiling_boundary_over_flat_depth(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([456]))
+    engine.x.fill_(752.9335632324219)
+    engine.y.fill_(49.700897216796875)
+    engine.z.zero_()
+    engine.view_z.fill_(41)
+    engine.angle.fill_(math.radians(165.67382816357394))
+    engine.episode_time.fill_(17)
+
+    flat_frame, surface_depth = engine._native_render_flats(
+        engine._current_sector(),
+        engine.view_z,
+    )
+    wall_distance, _wall_along = engine._native_portal_intersections()
+    frame, _scene_depth = engine._native_render_portal_walls(
+        flat_frame.clone(),
+        engine.view_z,
+        surface_depth,
+    )
+    flat_rgb = engine.map.playpal[flat_frame.to(torch.int64)]
+    rgb = engine.map.playpal[frame.to(torch.int64)]
+
+    # R_RenderSegLoop draws this solid wall before its front-sector ceiling
+    # visplane. The pixel-center flat intersection is slightly closer, but it
+    # must not leave a black diagonal hole through the BIGBRIK1 wall.
+    assert wall_distance[0, 137, 196] > surface_depth[0, 37, 137]
+    assert flat_rgb[0, 37, 137].tolist() == [0, 0, 0]
+    assert rgb[0, 37, 137].tolist() == [159, 135, 111]
+
+
 def test_native_walls_use_reference_fixed_vertical_sampling(
     pinned_deathmatch_scenario,
 ) -> None:

@@ -8434,11 +8434,13 @@ class TorchDeathmatchEngine:
         center = self.native_view_height / 2.0 - 1.0 + self._pitch_projection_offset(
             focal_length
         )
+        flat_center = center + 0.5
         distances, wall_along = self._native_portal_intersections()
         wall_vertical_steps = self._native_wall_vertical_steps()
         filled = torch.zeros_like(frame, dtype=torch.bool)
         scene_depth = surface_depth.clone()
         pixel_y = self._native_pixel_y.to(torch.float32)
+        ceiling_pixels = pixel_y <= flat_center[:, None, None]
         current_sector = (
             self._current_sector()[:, None].expand(-1, self.native_screen_width).clone()
         )
@@ -8512,10 +8514,14 @@ class TorchDeathmatchEngine:
                 ),
             )
             in_front_of_surface = distance[:, None, :] <= surface_depth + 1e-3
+            # Doom draws a solid one-sided wall before marking its front-sector
+            # ceiling visplane. Our flat prepass samples through pixel centers,
+            # so its approximate depth can otherwise punch holes along the
+            # projected top edge of the wall.
             span = (
                 (one_span | lower_span | upper_span)
                 & (texture_id >= 0)
-                & in_front_of_surface
+                & (in_front_of_surface | (one_span & ceiling_pixels))
                 & ~filled
             )
             safe_texture_id = self._native_animated_texture_ids(texture_id.clamp_min(0))
