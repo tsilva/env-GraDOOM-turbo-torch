@@ -345,6 +345,12 @@ class CompiledScenario:
     native_weapon_screen_alpha: np.ndarray | None = None
     native_weapon_frame_values: np.ndarray | None = None
     native_weapon_frame_alpha: np.ndarray | None = None
+    native_weapon_patch_atlas: np.ndarray | None = None
+    native_weapon_patch_opaque: np.ndarray | None = None
+    native_weapon_patch_widths: np.ndarray | None = None
+    native_weapon_patch_heights: np.ndarray | None = None
+    native_weapon_patch_left_offsets: np.ndarray | None = None
+    native_weapon_patch_top_offsets: np.ndarray | None = None
     native_weapon_frame_ids: np.ndarray | None = None
     native_weapon_flash_ids: np.ndarray | None = None
     native_weapon_flash_lights: np.ndarray | None = None
@@ -640,6 +646,15 @@ def compile_deathmatch_scenario(
     _, native_weapon_frame_values, native_weapon_frame_alpha = compile_indexed_weapon_overlays(
         game, DEATHMATCH_NATIVE_WEAPON_FRAMES
     )
+    (
+        _,
+        native_weapon_patch_atlas,
+        native_weapon_patch_opaque,
+        native_weapon_patch_widths,
+        native_weapon_patch_heights,
+        native_weapon_patch_left_offsets,
+        native_weapon_patch_top_offsets,
+    ) = compile_indexed_patch_atlas(game, DEATHMATCH_NATIVE_WEAPON_FRAMES)
     native_weapon_ids_by_name = {
         name: index for index, name in enumerate(DEATHMATCH_NATIVE_WEAPON_FRAMES)
     }
@@ -954,6 +969,12 @@ def compile_deathmatch_scenario(
         native_weapon_screen_alpha=native_weapon_screen_alpha,
         native_weapon_frame_values=native_weapon_frame_values,
         native_weapon_frame_alpha=native_weapon_frame_alpha,
+        native_weapon_patch_atlas=native_weapon_patch_atlas,
+        native_weapon_patch_opaque=native_weapon_patch_opaque,
+        native_weapon_patch_widths=native_weapon_patch_widths,
+        native_weapon_patch_heights=native_weapon_patch_heights,
+        native_weapon_patch_left_offsets=native_weapon_patch_left_offsets,
+        native_weapon_patch_top_offsets=native_weapon_patch_top_offsets,
         native_weapon_frame_ids=native_weapon_frame_ids,
         native_weapon_flash_ids=native_weapon_flash_ids,
         native_weapon_flash_lights=native_weapon_flash_lights,

@@ -678,6 +678,47 @@ def test_native_weapon_uses_reference_fixed_point_vertical_sampling(
     assert value[152, 159].item() == 6
 
 
+def test_native_weapon_preserves_fractional_bob_during_sampling(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([1337]))
+    engine.selected_weapon.fill_(6)
+    engine.weapon_state_cooldown.zero_()
+    engine.weapon_raise_cooldown.zero_()
+    engine.pending_weapon.fill_(-1)
+    engine.weapon_ready_tics.fill_(5)
+    engine.episode_time.fill_(101)
+    engine._player_bob_fixed.fill_(310906)
+
+    frame_id, _flash_id, _flash_light = engine._native_weapon_frame_selection()
+    assert frame_id.item() == 38  # PLSGA0
+
+    black = engine._native_render_weapon(
+        torch.zeros((1, 208, 320), dtype=torch.uint8)
+    )
+    white = engine._native_render_weapon(
+        torch.full((1, 208, 320), 255, dtype=torch.uint8)
+    )
+    opaque = black == white
+    coordinates = torch.nonzero(opaque[0])
+
+    # R_DrawPSprite subtracts the 16.16 bob from texturemid before applying
+    # its reciprocal 320x240 y scale. Shifting a ready-state raster by two
+    # integer rows instead makes 30 extra texels opaque and samples the wrong
+    # source row throughout the top of the plasma rifle.
+    assert coordinates.min(dim=0).values.tolist() == [153, 127]
+    assert coordinates.max(dim=0).values.tolist() == [207, 191]
+    assert coordinates.shape[0] == 3001
+    assert not opaque[0, 154, 142]
+    assert opaque[0, 154, 147]
+    assert black[0, 154, 147].item() == 108
+
+
 def test_enemy_fullbright_matches_actor_attack_states() -> None:
     enemy_type = torch.tensor((0, 1, 1, 3, 3, 3, 3, 3, 3))
     attack_phase = torch.tensor((2, 2, 2, 2, 3, 3, 4, 1, 1))

@@ -116,6 +116,18 @@ def test_pinned_deathmatch_compiles_external_doom2_data() -> None:
     assert scenario.native_weapon_frame_values.shape[1:] == (208, 320)
     assert scenario.native_weapon_frame_alpha is not None
     assert scenario.native_weapon_frame_alpha.any(axis=(1, 2)).all()
+    assert scenario.native_weapon_patch_atlas is not None
+    assert scenario.native_weapon_patch_atlas.shape == (42, 151, 201)
+    assert scenario.native_weapon_patch_opaque is not None
+    assert scenario.native_weapon_patch_opaque.shape == (42, 151, 201)
+    assert scenario.native_weapon_patch_widths is not None
+    assert scenario.native_weapon_patch_heights is not None
+    assert scenario.native_weapon_patch_left_offsets is not None
+    assert scenario.native_weapon_patch_top_offsets is not None
+    assert scenario.native_weapon_patch_widths[38] == 83
+    assert scenario.native_weapon_patch_heights[38] == 61
+    assert scenario.native_weapon_patch_left_offsets[38] == -123
+    assert scenario.native_weapon_patch_top_offsets[38] == -107
     assert scenario.native_weapon_frame_ids is not None
     assert scenario.native_weapon_frame_ids.shape == (8, 2, 62)
     assert scenario.native_weapon_flash_ids is not None

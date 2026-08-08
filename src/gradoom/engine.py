@@ -492,6 +492,13 @@ class DeviceScenario:
     native_weapon_screen_alpha: torch.Tensor
     native_weapon_frame_values: torch.Tensor
     native_weapon_frame_alpha: torch.Tensor
+    native_weapon_patch_atlas: torch.Tensor
+    native_weapon_patch_opaque: torch.Tensor
+    native_weapon_patch_widths: torch.Tensor
+    native_weapon_patch_heights: torch.Tensor
+    native_weapon_patch_left_offsets: torch.Tensor
+    native_weapon_patch_top_offsets: torch.Tensor
+    native_weapon_patch_available: bool
     native_weapon_frame_ids: torch.Tensor
     native_weapon_flash_ids: torch.Tensor
     native_weapon_flash_lights: torch.Tensor
@@ -824,6 +831,37 @@ class DeviceScenario:
             if scenario.native_weapon_frame_alpha is None
             else scenario.native_weapon_frame_alpha
         )
+        native_weapon_patch_available = scenario.native_weapon_patch_atlas is not None
+        native_weapon_patch_atlas = (
+            np.zeros((len(native_weapon_frame_values), 1, 1), dtype=np.uint8)
+            if scenario.native_weapon_patch_atlas is None
+            else scenario.native_weapon_patch_atlas
+        )
+        native_weapon_patch_opaque = (
+            np.zeros_like(native_weapon_patch_atlas, dtype=np.bool_)
+            if scenario.native_weapon_patch_opaque is None
+            else scenario.native_weapon_patch_opaque
+        )
+        native_weapon_patch_widths = (
+            np.zeros(len(native_weapon_patch_atlas), dtype=np.int32)
+            if scenario.native_weapon_patch_widths is None
+            else scenario.native_weapon_patch_widths
+        )
+        native_weapon_patch_heights = (
+            np.zeros(len(native_weapon_patch_atlas), dtype=np.int32)
+            if scenario.native_weapon_patch_heights is None
+            else scenario.native_weapon_patch_heights
+        )
+        native_weapon_patch_left_offsets = (
+            np.zeros(len(native_weapon_patch_atlas), dtype=np.int32)
+            if scenario.native_weapon_patch_left_offsets is None
+            else scenario.native_weapon_patch_left_offsets
+        )
+        native_weapon_patch_top_offsets = (
+            np.zeros(len(native_weapon_patch_atlas), dtype=np.int32)
+            if scenario.native_weapon_patch_top_offsets is None
+            else scenario.native_weapon_patch_top_offsets
+        )
         if scenario.native_weapon_frame_ids is None:
             native_weapon_frame_ids = np.broadcast_to(
                 np.arange(8, dtype=np.int32)[:, None, None],
@@ -1068,6 +1106,37 @@ class DeviceScenario:
             native_weapon_screen_alpha=torch.as_tensor(native_weapon_screen_alpha, device=device),
             native_weapon_frame_values=torch.as_tensor(native_weapon_frame_values, device=device),
             native_weapon_frame_alpha=torch.as_tensor(native_weapon_frame_alpha, device=device),
+            native_weapon_patch_atlas=torch.as_tensor(
+                native_weapon_patch_atlas,
+                device=device,
+                dtype=torch.uint8,
+            ),
+            native_weapon_patch_opaque=torch.as_tensor(
+                native_weapon_patch_opaque,
+                device=device,
+                dtype=torch.bool,
+            ),
+            native_weapon_patch_widths=torch.as_tensor(
+                native_weapon_patch_widths,
+                device=device,
+                dtype=torch.int64,
+            ),
+            native_weapon_patch_heights=torch.as_tensor(
+                native_weapon_patch_heights,
+                device=device,
+                dtype=torch.int64,
+            ),
+            native_weapon_patch_left_offsets=torch.as_tensor(
+                native_weapon_patch_left_offsets,
+                device=device,
+                dtype=torch.int64,
+            ),
+            native_weapon_patch_top_offsets=torch.as_tensor(
+                native_weapon_patch_top_offsets,
+                device=device,
+                dtype=torch.int64,
+            ),
+            native_weapon_patch_available=native_weapon_patch_available,
             native_weapon_frame_ids=torch.as_tensor(
                 native_weapon_frame_ids, device=device, dtype=torch.int64
             ),
@@ -10965,10 +11034,74 @@ class TorchDeathmatchEngine:
             alpha.gather(1, source_y).gather(2, source_x) & valid
         )
 
+    def _native_composite_weapon_patch(
+        self,
+        frame: torch.Tensor,
+        frame_id: torch.Tensor,
+        horizontal_offset_fixed: torch.Tensor,
+        vertical_offset_fixed: torch.Tensor,
+        visible: torch.Tensor,
+    ) -> torch.Tensor:
+        """Draw one psprite through R_DrawPSprite's fixed-point sampling."""
+
+        atlas = self.map.native_weapon_patch_atlas[frame_id]
+        opaque_atlas = self.map.native_weapon_patch_opaque[frame_id]
+        width = self.map.native_weapon_patch_widths[frame_id]
+        height = self.map.native_weapon_patch_heights[frame_id]
+        left_offset = self.map.native_weapon_patch_left_offsets[frame_id]
+        top_offset = self.map.native_weapon_patch_top_offsets[frame_id]
+
+        screen_left = torch.bitwise_right_shift(
+            horizontal_offset_fixed - left_offset * _FIXED_UNIT,
+            16,
+        )
+        source_x = self._native_pixel_x.to(torch.int64) - screen_left[:, None, None]
+
+        weapon_top_fixed = 32 * _FIXED_UNIT + 0x6000
+        texture_mid_fixed = (
+            100 * _FIXED_UNIT
+            - weapon_top_fixed
+            - vertical_offset_fixed
+            + top_offset * _FIXED_UNIT
+        )
+        psprite_y_scale_fixed = self.native_screen_height * _FIXED_UNIT // 200
+        psprite_y_iscale_fixed = _UINT32_MASK // psprite_y_scale_fixed
+        screen_delta = self._native_pixel_y.to(torch.int64) - (
+            self.native_view_height // 2 - 1
+        )
+        source_y = torch.bitwise_right_shift(
+            texture_mid_fixed[:, None, None] + screen_delta * psprite_y_iscale_fixed,
+            16,
+        )
+        inside = (
+            visible[:, None, None]
+            & (source_x >= 0)
+            & (source_x < width[:, None, None])
+            & (source_y >= 0)
+            & (source_y < height[:, None, None])
+        )
+
+        source_x = source_x.clamp(0, atlas.shape[2] - 1).expand(
+            -1,
+            self.native_view_height,
+            -1,
+        )
+        source_y = source_y.clamp(0, atlas.shape[1] - 1).expand(
+            -1,
+            -1,
+            self.native_screen_width,
+        )
+        source_index = source_y * atlas.shape[2] + source_x
+        value = atlas.flatten(1).gather(1, source_index.flatten(1)).reshape_as(frame)
+        alpha = (
+            opaque_atlas.flatten(1)
+            .gather(1, source_index.flatten(1))
+            .reshape_as(frame)
+        )
+        return torch.where(inside & alpha, value, frame)
+
     def _native_render_weapon(self, frame: torch.Tensor) -> torch.Tensor:
         frame_id, flash_id, _flash_light = self._native_weapon_frame_selection()
-        value = self.map.native_weapon_frame_values[frame_id]
-        alpha = self.map.native_weapon_frame_alpha[frame_id]
         lower_vertical_tics = torch.clamp(
             _WEAPON_LOWER_TICS - self.weapon_lower_cooldown,
             0,
@@ -10985,9 +11118,6 @@ class TorchDeathmatchEngine:
             _WEAPON_SPAWN_RAISE_TICS,
         )
         vertical_tics = torch.maximum(vertical_tics, spawn_raise_tics)
-        raise_pixels = torch.floor(
-            vertical_tics.to(torch.float32) * _WEAPON_VERTICAL_STEP_PIXELS
-        ).to(torch.int64)
         ready = (
             (self.weapon_state_cooldown <= 0)
             & (self.weapon_raise_cooldown <= 0)
@@ -11002,26 +11132,55 @@ class TorchDeathmatchEngine:
             self._player_bob_fixed
             * self._fine_sine_fixed[bob_angle & (_FINE_ANGLES // 2 - 1)]
         ) >> 16
-        # The software renderer converts the fixed psprite origin to screen
-        # coordinates by dropping fractional bits.  Flooring matters for both
-        # the negative horizontal swing and the positive vertical swing.
+        bob_x_fixed = torch.where(ready, bob_x_fixed, torch.zeros_like(bob_x_fixed))
+        bob_y_fixed = torch.where(ready, bob_y_fixed, torch.zeros_like(bob_y_fixed))
+        visible = ~self.player_dead
+        has_flash = flash_id >= 0
+        safe_flash_id = flash_id.clamp_min(0)
+
+        if self.map.native_weapon_patch_available:
+            # A_Raise/A_Lower move sy by six logical 320x200 pixels per tic.
+            # Keep that and weapon bob in 16.16 until R_DrawPSprite converts
+            # texturemid through the 320x240 target's reciprocal y scale.
+            vertical_offset_fixed = (
+                vertical_tics.to(torch.int64) * 6 * _FIXED_UNIT + bob_y_fixed
+            )
+            frame = self._native_composite_weapon_patch(
+                frame,
+                frame_id,
+                bob_x_fixed,
+                vertical_offset_fixed,
+                visible,
+            )
+            return self._native_composite_weapon_patch(
+                frame,
+                safe_flash_id,
+                bob_x_fixed,
+                vertical_offset_fixed,
+                visible & has_flash,
+            )
+
+        # Compatibility path for synthetic CompiledScenario fixtures that do
+        # not carry raw psprite patches. The certified scenario always takes
+        # the fixed-point path above.
+        value = self.map.native_weapon_frame_values[frame_id]
+        alpha = self.map.native_weapon_frame_alpha[frame_id]
+        raise_pixels = torch.floor(
+            vertical_tics.to(torch.float32) * _WEAPON_VERTICAL_STEP_PIXELS
+        ).to(torch.int64)
         bob_x = torch.floor(bob_x_fixed.to(torch.float32) / _FIXED_UNIT).to(torch.int64)
         bob_y = torch.floor(
             bob_y_fixed.to(torch.float32) / _FIXED_UNIT * self.native_vertical_aspect
         ).to(torch.int64)
-        bob_x = torch.where(ready, bob_x, torch.zeros_like(bob_x))
-        bob_y = torch.where(ready, bob_y, torch.zeros_like(bob_y))
         value, alpha = self._native_shift_weapon_overlay(
             value,
             alpha,
             bob_x,
             raise_pixels + bob_y,
         )
-        visible = ~self.player_dead[:, None, None]
-        frame = torch.where(alpha & visible, value, frame)
+        visible_pixels = visible[:, None, None]
+        frame = torch.where(alpha & visible_pixels, value, frame)
 
-        has_flash = flash_id >= 0
-        safe_flash_id = flash_id.clamp_min(0)
         flash_value = self.map.native_weapon_frame_values[safe_flash_id]
         flash_alpha = self.map.native_weapon_frame_alpha[safe_flash_id]
         flash_value, flash_alpha = self._native_shift_weapon_overlay(
@@ -11031,7 +11190,7 @@ class TorchDeathmatchEngine:
             raise_pixels + bob_y,
         )
         return torch.where(
-            flash_alpha & has_flash[:, None, None] & visible,
+            flash_alpha & has_flash[:, None, None] & visible_pixels,
             flash_value,
             frame,
         )
