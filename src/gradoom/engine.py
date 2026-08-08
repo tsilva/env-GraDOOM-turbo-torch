@@ -8137,6 +8137,77 @@ class TorchDeathmatchEngine:
         direction_y = view_sine[:, None] - view_cosine[:, None] * columns[None, :]
         return torch.stack((direction_x, direction_y), dim=-1)
 
+    def _native_wall_vertical_steps(self) -> torch.Tensor:
+        """Build PrepWall's per-column fixed-point vertical texture steps."""
+
+        walls_fixed = torch.round(self.map.portal_walls * _FIXED_UNIT).to(torch.int64)
+        visible_x_fixed = self._x_fixed.to(torch.float32) / _FIXED_UNIT
+        visible_y_fixed = self._y_fixed.to(torch.float32) / _FIXED_UNIT
+        view_x_fixed = torch.where(
+            self.x != visible_x_fixed,
+            torch.round(self.x * _FIXED_UNIT).to(torch.int64),
+            self._x_fixed,
+        )
+        view_y_fixed = torch.where(
+            self.y != visible_y_fixed,
+            torch.round(self.y * _FIXED_UNIT).to(torch.int64),
+            self._y_fixed,
+        )
+        relative_x = walls_fixed[None, :, 0::2] - view_x_fixed[:, None, None]
+        relative_y = walls_fixed[None, :, 1::2] - view_y_fixed[:, None, None]
+
+        fine_angle = self._native_view_angle_bam() >> _ANGLE_TO_FINE_SHIFT
+        view_sine = self._fine_sine_fixed[fine_angle][:, None, None]
+        view_cosine = self._fine_sine_fixed[
+            (fine_angle + _FINE_ANGLES // 4) & (_FINE_ANGLES - 1)
+        ][:, None, None]
+        transformed_x = (
+            relative_x * view_sine - relative_y * view_cosine
+        ) >> 20
+        transformed_y = (
+            relative_x * view_cosine + relative_y * view_sine
+        ) >> 20
+        tx1, tx2 = transformed_x[..., 0], transformed_x[..., 1]
+        ty1, ty2 = transformed_y[..., 0], transformed_y[..., 1]
+
+        # FWallTmapVals first narrows these values to float, while PrepWall
+        # promotes the stored values to double for its perspective division.
+        u_over_z_origin = (tx1.to(torch.float32) * (self.native_screen_width // 2)).to(
+            torch.float64
+        )
+        u_over_z_step = (-ty1.to(torch.float32)).to(torch.float64)
+        inv_z_origin = (
+            (tx1 - tx2).to(torch.float32) * (self.native_screen_width // 2)
+        ).to(torch.float64)
+        inv_z_step_float = (ty2 - ty1).to(torch.float32)
+        inv_z_step = inv_z_step_float.to(torch.float64)
+        columns = (
+            self._native_pixel_x[0, 0].to(torch.float64)
+            - self.native_screen_width // 2
+        )[None, :, None]
+        top = u_over_z_origin[:, None, :] + u_over_z_step[:, None, :] * columns
+        bottom = inv_z_origin[:, None, :] + inv_z_step[:, None, :] * columns
+        safe_bottom = torch.where(bottom == 0, torch.ones_like(bottom), bottom)
+        fraction = top / safe_bottom
+
+        inverse_vertical_aspect = torch.tensor(
+            self.native_screen_width * 200.0,
+            device=self.device,
+            dtype=torch.float32,
+        )
+        inverse_vertical_aspect /= 320.0
+        inverse_vertical_aspect /= float(self.native_screen_height)
+        wall_map_scale = inverse_vertical_aspect * 64.0 / (
+            self.native_screen_width / 2.0
+        )
+        depth_scale = (inv_z_step_float * wall_map_scale).to(torch.float64)
+        depth_origin = (-u_over_z_step.to(torch.float32) * wall_map_scale).to(
+            torch.float64
+        )
+        return torch.floor(
+            fraction * depth_scale[:, None, :] + depth_origin[:, None, :] + 0.5
+        ).to(torch.int64)
+
     def _native_flat_texture_coordinates(
         self,
         texture_ids: torch.Tensor,
@@ -8353,6 +8424,7 @@ class TorchDeathmatchEngine:
             focal_length
         )
         distances, wall_along = self._native_portal_intersections()
+        wall_vertical_steps = self._native_wall_vertical_steps()
         filled = torch.zeros_like(frame, dtype=torch.bool)
         scene_depth = surface_depth.clone()
         pixel_y = self._native_pixel_y.to(torch.float32)
@@ -8447,9 +8519,6 @@ class TorchDeathmatchEngine:
                 ).to(torch.int64)[:, None, :],
                 texture_width,
             ).expand(-1, self.native_view_height, -1)
-            world_z = view_z[:, None, None] + (
-                (center[:, None, None] - pixel_y) * distance[:, None, :] / focal_length
-            )
             texture_origin_z = torch.where(
                 one_span,
                 view_ceiling[:, None, :],
@@ -8459,11 +8528,45 @@ class TorchDeathmatchEngine:
                     other_ceiling[:, None, :],
                 ),
             )
-            texture_v = torch.remainder(
-                torch.floor(texture_origin_z - world_z + texture_offset[:, None, :, 1]).to(
-                    torch.int64
-                ),
-                texture_height,
+            height_bits = torch.floor(torch.log2(texture_height.to(torch.float32))).to(
+                torch.int64
+            )
+            vertical_step = wall_vertical_steps.gather(
+                2,
+                wall_index[:, :, None],
+            ).squeeze(2)[:, None, :] * torch.bitwise_left_shift(
+                torch.ones_like(height_bits),
+                14 - height_bits,
+            )
+            tangent_index = torch.bitwise_right_shift(
+                _ANGLE_90 - self._pitch_bam,
+                _ANGLE_TO_FINE_SHIFT,
+            ).clamp(0, _FINE_ANGLES // 2 - 1)
+            pitch_offset_fixed = (
+                _NATIVE_FOCAL_Y_FIXED * self._fine_tangent_fixed[tangent_index]
+            ) >> 16
+            center_fixed = (
+                self.native_view_height // 2 * _FIXED_UNIT + pitch_offset_fixed
+            )
+            screen_delta_fixed = (
+                self._native_pixel_y.to(torch.int64) * _FIXED_UNIT
+                - center_fixed[:, None, None]
+                + _FIXED_UNIT
+            )
+            texture_mid_fixed = torch.round(
+                (texture_origin_z - view_z[:, None, None]) * _FIXED_UNIT
+                + texture_offset[:, None, :, 1] * _FIXED_UNIT
+            ).to(torch.int64)
+            texture_fraction = torch.bitwise_left_shift(
+                texture_mid_fixed,
+                16 - height_bits,
+            ) + torch.bitwise_right_shift(
+                vertical_step * screen_delta_fixed,
+                16,
+            )
+            texture_v = torch.bitwise_right_shift(
+                torch.bitwise_and(texture_fraction, _UINT32_MASK),
+                32 - height_bits,
             )
             texture = self.map.texture_index_atlas[
                 safe_texture_id,

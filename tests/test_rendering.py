@@ -161,6 +161,38 @@ def test_native_walls_use_reference_fine_angle_rays(
     assert rgb[0, 0, 272].tolist() == [43, 35, 15]
 
 
+def test_native_walls_use_reference_fixed_vertical_sampling(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([456]))
+    engine.x.fill_(752.9335632324219)
+    engine.y.fill_(49.700897216796875)
+    engine.z.zero_()
+    engine.view_z.fill_(41)
+    engine.angle.fill_(math.radians(165.67382816357394))
+    engine.episode_time.fill_(17)
+
+    frame, surface_depth = engine._native_render_flats(
+        engine._current_sector(),
+        engine.view_z,
+    )
+    frame, _scene_depth = engine._native_render_portal_walls(
+        frame,
+        engine.view_z,
+        surface_depth,
+    )
+    rgb = engine.map.playpal[frame.to(torch.int64)]
+
+    # PrepWall rounds its inverse-depth scale before wallscan advances the
+    # vertical column DDA. Continuous world-Z sampling selects [123, 99, 79].
+    assert rgb[0, 1, 40].tolist() == [131, 107, 87]
+
+
 def test_native_weapon_uses_reference_fixed_point_vertical_sampling(
     pinned_deathmatch_scenario,
 ) -> None:
