@@ -654,6 +654,55 @@ def test_native_walls_use_reference_half_open_screen_bounds(
     assert rgb[0, 40, 90].tolist() == [95, 75, 55]
 
 
+def test_native_projected_portal_keeps_geometric_sector_path(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([789]))
+    engine.x.fill_(262.93389892578125)
+    engine.y.fill_(576.4520263671875)
+    engine.z.zero_()
+    engine.view_z.fill_(41)
+    engine.angle.fill_(math.radians(348.81591804996503))
+    engine.episode_time.fill_(61)
+
+    (
+        _wall_distance,
+        _wall_along,
+        geometric_intersections,
+        projected_intersections,
+        _projected_left_edges,
+        _wall_visibility,
+    ) = engine._native_portal_intersections()
+    frame, surface_depth, scene_surface_depth = engine._native_render_flats(
+        engine._current_sector(),
+        engine.view_z,
+    )
+    frame, _scene_depth = engine._native_render_portal_walls(
+        frame,
+        engine.view_z,
+        surface_depth,
+        scene_surface_depth,
+    )
+    rgb = engine.map.playpal[frame.to(torch.int64)]
+
+    # Portal 206 owns column 50 through its projected half-open span, but the
+    # mathematical ray crosses portal 213 at their shared vertex. Rasterizing
+    # 206 must therefore retain 213's sector path so the farther solid wall is
+    # reached instead of leaking the sky through one complete screen column.
+    assert projected_intersections[0, 50, 206]
+    assert not geometric_intersections[0, 50, 206]
+    assert not projected_intersections[0, 50, 213]
+    assert geometric_intersections[0, 50, 213]
+    assert rgb[0, 40, 50].tolist() == [123, 99, 79]
+    assert rgb[0, 60, 50].tolist() == [159, 135, 111]
+    assert rgb[0, 100, 50].tolist() == [119, 95, 75]
+
+
 def test_native_weapon_uses_reference_fixed_point_vertical_sampling(
     pinned_deathmatch_scenario,
 ) -> None:

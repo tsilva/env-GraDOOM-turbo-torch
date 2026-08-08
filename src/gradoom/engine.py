@@ -9940,28 +9940,78 @@ class TorchDeathmatchEngine:
                 & (other_sector >= 0)
                 & (other_shared_distance < current_shared_distance)
             )
+            # A projected-only portal can own this screen column even while
+            # the mathematical ray crosses a different portal at the shared
+            # vertex. If the projected owner does not lead into its sector,
+            # continue the depth traversal through that same-depth geometric
+            # portal. Doom's BSP keeps these two decisions separate: the seg
+            # span owns rasterization, while the subsector behind it still
+            # determines which farther solid wall remains visible.
+            shared_geometric_portal = (
+                geometric_intersections
+                & incident
+                & shares_endpoint
+                & (all_sectors[None, None, :, 1] >= 0)
+                & (distances > prior_distance[:, :, None] + 1e-3)
+                & (
+                    torch.abs(distances - distance[:, :, None])
+                    <= _NATIVE_SHARED_ENDPOINT_DEPTH_TOLERANCE
+                )
+            )
+            geometric_portal_distance, geometric_portal_index = torch.min(
+                torch.where(
+                    shared_geometric_portal,
+                    distances,
+                    torch.full_like(distances, torch.inf),
+                ),
+                dim=2,
+            )
+            geometric_portal_sectors = all_sectors[geometric_portal_index]
+            geometric_portal_from_front = (
+                current_sector == geometric_portal_sectors[..., 0]
+            )
+            geometric_portal_other = torch.where(
+                geometric_portal_from_front,
+                geometric_portal_sectors[..., 1],
+                geometric_portal_sectors[..., 0],
+            )
+            endpoint_uses_geometric_path = (
+                endpoint_only_portal
+                & ~endpoint_enters_other
+                & ~endpoint_enters_shared
+                & torch.isfinite(geometric_portal_distance)
+                & (geometric_portal_other >= 0)
+            )
             previous_distance = torch.where(
                 valid,
                 torch.where(
                     endpoint_enters_shared & (other_shared_distance < distance),
                     prior_distance,
-                    distance,
+                    torch.where(
+                        endpoint_uses_geometric_path,
+                        geometric_portal_distance,
+                        distance,
+                    ),
                 ),
                 prior_distance,
             )
             current_sector = torch.where(
-                valid
-                & ~one_sided
-                & (
-                    geometric_intersection
-                    | endpoint_enters_other
-                    | endpoint_enters_shared
-                ),
-                other_sector,
+                endpoint_uses_geometric_path,
+                geometric_portal_other,
                 torch.where(
-                    endpoint_only_portal,
-                    current_sector,
-                    torch.full_like(current_sector, -1),
+                    valid
+                    & ~one_sided
+                    & (
+                        geometric_intersection
+                        | endpoint_enters_other
+                        | endpoint_enters_shared
+                    ),
+                    other_sector,
+                    torch.where(
+                        endpoint_only_portal,
+                        current_sector,
+                        torch.full_like(current_sector, -1),
+                    ),
                 ),
             )
         return frame, scene_depth
