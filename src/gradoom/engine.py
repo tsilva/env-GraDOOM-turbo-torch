@@ -85,7 +85,8 @@ _ROCKET_SPLASH_DAMAGE = 128.0
 _ROCKET_WALL_GRID_CELL = 64.0
 _ROCKET_MAX_TARGET_CENTER_OFFSET = _ROCKET_SPLASH_DAMAGE + max(_ENEMY_RADIUS)
 _WEAPON_LOWER_TICS = 16
-_WEAPON_RAISE_TICS = 16
+# Entering Select executes A_Raise immediately; fifteen future tics remain.
+_WEAPON_RAISE_TICS = 15
 _WEAPON_SPAWN_RAISE_TICS = 14
 _WEAPON_VERTICAL_STEP_PIXELS = 7.2
 # Internal weapon order follows the DoomPlayer slot lists exactly:

@@ -239,7 +239,7 @@ def test_weapon_change_blocks_fire_for_reference_raise_window(square_scenario) -
         engine._weapon_switch_tick(torch.ones(2, dtype=torch.bool))
         engine._player_attack(attack)
     assert engine._active_weapon().tolist() == [3, 3]
-    assert engine.weapon_raise_cooldown.tolist() == [16, 16]
+    assert engine.weapon_raise_cooldown.tolist() == [15, 15]
     for _ in range(15):
         engine._weapon_switch_tick(torch.ones(2, dtype=torch.bool))
         engine._player_attack(attack)
@@ -848,7 +848,7 @@ def test_empty_weapon_switches_to_best_owned_usable_weapon(square_scenario) -> N
     _advance_weapon_switch(engine)
     assert engine.selected_weapon.tolist() == [3, 3]
     assert engine.selected_weapon_variant.tolist() == [True, True]
-    assert engine.weapon_raise_cooldown.tolist() == [16, 16]
+    assert engine.weapon_raise_cooldown.tolist() == [15, 15]
     assert engine.ammo[:, 2].tolist() == [2.0, 2.0]
 
 
@@ -867,7 +867,7 @@ def test_empty_weapon_falls_back_to_chainsaw_then_fist(square_scenario) -> None:
     _advance_weapon_switch(engine)
     assert engine.selected_weapon.tolist() == [1, 1]
     assert engine.selected_weapon_variant.tolist() == [True, False]
-    assert engine.weapon_raise_cooldown.tolist() == [16, 16]
+    assert engine.weapon_raise_cooldown.tolist() == [15, 15]
 
 
 def test_rocket_uses_delayed_projectile_impact_and_splash(square_scenario) -> None:

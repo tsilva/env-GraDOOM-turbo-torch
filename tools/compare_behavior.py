@@ -50,10 +50,15 @@ VARIABLES = (
 PROGRAMS = (
     "noop",
     "forward",
+    "backward",
+    "run-forward",
+    "strafe-left",
     "strafe-right",
     "turn-left",
+    "turn-right",
     "spiral",
     "forward-fire",
+    "weapon-next-fire",
     "weapon-switch-fire",
 )
 _FIXED_UNIT = 1 << 16
@@ -69,12 +74,22 @@ def _action_index(program: str, step: int) -> int:
         return 0
     if program == "forward":
         return 2
+    if program == "backward":
+        return 3
+    if program == "run-forward":
+        return 8
+    if program == "strafe-left":
+        return 4
     if program == "strafe-right":
         return 5
     if program == "turn-left":
         return 6
+    if program == "turn-right":
+        return 7
     if program == "forward-fire":
         return 9
+    if program == "weapon-next-fire":
+        return 0 if step == 0 else 15 if step == 1 else 1
     if program == "weapon-switch-fire":
         return 0 if step == 0 else 16 if step == 1 else 1
     return 13 if (step // 20) % 2 == 0 else 14
@@ -187,7 +202,7 @@ def _run_case(
     game.init()
     try:
         game.new_episode()
-        if program == "weapon-switch-fire":
+        if program in {"weapon-next-fire", "weapon-switch-fire"}:
             game.send_game_command("give all")
         available = tuple(value.name for value in game.get_available_buttons())
         actions = _action_matrix(available)
@@ -259,7 +274,7 @@ def _run_case(
                 torch.tensor(actions[action_index], dtype=torch.bool)
             )
             previous_engine_reward = float(reward[0])
-            if program == "weapon-switch-fire" and step == 0:
+            if program in {"weapon-next-fire", "weapon-switch-fire"} and step == 0:
                 _align_give_all(engine)
         return {
             "matched_transitions": steps + 1,
