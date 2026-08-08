@@ -8420,7 +8420,93 @@ class TorchDeathmatchEngine:
         )
         distance = (offset[..., 0] * segment[..., 1] - offset[..., 1] * segment[..., 0]) / safe
         along = (offset[..., 0] * ray[..., 1] - offset[..., 1] * ray[..., 0]) / safe
-        valid = (denominator.abs() >= 1e-6) & (distance > 0) & (along >= 0) & (along <= 1)
+        geometric_valid = (
+            (denominator.abs() >= 1e-6)
+            & (distance > 0)
+            & (along >= 0)
+            & (along <= 1)
+        )
+
+        # FWallCoords projects segment endpoints to integer screen bounds and
+        # renders the resulting [sx1, sx2) range. A pure ray/segment test owns
+        # the last subpixel column on the opposite side of shared vertices.
+        by_wall = geometric_valid.permute(0, 2, 1)
+        has_columns = torch.any(by_wall, dim=2)
+        first_column = torch.argmax(by_wall.to(torch.int64), dim=2)
+        last_column = self.native_screen_width - 1 - torch.argmax(
+            torch.flip(by_wall, dims=(2,)).to(torch.int64),
+            dim=2,
+        )
+        screen_left = first_column
+        screen_right = last_column + 1
+
+        walls_fixed = torch.round(self.map.portal_walls * _FIXED_UNIT).to(torch.int64)
+        visible_x_fixed = self._x_fixed.to(torch.float32) / _FIXED_UNIT
+        visible_y_fixed = self._y_fixed.to(torch.float32) / _FIXED_UNIT
+        view_x_fixed = torch.where(
+            self.x != visible_x_fixed,
+            torch.round(self.x * _FIXED_UNIT).to(torch.int64),
+            self._x_fixed,
+        )
+        view_y_fixed = torch.where(
+            self.y != visible_y_fixed,
+            torch.round(self.y * _FIXED_UNIT).to(torch.int64),
+            self._y_fixed,
+        )
+        relative_x = walls_fixed[None, :, 0::2] - view_x_fixed[:, None, None]
+        relative_y = walls_fixed[None, :, 1::2] - view_y_fixed[:, None, None]
+        fine_angle = self._native_view_angle_bam() >> _ANGLE_TO_FINE_SHIFT
+        view_sine = self._fine_sine_fixed[fine_angle][:, None, None]
+        view_cosine = self._fine_sine_fixed[
+            (fine_angle + _FINE_ANGLES // 4) & (_FINE_ANGLES - 1)
+        ][:, None, None]
+        transformed_x = (
+            relative_x * view_sine - relative_y * view_cosine
+        ) >> 20
+        transformed_y = (
+            relative_x * view_cosine + relative_y * view_sine
+        ) >> 20
+        safe_transformed_y = torch.where(
+            transformed_y == 0,
+            torch.ones_like(transformed_y),
+            transformed_y,
+        )
+        center_fixed = (self.native_screen_width // 2) * _FIXED_UNIT
+        projected_fixed = center_fixed + self._trunc_divide(
+            transformed_x * center_fixed,
+            safe_transformed_y,
+        )
+        endpoint_columns = (projected_fixed >> 16) + (transformed_x >= 0).to(
+            torch.int64
+        )
+        endpoint_visible = (
+            (transformed_y > 0)
+            & (transformed_x >= -transformed_y)
+            & (transformed_x <= transformed_y)
+            & (endpoint_columns >= 0)
+            & (endpoint_columns <= self.native_screen_width)
+        )
+        for endpoint in range(2):
+            column = endpoint_columns[..., endpoint]
+            visible = endpoint_visible[..., endpoint] & has_columns
+            owns_left = torch.abs(column - screen_left) <= torch.abs(
+                column - screen_right
+            )
+            screen_left = torch.where(visible & owns_left, column, screen_left)
+            screen_right = torch.where(visible & ~owns_left, column, screen_right)
+
+        pixel_x = self._native_pixel_x[0, 0].to(torch.int64)[None, :, None]
+        screen_valid = (
+            has_columns[:, None, :]
+            & (pixel_x >= screen_left[:, None, :])
+            & (pixel_x < screen_right[:, None, :])
+        )
+        one_sided = self.map.portal_wall_sectors[:, 1] < 0
+        valid = torch.where(
+            one_sided[None, None, :],
+            (denominator.abs() >= 1e-6) & (distance > 0) & screen_valid,
+            geometric_valid,
+        )
         distance = torch.where(valid, distance, torch.full_like(distance, torch.inf))
         return distance, along.clamp(0, 1)
 

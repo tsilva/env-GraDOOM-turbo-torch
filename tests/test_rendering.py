@@ -235,6 +235,45 @@ def test_native_walls_use_reference_fixed_vertical_sampling(
     assert rgb[0, 1, 40].tolist() == [131, 107, 87]
 
 
+def test_native_solid_walls_use_reference_half_open_screen_bounds(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([456]))
+    engine.x.fill_(752.9335632324219)
+    engine.y.fill_(49.700897216796875)
+    engine.z.zero_()
+    engine.view_z.fill_(41)
+    engine.angle.fill_(math.radians(165.67382816357394))
+    engine.episode_time.fill_(17)
+
+    wall_distance, _wall_along = engine._native_portal_intersections()
+    frame, surface_depth = engine._native_render_flats(
+        engine._current_sector(),
+        engine.view_z,
+    )
+    frame, _scene_depth = engine._native_render_portal_walls(
+        frame,
+        engine.view_z,
+        surface_depth,
+    )
+    rgb = engine.map.playpal[frame.to(torch.int64)]
+
+    # FWallCoords projects shared endpoints to [sx1, sx2). The right edge of
+    # walls 17 and 168 is therefore excluded, while the adjacent walls 60 and
+    # 59 own those exact columns. A closed ray/segment test reverses ownership.
+    assert torch.isinf(wall_distance[0, 67, 17])
+    assert torch.isfinite(wall_distance[0, 67, 60])
+    assert torch.isinf(wall_distance[0, 90, 168])
+    assert torch.isfinite(wall_distance[0, 90, 59])
+    assert rgb[0, 40, 67].tolist() == [0, 0, 71]
+    assert rgb[0, 40, 90].tolist() == [95, 75, 55]
+
+
 def test_native_weapon_uses_reference_fixed_point_vertical_sampling(
     pinned_deathmatch_scenario,
 ) -> None:
