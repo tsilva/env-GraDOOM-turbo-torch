@@ -527,6 +527,44 @@ def test_enemy_overkill_uses_reference_extreme_death_states(
 
 
 @pytest.mark.skipif(not SCENARIO.is_file() or not DOOM2.is_file(), reason="operator WADs absent")
+def test_native_renderer_uses_independent_drop_coordinates(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([123]))
+    engine.x.fill_(835.9440307617188)
+    engine.y.fill_(391.3482971191406)
+    engine.z.zero_()
+    engine.angle.fill_(math.radians(102.16735842222519))
+    engine.item_available.zero_()
+    engine.enemy_alive.zero_()
+    engine.enemy_death_tics.zero_()
+    engine.projectile_alive.zero_()
+    engine.enemy_projectile_alive.zero_()
+    engine.teleport_fog_tics.zero_()
+    engine.drop_type.fill_(-1)
+    engine.drop_type[:, 0] = 2007
+    engine.drop_spawned[:, 0] = True
+    engine.drop_x[:, 0] = engine.x + torch.cos(engine.angle) * 64.0
+    engine.drop_y[:, 0] = engine.y + torch.sin(engine.angle) * 64.0
+    engine.drop_z[:, 0] = 0
+    # The owning corpse is deliberately behind the camera. Rendering at the
+    # corpse coordinates would therefore make this drop disappear.
+    engine.enemy_x[:, 0] = engine.x - torch.cos(engine.angle) * 64.0
+    engine.enemy_y[:, 0] = engine.y - torch.sin(engine.angle) * 64.0
+
+    with_drop = engine.render_native_frame(include_hud=False)
+    engine.drop_spawned[:, 0] = False
+    without_drop = engine.render_native_frame(include_hud=False)
+
+    assert not torch.equal(with_drop, without_drop)
+
+
+@pytest.mark.skipif(not SCENARIO.is_file() or not DOOM2.is_file(), reason="operator WADs absent")
 def test_native_pit_depth_occludes_map_items(pinned_deathmatch_scenario) -> None:
     scenario = pinned_deathmatch_scenario
     engine = TorchDeathmatchEngine(scenario, 1, device=torch.device("cpu"))

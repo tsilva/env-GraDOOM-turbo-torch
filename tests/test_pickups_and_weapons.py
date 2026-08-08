@@ -663,6 +663,83 @@ def test_shotgun_guy_drop_waits_for_death_state_and_gives_half_ammo(square_scena
     assert engine.drop_type[:, 0].tolist() == [-1, -1]
 
 
+def test_monster_drop_is_independently_tossed_and_gravity_driven(square_scenario) -> None:
+    engine = _engine(_large_arena_scenario(square_scenario))
+    engine.x.fill_(2000)
+    engine.y.fill_(2000)
+    engine.enemy_x[:, 0] = torch.tensor([10.0, 20.0])
+    engine.enemy_y[:, 0] = torch.tensor([30.0, 40.0])
+    engine.enemy_z[:, 0] = 0
+    engine.enemy_type[:, 0] = 0
+    engine.enemy_health[:, 0] = 1
+    engine.enemy_alive[:, 0] = True
+    damage = torch.zeros_like(engine.enemy_health)
+    damage[:, 0] = 1
+
+    engine._apply_enemy_damage(damage)
+    for _ in range(9):
+        engine._collect_drops()
+    assert not torch.any(engine.drop_spawned[:, 0])
+
+    engine._collect_drops()
+
+    fixed = 65536
+    assert torch.all(engine.drop_spawned[:, 0])
+    # P_Die quarters the 56-unit corpse to 14 units. P_DropItem starts at
+    # half that height, then the new actor consumes its first toss tic.
+    assert torch.equal(
+        engine._drop_x_fixed[:, 0],
+        engine._enemy_x_fixed[:, 0] + engine._drop_velocity_x_fixed[:, 0],
+    )
+    assert torch.equal(
+        engine._drop_y_fixed[:, 0],
+        engine._enemy_y_fixed[:, 0] + engine._drop_velocity_y_fixed[:, 0],
+    )
+    assert torch.equal(
+        engine._drop_z_fixed[:, 0],
+        7 * fixed + engine._drop_velocity_z_fixed[:, 0] + fixed,
+    )
+
+    previous_x = engine._drop_x_fixed[:, 0].clone()
+    previous_y = engine._drop_y_fixed[:, 0].clone()
+    previous_z = engine._drop_z_fixed[:, 0].clone()
+    engine.enemy_x[:, 0] = 1000
+    engine.enemy_y[:, 0] = 1000
+    engine._drop_velocity_x_fixed[:, 0] = fixed // 2
+    engine._drop_velocity_y_fixed[:, 0] = -fixed // 4
+    engine._drop_velocity_z_fixed[:, 0] = 2 * fixed
+
+    engine._collect_drops()
+
+    assert torch.equal(engine._drop_x_fixed[:, 0], previous_x + fixed // 2)
+    assert torch.equal(engine._drop_y_fixed[:, 0], previous_y - fixed // 4)
+    assert torch.equal(engine._drop_z_fixed[:, 0], previous_z + 2 * fixed)
+    assert torch.all(engine._drop_velocity_z_fixed[:, 0] == fixed)
+    assert torch.all(engine.drop_x[:, 0] != engine.enemy_x[:, 0])
+
+    # Grounded dropped actors move first and then receive Doom's 0xe800
+    # friction, while pickup uses the independent item position.
+    engine.drop_x[:, 0] = 0
+    engine.drop_y[:, 0] = 0
+    engine.drop_z[:, 0] = 0
+    engine._drop_x_fixed[:, 0] = 0
+    engine._drop_y_fixed[:, 0] = 0
+    engine._drop_z_fixed[:, 0] = 0
+    engine._drop_velocity_x_fixed[:, 0] = fixed
+    engine._drop_velocity_y_fixed[:, 0] = 0
+    engine._drop_velocity_z_fixed[:, 0] = 0
+    engine._collect_drops()
+    assert torch.all(engine._drop_x_fixed[:, 0] == fixed)
+    assert torch.all(engine._drop_velocity_x_fixed[:, 0] == 0xE800)
+
+    engine.x.fill_(1)
+    engine.y.zero_()
+    engine._drop_velocity_x_fixed[:, 0] = 0
+    engine._collect_drops()
+    assert engine.drop_type[:, 0].tolist() == [-1, -1]
+    assert not torch.any(engine.drop_spawned[:, 0])
+
+
 def test_policy_observation_contains_available_pickups(square_scenario) -> None:
     scenario = replace(
         square_scenario,

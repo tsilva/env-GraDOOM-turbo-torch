@@ -421,6 +421,44 @@ def test_enemy_projectile_hits_monsters_without_player_kill_credit(
     assert engine.killcount.tolist() == [0, 0]
 
 
+def test_pooled_enemy_projectile_uses_recorded_owner_for_collision_and_retaliation(
+    square_scenario,
+) -> None:
+    engine = _engine(square_scenario)
+    engine.x.fill_(200)
+    engine.y.fill_(200)
+    engine.z.zero_()
+    engine.enemy_alive.zero_()
+    engine.enemy_x[:, 0] = -100
+    engine.enemy_y[:, 0] = 0
+    engine.enemy_z[:, 0] = 0
+    engine.enemy_type[:, 0] = 5
+    engine.enemy_health[:, 0] = 500
+    engine.enemy_alive[:, 0] = True
+    engine.enemy_x[:, 1] = 0
+    engine.enemy_y[:, 1] = 0
+    engine.enemy_z[:, 1] = 0
+    engine.enemy_type[:, 1] = torch.tensor([0, 4])
+    engine.enemy_health[:, 1] = 150
+    engine.enemy_alive[:, 1] = True
+    # Projectile pool slot 1 belongs to monster slot 0. Treating its pool
+    # index as its owner would incorrectly make it pass through enemy slot 1.
+    engine.enemy_projectile_x[:, 1] = -42
+    engine.enemy_projectile_y[:, 1] = 0
+    engine.enemy_projectile_z[:, 1] = 32
+    engine.enemy_projectile_velocity_x[:, 1] = 15
+    engine.enemy_projectile_alive[:, 1] = True
+    engine.enemy_projectile_source_slot[:, 1] = 0
+    active = torch.ones(2, dtype=torch.bool)
+
+    engine._enemy_projectile_tick(active)
+    engine._enemy_projectile_tick(active)
+
+    assert not torch.any(engine.enemy_projectile_alive[:, 1])
+    assert torch.all(engine.enemy_health[:, 1] < 150)
+    assert engine.enemy_target_slot[:, 1].tolist() == [0, 0]
+
+
 def test_monster_damage_switches_targets_until_retaliation_threshold_expires(
     square_scenario,
 ) -> None:
@@ -677,8 +715,9 @@ def test_hell_knight_aims_baron_ball_at_monster_target(square_scenario) -> None:
 
     engine._enemy_tick()
 
-    assert torch.all(engine.enemy_projectile_velocity_x[:, 1] < 0)
-    assert torch.all(engine.enemy_projectile_velocity_y[:, 1] == 0)
+    assert engine.enemy_projectile_source_slot[:, 0].tolist() == [1, 1]
+    assert torch.all(engine.enemy_projectile_velocity_x[:, 0] < 0)
+    assert torch.all(engine.enemy_projectile_velocity_y[:, 0] == 0)
     assert engine.health.tolist() == [100.0, 100.0]
     for _ in range(8):
         engine._enemy_projectile_tick(torch.ones(2, dtype=torch.bool))
@@ -730,7 +769,7 @@ def test_enemy_projectile_only_passes_corpse_after_no_block_frame(
     engine.enemy_death_elapsed[:, 1] = torch.tensor([0, 10])
     engine.enemy_projectile_x[:, 0] = -42
     engine.enemy_projectile_y[:, 0] = 0
-    engine.enemy_projectile_z[:, 0] = 32
+    engine.enemy_projectile_z[:, 0] = 8
     engine.enemy_projectile_velocity_x[:, 0] = 15
     engine.enemy_projectile_alive[:, 0] = True
     active = torch.ones(2, dtype=torch.bool)
@@ -1363,6 +1402,16 @@ def test_solid_corpses_retain_actor_specific_collision_radius(square_scenario) -
     # Demon radius 30 plus player radius 16 overlaps at distance 45. The
     # zombieman corpse in the second lane retains radius 20 and does not.
     assert collision.tolist() == [True, False]
+
+    assert engine._effective_enemy_height()[:, 0].tolist() == [14.0, 14.0]
+    engine.z.fill_(15)
+    vertical_collision = engine._player_collides(
+        torch.zeros(2),
+        torch.zeros(2),
+    )
+    # P_Die quarters both actors' 56-unit live height immediately, so a
+    # player whose feet are at z=15 passes above these still-solid corpses.
+    assert vertical_collision.tolist() == [False, False]
 
 
 def test_zombieman_chase_uses_eight_unit_four_tic_cadence(square_scenario) -> None:
@@ -2158,6 +2207,43 @@ def test_hell_knight_projectile_quantizes_velocity_before_half_step(
         [6139665, 3069833, 2262725],
         [6888036, 2942363, 1963377],
     ]
+
+
+def test_hell_knight_can_own_multiple_projectiles_in_flight(square_scenario) -> None:
+    engine = _engine(square_scenario)
+    engine.enemy_alive.zero_()
+    engine.enemy_x[:, 0] = 100
+    engine.enemy_y[:, 0] = 0
+    engine.enemy_z[:, 0] = 0
+    engine.enemy_type[:, 0] = 5
+    engine.enemy_health[:, 0] = 500
+    engine.enemy_alive[:, 0] = True
+    engine.x.zero_()
+    engine.y.zero_()
+    engine.z.zero_()
+    dx = engine.x[:, None] - engine.enemy_x
+    dy = engine.y[:, None] - engine.enemy_y
+    requested = torch.zeros_like(engine.enemy_alive)
+    requested[:, 0] = True
+
+    engine._spawn_enemy_projectiles(requested, dx, dy)
+    engine._spawn_enemy_projectiles(requested, dx, dy)
+
+    # P_SpawnMissile creates a new BaronBall actor for every attack; the
+    # second shot must not be suppressed merely because its owner still has
+    # a first shot in flight.
+    assert engine.enemy_projectile_alive[:, :2].tolist() == [
+        [True, True],
+        [True, True],
+    ]
+    assert engine.enemy_projectile_source_slot[:, :2].tolist() == [
+        [0, 0],
+        [0, 0],
+    ]
+    assert torch.equal(
+        engine.enemy_projectile_velocity_x[:, 0],
+        engine.enemy_projectile_velocity_x[:, 1],
+    )
 
 
 def test_hell_knight_melee_attack_fires_after_reference_prefire(square_scenario) -> None:

@@ -111,6 +111,8 @@ _PLAYER_RADIUS = 16.0
 _PLAYER_HEIGHT = 56.0
 _PICKUP_RADIUS = 20.0
 _PICKUP_REACH_BELOW = 32.0
+_DROP_HEIGHT = 16.0
+_DROP_GRAVITY_FIXED = _FIXED_UNIT
 _VIEW_HEIGHT = 41.0
 _MUGSHOT_STATE_TICS = 35
 _MUGSHOT_RAMPAGE_DELAY = 70
@@ -915,6 +917,7 @@ class TorchDeathmatchEngine:
     native_screen_width = 320
     native_vertical_aspect = 1.2
     enemy_slots = 64
+    enemy_projectile_slots = 64
     player_projectile_slots = 32
 
     def __init__(
@@ -1107,6 +1110,30 @@ class TorchDeathmatchEngine:
         )
         self.drop_type = torch.full((n, self.enemy_slots), -1, device=device, dtype=torch.int64)
         self.drop_delay = torch.zeros((n, self.enemy_slots), device=device, dtype=torch.int32)
+        self.drop_spawned = torch.zeros(
+            (n, self.enemy_slots), device=device, dtype=torch.bool
+        )
+        self.drop_x = torch.zeros((n, self.enemy_slots), device=device)
+        self.drop_y = torch.zeros((n, self.enemy_slots), device=device)
+        self.drop_z = torch.zeros((n, self.enemy_slots), device=device)
+        self._drop_x_fixed = torch.zeros(
+            (n, self.enemy_slots), device=device, dtype=torch.int64
+        )
+        self._drop_y_fixed = torch.zeros(
+            (n, self.enemy_slots), device=device, dtype=torch.int64
+        )
+        self._drop_z_fixed = torch.zeros(
+            (n, self.enemy_slots), device=device, dtype=torch.int64
+        )
+        self._drop_velocity_x_fixed = torch.zeros(
+            (n, self.enemy_slots), device=device, dtype=torch.int64
+        )
+        self._drop_velocity_y_fixed = torch.zeros(
+            (n, self.enemy_slots), device=device, dtype=torch.int64
+        )
+        self._drop_velocity_z_fixed = torch.zeros(
+            (n, self.enemy_slots), device=device, dtype=torch.int64
+        )
         self.projectile_x = torch.zeros((n, self.player_projectile_slots), device=device)
         self.projectile_y = torch.zeros((n, self.player_projectile_slots), device=device)
         self.projectile_z = torch.zeros((n, self.player_projectile_slots), device=device)
@@ -1128,20 +1155,29 @@ class TorchDeathmatchEngine:
         self.projectile_impact_tics = torch.zeros(
             (n, self.player_projectile_slots), device=device, dtype=torch.int32
         )
-        self.enemy_projectile_x = torch.zeros((n, self.enemy_slots), device=device)
-        self.enemy_projectile_y = torch.zeros((n, self.enemy_slots), device=device)
-        self.enemy_projectile_z = torch.zeros((n, self.enemy_slots), device=device)
-        self.enemy_projectile_velocity_x = torch.zeros((n, self.enemy_slots), device=device)
-        self.enemy_projectile_velocity_y = torch.zeros((n, self.enemy_slots), device=device)
-        self.enemy_projectile_velocity_z = torch.zeros((n, self.enemy_slots), device=device)
+        self.enemy_projectile_x = torch.zeros((n, self.enemy_projectile_slots), device=device)
+        self.enemy_projectile_y = torch.zeros((n, self.enemy_projectile_slots), device=device)
+        self.enemy_projectile_z = torch.zeros((n, self.enemy_projectile_slots), device=device)
+        self.enemy_projectile_velocity_x = torch.zeros(
+            (n, self.enemy_projectile_slots), device=device
+        )
+        self.enemy_projectile_velocity_y = torch.zeros(
+            (n, self.enemy_projectile_slots), device=device
+        )
+        self.enemy_projectile_velocity_z = torch.zeros(
+            (n, self.enemy_projectile_slots), device=device
+        )
         self.enemy_projectile_age = torch.zeros(
-            (n, self.enemy_slots), device=device, dtype=torch.int32
+            (n, self.enemy_projectile_slots), device=device, dtype=torch.int32
         )
         self.enemy_projectile_alive = torch.zeros(
-            (n, self.enemy_slots), device=device, dtype=torch.bool
+            (n, self.enemy_projectile_slots), device=device, dtype=torch.bool
+        )
+        self.enemy_projectile_source_slot = torch.full(
+            (n, self.enemy_projectile_slots), -1, device=device, dtype=torch.int64
         )
         self.enemy_projectile_impact_tics = torch.zeros(
-            (n, self.enemy_slots), device=device, dtype=torch.int32
+            (n, self.enemy_projectile_slots), device=device, dtype=torch.int32
         )
         self.next_spawn_check = torch.zeros(n, device=device, dtype=torch.int32)
         self.item_available = torch.ones(
@@ -1540,6 +1576,16 @@ class TorchDeathmatchEngine:
         self.teleport_fog_tics[mask] = 0
         self.drop_type[mask] = -1
         self.drop_delay[mask] = 0
+        self.drop_spawned[mask] = False
+        self.drop_x[mask] = 0
+        self.drop_y[mask] = 0
+        self.drop_z[mask] = 0
+        self._drop_x_fixed[mask] = 0
+        self._drop_y_fixed[mask] = 0
+        self._drop_z_fixed[mask] = 0
+        self._drop_velocity_x_fixed[mask] = 0
+        self._drop_velocity_y_fixed[mask] = 0
+        self._drop_velocity_z_fixed[mask] = 0
         self.projectile_x[mask] = 0
         self.projectile_y[mask] = 0
         self.projectile_z[mask] = 0
@@ -1559,6 +1605,7 @@ class TorchDeathmatchEngine:
         self.enemy_projectile_velocity_z[mask] = 0
         self.enemy_projectile_age[mask] = 0
         self.enemy_projectile_alive[mask] = False
+        self.enemy_projectile_source_slot[mask] = -1
         self.enemy_projectile_impact_tics[mask] = 0
         self.next_spawn_check.masked_fill_(mask, 1 + _ENEMY_SPAWN_DELAY)
 
@@ -1796,6 +1843,12 @@ class TorchDeathmatchEngine:
             self.enemy_death_type,
         ).clamp_min(0)
 
+    def _effective_enemy_height(self) -> torch.Tensor:
+        enemy_type = self._effective_enemy_type()
+        live_height = self._enemy_height[enemy_type]
+        # P_Die changes the actor height before entering either death state.
+        return torch.where(self.enemy_alive, live_height, live_height * 0.25)
+
     def _player_collides(
         self,
         x: torch.Tensor,
@@ -1816,7 +1869,7 @@ class TorchDeathmatchEngine:
             self.z[:, None],
             _PLAYER_HEIGHT,
             self.enemy_z,
-            self._enemy_height[enemy_type],
+            self._effective_enemy_height(),
         )
         collision |= torch.any(
             self._enemy_solid_mask()
@@ -1851,11 +1904,12 @@ class TorchDeathmatchEngine:
         enemy_type: torch.Tensor,
         *,
         allow_dropoff: bool = False,
+        actor_height: torch.Tensor | None = None,
     ) -> torch.Tensor:
         radius = self._enemy_radius[enemy_type]
         collision = self._points_collide(x, y, radius)
         floor, ceiling, dropoff = self._actor_opening_bounds(x, y, radius)
-        height = self._enemy_height[enemy_type]
+        height = self._enemy_height[enemy_type] if actor_height is None else actor_height
         collision |= floor > self.enemy_z + 24.0
         if not allow_dropoff:
             collision |= dropoff < self.enemy_z - 24.0
@@ -1868,7 +1922,7 @@ class TorchDeathmatchEngine:
             self.enemy_z[:, :, None],
             height[:, :, None],
             self.enemy_z[:, None, :],
-            self._enemy_height[other_type][:, None, :],
+            self._effective_enemy_height()[:, None, :],
         )
         not_self = ~torch.eye(
             self.enemy_slots,
@@ -2467,7 +2521,6 @@ class TorchDeathmatchEngine:
             ~self.enemy_alive
             & (self.enemy_death_tics <= 0)
             & (self.drop_type < 0)
-            & ~self.enemy_projectile_alive
         )
         has_free_slot = torch.any(free, dim=1)
         slot = torch.argmax(free.to(torch.int32), dim=1)
@@ -2610,6 +2663,26 @@ class TorchDeathmatchEngine:
             spawn,
             torch.zeros_like(self.enemy_death_elapsed[row, slot]),
             self.enemy_death_elapsed[row, slot],
+        )
+        self.drop_spawned[row, slot] = torch.where(
+            spawn,
+            torch.zeros_like(self.drop_spawned[row, slot]),
+            self.drop_spawned[row, slot],
+        )
+        self._drop_velocity_x_fixed[row, slot] = torch.where(
+            spawn,
+            torch.zeros_like(self._drop_velocity_x_fixed[row, slot]),
+            self._drop_velocity_x_fixed[row, slot],
+        )
+        self._drop_velocity_y_fixed[row, slot] = torch.where(
+            spawn,
+            torch.zeros_like(self._drop_velocity_y_fixed[row, slot]),
+            self._drop_velocity_y_fixed[row, slot],
+        )
+        self._drop_velocity_z_fixed[row, slot] = torch.where(
+            spawn,
+            torch.zeros_like(self._drop_velocity_z_fixed[row, slot]),
+            self._drop_velocity_z_fixed[row, slot],
         )
         self.enemy_alive[row, slot] |= spawn
 
@@ -3480,6 +3553,10 @@ class TorchDeathmatchEngine:
         self.enemy_move_count.masked_fill_(killed, 0)
         drop = self._monster_drop_type[killed_type]
         self.drop_type.copy_(torch.where(killed, drop, self.drop_type))
+        self.drop_spawned.masked_fill_(killed, False)
+        self._drop_velocity_x_fixed.masked_fill_(killed, 0)
+        self._drop_velocity_y_fixed.masked_fill_(killed, 0)
+        self._drop_velocity_z_fixed.masked_fill_(killed, 0)
         has_drop = killed & (drop >= 0)
         self.drop_delay.copy_(
             torch.where(
@@ -5332,16 +5409,31 @@ class TorchDeathmatchEngine:
         dx: torch.Tensor,
         dy: torch.Tensor,
     ) -> None:
-        spawn = (
-            requested
-            & ~self.enemy_projectile_alive
-            & (self.enemy_projectile_impact_tics <= 0)
+        # P_SpawnMissile creates an independent actor on every call. Allocate
+        # requested sources into the first free projectile slots instead of
+        # coupling projectile index to monster index, which incorrectly
+        # limited each Hell Knight to one in-flight BaronBall.
+        free = ~self.enemy_projectile_alive & (
+            self.enemy_projectile_impact_tics <= 0
         )
-        spawn_z = self.enemy_z + 32.0
-        target_z = self._enemy_target_geometry()[2]
-        dz = target_z - self.enemy_z
-        dx_fixed = torch.round(dx * _FIXED_UNIT).to(torch.int64)
-        dy_fixed = torch.round(dy * _FIXED_UNIT).to(torch.int64)
+        requested_prefix = torch.cumsum(requested.to(torch.int64), dim=1)
+        requested_count = requested_prefix[:, -1]
+        free_rank = torch.cumsum(free.to(torch.int64), dim=1) - 1
+        spawn = free & (free_rank < requested_count[:, None])
+        source_slot = torch.searchsorted(
+            requested_prefix.contiguous(),
+            (free_rank + 1).clamp_min(1),
+            right=False,
+        ).clamp(0, self.enemy_slots - 1)
+        source_x = self.enemy_x.gather(1, source_slot)
+        source_y = self.enemy_y.gather(1, source_slot)
+        source_z = self.enemy_z.gather(1, source_slot)
+        source_dx = dx.gather(1, source_slot)
+        source_dy = dy.gather(1, source_slot)
+        target_z = self._enemy_target_geometry()[2].gather(1, source_slot)
+        dz = target_z - source_z
+        dx_fixed = torch.round(source_dx * _FIXED_UNIT).to(torch.int64)
+        dy_fixed = torch.round(source_dy * _FIXED_UNIT).to(torch.int64)
         dz_fixed = torch.round(dz * _FIXED_UNIT).to(torch.int64)
         aim_norm = torch.sqrt(
             dx_fixed.to(torch.float32) * dx_fixed.to(torch.float32)
@@ -5364,7 +5456,7 @@ class TorchDeathmatchEngine:
         self.enemy_projectile_x.copy_(
             torch.where(
                 spawn,
-                self.enemy_x
+                source_x
                 + (velocity_x_fixed >> 1).to(torch.float32) / _FIXED_UNIT,
                 self.enemy_projectile_x,
             )
@@ -5372,7 +5464,7 @@ class TorchDeathmatchEngine:
         self.enemy_projectile_y.copy_(
             torch.where(
                 spawn,
-                self.enemy_y
+                source_y
                 + (velocity_y_fixed >> 1).to(torch.float32) / _FIXED_UNIT,
                 self.enemy_projectile_y,
             )
@@ -5380,7 +5472,8 @@ class TorchDeathmatchEngine:
         self.enemy_projectile_z.copy_(
             torch.where(
                 spawn,
-                spawn_z
+                source_z
+                + 32.0
                 + (velocity_z_fixed >> 1).to(torch.float32) / _FIXED_UNIT,
                 self.enemy_projectile_z,
             )
@@ -5409,6 +5502,13 @@ class TorchDeathmatchEngine:
         self.enemy_projectile_age.copy_(
             torch.where(
                 spawn, torch.zeros_like(self.enemy_projectile_age), self.enemy_projectile_age
+            )
+        )
+        self.enemy_projectile_source_slot.copy_(
+            torch.where(
+                spawn,
+                source_slot,
+                self.enemy_projectile_source_slot,
             )
         )
         self.enemy_projectile_alive |= spawn
@@ -5448,11 +5548,22 @@ class TorchDeathmatchEngine:
         )
         solid_enemy_type = self._effective_enemy_type()
         solid_enemy = self._enemy_solid_mask()
-        not_source = ~torch.eye(
+        projectile_slot = torch.arange(
+            self.enemy_projectile_slots,
+            device=self.device,
+            dtype=torch.int64,
+        )[None, :]
+        source_slot = torch.where(
+            self.enemy_projectile_source_slot >= 0,
+            self.enemy_projectile_source_slot,
+            projectile_slot,
+        ).clamp(0, self.enemy_slots - 1)
+        enemy_slot = torch.arange(
             self.enemy_slots,
             device=self.device,
-            dtype=torch.bool,
-        )[None, :, :]
+            dtype=torch.int64,
+        )[None, None, :]
+        not_source = enemy_slot != source_slot[:, :, None]
         doll_count = max(len(self.map.player_starts) - 1, 0)
         if doll_count:
             doll_x = self.map.player_starts[:-1, 0]
@@ -5534,7 +5645,7 @@ class TorchDeathmatchEngine:
                 current_z[:, :, None],
                 16.0,
                 self.enemy_z[:, None, :],
-                self._enemy_height[solid_enemy_type][:, None, :],
+                self._effective_enemy_height()[:, None, :],
             )
             enemy_candidate = (
                 enabled[:, :, None]
@@ -5606,7 +5717,7 @@ class TorchDeathmatchEngine:
         impact |= plane_impact
         random_bits = self._random_u32(torch.any(impact, dim=1))[:, None]
         slot_bits = torch.arange(
-            self.enemy_slots,
+            self.enemy_projectile_slots,
             device=self.device,
             dtype=torch.int64,
         )[None, :]
@@ -5662,7 +5773,7 @@ class TorchDeathmatchEngine:
         damage_by_projectile_enemy = torch.zeros(
             (
                 self.num_envs,
-                self.enemy_slots,
+                self.enemy_projectile_slots,
                 self.enemy_slots,
             ),
             device=self.device,
@@ -5677,13 +5788,26 @@ class TorchDeathmatchEngine:
             current_x[:, :, None],
             current_y[:, :, None],
         )
+        monster_damage_by_source = torch.zeros(
+            (
+                self.num_envs,
+                self.enemy_slots,
+                self.enemy_slots,
+            ),
+            device=self.device,
+        )
+        monster_damage_by_source.scatter_add_(
+            1,
+            source_slot[:, :, None].expand_as(damage_by_projectile_enemy),
+            damage_by_projectile_enemy,
+        )
         self._apply_enemy_damage(
-            torch.sum(damage_by_projectile_enemy, dim=1),
+            torch.sum(monster_damage_by_source, dim=1),
             thrust_x_fixed=torch.sum(enemy_thrust_x, dim=1),
             thrust_y_fixed=torch.sum(enemy_thrust_y, dim=1),
             credit_player=False,
             attacker_is_player=False,
-            monster_damage_by_source=damage_by_projectile_enemy,
+            monster_damage_by_source=monster_damage_by_source,
         )
         self.enemy_projectile_x.copy_(
             torch.where(alive, current_x, self.enemy_projectile_x)
@@ -5738,6 +5862,11 @@ class TorchDeathmatchEngine:
             self.enemy_type,
             self.enemy_death_type,
         ).clamp_min(0)
+        actor_height = torch.where(
+            self.enemy_alive,
+            self._enemy_height[actor_type],
+            self._enemy_height[actor_type] * 0.25,
+        )
         proposed_x_fixed = self._enemy_x_fixed + torch.where(
             actor_exists,
             self._enemy_momentum_x_fixed,
@@ -5755,6 +5884,7 @@ class TorchDeathmatchEngine:
             proposed_y,
             actor_type,
             allow_dropoff=True,
+            actor_height=actor_height,
         )
         moved = actor_exists & ~collision
         self._enemy_x_fixed.copy_(
@@ -5773,7 +5903,7 @@ class TorchDeathmatchEngine:
         floor_z_fixed = torch.round(actor_floor * _FIXED_UNIT).to(torch.int64)
         ceiling_z_fixed = torch.round(actor_ceiling * _FIXED_UNIT).to(torch.int64)
         actor_height_fixed = torch.round(
-            self._enemy_height[actor_type] * _FIXED_UNIT
+            actor_height * _FIXED_UNIT
         ).to(torch.int64)
         proposed_z_fixed = self._enemy_z_fixed + torch.where(
             actor_exists,
@@ -6695,8 +6825,236 @@ class TorchDeathmatchEngine:
             )
         )
         self.drop_delay.sub_(1).clamp_min_(0)
-        available = (self.drop_type >= 0) & (self.drop_delay <= 0)
-        touched = available & self._touching(self.enemy_x, self.enemy_y, self.enemy_z)
+
+        # Public coordinates are mutable for tests and advanced callers. Keep
+        # their fixed-point mirrors authoritative only while they still match.
+        visible_enemy_x = self._enemy_x_fixed.to(torch.float32) / _FIXED_UNIT
+        visible_enemy_y = self._enemy_y_fixed.to(torch.float32) / _FIXED_UNIT
+        visible_enemy_z = self._enemy_z_fixed.to(torch.float32) / _FIXED_UNIT
+        self._enemy_x_fixed.copy_(
+            torch.where(
+                self.enemy_x != visible_enemy_x,
+                torch.round(self.enemy_x * _FIXED_UNIT).to(torch.int64),
+                self._enemy_x_fixed,
+            )
+        )
+        self._enemy_y_fixed.copy_(
+            torch.where(
+                self.enemy_y != visible_enemy_y,
+                torch.round(self.enemy_y * _FIXED_UNIT).to(torch.int64),
+                self._enemy_y_fixed,
+            )
+        )
+        self._enemy_z_fixed.copy_(
+            torch.where(
+                self.enemy_z != visible_enemy_z,
+                torch.round(self.enemy_z * _FIXED_UNIT).to(torch.int64),
+                self._enemy_z_fixed,
+            )
+        )
+        visible_drop_x = self._drop_x_fixed.to(torch.float32) / _FIXED_UNIT
+        visible_drop_y = self._drop_y_fixed.to(torch.float32) / _FIXED_UNIT
+        visible_drop_z = self._drop_z_fixed.to(torch.float32) / _FIXED_UNIT
+        self._drop_x_fixed.copy_(
+            torch.where(
+                self.drop_spawned & (self.drop_x != visible_drop_x),
+                torch.round(self.drop_x * _FIXED_UNIT).to(torch.int64),
+                self._drop_x_fixed,
+            )
+        )
+        self._drop_y_fixed.copy_(
+            torch.where(
+                self.drop_spawned & (self.drop_y != visible_drop_y),
+                torch.round(self.drop_y * _FIXED_UNIT).to(torch.int64),
+                self._drop_y_fixed,
+            )
+        )
+        self._drop_z_fixed.copy_(
+            torch.where(
+                self.drop_spawned & (self.drop_z != visible_drop_z),
+                torch.round(self.drop_z * _FIXED_UNIT).to(torch.int64),
+                self._drop_z_fixed,
+            )
+        )
+
+        has_drop = self.drop_type >= 0
+        spawn_drop = has_drop & ~self.drop_spawned & (self.drop_delay <= 0)
+        spawn_lanes = torch.any(spawn_drop, dim=1)
+        random_draws = torch.stack(
+            [self._random_u32(spawn_lanes).clone() for _ in range(5)],
+            dim=1,
+        )
+        slot = torch.arange(
+            self.enemy_slots,
+            device=self.device,
+            dtype=torch.int64,
+        )[None, None, :]
+        mixed = random_draws[:, :, None] ^ (slot * _HASH_GOLDEN_RATIO_SIGNED)
+        mixed = torch.bitwise_xor(mixed, mixed >> 16)
+        random_bytes = torch.bitwise_and(mixed, 255)
+        toss_x_fixed = (random_bytes[:, 0] - random_bytes[:, 1]) << 8
+        toss_y_fixed = (random_bytes[:, 2] - random_bytes[:, 3]) << 8
+        toss_z_fixed = 5 * _FIXED_UNIT + (random_bytes[:, 4] << 10)
+        corpse_type = self.enemy_death_type.clamp(0, len(_ENEMY_HEIGHT) - 1)
+        drop_spawn_z_fixed = self._enemy_z_fixed + torch.round(
+            self._enemy_height[corpse_type] * (0.125 * _FIXED_UNIT)
+        ).to(torch.int64)
+        self._drop_x_fixed.copy_(
+            torch.where(spawn_drop, self._enemy_x_fixed, self._drop_x_fixed)
+        )
+        self._drop_y_fixed.copy_(
+            torch.where(spawn_drop, self._enemy_y_fixed, self._drop_y_fixed)
+        )
+        self._drop_z_fixed.copy_(
+            torch.where(spawn_drop, drop_spawn_z_fixed, self._drop_z_fixed)
+        )
+        self._drop_velocity_x_fixed.copy_(
+            torch.where(spawn_drop, toss_x_fixed, self._drop_velocity_x_fixed)
+        )
+        self._drop_velocity_y_fixed.copy_(
+            torch.where(spawn_drop, toss_y_fixed, self._drop_velocity_y_fixed)
+        )
+        self._drop_velocity_z_fixed.copy_(
+            torch.where(spawn_drop, toss_z_fixed, self._drop_velocity_z_fixed)
+        )
+        self.drop_spawned |= spawn_drop
+        active_drop = has_drop & self.drop_spawned
+
+        current_x = self._drop_x_fixed.to(torch.float32) / _FIXED_UNIT
+        current_y = self._drop_y_fixed.to(torch.float32) / _FIXED_UNIT
+        current_z = self._drop_z_fixed.to(torch.float32) / _FIXED_UNIT
+        old_floor, _old_ceiling = self._actor_opening_at(
+            current_x,
+            current_y,
+            _PICKUP_RADIUS,
+        )
+        old_floor_fixed = torch.round(old_floor * _FIXED_UNIT).to(torch.int64)
+        grounded_before_move = self._drop_z_fixed <= old_floor_fixed
+        proposed_x_fixed = self._drop_x_fixed + torch.where(
+            active_drop,
+            self._drop_velocity_x_fixed,
+            torch.zeros_like(self._drop_velocity_x_fixed),
+        )
+        proposed_y_fixed = self._drop_y_fixed + torch.where(
+            active_drop,
+            self._drop_velocity_y_fixed,
+            torch.zeros_like(self._drop_velocity_y_fixed),
+        )
+        proposed_x = proposed_x_fixed.to(torch.float32) / _FIXED_UNIT
+        proposed_y = proposed_y_fixed.to(torch.float32) / _FIXED_UNIT
+        proposed_floor, proposed_ceiling = self._actor_opening_at(
+            proposed_x,
+            proposed_y,
+            _PICKUP_RADIUS,
+        )
+        horizontal_collision = active_drop & (
+            self._points_collide(proposed_x, proposed_y, _PICKUP_RADIUS)
+            | (proposed_floor > current_z + 24.0)
+            | (
+                proposed_ceiling - torch.maximum(current_z, proposed_floor)
+                < _DROP_HEIGHT
+            )
+        )
+        moved = active_drop & ~horizontal_collision
+        self._drop_x_fixed.copy_(
+            torch.where(moved, proposed_x_fixed, self._drop_x_fixed)
+        )
+        self._drop_y_fixed.copy_(
+            torch.where(moved, proposed_y_fixed, self._drop_y_fixed)
+        )
+        retained_x = torch.where(
+            moved,
+            self._drop_velocity_x_fixed,
+            torch.zeros_like(self._drop_velocity_x_fixed),
+        )
+        retained_y = torch.where(
+            moved,
+            self._drop_velocity_y_fixed,
+            torch.zeros_like(self._drop_velocity_y_fixed),
+        )
+        stopped = (
+            (retained_x > -_ACTOR_STOP_SPEED_FIXED)
+            & (retained_x < _ACTOR_STOP_SPEED_FIXED)
+            & (retained_y > -_ACTOR_STOP_SPEED_FIXED)
+            & (retained_y < _ACTOR_STOP_SPEED_FIXED)
+        )
+        friction_x = torch.where(
+            stopped,
+            torch.zeros_like(retained_x),
+            retained_x * _PLAYER_FRICTION_FIXED >> 16,
+        )
+        friction_y = torch.where(
+            stopped,
+            torch.zeros_like(retained_y),
+            retained_y * _PLAYER_FRICTION_FIXED >> 16,
+        )
+        self._drop_velocity_x_fixed.copy_(
+            torch.where(
+                active_drop & grounded_before_move,
+                friction_x,
+                retained_x,
+            )
+        )
+        self._drop_velocity_y_fixed.copy_(
+            torch.where(
+                active_drop & grounded_before_move,
+                friction_y,
+                retained_y,
+            )
+        )
+
+        moved_x = self._drop_x_fixed.to(torch.float32) / _FIXED_UNIT
+        moved_y = self._drop_y_fixed.to(torch.float32) / _FIXED_UNIT
+        floor, ceiling = self._actor_opening_at(
+            moved_x,
+            moved_y,
+            _PICKUP_RADIUS,
+        )
+        floor_fixed = torch.round(floor * _FIXED_UNIT).to(torch.int64)
+        ceiling_fixed = torch.round(ceiling * _FIXED_UNIT).to(torch.int64)
+        proposed_z_fixed = self._drop_z_fixed + torch.where(
+            active_drop,
+            self._drop_velocity_z_fixed,
+            torch.zeros_like(self._drop_velocity_z_fixed),
+        )
+        above_floor = proposed_z_fixed > floor_fixed
+        next_velocity_z = torch.where(
+            above_floor,
+            self._drop_velocity_z_fixed - _DROP_GRAVITY_FIXED,
+            self._drop_velocity_z_fixed,
+        )
+        hit_floor = proposed_z_fixed <= floor_fixed
+        ceiling_limit_fixed = ceiling_fixed - int(_DROP_HEIGHT * _FIXED_UNIT)
+        hit_ceiling = proposed_z_fixed > ceiling_limit_fixed
+        clipped_z_fixed = torch.minimum(
+            torch.maximum(proposed_z_fixed, floor_fixed),
+            ceiling_limit_fixed,
+        )
+        next_velocity_z = torch.where(
+            hit_floor & (next_velocity_z < 0),
+            torch.zeros_like(next_velocity_z),
+            next_velocity_z,
+        )
+        next_velocity_z = torch.where(
+            hit_ceiling & (next_velocity_z > 0),
+            torch.zeros_like(next_velocity_z),
+            next_velocity_z,
+        )
+        self._drop_z_fixed.copy_(
+            torch.where(active_drop, clipped_z_fixed, self._drop_z_fixed)
+        )
+        self._drop_velocity_z_fixed.copy_(
+            torch.where(
+                active_drop,
+                next_velocity_z,
+                torch.zeros_like(next_velocity_z),
+            )
+        )
+        self.drop_x.copy_(self._drop_x_fixed.to(torch.float32) / _FIXED_UNIT)
+        self.drop_y.copy_(self._drop_y_fixed.to(torch.float32) / _FIXED_UNIT)
+        self.drop_z.copy_(self._drop_z_fixed.to(torch.float32) / _FIXED_UNIT)
+
+        touched = active_drop & self._touching(self.drop_x, self.drop_y, self.drop_z)
         consumed = torch.zeros_like(touched)
         clip = touched & (self.drop_type == 2007)
         clip_success = self._successful_fixed_gain_pickups(clip, self.ammo[:, 1], 5.0, 200.0)
@@ -6715,6 +7073,11 @@ class TorchDeathmatchEngine:
             ammo_cap=200.0,
         )
         self.drop_type.masked_fill_(consumed, -1)
+        self.drop_delay.masked_fill_(consumed, 0)
+        self.drop_spawned.masked_fill_(consumed, False)
+        self._drop_velocity_x_fixed.masked_fill_(consumed, 0)
+        self._drop_velocity_y_fixed.masked_fill_(consumed, 0)
+        self._drop_velocity_z_fixed.masked_fill_(consumed, 0)
         self.bonus_count.copy_(
             torch.where(
                 torch.any(consumed, dim=1),
@@ -7186,13 +7549,13 @@ class TorchDeathmatchEngine:
         map_item_y = self.map.item_spawns[None, :, 1].expand(self.num_envs, -1)
         map_item_z = self._item_z[None, :].expand(self.num_envs, -1)
         map_item_type = self.map.item_visual_types[None, :].expand(self.num_envs, -1)
-        drop_visible = (self.drop_type >= 0) & (self.drop_delay <= 0)
+        drop_visible = (self.drop_type >= 0) & self.drop_spawned
         drop_visual_type = torch.full_like(self.drop_type, 18)
         drop_visual_type = torch.where(self.drop_type == 2007, 12, drop_visual_type)
         drop_visual_type = torch.where(self.drop_type == 2002, 20, drop_visual_type)
-        actor_x = torch.cat((actor_x, map_item_x, self.enemy_x), dim=1)
-        actor_y = torch.cat((actor_y, map_item_y, self.enemy_y), dim=1)
-        actor_z = torch.cat((actor_z, map_item_z, self.enemy_z), dim=1)
+        actor_x = torch.cat((actor_x, map_item_x, self.drop_x), dim=1)
+        actor_y = torch.cat((actor_y, map_item_y, self.drop_y), dim=1)
+        actor_z = torch.cat((actor_z, map_item_z, self.drop_z), dim=1)
         actor_alive = torch.cat((actor_alive, self.item_available, drop_visible), dim=1)
         actor_type = torch.cat((actor_type, map_item_type, drop_visual_type), dim=1)
         dx = actor_x - self.x[:, None]
@@ -8106,16 +8469,16 @@ class TorchDeathmatchEngine:
                 dim=1,
             )
 
-        drop_visible = (self.drop_type >= 0) & (self.drop_delay <= 0)
+        drop_visible = (self.drop_type >= 0) & self.drop_spawned
         drop_sprite = static[12].expand_as(self.drop_type)
         drop_sprite = torch.where(self.drop_type == 2007, static[6], drop_sprite)
         drop_sprite = torch.where(self.drop_type == 2002, static[14], drop_sprite)
         drop_slots = torch.nonzero(torch.any(drop_visible, dim=0)).flatten()
         if drop_slots.numel():
             visible_drop_sprite = drop_sprite[:, drop_slots]
-            actor_x = torch.cat((actor_x, self.enemy_x[:, drop_slots]), dim=1)
-            actor_y = torch.cat((actor_y, self.enemy_y[:, drop_slots]), dim=1)
-            actor_z = torch.cat((actor_z, self.enemy_z[:, drop_slots]), dim=1)
+            actor_x = torch.cat((actor_x, self.drop_x[:, drop_slots]), dim=1)
+            actor_y = torch.cat((actor_y, self.drop_y[:, drop_slots]), dim=1)
+            actor_z = torch.cat((actor_z, self.drop_z[:, drop_slots]), dim=1)
             actor_alive = torch.cat((actor_alive, drop_visible[:, drop_slots]), dim=1)
             actor_sprite = torch.cat((actor_sprite, visible_drop_sprite), dim=1)
             actor_fullbright = torch.cat(
