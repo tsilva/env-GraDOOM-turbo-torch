@@ -287,6 +287,13 @@ def test_native_walls_use_reference_half_open_screen_bounds(
     # Sector 8's next geometric boundary is nearer than sector 0's, so the
     # endpoint portal continues into it and exposes the lower COMPBLUE wall.
     assert rgb[0, 100, 76].tolist() == [0, 0, 107]
+    # At this shared vertex, solid wall 196 and portal 186 are both projected
+    # endpoint-only spans. The solid's line depth rounds slightly nearer, so
+    # traversal retains the prior depth and exposes its BRICK12 column.
+    assert not geometric_intersections[0, 110, 186]
+    assert not geometric_intersections[0, 110, 196]
+    assert wall_distance[0, 110, 196] < wall_distance[0, 110, 186]
+    assert rgb[0, 82, 110].tolist() == [159, 135, 111]
     assert rgb[0, 40, 90].tolist() == [95, 75, 55]
 
 

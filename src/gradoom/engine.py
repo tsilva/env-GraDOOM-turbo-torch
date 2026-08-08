@@ -8776,7 +8776,7 @@ class TorchDeathmatchEngine:
                 floor_update,
                 floor_clip,
             )
-            previous_distance = torch.where(valid, distance, previous_distance)
+            prior_distance = previous_distance
             endpoint_only_portal = valid & ~one_sided & ~geometric_intersection
             # A projected endpoint can reveal the adjacent sector without the
             # column ray crossing the portal segment. Continue on the side
@@ -8811,10 +8811,66 @@ class TorchDeathmatchEngine:
                 & (other_sector >= 0)
                 & (other_next_distance < current_next_distance)
             )
+            # Two projected spans meeting at one map vertex can straddle in
+            # infinite-line depth even though Doom clips them as one corner.
+            # Rewind only for a terminal solid on the other side; allowing a
+            # second portal here would re-route shared-vertex traversal.
+            selected_wall = self.map.portal_walls[wall_index]
+            all_wall_starts = self.map.portal_walls[None, None, :, :2]
+            all_wall_ends = self.map.portal_walls[None, None, :, 2:]
+            selected_start = selected_wall[:, :, None, :2]
+            selected_end = selected_wall[:, :, None, 2:]
+            shares_endpoint = (
+                torch.all(all_wall_starts == selected_start, dim=3)
+                | torch.all(all_wall_starts == selected_end, dim=3)
+                | torch.all(all_wall_ends == selected_start, dim=3)
+                | torch.all(all_wall_ends == selected_end, dim=3)
+            )
+            shared_solid = (
+                torch.isfinite(distances)
+                & (all_sectors[None, None, :, 1] < 0)
+                & shares_endpoint
+                & (distances > prior_distance[:, :, None] + 1e-3)
+                & (distances <= distance[:, :, None] + 1e-3)
+            )
+            current_shared_distance = torch.min(
+                torch.where(
+                    incident & shared_solid,
+                    distances,
+                    torch.full_like(distances, torch.inf),
+                ),
+                dim=2,
+            ).values
+            other_shared_distance = torch.min(
+                torch.where(
+                    other_incident & shared_solid,
+                    distances,
+                    torch.full_like(distances, torch.inf),
+                ),
+                dim=2,
+            ).values
+            endpoint_enters_shared = (
+                endpoint_only_portal
+                & (other_sector >= 0)
+                & (other_shared_distance < current_shared_distance)
+            )
+            previous_distance = torch.where(
+                valid,
+                torch.where(
+                    endpoint_enters_shared & (other_shared_distance < distance),
+                    prior_distance,
+                    distance,
+                ),
+                prior_distance,
+            )
             current_sector = torch.where(
                 valid
                 & ~one_sided
-                & (geometric_intersection | endpoint_enters_other),
+                & (
+                    geometric_intersection
+                    | endpoint_enters_other
+                    | endpoint_enters_shared
+                ),
                 other_sector,
                 torch.where(
                     endpoint_only_portal,
