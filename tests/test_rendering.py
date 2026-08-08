@@ -181,7 +181,9 @@ def test_native_portal_clips_bound_solid_wall_against_planes(
         engine._current_sector(),
         engine.view_z,
     )
-    wall_distance, _wall_along = engine._native_portal_intersections()
+    wall_distance, _wall_along, _geometric_intersections = (
+        engine._native_portal_intersections()
+    )
     frame, _scene_depth = engine._native_render_portal_walls(
         flat_frame.clone(),
         engine.view_z,
@@ -235,7 +237,7 @@ def test_native_walls_use_reference_fixed_vertical_sampling(
     assert rgb[0, 1, 40].tolist() == [131, 107, 87]
 
 
-def test_native_solid_walls_use_reference_half_open_screen_bounds(
+def test_native_walls_use_reference_half_open_screen_bounds(
     pinned_deathmatch_scenario,
 ) -> None:
     engine = TorchDeathmatchEngine(
@@ -251,7 +253,9 @@ def test_native_solid_walls_use_reference_half_open_screen_bounds(
     engine.angle.fill_(math.radians(165.67382816357394))
     engine.episode_time.fill_(17)
 
-    wall_distance, _wall_along = engine._native_portal_intersections()
+    wall_distance, _wall_along, geometric_intersections = (
+        engine._native_portal_intersections()
+    )
     frame, surface_depth = engine._native_render_flats(
         engine._current_sector(),
         engine.view_z,
@@ -273,7 +277,13 @@ def test_native_solid_walls_use_reference_half_open_screen_bounds(
     # R_AddLine rejects this one-sided linedef's back face. Sector 0 is
     # non-convex, so incidence alone would incorrectly expose BIGBRIK1 here.
     assert torch.isinf(wall_distance[0, 76, 8])
+    # Portal 163 owns this projected endpoint column even though the column's
+    # geometric ray misses its segment. Its upper tier renders COMPBLUE, but
+    # it must not move traversal into sector 8.
+    assert torch.isfinite(wall_distance[0, 76, 163])
+    assert not geometric_intersections[0, 76, 163]
     assert rgb[0, 40, 67].tolist() == [0, 0, 71]
+    assert rgb[0, 40, 76].tolist() == [0, 0, 35]
     assert rgb[0, 40, 90].tolist() == [95, 75, 55]
 
 

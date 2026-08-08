@@ -8405,7 +8405,7 @@ class TorchDeathmatchEngine:
 
     def _native_portal_intersections(
         self,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         direction = self._native_wall_ray_directions()
         origin = torch.stack((self.x, self.y), dim=-1)[:, None, None, :]
         start = self.map.portal_walls[None, None, :, :2]
@@ -8507,16 +8507,18 @@ class TorchDeathmatchEngine:
             segment[..., 0] * viewer_from_start[..., 1]
             - segment[..., 1] * viewer_from_start[..., 0]
         ) < 0
-        valid = torch.where(
-            one_sided[None, None, :],
+        projected_valid = (
             (denominator.abs() >= 1e-6)
             & (distance > 0)
             & screen_valid
-            & front_facing,
-            geometric_valid,
+        )
+        valid = torch.where(
+            one_sided[None, None, :],
+            projected_valid & front_facing,
+            geometric_valid | projected_valid,
         )
         distance = torch.where(valid, distance, torch.full_like(distance, torch.inf))
-        return distance, along.clamp(0, 1)
+        return distance, along.clamp(0, 1), geometric_valid
 
     def _native_render_portal_walls(
         self,
@@ -8529,7 +8531,9 @@ class TorchDeathmatchEngine:
             focal_length
         )
         flat_center = center + 0.5
-        distances, wall_along = self._native_portal_intersections()
+        distances, wall_along, geometric_intersections = (
+            self._native_portal_intersections()
+        )
         wall_vertical_steps = self._native_wall_vertical_steps()
         filled = torch.zeros_like(frame, dtype=torch.bool)
         scene_depth = surface_depth.clone()
@@ -8561,6 +8565,10 @@ class TorchDeathmatchEngine:
             distance, wall_index = torch.min(candidates, dim=2)
             valid = torch.isfinite(distance)
             along = wall_along.gather(2, wall_index[:, :, None]).squeeze(2)
+            geometric_intersection = geometric_intersections.gather(
+                2,
+                wall_index[:, :, None],
+            ).squeeze(2)
             sectors = self.map.portal_wall_sectors[wall_index]
             front = sectors[..., 0]
             back = sectors[..., 1]
@@ -8769,10 +8777,15 @@ class TorchDeathmatchEngine:
                 floor_clip,
             )
             previous_distance = torch.where(valid, distance, previous_distance)
+            endpoint_only_portal = valid & ~one_sided & ~geometric_intersection
             current_sector = torch.where(
-                valid & (other_sector >= 0),
+                valid & ~one_sided & geometric_intersection,
                 other_sector,
-                torch.full_like(current_sector, -1),
+                torch.where(
+                    endpoint_only_portal,
+                    current_sector,
+                    torch.full_like(current_sector, -1),
+                ),
             )
         return frame, scene_depth
 
