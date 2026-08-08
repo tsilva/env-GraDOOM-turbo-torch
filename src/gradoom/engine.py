@@ -8444,8 +8444,12 @@ class TorchDeathmatchEngine:
         current_sector = (
             self._current_sector()[:, None].expand(-1, self.native_screen_width).clone()
         )
-        # R_ClearPlanes starts every column with an open ceiling clip.
+        # R_ClearPlanes starts every column with open ceiling/floor clips.
         ceiling_clip = torch.zeros_like(current_sector, dtype=torch.float32)
+        floor_clip = torch.full_like(
+            ceiling_clip,
+            float(self.native_view_height),
+        )
         previous_distance = torch.zeros_like(current_sector, dtype=torch.float32)
         all_sectors = self.map.portal_wall_sectors
         for _ in range(32):
@@ -8487,19 +8491,26 @@ class TorchDeathmatchEngine:
             one_top = project(view_ceiling)
             one_bottom = project(view_floor)
             lower_top = project(other_floor)
-            lower_bottom = project(view_floor)
             upper_bottom = project(other_ceiling)
             clipped_top = torch.maximum(one_top, ceiling_clip)
-            clipped_upper_bottom = torch.maximum(upper_bottom, clipped_top)
+            clipped_bottom = torch.minimum(one_bottom, floor_clip)
+            clipped_upper_bottom = torch.maximum(
+                torch.minimum(upper_bottom, floor_clip),
+                clipped_top,
+            )
+            clipped_lower_top = torch.minimum(
+                torch.maximum(lower_top, ceiling_clip),
+                clipped_bottom,
+            )
             one_span = (
                 (one_sided & valid)[:, None, :]
                 & (pixel_y >= clipped_top[:, None, :])
-                & (pixel_y <= one_bottom[:, None, :])
+                & (pixel_y <= clipped_bottom[:, None, :])
             )
             lower_span = (
                 (~one_sided & valid & (view_floor < other_floor))[:, None, :]
-                & (pixel_y >= lower_top[:, None, :])
-                & (pixel_y <= lower_bottom[:, None, :])
+                & (pixel_y >= clipped_lower_top[:, None, :])
+                & (pixel_y <= clipped_bottom[:, None, :])
             )
             upper_span = (
                 (~one_sided & valid & (view_ceiling > other_ceiling))[:, None, :]
@@ -8637,6 +8648,31 @@ class TorchDeathmatchEngine:
                 valid & ~one_sided & (draws_upper | mark_ceiling),
                 ceiling_update,
                 ceiling_clip,
+            )
+            # The matching floorclip boundary prevents lower wall tiers behind
+            # a nearer portal from bleeding over the front sector's flat.
+            has_lower_texture = side_textures[..., 1] >= 0
+            draws_lower = (view_floor < other_floor) & has_lower_texture
+            mark_floor = (
+                (view_floor != other_floor)
+                | (
+                    self.map.sector_floor_texture_ids[current]
+                    != self.map.sector_floor_texture_ids[safe_other]
+                )
+                | (
+                    self.map.sector_lights[current]
+                    != self.map.sector_lights[safe_other]
+                )
+            )
+            floor_update = torch.where(
+                draws_lower,
+                clipped_lower_top,
+                clipped_bottom,
+            )
+            floor_clip = torch.where(
+                valid & ~one_sided & (draws_lower | mark_floor),
+                floor_update,
+                floor_clip,
             )
             previous_distance = torch.where(valid, distance, previous_distance)
             current_sector = torch.where(

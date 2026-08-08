@@ -161,7 +161,7 @@ def test_native_walls_use_reference_fine_angle_rays(
     assert rgb[0, 0, 272].tolist() == [43, 35, 15]
 
 
-def test_native_one_sided_wall_owns_ceiling_boundary_over_flat_depth(
+def test_native_portal_clips_bound_solid_wall_against_planes(
     pinned_deathmatch_scenario,
 ) -> None:
     engine = TorchDeathmatchEngine(
@@ -197,6 +197,10 @@ def test_native_one_sided_wall_owns_ceiling_boundary_over_flat_depth(
     assert flat_rgb[0, 37, 137].tolist() == [0, 0, 0]
     assert rgb[0, 35, 118].tolist() == [0, 0, 23]
     assert rgb[0, 37, 137].tolist() == [159, 135, 111]
+    # The accumulated floor clip keeps a farther red lower wall behind this
+    # front-sector flat, matching the inverse operation at the ceiling edge.
+    assert flat_rgb[0, 122, 260].tolist() == [83, 63, 47]
+    assert rgb[0, 122, 260].tolist() == [83, 63, 47]
 
 
 def test_native_walls_use_reference_fixed_vertical_sampling(
