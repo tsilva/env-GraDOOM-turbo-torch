@@ -8444,6 +8444,8 @@ class TorchDeathmatchEngine:
         current_sector = (
             self._current_sector()[:, None].expand(-1, self.native_screen_width).clone()
         )
+        # R_ClearPlanes starts every column with an open ceiling clip.
+        ceiling_clip = torch.zeros_like(current_sector, dtype=torch.float32)
         previous_distance = torch.zeros_like(current_sector, dtype=torch.float32)
         all_sectors = self.map.portal_wall_sectors
         for _ in range(32):
@@ -8486,11 +8488,12 @@ class TorchDeathmatchEngine:
             one_bottom = project(view_floor)
             lower_top = project(other_floor)
             lower_bottom = project(view_floor)
-            upper_top = project(view_ceiling)
             upper_bottom = project(other_ceiling)
+            clipped_top = torch.maximum(one_top, ceiling_clip)
+            clipped_upper_bottom = torch.maximum(upper_bottom, clipped_top)
             one_span = (
                 (one_sided & valid)[:, None, :]
-                & (pixel_y >= one_top[:, None, :])
+                & (pixel_y >= clipped_top[:, None, :])
                 & (pixel_y <= one_bottom[:, None, :])
             )
             lower_span = (
@@ -8500,8 +8503,8 @@ class TorchDeathmatchEngine:
             )
             upper_span = (
                 (~one_sided & valid & (view_ceiling > other_ceiling))[:, None, :]
-                & (pixel_y >= upper_top[:, None, :])
-                & (pixel_y <= upper_bottom[:, None, :])
+                & (pixel_y >= clipped_top[:, None, :])
+                & (pixel_y <= clipped_upper_bottom[:, None, :])
             )
             side_textures = self.map.portal_side_texture_ids[wall_index, side_index]
             texture_id = torch.where(
@@ -8609,6 +8612,32 @@ class TorchDeathmatchEngine:
             frame = torch.where(span, wall_value, frame)
             scene_depth = torch.where(span, distance[:, None, :], scene_depth)
             filled |= span
+            # R_RenderSegLoop tightens ceilingclip at every marked portal, even
+            # if that portal has no upper texture. This keeps a farther solid
+            # wall from leaking above the nearer sector's ceiling boundary.
+            has_upper_texture = side_textures[..., 2] >= 0
+            draws_upper = (view_ceiling > other_ceiling) & has_upper_texture
+            mark_ceiling = (
+                (view_ceiling != other_ceiling)
+                | (
+                    self.map.sector_ceiling_texture_ids[current]
+                    != self.map.sector_ceiling_texture_ids[safe_other]
+                )
+                | (
+                    self.map.sector_lights[current]
+                    != self.map.sector_lights[safe_other]
+                )
+            )
+            ceiling_update = torch.where(
+                draws_upper,
+                clipped_upper_bottom,
+                clipped_top,
+            )
+            ceiling_clip = torch.where(
+                valid & ~one_sided & (draws_upper | mark_ceiling),
+                ceiling_update,
+                ceiling_clip,
+            )
             previous_distance = torch.where(valid, distance, previous_distance)
             current_sector = torch.where(
                 valid & (other_sector >= 0),

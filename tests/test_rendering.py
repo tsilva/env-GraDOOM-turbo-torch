@@ -195,6 +195,7 @@ def test_native_one_sided_wall_owns_ceiling_boundary_over_flat_depth(
     # must not leave a black diagonal hole through the BIGBRIK1 wall.
     assert wall_distance[0, 137, 196] > surface_depth[0, 37, 137]
     assert flat_rgb[0, 37, 137].tolist() == [0, 0, 0]
+    assert rgb[0, 35, 118].tolist() == [0, 0, 23]
     assert rgb[0, 37, 137].tolist() == [159, 135, 111]
 
 
