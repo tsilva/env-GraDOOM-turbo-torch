@@ -439,6 +439,33 @@ def test_native_portal_clips_bound_solid_wall_against_planes(
     assert scene_depth[0, 124, 290].item() == pytest.approx(458.92681884765625)
 
 
+def test_native_sector_lookup_ignores_self_referencing_linedef(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([456]))
+    engine.x.fill_(-143.1327362060547)
+    engine.y.fill_(246.9293975830078)
+    engine.z.zero_()
+    engine.view_z.fill_(41)
+    angle_degrees = 165.67382816357394
+    engine.angle.fill_(math.radians(angle_degrees))
+    engine._angle_bam.fill_(round(angle_degrees / 360.0 * (1 << 32)))
+    engine.episode_time.fill_(81)
+
+    # Linedef 52 has sector 11 on both sides. It carries a visible masked
+    # texture elsewhere, but treating it as polygon boundary makes this valid
+    # outer-room position fall through to sector 0 and removes wall 48.
+    assert engine._current_sector().item() == 11
+    frame = engine.render_native_frame(include_hud=False)[0]
+    assert frame[50, 100].tolist() == [51, 43, 19]
+    assert frame[100, 100].tolist() == [47, 27, 11]
+
+
 def test_native_repaired_visplane_depth_occludes_drops(
     pinned_deathmatch_scenario,
 ) -> None:

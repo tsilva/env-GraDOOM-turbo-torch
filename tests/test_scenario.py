@@ -60,6 +60,8 @@ def test_pinned_deathmatch_compiles_external_doom2_data() -> None:
     ]
     assert (scenario.wall_texture_ids[scenario.blocking_wall_indices] >= 0).all()
     assert scenario.sector_edge_mask.shape == (14, 215)
+    assert scenario.wall_sectors[52].tolist() == [11, 11]
+    assert not scenario.sector_edge_mask[11, 52]
     assert scenario.sector_floor_texture_ids.shape == (14,)
     assert scenario.sector_ceiling_texture_ids.shape == (14,)
     assert len(scenario.sprite_names) == 26

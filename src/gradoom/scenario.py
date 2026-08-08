@@ -821,6 +821,11 @@ def compile_deathmatch_scenario(
     )
     sector_edge_mask = np.zeros((len(sectors), len(linedefs)), dtype=np.bool_)
     for line_index, (front_sector, back_sector) in enumerate(wall_sectors):
+        # A self-referencing linedef can carry a masked middle texture, but it
+        # does not bound the sector that appears on both sides. Counting it in
+        # the odd/even polygon test cuts a false hole out of that sector.
+        if front_sector >= 0 and front_sector == back_sector:
+            continue
         if front_sector >= 0:
             sector_edge_mask[front_sector, line_index] = True
         if back_sector >= 0:
