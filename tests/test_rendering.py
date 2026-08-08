@@ -35,10 +35,10 @@ def test_doom_sprite_rotation_uses_actor_to_viewer_angle() -> None:
 
 
 def test_enemy_fullbright_matches_actor_attack_states() -> None:
-    enemy_type = torch.tensor((0, 1, 1, 3, 3, 3))
-    attack_phase = torch.tensor((2, 2, 2, 2, 3, 3))
-    cooldown = torch.tensor((16, 20, 10, 4, 5, 1))
-    attack_recovery = torch.tensor((16, 20, 20, 4, 4, 4))
+    enemy_type = torch.tensor((0, 1, 1, 3, 3, 3, 3, 3, 3))
+    attack_phase = torch.tensor((2, 2, 2, 2, 3, 3, 4, 1, 1))
+    cooldown = torch.tensor((16, 20, 10, 4, 4, 1, 1, 1, 10))
+    attack_recovery = torch.tensor((16, 20, 20, 4, 4, 4, 4, 4, 4))
 
     fullbright = TorchDeathmatchEngine._native_enemy_fullbright(
         enemy_type,
@@ -48,9 +48,57 @@ def test_enemy_fullbright_matches_actor_attack_states() -> None:
     )
 
     # Zombieman's POSS F state is not BRIGHT. ShotgunGuy's SPOS F and
-    # ChaingunGuy's CPOS F/E firing states are; their recovery/refire states
-    # are not.
-    assert fullbright.tolist() == [False, True, False, True, True, False]
+    # ChaingunGuy's CPOS F/E firing states are. The one-tic CPOS F
+    # A_CPosRefire gap and the initial CPOS E prefire state are not.
+    assert fullbright.tolist() == [
+        False,
+        True,
+        False,
+        True,
+        True,
+        True,
+        False,
+        False,
+        False,
+    ]
+
+
+def test_chaingunner_refire_gap_uses_nonbright_f_frame(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([123]))
+    engine.x.zero_()
+    engine.y.zero_()
+    engine.enemy_x[:, 0] = 64
+    engine.enemy_y[:, 0] = 0
+    engine.enemy_angle[:, 0] = 0
+    engine.enemy_type[:, 0] = 3
+    engine.enemy_alive[:, 0] = True
+
+    # CPOS E 4 BRIGHT A_CPosAttack remains visible until A_CPosRefire.
+    engine.enemy_attack_phase[:, 0] = 3
+    engine.enemy_cooldown[:, 0] = 1
+    firing_e = engine._native_enemy_sprite_ids()[0, 0]
+
+    # The final tic of the initial CPOS E prefire remains E as well.
+    engine.enemy_attack_phase[:, 0] = 1
+    engine.enemy_cooldown[:, 0] = 1
+    prefire_e = engine._native_enemy_sprite_ids()[0, 0]
+
+    # After the refire action, CPOS F remains for one non-BRIGHT tic before
+    # Goto Missile+1 enters the next CPOS F attack state.
+    engine.enemy_attack_phase[:, 0] = 4
+    engine.enemy_cooldown[:, 0] = 1
+    refire_f = engine._native_enemy_sprite_ids()[0, 0]
+
+    assert firing_e == engine.map.enemy_attack_sprite_ids[3, 2, 4]
+    assert prefire_e == engine.map.enemy_attack_sprite_ids[3, 0, 4]
+    assert refire_f == engine.map.enemy_attack_sprite_ids[3, 1, 4]
 
 
 def test_native_enemy_rotation_matches_vizdoom_summoned_pose(

@@ -5551,6 +5551,18 @@ class TorchDeathmatchEngine:
         threshold = self._enemy_missile_threshold(enemy_type, dx, dy)
         return candidates & (roll >= threshold)
 
+    def _enemy_chaingun_refire_decision(
+        self,
+        candidates: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return the 40/256 A_CPosRefire bypass decision per actor."""
+
+        random_bits = self._random_u32(torch.any(candidates, dim=1))[:, None]
+        slot = torch.arange(self.enemy_slots, device=self.device, dtype=torch.int64)[None, :]
+        mixed = random_bits ^ (slot * _HASH_GOLDEN_RATIO_SIGNED)
+        mixed ^= mixed >> 16
+        return candidates & (torch.bitwise_and(mixed, 255) < 40)
+
     def _spawn_enemy_projectiles(
         self,
         requested: torch.Tensor,
@@ -6471,16 +6483,24 @@ class TorchDeathmatchEngine:
         phase_one_due = phase_due & (attack_phase == 1)
         phase_two_due = phase_due & (attack_phase == 2)
         phase_three_due = phase_due & (attack_phase == 3)
+        phase_four_due = phase_due & (attack_phase == 4)
         finite_type = (enemy_type == 0) | (enemy_type == 1) | (enemy_type == 4) | (enemy_type == 5)
         chainsaw_target = melee_target
-        chaingun_target = line_of_sight & (
-            distance < self._enemy_attack_range[enemy_type]
+        chainsaw_action = phase_one_due & (enemy_type == 2)
+        second_prefire_face = (
+            alive
+            & (attack_phase == 1)
+            & ((enemy_type == 4) | (enemy_type == 5))
+            & (self.enemy_cooldown == 9)
         )
         finite_fire = phase_one_due & finite_type
-        chainsaw_fire = phase_one_due & (enemy_type == 2) & chainsaw_target
+        chainsaw_fire = chainsaw_action & chainsaw_target
         chaingun_fire = (enemy_type == 3) & (
-            phase_one_due | phase_two_due | (phase_three_due & chaingun_target)
+            phase_one_due | phase_two_due | phase_four_due
         )
+        chaingun_refire = phase_three_due & (enemy_type == 3)
+        random_refire = self._enemy_chaingun_refire_decision(chaingun_refire)
+        chaingun_continue = chaingun_refire & (random_refire | line_of_sight)
         fire_event = finite_fire | chainsaw_fire | chaingun_fire
         knight_projectile = fire_event & (enemy_type == 5) & ~melee_target
         self._spawn_enemy_projectiles(knight_projectile, dx, dy)
@@ -6640,7 +6660,9 @@ class TorchDeathmatchEngine:
             next_cooldown,
         )
 
-        chaingun_first = phase_one_due & (enemy_type == 3)
+        # Phase 1 is the initial E prefire. Phase 4 is the one-tic, non-BRIGHT
+        # F gap left by A_CPosRefire; both enter the first bright F shot.
+        chaingun_first = (phase_one_due | phase_four_due) & (enemy_type == 3)
         next_phase = torch.where(
             chaingun_first,
             torch.full_like(next_phase, 2),
@@ -6659,15 +6681,16 @@ class TorchDeathmatchEngine:
         )
         next_cooldown = torch.where(
             chaingun_second,
-            torch.full_like(next_cooldown, 5),
+            self._enemy_attack_recovery[enemy_type],
             next_cooldown,
         )
-        chaingun_refire = phase_three_due & (enemy_type == 3)
+        # Phase 3 retains the second bright E shot for four tics. Its due
+        # action is A_CPosRefire, not another attack.
         next_phase = torch.where(
             chaingun_refire,
             torch.where(
-                chaingun_target,
-                torch.full_like(next_phase, 2),
+                chaingun_continue,
+                torch.full_like(next_phase, 4),
                 torch.zeros_like(next_phase),
             ),
             next_phase,
@@ -6675,8 +6698,8 @@ class TorchDeathmatchEngine:
         next_cooldown = torch.where(
             chaingun_refire,
             torch.where(
-                chaingun_target,
-                self._enemy_attack_recovery[enemy_type],
+                chaingun_continue,
+                torch.ones_like(next_cooldown),
                 torch.zeros_like(next_cooldown),
             ),
             next_cooldown,
@@ -6786,8 +6809,20 @@ class TorchDeathmatchEngine:
                 ),
             )
         )
-        face_target = can_attack | (fire_event & hitscan_type)
-        target_angle = target_bam_angle.to(torch.float32) * _BAM_TO_RADIANS
+        action_faces_target = (fire_event & (enemy_type != 5)) | chainsaw_action
+        face_target = (
+            can_attack
+            | action_faces_target
+            | chaingun_refire
+            | second_prefire_face
+        )
+        chainsaw_hit = direct_attack & (enemy_type == 2)
+        facing_bam_angle = torch.where(
+            chainsaw_hit,
+            (target_bam_angle + (_ANGLE_90 // 20)) & _UINT32_MASK,
+            target_bam_angle,
+        )
+        target_angle = facing_bam_angle.to(torch.float32) * _BAM_TO_RADIANS
         self.enemy_angle.copy_(
             torch.where(
                 face_target,
@@ -8240,15 +8275,18 @@ class TorchDeathmatchEngine:
             attack_frame,
         )
         attack_frame = torch.where(
+            (enemy_type == 3) & (phase == 4),
+            torch.ones_like(attack_frame),
+            attack_frame,
+        )
+        attack_frame = torch.where(
             (enemy_type == 3) & (phase == 2),
             torch.ones_like(attack_frame),
             attack_frame,
         )
         attack_frame = torch.where(
             (enemy_type == 3) & (phase == 3),
-            torch.where(
-                cooldown > 1, torch.full_like(attack_frame, 2), torch.ones_like(attack_frame)
-            ),
+            torch.full_like(attack_frame, 2),
             attack_frame,
         )
         walk = self.map.enemy_walk_sprite_ids[enemy_type, walk_frame, rotation]
@@ -8314,8 +8352,7 @@ class TorchDeathmatchEngine:
             cooldown > (attack_recovery // 2)
         )
         chaingun_muzzle = (enemy_type == 3) & (
-            (attack_phase == 2)
-            | ((attack_phase == 3) & (cooldown > 1))
+            (attack_phase == 2) | (attack_phase == 3)
         )
         return shotgun_muzzle | chaingun_muzzle
 

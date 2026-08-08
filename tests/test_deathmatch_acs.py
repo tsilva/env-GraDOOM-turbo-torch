@@ -1718,6 +1718,96 @@ def test_monster_face_target_uses_vizdoom_fixed_point_angle(square_scenario) -> 
     assert engine._fine_angle_index(engine.enemy_angle[:, 0]).tolist() == [432, 432]
 
 
+def test_demon_and_knight_repeat_face_target_on_second_prefire_frame(
+    square_scenario,
+) -> None:
+    engine = _engine(square_scenario)
+    engine.enemy_alive.zero_()
+    engine.enemy_x[:, 0].zero_()
+    engine.enemy_y[:, 0].zero_()
+    engine._enemy_x_fixed[:, 0].zero_()
+    engine._enemy_y_fixed[:, 0].zero_()
+    engine.enemy_angle[:, 0].zero_()
+    engine.enemy_type[:, 0] = torch.tensor([4, 5])
+    engine.enemy_health[:, 0] = torch.tensor([150.0, 500.0])
+    engine.enemy_alive[:, 0] = True
+    engine.enemy_target_slot[:, 0] = -1
+    engine.enemy_attack_phase[:, 0] = 1
+    engine.enemy_cooldown[:, 0] = 16
+    engine.x.zero_()
+    engine.y.fill_(100)
+    engine._x_fixed.zero_()
+    engine._y_fixed.fill_(100 * 65536)
+
+    for _ in range(7):
+        engine._enemy_tick()
+    assert torch.equal(engine.enemy_angle[:, 0], torch.zeros(2))
+
+    engine._enemy_tick()
+
+    north_bam = engine._doom_bam_angle(
+        torch.zeros(2, dtype=torch.int64),
+        torch.full((2,), 100 * 65536, dtype=torch.int64),
+    )
+    north = north_bam.to(torch.float32) * (2.0 * math.pi / float(1 << 32))
+    assert torch.allclose(engine.enemy_angle[:, 0], north, rtol=0, atol=1e-7)
+
+    engine.x.fill_(-100)
+    engine.y.zero_()
+    engine._x_fixed.fill_(-100 * 65536)
+    engine._y_fixed.zero_()
+    for _ in range(7):
+        engine._enemy_tick()
+    assert torch.allclose(engine.enemy_angle[:, 0], north, rtol=0, atol=1e-7)
+
+    engine._enemy_tick()
+
+    west_bam = engine._doom_bam_angle(
+        torch.full((2,), -100 * 65536, dtype=torch.int64),
+        torch.zeros(2, dtype=torch.int64),
+    )
+    west = west_bam.to(torch.float32) * (2.0 * math.pi / float(1 << 32))
+    # A_SargAttack faces again at the G action. A_BruisAttack does not, so the
+    # Hell Knight retains the angle selected on its F prefire frame.
+    assert torch.allclose(engine.enemy_angle[0, 0], west[0], rtol=0, atol=1e-7)
+    assert torch.allclose(engine.enemy_angle[1, 0], north[1], rtol=0, atol=1e-7)
+
+
+def test_chainsaw_marine_faces_target_and_applies_post_hit_turn(square_scenario) -> None:
+    engine = _engine(square_scenario)
+    engine.enemy_alive.zero_()
+    engine.enemy_x[:, 0].zero_()
+    engine.enemy_y[:, 0].zero_()
+    engine._enemy_x_fixed[:, 0].zero_()
+    engine._enemy_y_fixed[:, 0].zero_()
+    engine.enemy_angle[:, 0].zero_()
+    engine.enemy_type[:, 0] = 2
+    engine.enemy_health[:, 0] = 100
+    engine.enemy_alive[:, 0] = True
+    engine.enemy_target_slot[:, 0] = -1
+    engine.enemy_attack_phase[:, 0] = 1
+    engine.enemy_cooldown[:, 0] = 4
+    engine.x.zero_()
+    engine.y.fill_(32)
+    engine._x_fixed.zero_()
+    engine._y_fixed.fill_(32 * 65536)
+
+    for _ in range(3):
+        engine._enemy_tick()
+    assert torch.equal(engine.enemy_angle[:, 0], torch.zeros(2))
+
+    engine._enemy_tick()
+
+    target_bam = engine._doom_bam_angle(
+        torch.zeros(2, dtype=torch.int64),
+        torch.full((2,), 32 * 65536, dtype=torch.int64),
+    )
+    expected_bam = (target_bam + ((1 << 30) // 20)) & ((1 << 32) - 1)
+    expected = expected_bam.to(torch.float32) * (2.0 * math.pi / float(1 << 32))
+    assert torch.allclose(engine.enemy_angle[:, 0], expected, rtol=0, atol=1e-7)
+    assert torch.all(engine.health < 100)
+
+
 def test_chainsaw_marine_repeats_four_tic_attack_cycle(square_scenario) -> None:
     engine = _engine(square_scenario)
     engine.x.zero_()
@@ -1859,14 +1949,16 @@ def test_demon_melee_action_whiffs_after_target_retreats(square_scenario) -> Non
     assert engine.enemy_attack_phase[:, 0].tolist() == [2, 2]
 
 
-def test_chaingunner_uses_prefire_and_alternating_burst_gaps(square_scenario) -> None:
+def test_chaingunner_refire_state_does_not_fire_extra_bullet(square_scenario) -> None:
     engine = _engine(square_scenario)
     engine.x.zero_()
     engine.y.zero_()
     engine._x_fixed.zero_()
     engine._y_fixed.zero_()
-    engine.enemy_x[:, 0] = 100
+    engine.enemy_x[:, 0] = 32
     engine.enemy_y[:, 0] = 0
+    engine._enemy_x_fixed[:, 0] = 32 * 65536
+    engine._enemy_y_fixed[:, 0] = 0
     engine.enemy_type[:, 0] = 3
     engine.enemy_health[:, 0] = 70
     engine.enemy_alive[:, 0] = True
@@ -1884,12 +1976,34 @@ def test_chaingunner_uses_prefire_and_alternating_burst_gaps(square_scenario) ->
         engine._enemy_tick()
     after_second_shot = engine.health.clone()
     assert torch.all(after_second_shot < after_first_shot)
-    for _ in range(5):
+    for _ in range(4):
         engine._enemy_tick()
-    # The third action occurs on schedule but its spread bullet can miss.
-    assert torch.all(engine.health <= after_second_shot)
+
+    # ViZDoom's CPOS F 1 A_CPosRefire action only faces the target and decides
+    # whether to loop. It neither fires nor consumes a four-tic attack frame.
+    assert torch.equal(engine.health, after_second_shot)
+    assert engine.enemy_attack_phase[:, 0].tolist() == [4, 4]
+    assert engine.enemy_cooldown[:, 0].tolist() == [1, 1]
+
+    engine._enemy_tick()
+
+    assert torch.all(engine.health < after_second_shot)
     assert engine.enemy_attack_phase[:, 0].tolist() == [2, 2]
     assert engine.enemy_cooldown[:, 0].tolist() == [4, 4]
+
+
+def test_chaingunner_refire_bypass_uses_reference_threshold(square_scenario) -> None:
+    engine = _engine(square_scenario)
+    engine.rng_state.copy_(torch.tensor([1, 2]))
+    candidates = torch.zeros_like(engine.enemy_alive)
+    candidates[:, 0] = True
+
+    bypass = engine._enemy_chaingun_refire_decision(candidates)
+
+    # The first xorshift draws have low bytes 33 and 66. A_CPosRefire only
+    # bypasses its target/sight checks when the byte is strictly below 40.
+    assert bypass[:, 0].tolist() == [True, False]
+    assert not torch.any(bypass[:, 1:])
 
 
 def test_monster_hitscan_uses_independent_reference_pellets(square_scenario) -> None:
