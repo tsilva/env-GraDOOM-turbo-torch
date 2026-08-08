@@ -1040,6 +1040,15 @@ class TorchDeathmatchEngine:
         self._enemy_z_fixed = torch.zeros(
             (n, self.enemy_slots), device=device, dtype=torch.int64
         )
+        self._enemy_floor_z_fixed = torch.zeros(
+            (n, self.enemy_slots), device=device, dtype=torch.int64
+        )
+        self._enemy_ceiling_z_fixed = torch.zeros(
+            (n, self.enemy_slots), device=device, dtype=torch.int64
+        )
+        self._enemy_opening_initialized = torch.zeros(
+            (n, self.enemy_slots), device=device, dtype=torch.bool
+        )
         self._enemy_momentum_x_fixed = torch.zeros(
             (n, self.enemy_slots), device=device, dtype=torch.int64
         )
@@ -1324,6 +1333,20 @@ class TorchDeathmatchEngine:
     def _random_unit(self, mask: torch.Tensor | None = None) -> torch.Tensor:
         return self._random_u32(mask).to(torch.float32) * (1.0 / 4294967296.0)
 
+    @staticmethod
+    def _public_or_retained_fixed(
+        public: torch.Tensor,
+        retained: torch.Tensor,
+    ) -> torch.Tensor:
+        """Honor mutable public coordinates without discarding retained low bits."""
+
+        visible = retained.to(torch.float32) / _FIXED_UNIT
+        return torch.where(
+            public != visible,
+            torch.round(public * _FIXED_UNIT).to(torch.int64),
+            retained,
+        )
+
     def _enemy_chase_random(self, mask: torch.Tensor) -> torch.Tensor:
         """Advance Doom's logically separate chase-direction random stream."""
 
@@ -1353,19 +1376,25 @@ class TorchDeathmatchEngine:
         self,
         angle: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        fine_angle = self._fine_angle_index(angle)
+        return self._fine_direction_from_index(self._fine_angle_index(angle))
+
+    def _fine_direction_from_index(
+        self,
+        fine_angle: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        fine_angle = fine_angle & (_FINE_ANGLES - 1)
         sine = self._fine_sine_fixed[fine_angle].to(torch.float32) / _FIXED_UNIT
         cosine = self._fine_sine_fixed[
             (fine_angle + _FINE_ANGLES // 4) & (_FINE_ANGLES - 1)
         ].to(torch.float32) / _FIXED_UNIT
         return cosine, sine
 
-    def _doom_fine_angle(
+    def _doom_bam_angle(
         self,
         delta_x_fixed: torch.Tensor,
         delta_y_fixed: torch.Tensor,
     ) -> torch.Tensor:
-        """Return R_PointToAngle2's 13-bit fine-angle result on device."""
+        """Return R_PointToAngle2's unsigned 32-bit BAM result on device."""
 
         def slope_div(numerator: torch.Tensor, denominator: torch.Tensor) -> torch.Tensor:
             use_lookup = denominator >= 512
@@ -1423,7 +1452,19 @@ class TorchDeathmatchEngine:
             torch.zeros_like(angle),
             angle,
         )
-        return (angle & _UINT32_MASK) >> _ANGLE_TO_FINE_SHIFT
+        return angle & _UINT32_MASK
+
+    def _doom_fine_angle(
+        self,
+        delta_x_fixed: torch.Tensor,
+        delta_y_fixed: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return R_PointToAngle2's 13-bit fine-angle result on device."""
+
+        return self._doom_bam_angle(
+            delta_x_fixed,
+            delta_y_fixed,
+        ) >> _ANGLE_TO_FINE_SHIFT
 
     def reset(self, mask: torch.Tensor, seeds: torch.Tensor) -> torch.Tensor:
         if mask.dtype != torch.bool or mask.shape != (self.num_envs,):
@@ -1547,6 +1588,9 @@ class TorchDeathmatchEngine:
         self._enemy_x_fixed[mask] = 0
         self._enemy_y_fixed[mask] = 0
         self._enemy_z_fixed[mask] = 0
+        self._enemy_floor_z_fixed[mask] = 0
+        self._enemy_ceiling_z_fixed[mask] = 0
+        self._enemy_opening_initialized[mask] = False
         self._enemy_momentum_x_fixed[mask] = 0
         self._enemy_momentum_y_fixed[mask] = 0
         self._enemy_velocity_z_fixed[mask] = 0
@@ -1768,6 +1812,8 @@ class TorchDeathmatchEngine:
         avoid_player: bool,
         candidate_count: int = 16,
         actor_radius: float | torch.Tensor = _PLAYER_RADIUS,
+        actor_z: float | torch.Tensor | None = None,
+        actor_height: float | torch.Tensor = _PLAYER_HEIGHT,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         low_x, high_x, low_y, high_y = self.map.spawn_bounds
         unit_x = torch.stack([self._random_unit(mask) for _ in range(candidate_count)], dim=1)
@@ -1776,22 +1822,57 @@ class TorchDeathmatchEngine:
         candidate_y = low_y + unit_y * (high_y - low_y)
         radius = torch.as_tensor(actor_radius, device=self.device, dtype=candidate_x.dtype)
         valid = ~self._points_collide(candidate_x, candidate_y, radius)
+        candidate_z: torch.Tensor | None = None
+        candidate_height: torch.Tensor | None = None
+        if actor_z is not None:
+            candidate_z = torch.broadcast_to(
+                torch.as_tensor(actor_z, device=self.device, dtype=candidate_x.dtype),
+                (self.num_envs,),
+            )[:, None]
+            candidate_height = torch.broadcast_to(
+                torch.as_tensor(
+                    actor_height,
+                    device=self.device,
+                    dtype=candidate_x.dtype,
+                ),
+                (self.num_envs,),
+            )[:, None]
+            floor, ceiling = self._actor_opening_at(candidate_x, candidate_y, radius)
+            valid &= (candidate_z >= floor) & (
+                candidate_z + candidate_height <= ceiling
+            )
 
         if len(self.map.player_starts) > 1:
             dolls = self.map.player_starts[:-1, :2]
             doll_dx = candidate_x[..., None] - dolls[None, None, :, 0]
             doll_dy = candidate_y[..., None] - dolls[None, None, :, 1]
-            valid &= torch.all(
-                (doll_dx.abs() >= radius + _PLAYER_RADIUS)
-                | (doll_dy.abs() >= radius + _PLAYER_RADIUS),
-                dim=-1,
+            overlaps_doll = (
+                (doll_dx.abs() < radius + _PLAYER_RADIUS)
+                & (doll_dy.abs() < radius + _PLAYER_RADIUS)
             )
+            if candidate_z is not None and candidate_height is not None:
+                overlaps_doll &= self._vertical_overlap(
+                    candidate_z[..., None],
+                    candidate_height[..., None],
+                    self._player_start_z[:-1][None, None, :],
+                    _PLAYER_HEIGHT,
+                )
+            valid &= ~torch.any(overlaps_doll, dim=-1)
         if avoid_player:
             player_dx = candidate_x - self.x[:, None]
             player_dy = candidate_y - self.y[:, None]
-            valid &= (player_dx.abs() >= radius + _PLAYER_RADIUS) | (
-                player_dy.abs() >= radius + _PLAYER_RADIUS
+            overlaps_player = (
+                (player_dx.abs() < radius + _PLAYER_RADIUS)
+                & (player_dy.abs() < radius + _PLAYER_RADIUS)
             )
+            if candidate_z is not None and candidate_height is not None:
+                overlaps_player &= self._vertical_overlap(
+                    candidate_z,
+                    candidate_height,
+                    self.z[:, None],
+                    _PLAYER_HEIGHT,
+                )
+            valid &= ~overlaps_player
             enemy_dx = candidate_x[..., None] - self.enemy_x[:, None, :]
             enemy_dy = candidate_y[..., None] - self.enemy_y[:, None, :]
             enemy_radius = self._enemy_radius[self._effective_enemy_type()]
@@ -1799,6 +1880,13 @@ class TorchDeathmatchEngine:
                 (enemy_dx.abs() < radius + enemy_radius[:, None, :])
                 & (enemy_dy.abs() < radius + enemy_radius[:, None, :])
             )
+            if candidate_z is not None and candidate_height is not None:
+                overlaps_enemy &= self._vertical_overlap(
+                    candidate_z[..., None],
+                    candidate_height[..., None],
+                    self.enemy_z[:, None, :],
+                    self._effective_enemy_height()[:, None, :],
+                )
             valid &= ~torch.any(overlaps_enemy, dim=-1)
 
         has_valid = torch.any(valid, dim=1) & mask
@@ -2529,6 +2617,8 @@ class TorchDeathmatchEngine:
             spawn_mask,
             avoid_player=True,
             actor_radius=self._enemy_radius[enemy_type],
+            actor_z=0.0,
+            actor_height=self._enemy_height[enemy_type],
         )
         spawn = spawn_mask & has_position
         row = torch.arange(self.num_envs, device=self.device)
@@ -2550,6 +2640,11 @@ class TorchDeathmatchEngine:
         old_move_count = self.enemy_move_count[row, slot]
         old_move_cooldown = self.enemy_move_cooldown[row, slot]
         old_animation_tics = self.enemy_animation_tics[row, slot]
+        # ACS Spawn accepts its angle as an 8-bit turn. Runtime object traces
+        # therefore expose exact 360/256-degree increments.
+        spawn_angle = torch.floor(angle * (256.0 / (2.0 * math.pi))) * (
+            2.0 * math.pi / 256.0
+        )
         self.enemy_x[row, slot] = torch.where(spawn, x, old_x)
         self.enemy_y[row, slot] = torch.where(spawn, y, old_y)
         self._enemy_x_fixed[row, slot] = torch.where(
@@ -2563,14 +2658,29 @@ class TorchDeathmatchEngine:
             self._enemy_y_fixed[row, slot],
         )
         spawn_sector = self._sector_at(x, y)
-        spawn_z = self.map.sector_heights[spawn_sector, 0]
+        spawn_floor = self.map.sector_heights[spawn_sector, 0]
+        spawn_ceiling = self.map.sector_heights[spawn_sector, 1]
+        # deathmatch.acs passes absolute z=0 to Spawn. StaticSpawn retains the
+        # center subsector's floor until the actor successfully moves in XY.
+        spawn_z = torch.zeros_like(spawn_floor)
         self.enemy_z[row, slot] = torch.where(spawn, spawn_z, old_z)
         self._enemy_z_fixed[row, slot] = torch.where(
             spawn,
             torch.round(spawn_z * _FIXED_UNIT).to(torch.int64),
             self._enemy_z_fixed[row, slot],
         )
-        self.enemy_angle[row, slot] = torch.where(spawn, angle, old_angle)
+        self._enemy_floor_z_fixed[row, slot] = torch.where(
+            spawn,
+            torch.round(spawn_floor * _FIXED_UNIT).to(torch.int64),
+            self._enemy_floor_z_fixed[row, slot],
+        )
+        self._enemy_ceiling_z_fixed[row, slot] = torch.where(
+            spawn,
+            torch.round(spawn_ceiling * _FIXED_UNIT).to(torch.int64),
+            self._enemy_ceiling_z_fixed[row, slot],
+        )
+        self._enemy_opening_initialized[row, slot] |= spawn
+        self.enemy_angle[row, slot] = torch.where(spawn, spawn_angle, old_angle)
         self.enemy_type[row, slot] = torch.where(
             spawn, torch.full_like(old_type, enemy_type), old_type
         )
@@ -2626,7 +2736,7 @@ class TorchDeathmatchEngine:
         )
         self.enemy_animation_tics[row, slot] = torch.where(
             spawn,
-            torch.zeros_like(old_animation_tics),
+            torch.ones_like(old_animation_tics),
             old_animation_tics,
         )
         self._enemy_momentum_x_fixed[row, slot] = torch.where(
@@ -2641,7 +2751,11 @@ class TorchDeathmatchEngine:
         )
         self._enemy_velocity_z_fixed[row, slot] = torch.where(
             spawn,
-            torch.zeros_like(self._enemy_velocity_z_fixed[row, slot]),
+            torch.where(
+                spawn_z > spawn_floor,
+                torch.full_like(self._enemy_velocity_z_fixed[row, slot], -_FIXED_UNIT),
+                torch.zeros_like(self._enemy_velocity_z_fixed[row, slot]),
+            ),
             self._enemy_velocity_z_fixed[row, slot],
         )
         self.enemy_death_type[row, slot] = torch.where(
@@ -4962,13 +5076,13 @@ class TorchDeathmatchEngine:
             mixed ^= mixed >> 16
             return torch.bitwise_right_shift(mixed, pellet * 8)
 
-        first = torch.bitwise_and(mixed_draw(0), 255).to(torch.float32)
-        second = torch.bitwise_and(mixed_draw(1), 255).to(torch.float32)
+        first = torch.bitwise_and(mixed_draw(0), 255)
+        second = torch.bitwise_and(mixed_draw(1), 255)
         damage_roll = torch.remainder(mixed_draw(2), 5).to(torch.float32) + 1.0
-        spread = (first - second) * float(1 << 20) * _BAM_TO_RADIANS
+        spread_bam = (first - second) * (1 << 20)
         return (
             torch.where(active, damage_roll * 3.0, 0.0),
-            torch.where(active, spread, 0.0),
+            torch.where(active, spread_bam, 0),
         )
 
     def _enemy_target_geometry(
@@ -5035,7 +5149,11 @@ class TorchDeathmatchEngine:
         target_radius: torch.Tensor,
     ) -> torch.Tensor:
         """Return PT_COMPATIBLE intercepts for arbitrary shootable actors."""
-        cosine, sine = self._fine_direction(ray_angle)
+        cosine, sine = (
+            self._fine_direction(ray_angle)
+            if ray_angle.dtype.is_floating_point
+            else self._fine_direction_from_index(ray_angle)
+        )
         cosine = cosine[..., None]
         sine = sine[..., None]
         same_sign = (cosine >= 0) == (sine >= 0)
@@ -5117,7 +5235,11 @@ class TorchDeathmatchEngine:
 
     def _enemy_ray_wall_distance(self, ray_angle: torch.Tensor) -> torch.Tensor:
         """Return linedef intercepts for each monster bullet ray."""
-        cosine, sine = self._fine_direction(ray_angle)
+        cosine, sine = (
+            self._fine_direction(ray_angle)
+            if ray_angle.dtype.is_floating_point
+            else self._fine_direction_from_index(ray_angle)
+        )
         cosine = cosine[..., None]
         sine = sine[..., None]
         walls = self.map.portal_walls
@@ -5153,23 +5275,49 @@ class TorchDeathmatchEngine:
         fires: torch.Tensor,
         distance: torch.Tensor,
         visible: torch.Tensor,
+        *,
+        base_bam: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Trace monster bullets through walls and every shootable actor."""
-        pellet_damage, spread = self._enemy_hitscan_rolls(enemy_type, fires)
+        pellet_damage, spread_bam = self._enemy_hitscan_rolls(enemy_type, fires)
         (
-            intended_x,
-            intended_y,
+            _intended_x,
+            _intended_y,
             intended_z,
             intended_height,
             _intended_radius,
-            _intended_is_monster,
+            intended_is_monster,
             _intended_alive,
         ) = self._enemy_target_geometry()
-        base_angle = torch.atan2(
-            intended_y - self.enemy_y,
-            intended_x - self.enemy_x,
-        )
-        pellet_angle = base_angle[:, :, None] + spread
+        if base_bam is None:
+            safe_target = self.enemy_target_slot.clamp(0, self.enemy_slots - 1)
+            enemy_x_fixed = self._public_or_retained_fixed(
+                self.enemy_x,
+                self._enemy_x_fixed,
+            )
+            enemy_y_fixed = self._public_or_retained_fixed(
+                self.enemy_y,
+                self._enemy_y_fixed,
+            )
+            player_x_fixed = self._public_or_retained_fixed(self.x, self._x_fixed)
+            player_y_fixed = self._public_or_retained_fixed(self.y, self._y_fixed)
+            intended_x_fixed = torch.where(
+                intended_is_monster,
+                enemy_x_fixed.gather(1, safe_target),
+                player_x_fixed[:, None],
+            )
+            intended_y_fixed = torch.where(
+                intended_is_monster,
+                enemy_y_fixed.gather(1, safe_target),
+                player_y_fixed[:, None],
+            )
+            base_bam = self._doom_bam_angle(
+                intended_x_fixed - enemy_x_fixed,
+                intended_y_fixed - enemy_y_fixed,
+            )
+        pellet_fine_angle = (
+            (base_bam[:, :, None] + spread_bam) & _UINT32_MASK
+        ) >> _ANGLE_TO_FINE_SHIFT
 
         doll_count = max(len(self.map.player_starts) - 1, 0)
         actor_x = torch.cat((self.enemy_x, self.x[:, None]), dim=1)
@@ -5230,7 +5378,7 @@ class TorchDeathmatchEngine:
                 dim=1,
             )
         actor_distance = self._enemy_ray_actor_distances(
-            pellet_angle,
+            pellet_fine_angle,
             actor_x,
             actor_y,
             actor_radius,
@@ -5258,7 +5406,7 @@ class TorchDeathmatchEngine:
             )
         )
         maximum_horizontal_distance = 2048.0 * cosine_pitch
-        pellet_wall_distance = self._enemy_ray_wall_distance(pellet_angle)
+        pellet_wall_distance = self._enemy_ray_wall_distance(pellet_fine_angle)
         wall_intercept = torch.isfinite(pellet_wall_distance)
         safe_wall_distance = torch.where(
             wall_intercept,
@@ -5832,6 +5980,9 @@ class TorchDeathmatchEngine:
         visible_x = self._enemy_x_fixed.to(torch.float32) / _FIXED_UNIT
         visible_y = self._enemy_y_fixed.to(torch.float32) / _FIXED_UNIT
         visible_z = self._enemy_z_fixed.to(torch.float32) / _FIXED_UNIT
+        position_resynchronized = (self.enemy_x != visible_x) | (
+            self.enemy_y != visible_y
+        )
         self._enemy_x_fixed.copy_(
             torch.where(
                 self.enemy_x != visible_x,
@@ -5867,6 +6018,31 @@ class TorchDeathmatchEngine:
             self._enemy_height[actor_type],
             self._enemy_height[actor_type] * 0.25,
         )
+        if self.debug_checks:
+            opening_resynchronized = actor_exists & (
+                position_resynchronized | ~self._enemy_opening_initialized
+            )
+            current_floor, current_ceiling = self._actor_opening_at(
+                self.enemy_x,
+                self.enemy_y,
+                self._enemy_radius[actor_type],
+            )
+            self._enemy_floor_z_fixed.copy_(
+                torch.where(
+                    opening_resynchronized,
+                    torch.round(current_floor * _FIXED_UNIT).to(torch.int64),
+                    self._enemy_floor_z_fixed,
+                )
+            )
+            self._enemy_ceiling_z_fixed.copy_(
+                torch.where(
+                    opening_resynchronized,
+                    torch.round(current_ceiling * _FIXED_UNIT).to(torch.int64),
+                    self._enemy_ceiling_z_fixed,
+                )
+            )
+            self._enemy_opening_initialized |= opening_resynchronized
+        old_floor_z_fixed = self._enemy_floor_z_fixed.clone()
         proposed_x_fixed = self._enemy_x_fixed + torch.where(
             actor_exists,
             self._enemy_momentum_x_fixed,
@@ -5879,14 +6055,18 @@ class TorchDeathmatchEngine:
         )
         proposed_x = proposed_x_fixed.to(torch.float32) / _FIXED_UNIT
         proposed_y = proposed_y_fixed.to(torch.float32) / _FIXED_UNIT
-        collision = actor_exists & self._enemy_collides(
+        horizontal_motion = actor_exists & (
+            (self._enemy_momentum_x_fixed != 0)
+            | (self._enemy_momentum_y_fixed != 0)
+        )
+        collision = horizontal_motion & self._enemy_collides(
             proposed_x,
             proposed_y,
             actor_type,
             allow_dropoff=True,
             actor_height=actor_height,
         )
-        moved = actor_exists & ~collision
+        moved = horizontal_motion & ~collision
         self._enemy_x_fixed.copy_(
             torch.where(moved, proposed_x_fixed, self._enemy_x_fixed)
         )
@@ -5900,8 +6080,22 @@ class TorchDeathmatchEngine:
             self.enemy_y,
             self._enemy_radius[actor_type],
         )
-        floor_z_fixed = torch.round(actor_floor * _FIXED_UNIT).to(torch.int64)
-        ceiling_z_fixed = torch.round(actor_ceiling * _FIXED_UNIT).to(torch.int64)
+        self._enemy_floor_z_fixed.copy_(
+            torch.where(
+                moved,
+                torch.round(actor_floor * _FIXED_UNIT).to(torch.int64),
+                self._enemy_floor_z_fixed,
+            )
+        )
+        self._enemy_ceiling_z_fixed.copy_(
+            torch.where(
+                moved,
+                torch.round(actor_ceiling * _FIXED_UNIT).to(torch.int64),
+                self._enemy_ceiling_z_fixed,
+            )
+        )
+        floor_z_fixed = self._enemy_floor_z_fixed
+        ceiling_z_fixed = self._enemy_ceiling_z_fixed
         actor_height_fixed = torch.round(
             actor_height * _FIXED_UNIT
         ).to(torch.int64)
@@ -5911,9 +6105,19 @@ class TorchDeathmatchEngine:
             torch.zeros_like(self._enemy_velocity_z_fixed),
         )
         above_floor = proposed_z_fixed > floor_z_fixed
+        walked_off_ledge = (
+            (self._enemy_velocity_z_fixed == 0)
+            & (old_floor_z_fixed > floor_z_fixed)
+            & (proposed_z_fixed == old_floor_z_fixed)
+        )
+        gravity_fixed = torch.where(
+            walked_off_ledge,
+            torch.full_like(self._enemy_velocity_z_fixed, 2 * _FIXED_UNIT),
+            torch.full_like(self._enemy_velocity_z_fixed, _FIXED_UNIT),
+        )
         next_velocity_z = torch.where(
             above_floor,
-            self._enemy_velocity_z_fixed - _FIXED_UNIT,
+            self._enemy_velocity_z_fixed - gravity_fixed,
             self._enemy_velocity_z_fixed,
         )
         hit_floor = proposed_z_fixed <= floor_z_fixed
@@ -6257,6 +6461,10 @@ class TorchDeathmatchEngine:
             target_height,
         )
         melee_target = line_of_sight & melee_vertical_overlap & in_melee_range
+        target_bam_angle = self._doom_bam_angle(
+            target_x_fixed - self._enemy_x_fixed,
+            target_y_fixed - self._enemy_y_fixed,
+        )
 
         attack_phase = self.enemy_attack_phase
         phase_due = alive & (attack_phase > 0) & (self.enemy_cooldown <= 1)
@@ -6291,6 +6499,7 @@ class TorchDeathmatchEngine:
             direct_attack & hitscan_type,
             distance,
             visible,
+            base_bam=target_bam_angle,
         )
         direct_damage_by_attacker = self._enemy_damage_roll(
             enemy_type,
@@ -6578,10 +6787,11 @@ class TorchDeathmatchEngine:
             )
         )
         face_target = can_attack | (fire_event & hitscan_type)
+        target_angle = target_bam_angle.to(torch.float32) * _BAM_TO_RADIANS
         self.enemy_angle.copy_(
             torch.where(
                 face_target,
-                torch.atan2(dy, dx),
+                target_angle,
                 self.enemy_angle,
             )
         )

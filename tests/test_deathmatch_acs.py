@@ -90,6 +90,11 @@ def test_spawn_check_attempts_each_acs_actor_class(square_scenario) -> None:
     )
     assert torch.all(engine.enemy_target_slot[engine.enemy_alive] == -2)
     spawned_type = engine.enemy_type[engine.enemy_alive]
+    spawned_angle_byte = (
+        engine.enemy_angle[engine.enemy_alive] * (256.0 / (2.0 * math.pi))
+    )
+    assert torch.allclose(spawned_angle_byte, torch.round(spawned_angle_byte))
+    assert torch.all(engine.enemy_animation_tics[engine.enemy_alive] == 1)
     assert torch.all(engine.enemy_cooldown[engine.enemy_alive] == 0)
     assert torch.all(engine.enemy_reaction_time[engine.enemy_alive] == 8)
     assert torch.equal(
@@ -788,6 +793,8 @@ def test_monster_hitscan_hits_intervening_voodoo_doll_without_player_thrust(
     engine = _engine(square_scenario)
     engine.x.fill_(-200)
     engine.y.fill_(-128)
+    engine._x_fixed.fill_(-200 * 65536)
+    engine._y_fixed.fill_(-128 * 65536)
     engine.z.zero_()
     engine.enemy_alive.zero_()
     engine.enemy_x[:, 0] = 0
@@ -1505,6 +1512,8 @@ def test_monster_attacks_instead_of_moving_on_chase_tic(square_scenario) -> None
     engine = _engine(square_scenario)
     engine.x.zero_()
     engine.y.zero_()
+    engine._x_fixed.zero_()
+    engine._y_fixed.zero_()
     engine.enemy_x[:, 0] = 100
     engine.enemy_y[:, 0] = 0
     engine.enemy_type[:, 0] = 0
@@ -1643,6 +1652,8 @@ def test_monster_faces_target_at_prefire_and_hitscan_action(square_scenario) -> 
     engine = _engine(square_scenario)
     engine.x.zero_()
     engine.y.zero_()
+    engine._x_fixed.zero_()
+    engine._y_fixed.zero_()
     engine.enemy_x[:, 0] = 100
     engine.enemy_y[:, 0] = 0
     engine.enemy_angle[:, 0] = math.pi / 2
@@ -1659,6 +1670,7 @@ def test_monster_faces_target_at_prefire_and_hitscan_action(square_scenario) -> 
     )
 
     engine.y.fill_(100)
+    engine._y_fixed.fill_(100 * 65536)
     engine.enemy_cooldown[:, 0] = 1
     engine._enemy_tick()
 
@@ -1666,6 +1678,44 @@ def test_monster_faces_target_at_prefire_and_hitscan_action(square_scenario) -> 
         engine.enemy_angle[:, 0],
         torch.full((2,), 3.0 * math.pi / 4.0),
     )
+
+
+def test_monster_face_target_uses_vizdoom_fixed_point_angle(square_scenario) -> None:
+    engine = _engine(square_scenario)
+    delta_x_fixed = 11_709_040
+    delta_y_fixed = 4_041_447
+    engine.x.fill_(delta_x_fixed / 65536.0)
+    engine.y.fill_(delta_y_fixed / 65536.0)
+    engine._x_fixed.fill_(delta_x_fixed)
+    engine._y_fixed.fill_(delta_y_fixed)
+    engine.enemy_x[:, 0] = 0
+    engine.enemy_y[:, 0] = 0
+    engine._enemy_x_fixed[:, 0] = 0
+    engine._enemy_y_fixed[:, 0] = 0
+    engine.enemy_type[:, 0] = 0
+    engine.enemy_health[:, 0] = 20
+    engine.enemy_alive[:, 0] = True
+    engine.enemy_target_slot[:, 0] = -1
+    engine.enemy_attack_phase[:, 0] = 1
+    engine.enemy_cooldown[:, 0] = 1
+
+    bam_angle = engine._doom_bam_angle(
+        torch.full((2,), delta_x_fixed, dtype=torch.int64),
+        torch.full((2,), delta_y_fixed, dtype=torch.int64),
+    )
+    assert bam_angle.tolist() == [226_922_601, 226_922_601]
+
+    engine._enemy_tick()
+
+    # ViZDoom seed 123, tick 961, object 206 faces this exact fixed-point
+    # delta at BAM angle 226922601 (fine angle 432). Floating atan2 selects
+    # adjacent fine angle 433 and changes the bullet ray.
+    expected = torch.full(
+        (2,),
+        226_922_601 * (2.0 * math.pi / float(1 << 32)),
+    )
+    assert torch.allclose(engine.enemy_angle[:, 0], expected, rtol=0, atol=1e-7)
+    assert engine._fine_angle_index(engine.enemy_angle[:, 0]).tolist() == [432, 432]
 
 
 def test_chainsaw_marine_repeats_four_tic_attack_cycle(square_scenario) -> None:
@@ -1813,6 +1863,8 @@ def test_chaingunner_uses_prefire_and_alternating_burst_gaps(square_scenario) ->
     engine = _engine(square_scenario)
     engine.x.zero_()
     engine.y.zero_()
+    engine._x_fixed.zero_()
+    engine._y_fixed.zero_()
     engine.enemy_x[:, 0] = 100
     engine.enemy_y[:, 0] = 0
     engine.enemy_type[:, 0] = 3
@@ -2010,6 +2062,8 @@ def test_two_sided_portal_does_not_occlude_hitscan_or_monster_sight(square_scena
     engine = _engine(scenario)
     engine.x.fill_(-32)
     engine.y.zero_()
+    engine._x_fixed.fill_(-32 * 65536)
+    engine._y_fixed.zero_()
     engine.angle.zero_()
     engine.enemy_x[:, 0] = 32
     engine.enemy_y[:, 0] = 0

@@ -196,6 +196,56 @@ def test_player_floor_uses_full_box_across_pit_steps(pinned_deathmatch_scenario)
 
 
 @pytest.mark.skipif(not SCENARIO.is_file() or not DOOM2.is_file(), reason="operator WADs absent")
+def test_acs_monster_spawn_falls_from_absolute_zero_into_center_pit(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([2]))
+    spawn_x = 560.7010192871094
+    spawn_y = 481.3784484863281
+    engine.map.spawn_bounds.copy_(
+        torch.tensor((spawn_x, spawn_x, spawn_y, spawn_y))
+    )
+    # The player occupies the same XY in the pit but ends below the spawned
+    # monster. ACS Spawn temporarily enables PASSMOBJ, so this vertical gap is
+    # legal even though their 2D boxes overlap.
+    engine.x.fill_(spawn_x)
+    engine.y.fill_(spawn_y)
+    engine.z.fill_(-64)
+
+    engine._spawn_enemy_type(1, torch.ones(1, dtype=torch.bool))
+
+    assert engine.enemy_alive[0, 0]
+    assert engine.enemy_z[0, 0].item() == 0.0
+    assert engine._enemy_velocity_z_fixed[0, 0].item() == -65536
+    assert engine._enemy_floor_z_fixed[0, 0].item() == -64 * 65536
+    assert engine.teleport_fog_z[0, 0].item() == 0.0
+    opening_floor, _ = engine._actor_opening_at(
+        engine.enemy_x[:, 0],
+        engine.enemy_y[:, 0],
+        engine._enemy_radius[1],
+    )
+    assert opening_floor.item() == -24.0
+
+    z_trace: list[float] = []
+    velocity_trace: list[float] = []
+    for _ in range(11):
+        engine._move_enemy_thrust(torch.ones(1, dtype=torch.bool))
+        z_trace.append(float(engine.enemy_z[0, 0]))
+        velocity_trace.append(
+            float(engine._enemy_velocity_z_fixed[0, 0]) / 65536.0
+        )
+
+    # ViZDoom seed 2, object 196 (ShotgunGuy), episode times 117..127.
+    assert z_trace == [-1.0, -3.0, -6.0, -10.0, -15.0, -21.0, -28.0, -36.0, -45.0, -55.0, -64.0]
+    assert velocity_trace == [-2.0, -3.0, -4.0, -5.0, -6.0, -7.0, -8.0, -9.0, -10.0, -11.0, 0.0]
+
+
+@pytest.mark.skipif(not SCENARIO.is_file() or not DOOM2.is_file(), reason="operator WADs absent")
 def test_awakened_zombieman_matches_reference_discrete_chase_steps(
     pinned_deathmatch_scenario,
 ) -> None:
