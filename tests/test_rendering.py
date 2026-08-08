@@ -1476,6 +1476,73 @@ def test_native_item_uses_fixed_point_sprite_projection(
 
 
 @pytest.mark.skipif(not SCENARIO.is_file() or not DOOM2.is_file(), reason="operator WADs absent")
+def test_native_sprites_keep_offcenter_spans_that_cross_view(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([1337]))
+    engine.x.fill_(1091.274826)
+    engine.y.fill_(784.0078125)
+    engine.z.zero_()
+    engine.view_z.fill_(41.0)
+    engine.angle.fill_(math.radians(341.290283))
+    engine.episode_time.fill_(41)
+    engine.player_dead.fill_(True)
+    engine.enemy_alive.zero_()
+    engine.enemy_death_tics.zero_()
+    engine.projectile_alive.zero_()
+    engine.enemy_projectile_alive.zero_()
+    engine.projectile_impact_tics.zero_()
+    engine.enemy_projectile_impact_tics.zero_()
+    engine.teleport_fog_tics.zero_()
+    engine.hitscan_puff_tics.zero_()
+    engine.drop_type.fill_(-1)
+    engine.drop_spawned.zero_()
+
+    black = torch.zeros(
+        (1, engine.native_view_height, engine.native_screen_width),
+        dtype=torch.uint8,
+    )
+    white = torch.full_like(black, 255)
+    wall_distance = torch.full((1, engine.native_screen_width), torch.inf)
+    scene_depth = torch.full_like(black, torch.inf, dtype=torch.float32)
+
+    # R_ProjectSprite clips the projected span, not the actor's center angle.
+    # These two pickups have centers beyond opposite 45-degree view edges, but
+    # their broad sprites still contribute columns at the edge of the screen.
+    for spawn_x, spawn_y, expected_x_bounds in (
+        (1126, 696, (317, 319)),
+        (1248, 873, (0, 15)),
+    ):
+        item_index = torch.where(
+            (engine.map.item_spawns[:, 0] == spawn_x)
+            & (engine.map.item_spawns[:, 1] == spawn_y)
+        )[0].item()
+        engine.item_available.zero_()
+        engine.item_available[0, item_index] = True
+        over_black = engine._native_render_sprites(
+            black,
+            wall_distance,
+            engine.view_z,
+            scene_depth,
+        )
+        over_white = engine._native_render_sprites(
+            white,
+            wall_distance,
+            engine.view_z,
+            scene_depth,
+        )
+        _sprite_y, sprite_x = torch.where(over_black[0] == over_white[0])
+
+        assert sprite_x.numel() > 0
+        assert (sprite_x.min().item(), sprite_x.max().item()) == expected_x_bounds
+
+
+@pytest.mark.skipif(not SCENARIO.is_file() or not DOOM2.is_file(), reason="operator WADs absent")
 def test_native_renderer_includes_voodoo_dolls(pinned_deathmatch_scenario) -> None:
     scenario = pinned_deathmatch_scenario
     engine = TorchDeathmatchEngine(scenario, 1, device=torch.device("cpu"))

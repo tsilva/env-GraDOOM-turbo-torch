@@ -10879,7 +10879,6 @@ class TorchDeathmatchEngine:
         candidate = (
             column_inside
             & actor_alive[:, :, None]
-            & (relative[:, :, None].abs() < math.pi / 4)
             & (actor_depth[:, :, None] > 0)
             & (actor_depth[:, :, None] < wall_distance[:, None, :])
         )
