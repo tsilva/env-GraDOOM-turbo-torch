@@ -479,30 +479,42 @@ def compile_indexed_weapon_overlays(
     wad: WadArchive,
     frame_names: tuple[str, ...],
 ) -> tuple[tuple[str, ...], np.ndarray, np.ndarray]:
-    """Rasterize aspect-corrected ready-state psprites in ViZDoom's play view."""
+    """Rasterize fixed-point ready-state psprites in ViZDoom's play view."""
 
     resolved_names: list[str] = []
     values: list[np.ndarray] = []
     alphas: list[np.ndarray] = []
+    fixed_unit = 1 << 16
+    view_height = 208
+    view_center_y = view_height // 2
+    base_y_center = 100
+    weapon_top = 32 * fixed_unit + 0x6000
+    # R_SWRSetWindow derives yaspectmul from the full 320x240 target, then
+    # R_DrawVisSprite uses the reciprocal below to step through source rows.
+    psprite_y_scale = 240 * fixed_unit // 200
+    psprite_y_iscale = ((1 << 32) - 1) // psprite_y_scale
     for requested_name in frame_names:
         normalized = requested_name.upper()
         if normalized not in wad.by_name:
             raise KeyError(f"IWAD has no weapon frame {normalized!r}")
         patch = decode_patch(wad.read(normalized), normalized)
         left = -patch.left_offset
-        vertical_scale = 1.2
-        ready_y = 32.0
-        top = 104.0 - (100.0 - ready_y + patch.top_offset) * vertical_scale
         x0 = max(left, 0)
         x1 = min(left + patch.width, 320)
-        source_rows = np.floor((np.arange(208, dtype=np.float32) - top) / vertical_scale).astype(
-            np.int32
+        texture_mid = (
+            base_y_center * fixed_unit - weapon_top + patch.top_offset * fixed_unit
         )
+        source_rows = np.right_shift(
+            texture_mid
+            + (np.arange(view_height, dtype=np.int64) - (view_center_y - 1))
+            * psprite_y_iscale,
+            16,
+        ).astype(np.int32)
         visible_rows = (source_rows >= 0) & (source_rows < patch.height)
         if x0 >= x1 or not visible_rows.any():
             raise ValueError(f"weapon frame {normalized!r} lies outside the logical view")
-        value_canvas = np.zeros((208, 320), dtype=np.uint8)
-        alpha_canvas = np.zeros((208, 320), dtype=np.bool_)
+        value_canvas = np.zeros((view_height, 320), dtype=np.uint8)
+        alpha_canvas = np.zeros((view_height, 320), dtype=np.bool_)
         patch_x0 = x0 - left
         patch_x1 = patch_x0 + x1 - x0
         destination_rows = np.flatnonzero(visible_rows)

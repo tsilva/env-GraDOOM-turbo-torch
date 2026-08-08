@@ -161,6 +161,30 @@ def test_native_walls_use_reference_fine_angle_rays(
     assert rgb[0, 0, 272].tolist() == [43, 35, 15]
 
 
+def test_native_weapon_uses_reference_fixed_point_vertical_sampling(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([123]))
+    engine.episode_time.fill_(17)
+    engine.weapon_raise_cooldown.zero_()
+
+    frame_id, _flash_id, _flash_light = engine._native_weapon_frame_selection()
+    value = engine.map.native_weapon_frame_values[frame_id][0]
+    alpha = engine.map.native_weapon_frame_alpha[frame_id][0]
+
+    # R_DrawPSprite retains WEAPONTOP's fractional 0x6000 and
+    # R_DrawMaskedColumn advances source rows through a 16.16 reciprocal.
+    assert alpha.sum().item() == 1783
+    assert alpha[152, 157]
+    assert value[152, 157].item() == 10
+    assert value[152, 159].item() == 6
+
+
 def test_enemy_fullbright_matches_actor_attack_states() -> None:
     enemy_type = torch.tensor((0, 1, 1, 3, 3, 3, 3, 3, 3))
     attack_phase = torch.tensor((2, 2, 2, 2, 3, 3, 4, 1, 1))
