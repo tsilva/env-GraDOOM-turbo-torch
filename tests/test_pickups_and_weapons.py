@@ -114,6 +114,18 @@ def test_ammo_pickup_consumes_only_boxes_needed_to_reach_capacity(square_scenari
     assert engine.item_available.tolist() == [[False, True], [False, True]]
 
 
+def test_ammo_pickup_does_not_reduce_existing_overcap_amount(square_scenario) -> None:
+    engine = _engine(_item_scenario(square_scenario, 2048))
+    engine.ammo[:, 1].fill_(400)
+    engine.ammo[:, 3].fill_(400)
+
+    engine._collect_items()
+
+    assert engine.ammo[:, 1].tolist() == [400.0, 400.0]
+    assert torch.equal(engine.ammo[:, 1], engine.ammo[:, 3])
+    assert torch.all(engine.item_available)
+
+
 def test_green_and_blue_armor_use_reference_absorption_fractions(square_scenario) -> None:
     green = _engine(_item_scenario(square_scenario, 2018))
     green.armor.fill_(50)

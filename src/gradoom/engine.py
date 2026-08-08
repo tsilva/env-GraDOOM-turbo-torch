@@ -7077,7 +7077,9 @@ class TorchDeathmatchEngine:
         return touched & (rank <= needed[:, None])
 
     def _add_ammo(self, slot: int, gain: torch.Tensor, cap: float) -> None:
-        updated = torch.minimum(self.ammo[:, slot] + gain, torch.full_like(gain, cap))
+        current = self.ammo[:, slot]
+        available = torch.clamp_min(torch.full_like(gain, cap) - current, 0)
+        updated = current + torch.minimum(gain, available)
         self.ammo[:, slot].copy_(updated)
         if slot == 1:
             self.ammo[:, 3].copy_(updated)
