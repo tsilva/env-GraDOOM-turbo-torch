@@ -18,6 +18,13 @@ Tick/action timing, movement, collision, weapon selection and state, ammo, hitsc
 - Raw fidelity captures explicitly enable the full Doom HUD, even though the pinned training config disables it.
 - Geometry, palette colors, lighting, weapon/HUD composition, directional sprites, and walk, attack, and death animation timing are compared at matched player poses and native tics.
 
+## Deterministic prefix oracle
+
+`tools/compare_behavior.py` aligns GraDOOM to ViZDoom's randomized initial
+pose, then compares player state, motion, weapons, ammo, rewards, and episode
+timing over scripted actions. It deliberately stops before episode time 106,
+where the first permitted stochastic ACS monster spawn occurs.
+
 ## Permitted statistical parity
 
 Spawn selection, random damage, monster decisions, and equivalent tie-breaking may use different random streams only when distribution tests and zero-shot policy transfer pass.
