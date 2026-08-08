@@ -639,6 +639,7 @@ def test_native_renderer_preserves_rgb_hud_and_enemy_animation(
     ready = engine.render_native_frame(include_hud=False)
     assert not torch.equal(firing, ready)
 
+    engine.mugshot_face_index.fill_(1)
     hud = engine._native_render_hud()[0]
     face_index = 14
     face_width = int(engine.map.hud_patch_widths[face_index].item())
@@ -653,15 +654,16 @@ def test_native_renderer_preserves_rgb_hud_and_enemy_animation(
     assert (number_x.min().item(), number_x.max().item()) == (16, 43)
     assert (number_y.min().item(), number_y.max().item()) == (3, 18)
 
-    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([123]))
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([456]))
     noop = torch.zeros((1, 20), dtype=torch.bool)
+    assert engine.mugshot_face_index.item() == 0
     for _ in range(8):
         engine.step(noop)
     assert engine.episode_time.item() == 17
-    assert engine.mugshot_face_index.item() == 1
+    assert engine.mugshot_face_index.item() == 0
     engine.step(noop)
     assert engine.episode_time.item() == 19
-    assert engine.mugshot_face_index.item() == 0
+    assert engine.mugshot_face_index.item() == 1
 
     engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([123]))
     engine.weapon_raise_cooldown.zero_()

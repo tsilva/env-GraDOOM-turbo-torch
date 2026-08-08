@@ -1619,7 +1619,17 @@ class TorchDeathmatchEngine:
         self.mugshot_ouch.masked_fill_(mask, False)
         self.mugshot_grin.masked_fill_(mask, False)
         self.mugshot_grin_tics.masked_fill_(mask, 0)
-        self.mugshot_face_index.masked_fill_(mask, 1)
+        # Doom chooses one of the three straight-ahead mugshots as soon as
+        # the normal face state is entered.  Keep this visual-only stream
+        # independent from gameplay while preserving cheap, lane-local reset
+        # determinism; exact agreement with M_Random is not gameplay-facing.
+        self.mugshot_face_index.copy_(
+            torch.where(
+                mask,
+                torch.remainder(self.mugshot_rng_state, 3),
+                self.mugshot_face_index,
+            )
+        )
         self.mugshot_face_tics.masked_fill_(mask, _MUGSHOT_NORMAL_FRAME_TICS)
         self.attack_held_tics.masked_fill_(mask, 0)
         self.turn_held_tics.masked_fill_(mask, 0)

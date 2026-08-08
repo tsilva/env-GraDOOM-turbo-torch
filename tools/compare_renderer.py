@@ -99,6 +99,23 @@ def _reference_frame(
         game.close()
 
 
+def _match_reference_mugshot(
+    engine: TorchDeathmatchEngine,
+    reference: torch.Tensor,
+) -> int:
+    """Synchronize Doom's permitted visual-only neutral-face randomness."""
+
+    scores: list[float] = []
+    for face_index in range(3):
+        engine.mugshot_face_index.fill_(face_index)
+        indexed_hud = engine._native_render_hud()[0]
+        rgb_hud = engine.map.playpal[indexed_hud.to(torch.int64)].to(torch.float32)
+        scores.append(float(torch.abs(reference[-32:] - rgb_hud).sum()))
+    matched = min(range(3), key=scores.__getitem__)
+    engine.mugshot_face_index.fill_(matched)
+    return matched
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True, type=Path)
@@ -145,6 +162,7 @@ def main() -> int:
         engine.pitch.fill_(pitch_degrees * math.pi / 180.0)
         engine.episode_time.fill_(args.settle_tics + 1 + int(bool(args.look_delta)))
         engine.weapon_raise_cooldown.zero_()
+        matched_mugshot_face_index = _match_reference_mugshot(engine, reference)
         actual = engine.render_native_frame(include_hud=True)[0].to(torch.float32)
         flattened = torch.stack((reference.flatten(), actual.flatten()))
         absolute_error = torch.abs(reference - actual)
@@ -167,6 +185,7 @@ def main() -> int:
                 "mae_ceiling": float(absolute_error[:104].mean()),
                 "mae_floor": float(absolute_error[104:208].mean()),
                 "mae_hud": float(absolute_error[208:].mean()),
+                "matched_mugshot_face_index": matched_mugshot_face_index,
                 "pitch": pitch_degrees,
                 "reference_mean": float(reference.mean()),
                 "seed": seed,
@@ -189,6 +208,7 @@ def main() -> int:
                 "records": records,
                 "scenario_sha256": scenario.scenario_sha256,
                 "schema": "gradoom.renderer-parity.raw-rgb-hud.v1",
+                "stochastic_state_alignment": ["mugshot_face_index"],
             },
             sort_keys=True,
         )
