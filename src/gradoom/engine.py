@@ -8843,6 +8843,11 @@ class TorchDeathmatchEngine:
             & (endpoint_columns >= 0)
             & (endpoint_columns <= self.native_screen_width)
         )
+        viewer_from_start = origin - start
+        front_facing = (
+            segment[..., 0] * viewer_from_start[..., 1]
+            - segment[..., 1] * viewer_from_start[..., 0]
+        ) < 0
         for endpoint in range(2):
             column = endpoint_columns[..., endpoint]
             visible = endpoint_visible[..., endpoint] & has_columns
@@ -8852,18 +8857,49 @@ class TorchDeathmatchEngine:
             screen_left = torch.where(visible & owns_left, column, screen_left)
             screen_right = torch.where(visible & ~owns_left, column, screen_right)
 
+        # A fully visible one-sided seg uses FWallCoords' exact fixed-point
+        # [sx1, sx2) bounds. Do not let the geometric ray fallback shift that
+        # solid range across a shared endpoint; the adjacent seg owns the next
+        # integer column.
+        front_facing_by_wall = front_facing.squeeze(1)
+        ordered_endpoint_columns = torch.where(
+            front_facing_by_wall[..., None],
+            endpoint_columns,
+            torch.flip(endpoint_columns, dims=(2,)),
+        )
+        ordered_endpoint_visible = torch.where(
+            front_facing_by_wall[..., None],
+            endpoint_visible,
+            torch.flip(endpoint_visible, dims=(2,)),
+        )
+        one_sided = self.map.portal_wall_sectors[:, 1] < 0
+        exact_solid_bounds = (
+            one_sided[None, :]
+            & front_facing_by_wall
+            & torch.all(ordered_endpoint_visible, dim=2)
+        )
+        screen_left = torch.where(
+            exact_solid_bounds,
+            ordered_endpoint_columns[..., 0],
+            screen_left,
+        )
+        screen_right = torch.where(
+            exact_solid_bounds,
+            ordered_endpoint_columns[..., 1],
+            screen_right,
+        )
+        has_columns = torch.where(
+            exact_solid_bounds,
+            screen_right > screen_left,
+            has_columns,
+        )
+
         pixel_x = self._native_pixel_x[0, 0].to(torch.int64)[None, :, None]
         screen_valid = (
             has_columns[:, None, :]
             & (pixel_x >= screen_left[:, None, :])
             & (pixel_x < screen_right[:, None, :])
         )
-        one_sided = self.map.portal_wall_sectors[:, 1] < 0
-        viewer_from_start = origin - start
-        front_facing = (
-            segment[..., 0] * viewer_from_start[..., 1]
-            - segment[..., 1] * viewer_from_start[..., 0]
-        ) < 0
         projected_valid = (
             (denominator.abs() >= 1e-6)
             & (distance > 0)
@@ -9204,19 +9240,21 @@ class TorchDeathmatchEngine:
             endpoint_only_portal = valid & ~one_sided & ~geometric_intersection
             # A projected endpoint can reveal the adjacent sector without the
             # column ray crossing the portal segment. Continue on the side
-            # whose next real boundary is nearer; keep the current side on a
-            # tie so shared vertices cannot bounce between adjacent portals.
-            future_geometric = (
+            # whose next geometric or projected solid boundary is nearer; keep
+            # the current side on a tie so shared vertices cannot bounce.
+            future_boundary = (
                 geometric_intersections
-                & torch.isfinite(distances)
-                & (distances > distance[:, :, None] + 1e-3)
-            )
+                | (
+                    (all_sectors[None, None, :, 1] < 0)
+                    & torch.isfinite(distances)
+                )
+            ) & (distances > distance[:, :, None] + 1e-3)
             other_incident = (
                 all_sectors[None, None, :, 0] == other_sector[:, :, None]
             ) | (all_sectors[None, None, :, 1] == other_sector[:, :, None])
             current_next_distance = torch.min(
                 torch.where(
-                    incident & future_geometric,
+                    incident & future_boundary,
                     distances,
                     torch.full_like(distances, torch.inf),
                 ),
@@ -9224,7 +9262,7 @@ class TorchDeathmatchEngine:
             ).values
             other_next_distance = torch.min(
                 torch.where(
-                    other_incident & future_geometric,
+                    other_incident & future_boundary,
                     distances,
                     torch.full_like(distances, torch.inf),
                 ),

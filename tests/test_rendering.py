@@ -366,6 +366,14 @@ def test_native_walls_use_reference_half_open_screen_bounds(
     assert torch.isfinite(wall_distance[0, 67, 60])
     assert torch.isinf(wall_distance[0, 90, 168])
     assert torch.isfinite(wall_distance[0, 90, 59])
+    # Wall 184's geometric ray hit falls outside its fixed [106, 107) solid
+    # span. The adjacent wall 185 owns [107, 110) even though this column ray
+    # misses it, preserving the continuous BFALL1 seam and its x offset.
+    assert geometric_intersections[0, 107, 184]
+    assert torch.isinf(wall_distance[0, 107, 184])
+    assert not geometric_intersections[0, 107, 185]
+    assert torch.isfinite(wall_distance[0, 107, 185])
+    assert rgb[0, 45, 107].tolist() == [107, 15, 15]
     # R_AddLine rejects this one-sided linedef's back face. Sector 0 is
     # non-convex, so incidence alone would incorrectly expose BIGBRIK1 here.
     assert torch.isinf(wall_distance[0, 76, 8])
