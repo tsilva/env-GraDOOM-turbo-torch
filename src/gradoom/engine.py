@@ -110,6 +110,7 @@ _NATIVE_FOCAL_X_FIXED = 160 * _FIXED_UNIT
 # R_ExecuteSetViewSize derives 320x240's y aspect as integer 16.16.
 _NATIVE_Y_ASPECT_FIXED = (320 * _FIXED_UNIT * 240) // (200 * 320)
 _NATIVE_FOCAL_Y_FIXED = 160 * _NATIVE_Y_ASPECT_FIXED
+_NATIVE_SPRITE_MIN_DEPTH_FIXED = 2048 * 4
 _FIST_RANGE = 64.0
 _CHAINSAW_RANGE = 65.0
 _CHAINSAW_SPREAD_RADIANS = 2.8125 * math.pi / 180.0
@@ -8751,6 +8752,58 @@ class TorchDeathmatchEngine:
         )
         return shotgun_muzzle | chaingun_muzzle
 
+    def _native_sprite_horizontal_projection(
+        self,
+        actor_x: torch.Tensor,
+        actor_y: torch.Tensor,
+        actor_sprite: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Replay R_ProjectSprite's fixed-point horizontal screen mapping."""
+
+        view_x_fixed = self._public_or_retained_fixed(self.x, self._x_fixed)
+        view_y_fixed = self._public_or_retained_fixed(self.y, self._y_fixed)
+        actor_x_fixed = torch.round(actor_x * _FIXED_UNIT).to(torch.int64)
+        actor_y_fixed = torch.round(actor_y * _FIXED_UNIT).to(torch.int64)
+        relative_x_fixed = actor_x_fixed - view_x_fixed[:, None]
+        relative_y_fixed = actor_y_fixed - view_y_fixed[:, None]
+        fine_angle = self._native_view_angle_bam() >> _ANGLE_TO_FINE_SHIFT
+        view_sine_fixed = self._fine_sine_fixed[fine_angle][:, None]
+        view_cosine_fixed = self._fine_sine_fixed[
+            (fine_angle + _FINE_ANGLES // 4) & (_FINE_ANGLES - 1)
+        ][:, None]
+        sprite_depth_fixed = (
+            relative_x_fixed * view_cosine_fixed
+            + relative_y_fixed * view_sine_fixed
+        ) >> 20
+        sprite_side_fixed = (
+            relative_x_fixed * view_sine_fixed
+            - relative_y_fixed * view_cosine_fixed
+        ) >> 16
+        sprite_xscale_fixed = self._trunc_divide(
+            torch.full_like(sprite_depth_fixed, _NATIVE_FOCAL_X_FIXED << 12),
+            sprite_depth_fixed.clamp_min(_NATIVE_SPRITE_MIN_DEPTH_FIXED),
+        )
+        sprite_left_fixed = (
+            sprite_side_fixed
+            - self.map.raw_sprite_left_offsets[actor_sprite].to(torch.int64)
+            * _FIXED_UNIT
+        )
+        sprite_left = self.native_screen_width // 2 + (
+            sprite_left_fixed * sprite_xscale_fixed >> 32
+        )
+        sprite_right_fixed = sprite_left_fixed + self.map.raw_sprite_widths[
+            actor_sprite
+        ] * _FIXED_UNIT
+        sprite_right = self.native_screen_width // 2 + (
+            sprite_right_fixed * sprite_xscale_fixed >> 32
+        )
+        sprite_span = (sprite_right - sprite_left).clamp_min(1)
+        horizontal_step_fixed = self._trunc_divide(
+            self.map.raw_sprite_widths[actor_sprite] << 16,
+            sprite_span,
+        )
+        return sprite_left, sprite_right, horizontal_step_fixed
+
     def _native_render_sprites(
         self,
         frame: torch.Tensor,
@@ -9145,24 +9198,21 @@ class TorchDeathmatchEngine:
         actor_distance = torch.sqrt(dx * dx + dy * dy).clamp_min_(1)
         relative = self._wrap_angle(torch.atan2(dy, dx) - self.angle[:, None])
         actor_depth = actor_distance * torch.cos(relative)
-        screen_center = (
-            self.native_screen_width / 2.0
-            - 1.0
-            - torch.tan(relative) * horizontal_focal_length
-        )
-        horizontal_scale = horizontal_focal_length / actor_depth.clamp_min(1)
         vertical_scale = vertical_focal_length / actor_depth.clamp_min(1)
         sprite_width = self.map.raw_sprite_widths[actor_sprite].to(torch.float32)
         sprite_height = self.map.raw_sprite_heights[actor_sprite].to(torch.float32)
-        sprite_left = (
-            screen_center - self.map.raw_sprite_left_offsets[actor_sprite] * horizontal_scale
+        sprite_left, sprite_right, horizontal_step_fixed = (
+            self._native_sprite_horizontal_projection(
+                actor_x,
+                actor_y,
+                actor_sprite,
+            )
         )
         sprite_top = (
             center[:, None]
             + (view_z[:, None] - actor_z) * vertical_scale
             - self.map.raw_sprite_top_offsets[actor_sprite] * vertical_scale
         )
-        sprite_right = sprite_left + sprite_width * horizontal_scale
         column_inside = (self._native_pixel_x >= sprite_left[:, :, None]) & (
             self._native_pixel_x < sprite_right[:, :, None]
         )
@@ -9202,15 +9252,18 @@ class TorchDeathmatchEngine:
             selected_actor = nearest_actors[:, layer, :]
             selected_distance = nearest_distances[:, layer, :]
             selected_sprite = actor_sprite.gather(1, selected_actor)
-            selected_horizontal_scale = horizontal_scale.gather(1, selected_actor)
+            selected_horizontal_step_fixed = horizontal_step_fixed.gather(
+                1, selected_actor
+            )
             selected_vertical_scale = vertical_scale.gather(1, selected_actor)
             selected_left = sprite_left.gather(1, selected_actor)
             selected_top = sprite_top.gather(1, selected_actor)
             selected_width = sprite_width.gather(1, selected_actor).to(torch.int64)
             selected_height = sprite_height.gather(1, selected_actor).to(torch.int64)
-            sprite_u = torch.floor(
-                (self._native_pixel_x[:, 0, :] - selected_left) / selected_horizontal_scale
-            ).to(torch.int64)
+            sprite_u = (
+                (self._native_pixel_x[:, 0, :] - selected_left)
+                * selected_horizontal_step_fixed
+            ) >> 16
             sprite_v = torch.floor(
                 (self._native_pixel_y - selected_top[:, None, :])
                 / selected_vertical_scale[:, None, :]

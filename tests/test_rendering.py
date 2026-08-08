@@ -890,6 +890,51 @@ def test_native_pit_depth_occludes_map_items(pinned_deathmatch_scenario) -> None
 
 
 @pytest.mark.skipif(not SCENARIO.is_file() or not DOOM2.is_file(), reason="operator WADs absent")
+def test_native_item_uses_fixed_point_sprite_projection(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([1337]))
+    engine.x.fill_(940.9204254150391)
+    engine.y.fill_(826.7186584472656)
+    engine.z.zero_()
+    engine.view_z.fill_(41.0)
+    engine.angle.fill_(math.radians(341.29028328258784))
+    engine.episode_time.fill_(17)
+    engine.weapon_raise_cooldown.zero_()
+    engine.player_dead.fill_(True)
+
+    item_index = torch.where(
+        (engine.map.item_spawns[:, 0] == 1248)
+        & (engine.map.item_spawns[:, 1] == 832)
+    )[0].item()
+    sprite = engine.map.item_raw_visual_types[item_index].reshape(1, 1)
+    sprite_left, sprite_right, texture_step = (
+        engine._native_sprite_horizontal_projection(
+            engine.map.item_spawns[item_index : item_index + 1, 0].reshape(1, 1),
+            engine.map.item_spawns[item_index : item_index + 1, 1].reshape(1, 1),
+            sprite,
+        )
+    )
+    assert sprite_left.item() == 85
+    assert sprite_right.item() == 119
+    assert texture_step.item() == 119506
+
+    engine.item_available.zero_()
+    engine.item_available[0, item_index] = True
+    with_item = engine.render_native_frame(include_hud=False)
+    engine.item_available.zero_()
+    without_item = engine.render_native_frame(include_hud=False)
+    changed_y, changed_x = torch.where(torch.any(with_item[0] != without_item[0], dim=-1))
+    assert (changed_x.min().item(), changed_x.max().item()) == (85, 118)
+    assert (changed_y.min().item(), changed_y.max().item()) == (119, 128)
+
+
+@pytest.mark.skipif(not SCENARIO.is_file() or not DOOM2.is_file(), reason="operator WADs absent")
 def test_native_renderer_includes_voodoo_dolls(pinned_deathmatch_scenario) -> None:
     scenario = pinned_deathmatch_scenario
     engine = TorchDeathmatchEngine(scenario, 1, device=torch.device("cpu"))
