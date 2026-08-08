@@ -50,7 +50,8 @@ def _reference_frame(
     iwad: Path,
     seed: int,
     settle_tics: int,
-) -> tuple[torch.Tensor, float, float, float, float, float]:
+    look_delta: float,
+) -> tuple[torch.Tensor, float, float, float, float, float, float]:
     try:
         import vizdoom as vzd
     except ImportError as exc:
@@ -68,6 +69,7 @@ def _reference_frame(
         vzd.GameVariable.POSITION_Z,
         vzd.GameVariable.ANGLE,
         vzd.GameVariable.CAMERA_POSITION_Z,
+        vzd.GameVariable.PITCH,
     )
     for variable in variables:
         game.add_available_game_variable(variable)
@@ -78,6 +80,10 @@ def _reference_frame(
         noop = [0.0] * len(game.get_available_buttons())
         for _ in range(settle_tics):
             game.make_action(noop, 1)
+        if look_delta:
+            look = noop.copy()
+            look[game.get_available_buttons().index(vzd.Button.LOOK_UP_DOWN_DELTA)] = look_delta
+            game.make_action(look, 1)
         state = game.get_state()
         if state is None:
             raise RuntimeError("ViZDoom did not expose an initial state")
@@ -85,10 +91,10 @@ def _reference_frame(
         if raw.shape != (240, 320, 3):
             raise RuntimeError(f"expected a 240x320 RGB24 frame, got {raw.shape}")
         frame = torch.from_numpy(raw).to(torch.float32)
-        x, y, z, angle, camera_z = (
+        x, y, z, angle, camera_z, pitch = (
             float(game.get_game_variable(variable)) for variable in variables
         )
-        return frame, x, y, z, angle, camera_z
+        return frame, x, y, z, angle, camera_z, pitch
     finally:
         game.close()
 
@@ -100,6 +106,12 @@ def main() -> int:
     parser.add_argument("--iwad", required=True, type=Path)
     parser.add_argument("--seeds", type=int, nargs="+", default=(123, 456, 789, 1_337))
     parser.add_argument("--settle-tics", type=int, default=16)
+    parser.add_argument(
+        "--look-delta",
+        type=float,
+        default=0.0,
+        help="apply one raw LOOK_UP_DOWN_DELTA action after settling",
+    )
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--allow-unpinned-scenario", action="store_true")
     args = parser.parse_args()
@@ -115,11 +127,12 @@ def main() -> int:
     mask = torch.ones(1, dtype=torch.bool)
     records: list[dict[str, float | int]] = []
     for seed in args.seeds:
-        reference, x, y, z, angle_degrees, camera_z = _reference_frame(
+        reference, x, y, z, angle_degrees, camera_z, pitch_degrees = _reference_frame(
             args.config,
             args.iwad,
             seed,
             args.settle_tics,
+            args.look_delta,
         )
         engine.reset(mask, torch.tensor([seed], dtype=torch.int64))
         engine.x.fill_(x)
@@ -128,7 +141,9 @@ def main() -> int:
         engine.view_z.fill_(camera_z)
         engine.view_height.fill_(camera_z - z)
         engine.angle.fill_(angle_degrees * math.pi / 180.0)
-        engine.episode_time.fill_(args.settle_tics + 1)
+        engine._pitch_bam.fill_(round(pitch_degrees / 360.0 * (1 << 32)))
+        engine.pitch.fill_(pitch_degrees * math.pi / 180.0)
+        engine.episode_time.fill_(args.settle_tics + 1 + int(bool(args.look_delta)))
         engine.weapon_raise_cooldown.zero_()
         actual = engine.render_native_frame(include_hud=True)[0].to(torch.float32)
         flattened = torch.stack((reference.flatten(), actual.flatten()))
@@ -152,6 +167,7 @@ def main() -> int:
                 "mae_ceiling": float(absolute_error[:104].mean()),
                 "mae_floor": float(absolute_error[104:208].mean()),
                 "mae_hud": float(absolute_error[208:].mean()),
+                "pitch": pitch_degrees,
                 "reference_mean": float(reference.mean()),
                 "seed": seed,
                 "x": x,

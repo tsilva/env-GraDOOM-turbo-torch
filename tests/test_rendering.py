@@ -34,6 +34,33 @@ def test_doom_sprite_rotation_uses_actor_to_viewer_angle() -> None:
     assert rotation.tolist() == [0, 2, 4, 6]
 
 
+def test_pitch_view_pan_uses_reference_fixed_tangent_projection(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([123]))
+    engine.enemy_alive.zero_()
+    engine.item_available.zero_()
+    baseline_native = engine.render_native_frame(include_hud=False)
+    baseline_training = engine.render_frame()
+
+    engine._pitch_bam.fill_(-(182 << 16) * 10)
+    engine.pitch.copy_(engine._pitch_bam.to(torch.float32) * (2.0 * math.pi / float(1 << 32)))
+
+    # ZDoom quantizes view pitch through its 8192-entry finetangent table;
+    # ten binary +1 deltas therefore pan a 320-wide view by this exact amount.
+    assert engine._pitch_projection_offset(192.0).item() == 33.7705078125
+    assert not torch.equal(
+        baseline_native[:, :150, :],
+        engine.render_native_frame(include_hud=False)[:, :150, :],
+    )
+    assert not torch.equal(baseline_training, engine.render_frame())
+
+
 def test_enemy_fullbright_matches_actor_attack_states() -> None:
     enemy_type = torch.tensor((0, 1, 1, 3, 3, 3, 3, 3, 3))
     attack_phase = torch.tensor((2, 2, 2, 2, 3, 3, 4, 1, 1))

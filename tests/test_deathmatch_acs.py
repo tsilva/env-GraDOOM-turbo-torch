@@ -1081,6 +1081,41 @@ def test_binary_delta_actions_contribute_reference_yaw_and_side_move(
     )
 
 
+def test_binary_pitch_delta_matches_reference_during_teleport_lock_and_clamps(
+    square_scenario,
+) -> None:
+    engine = _engine(square_scenario)
+    buttons = torch.zeros((2, 20), dtype=torch.bool)
+    buttons[:, 17] = True
+
+    # ViZDoom applies LOOK_UP_DOWN_DELTA before the reaction-time early exit.
+    # A binary value of one floors to 182 command units, or 0.999755859375°.
+    engine.reaction_time.fill_(7)
+    engine._move_player(buttons)
+
+    expected_bam = torch.full((2,), -(182 << 16), dtype=torch.int64)
+    expected_pitch = expected_bam.to(torch.float32) * (2.0 * math.pi / float(1 << 32))
+    assert torch.equal(engine._pitch_bam, expected_bam)
+    assert torch.equal(engine.pitch, expected_pitch)
+    assert engine.reaction_time.tolist() == [6, 6]
+
+    for _ in range(32):
+        engine._move_player(buttons)
+
+    minimum_pitch_bam = -32 * ((1 << 29) // 45)
+    assert engine._pitch_bam.tolist() == [minimum_pitch_bam, minimum_pitch_bam]
+    assert torch.allclose(
+        torch.rad2deg(engine.pitch),
+        torch.full((2,), -31.999998092651367),
+        rtol=0,
+        atol=2e-6,
+    )
+
+    engine.reset(torch.tensor([True, False]), torch.tensor([789, 456]))
+    assert engine._pitch_bam.tolist() == [0, minimum_pitch_bam]
+    assert engine.pitch[0] == 0
+
+
 def test_reference_forward_acceleration_and_right_strafe_basis(square_scenario) -> None:
     engine = _engine(square_scenario)
     engine.reaction_time.zero_()

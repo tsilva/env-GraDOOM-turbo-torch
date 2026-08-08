@@ -980,6 +980,50 @@ def test_player_missile_autoaim_stops_at_reference_range(square_scenario) -> Non
     assert engine.projectile_z[1, 0] == 32.0
 
 
+def test_player_missile_without_autoaim_uses_view_pitch(square_scenario) -> None:
+    engine = _engine(square_scenario)
+    engine.enemy_alive.zero_()
+    engine.x.zero_()
+    engine.y.zero_()
+    engine.z.zero_()
+    engine.angle.zero_()
+    engine.pitch.copy_(torch.deg2rad(torch.tensor([-10.0, 10.0])))
+
+    engine._execute_player_attack(
+        torch.tensor([6, 7]),
+        torch.ones(2, dtype=torch.bool),
+        torch.ones(2, dtype=torch.bool),
+    )
+
+    assert engine.projectile_velocity_z[0, 0] > 0
+    assert engine.projectile_velocity_z[1, 0] < 0
+
+
+def test_melee_targeting_uses_view_pitch_and_actor_height(square_scenario) -> None:
+    engine = _engine(square_scenario)
+    engine.enemy_alive.zero_()
+    engine.x.zero_()
+    engine.y.zero_()
+    engine.z.zero_()
+    engine.angle.zero_()
+    engine.enemy_x[:, 0] = 48
+    engine.enemy_y[:, 0] = 0
+    engine.enemy_z[:, 0] = 100
+    engine.enemy_type[:, 0] = 0
+    engine.enemy_health[:, 0] = 100
+    engine.enemy_alive[:, 0] = True
+    engine.pitch.copy_(torch.deg2rad(torch.tensor([0.0, -32.0])))
+
+    engine._execute_player_attack(
+        torch.zeros(2, dtype=torch.int64),
+        torch.ones(2, dtype=torch.bool),
+        torch.ones(2, dtype=torch.bool),
+    )
+
+    assert engine.enemy_health[0, 0] == 100
+    assert engine.enemy_health[1, 0] < 100
+
+
 def test_rocket_radius_damage_uses_square_actor_bounds_and_height(square_scenario) -> None:
     engine = _engine(square_scenario)
 

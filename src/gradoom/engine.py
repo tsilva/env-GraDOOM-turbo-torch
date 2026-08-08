@@ -70,6 +70,9 @@ _PLAYER_SLOW_TURN_YAW = 320
 _PLAYER_WALK_TURN_YAW = 640
 _PLAYER_RUN_TURN_YAW = 1280
 _PLAYER_BINARY_DELTA_TURN_YAW = 182
+_PLAYER_BINARY_DELTA_PITCH = 182 << 16
+_PLAYER_MIN_PITCH_BAM = -32 * (_ANGLE_45 // 45)
+_PLAYER_MAX_PITCH_BAM = 56 * (_ANGLE_45 // 45)
 _PLAYER_BINARY_DELTA_SIDE_ACCELERATION_FIXED = 1 << 11
 _PLAYER_MOVE_BOB_FIXED = _FIXED_UNIT // 4
 _PLAYER_MAX_BOB_FIXED = 16 * _FIXED_UNIT
@@ -262,6 +265,16 @@ def _build_fine_sine_fixed() -> np.ndarray:
     return table
 
 
+def _build_fine_tangent_fixed() -> np.ndarray:
+    """Reproduce ZDoom's R_InitTables 16.16 finetangent table exactly."""
+    half = _FINE_ANGLES // 2
+    phase = (
+        np.arange(half, dtype=np.float64) - _FINE_ANGLES // 4
+    ) * (2.0 * math.pi / _FINE_ANGLES)
+    phase[0] += math.pi / _FINE_ANGLES
+    return np.trunc(np.tan(phase) * _FIXED_UNIT + 0.5).astype(np.int64)
+
+
 def _build_tangent_to_angle() -> np.ndarray:
     """Reproduce the unsigned angle table used by Doom's R_PointToAngle2."""
     slope = np.arange(_SLOPE_RANGE + 1, dtype=np.float64) / _SLOPE_RANGE
@@ -323,6 +336,7 @@ def _build_rocket_wall_grid(
 
 
 _FINE_SINE_FIXED = _build_fine_sine_fixed()
+_FINE_TANGENT_FIXED = _build_fine_tangent_fixed()
 _TANGENT_TO_ANGLE = _build_tangent_to_angle()
 _ITEM_SPRITE_INDEX = {
     2011: 6,
@@ -985,6 +999,10 @@ class TorchDeathmatchEngine:
         # Keep the exact retained angle while exposing radians through the
         # established public tensor API.
         self._angle_bam = torch.zeros(n, device=device, dtype=torch.int64)
+        # Actor pitch is a signed BAM angle. ViZDoom exposes it in degrees,
+        # while the render and weapon paths consume the retained integer.
+        self._pitch_bam = torch.zeros(n, device=device, dtype=torch.int64)
+        self.pitch = torch.zeros(n, device=device)
         self.turn_held_tics = torch.zeros(n, device=device, dtype=torch.int32)
         self.momentum_x = torch.zeros(n, device=device)
         self.momentum_y = torch.zeros(n, device=device)
@@ -1294,6 +1312,11 @@ class TorchDeathmatchEngine:
             device=device,
             dtype=torch.int64,
         )
+        self._fine_tangent_fixed = torch.as_tensor(
+            _FINE_TANGENT_FIXED,
+            device=device,
+            dtype=torch.int64,
+        )
         self._tangent_to_angle = torch.as_tensor(
             _TANGENT_TO_ANGLE,
             device=device,
@@ -1524,6 +1547,8 @@ class TorchDeathmatchEngine:
                 self.angle,
             )
         )
+        self._pitch_bam.masked_fill_(mask, 0)
+        self.pitch.masked_fill_(mask, 0)
         spawn_x_fixed = torch.round(spawn_x * _FIXED_UNIT).to(torch.int64)
         spawn_y_fixed = torch.round(spawn_y * _FIXED_UNIT).to(torch.int64)
         self._x_fixed.copy_(torch.where(mask, spawn_x_fixed, self._x_fixed))
@@ -2996,6 +3021,7 @@ class TorchDeathmatchEngine:
         visible_momentum_x = self._momentum_x_fixed.to(torch.float32) / _FIXED_UNIT
         visible_momentum_y = self._momentum_y_fixed.to(torch.float32) / _FIXED_UNIT
         visible_angle = self._angle_bam.to(torch.float32) * _BAM_TO_RADIANS
+        visible_pitch = self._pitch_bam.to(torch.float32) * _BAM_TO_RADIANS
         position_resynchronized = (self.x != visible_x) | (self.y != visible_y)
         self._x_fixed.copy_(
             torch.where(
@@ -3034,12 +3060,31 @@ class TorchDeathmatchEngine:
         self._angle_bam.copy_(
             torch.where(self.angle != visible_angle, public_angle_bam, self._angle_bam)
         )
+        public_pitch_bam = torch.round(self.pitch / _BAM_TO_RADIANS).to(torch.int64)
+        self._pitch_bam.copy_(
+            torch.where(self.pitch != visible_pitch, public_pitch_bam, self._pitch_bam)
+        )
         if self.debug_checks and torch.any(position_resynchronized):
             current_floor, current_ceiling = self._player_opening_at(self.x, self.y)
             self.player_floor_z.copy_(current_floor)
             self.player_ceiling_z.copy_(current_ceiling)
 
         playing = ~self.player_dead & (self.episode_time < self.episode_timeout)
+        # P_PlayerThink applies vertical look before checking reactiontime, so
+        # the delta axis remains live during the seven-tic teleport freeze.
+        pitch_delta = (
+            buttons[:, 17].to(torch.int64)
+            * _PLAYER_BINARY_DELTA_PITCH
+            * playing.to(torch.int64)
+        )
+        self._pitch_bam.copy_(
+            torch.clamp(
+                self._pitch_bam - pitch_delta,
+                _PLAYER_MIN_PITCH_BAM,
+                _PLAYER_MAX_PITCH_BAM,
+            )
+        )
+        self.pitch.copy_(self._pitch_bam.to(torch.float32) * _BAM_TO_RADIANS)
         active = (self.reaction_time <= 0) & playing
         pull_requested = self.chainsaw_pull & playing
         pull_active = pull_requested & active
@@ -4419,14 +4464,32 @@ class TorchDeathmatchEngine:
         center_distance = torch.sqrt(
             center_dx * center_dx + center_dy * center_dy
         ).clamp_min_(1e-4)
+        shoot_z = self.z[:, None] + 36.0
+        target_bottom_delta = target_z - shoot_z
+        target_top_delta = target_z + target_height - shoot_z
         bottom_slope = torch.maximum(
+            target_bottom_delta / center_distance,
             opening_bottom / center_distance,
-            torch.full_like(center_distance, -_BULLET_AUTOAIM_MAX_SLOPE),
         )
         top_slope = torch.minimum(
+            target_top_delta / center_distance,
             opening_top / center_distance,
-            torch.full_like(center_distance, _BULLET_AUTOAIM_MAX_SLOPE),
         )
+        aim_range = 35.0 * math.pi / 180.0
+        maximum_pitch = self.pitch + aim_range
+        minimum_aim_slope = torch.where(
+            maximum_pitch >= math.pi / 2,
+            torch.full_like(maximum_pitch, -torch.inf),
+            -torch.tan(maximum_pitch),
+        )
+        minimum_pitch = self.pitch - aim_range
+        maximum_aim_slope = torch.where(
+            minimum_pitch <= -math.pi / 2,
+            torch.full_like(minimum_pitch, torch.inf),
+            -torch.tan(minimum_pitch),
+        )
+        bottom_slope = torch.maximum(bottom_slope, minimum_aim_slope[:, None])
+        top_slope = torch.minimum(top_slope, maximum_aim_slope[:, None])
         target_visible = target_alive & ~solid_sight & (top_slope > bottom_slope)
         melee_range = torch.where(
             weapon == 1,
@@ -4559,18 +4622,25 @@ class TorchDeathmatchEngine:
             target_bottom_delta[:, None, :] / safe_aim_distance,
             portal_bottom_slope[:, None, :],
         )
-        bottom_slope = torch.maximum(
-            bottom_slope,
-            torch.full_like(bottom_slope, -_BULLET_AUTOAIM_MAX_SLOPE),
-        )
         top_slope = torch.minimum(
             target_top_delta[:, None, :] / safe_aim_distance,
             portal_top_slope[:, None, :],
         )
-        top_slope = torch.minimum(
-            top_slope,
-            torch.full_like(top_slope, _BULLET_AUTOAIM_MAX_SLOPE),
+        aim_range = 35.0 * math.pi / 180.0
+        minimum_pitch = self.pitch - aim_range
+        maximum_pitch = self.pitch + aim_range
+        minimum_aim_slope = torch.where(
+            maximum_pitch >= math.pi / 2,
+            torch.full_like(maximum_pitch, -torch.inf),
+            -torch.tan(maximum_pitch),
         )
+        maximum_aim_slope = torch.where(
+            minimum_pitch <= -math.pi / 2,
+            torch.full_like(minimum_pitch, torch.inf),
+            -torch.tan(minimum_pitch),
+        )
+        bottom_slope = torch.maximum(bottom_slope, minimum_aim_slope[:, None, None])
+        top_slope = torch.minimum(top_slope, maximum_aim_slope[:, None, None])
         aim_wall_distance = self._player_ray_wall_distance(aim_angles)
         wall_sectors = self.map.portal_wall_sectors
         solid_wall = self.map.portal_wall_blocks_sight | torch.any(
@@ -4609,14 +4679,18 @@ class TorchDeathmatchEngine:
             2,
             aim_target[:, :, None],
         ).squeeze(2)
-        # PTR_AimTraverse averages the top and bottom pitch angles, not their
-        # slopes. The distinction is visible for close actors straddling the
-        # player's 36-unit hitscan origin. Only three selected actors need the
-        # comparatively expensive inverse tangent operation.
-        pitch_by_aim = (
-            -torch.atan(selected_top_slope)
-            - torch.atan(selected_bottom_slope)
-        ) * 0.5
+        selected_top_pitch = torch.maximum(
+            -torch.atan(selected_top_slope),
+            minimum_pitch[:, None],
+        )
+        selected_bottom_pitch = torch.minimum(
+            -torch.atan(selected_bottom_slope),
+            maximum_pitch[:, None],
+        )
+        # PTR_AimTraverse averages the clipped top and bottom pitch angles,
+        # not their slopes. The distinction is visible for close actors
+        # straddling the player's 36-unit hitscan origin.
+        pitch_by_aim = (selected_top_pitch + selected_bottom_pitch) * 0.5
         selected_probe = torch.argmax(aim_exists.to(torch.int32), dim=1)
         row = torch.arange(self.num_envs, device=self.device)
         has_autoaim = torch.any(aim_exists, dim=1)
@@ -4628,7 +4702,7 @@ class TorchDeathmatchEngine:
         selected_pitch = torch.where(
             has_autoaim,
             pitch_by_aim[row, selected_probe],
-            torch.zeros_like(self.angle),
+            self.pitch,
         )
         return selected_angle, selected_pitch, has_autoaim
 
@@ -7597,15 +7671,26 @@ class TorchDeathmatchEngine:
     def _current_sector(self) -> torch.Tensor:
         return self._sector_at(self.x, self.y)
 
+    def _pitch_projection_offset(self, focal_length: float) -> torch.Tensor:
+        """Return ZDoom's fixed-point vertical view-panning offset."""
+        tangent_index = torch.bitwise_right_shift(
+            _ANGLE_90 - self._pitch_bam,
+            _ANGLE_TO_FINE_SHIFT,
+        ).clamp(0, _FINE_ANGLES // 2 - 1)
+        tangent = self._fine_tangent_fixed[tangent_index]
+        focal_fixed = round(focal_length * _FIXED_UNIT)
+        offset_fixed = tangent * focal_fixed >> 16
+        return offset_fixed.to(torch.float32) / _FIXED_UNIT
+
     def _render_flats(
         self,
         sector: torch.Tensor,
         view_z: torch.Tensor,
-        center: float,
+        center: torch.Tensor,
     ) -> torch.Tensor:
         ray_angles = self.angle[:, None] + self._ray_offsets[None, :]
         cosine_correction = torch.cos(self._ray_offsets)[None, :]
-        pixel_delta = self._pixel_y.to(torch.float32) - center
+        pixel_delta = self._pixel_y.to(torch.float32) - center[:, None, None]
         floor_height = view_z - self.map.sector_heights[sector, 0]
         floor_depth = (
             floor_height[:, None, None] * _PROJECTION_FOCAL_LENGTH / pixel_delta.clamp_min(0.25)
@@ -7666,7 +7751,7 @@ class TorchDeathmatchEngine:
         self,
         frame: torch.Tensor,
         view_z: torch.Tensor,
-        center: float,
+        center: torch.Tensor,
     ) -> torch.Tensor:
         distances, wall_indices, wall_along = self._portal_intersections()
         filled = torch.zeros_like(frame, dtype=torch.bool)
@@ -7693,7 +7778,7 @@ class TorchDeathmatchEngine:
                 world_z: torch.Tensor,
                 layer_distance: torch.Tensor = distance,
             ) -> torch.Tensor:
-                return center - (
+                return center[:, None] - (
                     (world_z - view_z[:, None]) * _PROJECTION_FOCAL_LENGTH / layer_distance
                 )
 
@@ -7758,7 +7843,9 @@ class TorchDeathmatchEngine:
                 texture_width,
             )
             world_z = view_z[:, None, None] + (
-                (center - pixel_y) * distance[:, None, :] / _PROJECTION_FOCAL_LENGTH
+                (center[:, None, None] - pixel_y)
+                * distance[:, None, :]
+                / _PROJECTION_FOCAL_LENGTH
             )
             texture_v = torch.remainder(
                 torch.floor(-world_z + texture_offset[:, None, :, 1]).to(torch.int64),
@@ -7808,7 +7895,9 @@ class TorchDeathmatchEngine:
 
     def render_frame(self) -> torch.Tensor:
         distance, _wall_index, _wall_along = self._raycast()
-        center = self.observation_height * 0.48
+        center = self.observation_height * 0.48 + self._pitch_projection_offset(
+            _PROJECTION_FOCAL_LENGTH
+        )
         sector = self._current_sector()
         view_z = self.view_z
         frame = self._render_flats(sector, view_z, center)
@@ -7894,7 +7983,7 @@ class TorchDeathmatchEngine:
             screen_center - self.map.sprite_left_offsets[safe_actor_type] * projection_scale
         )
         sprite_top = (
-            center
+            center[:, None]
             + (view_z[:, None] - actor_z) * projection_scale
             - self.map.sprite_top_offsets[safe_actor_type] * projection_scale
         )
@@ -8018,11 +8107,13 @@ class TorchDeathmatchEngine:
         current_sector: torch.Tensor,
         view_z: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        center = self.native_view_height / 2.0 - 1.0
         focal_length = self.native_screen_width / 2.0 * self.native_vertical_aspect
+        center = self.native_view_height / 2.0 - 1.0 + self._pitch_projection_offset(
+            focal_length
+        )
         ray_angles = self.angle[:, None] + self._native_ray_offsets[None, :]
         cosine_correction = torch.cos(self._native_ray_offsets)[None, None, :]
-        pixel_delta = self._native_pixel_y.to(torch.float32) - center
+        pixel_delta = self._native_pixel_y.to(torch.float32) - center[:, None, None]
         floor_pixels = pixel_delta > 0
         shape = (self.num_envs, self.native_view_height, self.native_screen_width)
         sectors = current_sector[:, None, None].expand(shape).clone()
@@ -8148,8 +8239,10 @@ class TorchDeathmatchEngine:
         view_z: torch.Tensor,
         surface_depth: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        center = self.native_view_height / 2.0 - 1.0
         focal_length = self.native_screen_width / 2.0 * self.native_vertical_aspect
+        center = self.native_view_height / 2.0 - 1.0 + self._pitch_projection_offset(
+            focal_length
+        )
         distances, wall_along = self._native_portal_intersections()
         filled = torch.zeros_like(frame, dtype=torch.bool)
         scene_depth = surface_depth.clone()
@@ -8191,7 +8284,9 @@ class TorchDeathmatchEngine:
                 world_z: torch.Tensor,
                 layer_distance: torch.Tensor = distance,
             ) -> torch.Tensor:
-                return center - ((world_z - view_z[:, None]) * focal_length / layer_distance)
+                return center[:, None] - (
+                    (world_z - view_z[:, None]) * focal_length / layer_distance
+                )
 
             one_top = project(view_ceiling)
             one_bottom = project(view_floor)
@@ -8244,7 +8339,7 @@ class TorchDeathmatchEngine:
                 texture_width,
             ).expand(-1, self.native_view_height, -1)
             world_z = view_z[:, None, None] + (
-                (center - pixel_y) * distance[:, None, :] / focal_length
+                (center[:, None, None] - pixel_y) * distance[:, None, :] / focal_length
             )
             texture_origin_z = torch.where(
                 one_span,
@@ -8441,9 +8536,11 @@ class TorchDeathmatchEngine:
         view_z: torch.Tensor,
         scene_depth: torch.Tensor,
     ) -> torch.Tensor:
-        center = self.native_view_height / 2.0 - 1.0
         horizontal_focal_length = self.native_screen_width / 2.0
         vertical_focal_length = horizontal_focal_length * self.native_vertical_aspect
+        center = self.native_view_height / 2.0 - 1.0 + self._pitch_projection_offset(
+            vertical_focal_length
+        )
         enemy_sprite = self._native_enemy_sprite_ids()
         static = self.map.raw_static_sprite_ids
         enemy_slots = torch.nonzero(torch.any(self.enemy_alive, dim=0)).flatten()
@@ -8839,7 +8936,7 @@ class TorchDeathmatchEngine:
             screen_center - self.map.raw_sprite_left_offsets[actor_sprite] * horizontal_scale
         )
         sprite_top = (
-            center
+            center[:, None]
             + (view_z[:, None] - actor_z) * vertical_scale
             - self.map.raw_sprite_top_offsets[actor_sprite] * vertical_scale
         )
