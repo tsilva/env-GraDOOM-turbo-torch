@@ -71,6 +71,75 @@ def _finish_pending_attack(engine: TorchDeathmatchEngine) -> torch.Tensor:
     return reward
 
 
+def test_hitscan_wall_puffs_use_separate_randomized_actor_state(square_scenario) -> None:
+    engine = _engine(square_scenario)
+    pellet_damage = torch.zeros((2, 20))
+    pellet_damage[:, 0] = 5
+    pellet_angle = torch.zeros((2, 20))
+    vertical_slope = torch.zeros((2, 20))
+    wall_distance = torch.full((2, 20), torch.inf)
+    wall_distance[:, 0] = 256
+    hit_actor = torch.zeros((2, 20), dtype=torch.bool)
+    gameplay_rng = engine.rng_state.clone()
+    puff_rng = engine.hitscan_puff_rng_state.clone()
+
+    engine._spawn_player_hitscan_puffs(
+        pellet_damage,
+        pellet_angle,
+        vertical_slope,
+        wall_distance,
+        hit_actor,
+    )
+
+    assert torch.equal(engine.rng_state, gameplay_rng)
+    assert not torch.equal(engine.hitscan_puff_rng_state, puff_rng)
+    assert torch.sum(engine.hitscan_puff_tics > 0, dim=1).tolist() == [1, 1]
+    assert engine.hitscan_puff_x[:, 0].tolist() == [252.0, 252.0]
+    assert engine.hitscan_puff_y[:, 0].tolist() == [0.0, 0.0]
+    assert torch.all((engine.hitscan_puff_z[:, 0] >= 32) & (engine.hitscan_puff_z[:, 0] < 40))
+    assert torch.all(
+        (engine.hitscan_puff_tics[:, 0] >= 13)
+        & (engine.hitscan_puff_tics[:, 0] <= 16)
+    )
+
+    previous_z = engine.hitscan_puff_z.clone()
+    previous_tics = engine.hitscan_puff_tics.clone()
+    engine._hitscan_puff_tick(torch.ones(2, dtype=torch.bool))
+    assert torch.equal(engine.hitscan_puff_z[:, 0], previous_z[:, 0] + 1)
+    assert torch.equal(engine.hitscan_puff_tics[:, 0], previous_tics[:, 0] - 1)
+
+    engine.hitscan_puff_tics.zero_()
+    previous_puff_rng = engine.hitscan_puff_rng_state.clone()
+    hit_actor[:, 0] = True
+    engine._spawn_player_hitscan_puffs(
+        pellet_damage,
+        pellet_angle,
+        vertical_slope,
+        wall_distance,
+        hit_actor,
+    )
+    assert not torch.equal(engine.hitscan_puff_rng_state, previous_puff_rng)
+    assert not torch.any(engine.hitscan_puff_tics)
+
+
+def test_player_pistol_wall_hit_spawns_puff(square_scenario) -> None:
+    engine = _engine(square_scenario)
+    engine.angle.zero_()
+    engine._angle_bam.zero_()
+    engine.pitch.zero_()
+    engine._pitch_bam.zero_()
+
+    engine._execute_player_attack(
+        torch.full((2,), 2, dtype=torch.int64),
+        torch.ones(2, dtype=torch.bool),
+        torch.ones(2, dtype=torch.bool),
+    )
+
+    assert engine.ammo[:, 1].tolist() == [49.0, 49.0]
+    assert torch.sum(engine.hitscan_puff_tics > 0, dim=1).tolist() == [1, 1]
+    assert engine.hitscan_puff_x[:, 0].tolist() == [252.0, 252.0]
+
+
 def test_standard_health_stays_when_full_but_bonus_is_always_consumed(square_scenario) -> None:
     engine = _engine(_item_scenario(square_scenario, 2011, 2014))
 

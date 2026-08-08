@@ -143,6 +143,7 @@ DEATHMATCH_PROJECTILE_EXPLOSION_DURATIONS = (
     (6, 6, 6),
 )
 DEATHMATCH_TELEPORT_FOG_FRAMES = tuple(f"TFOG{frame}0" for frame in "ABABCDEFGHIJ")
+DEATHMATCH_BULLET_PUFF_FRAMES = tuple(f"PUFF{frame}0" for frame in "ABCD")
 DEATHMATCH_HUD_PATCHES = (
     "STBAR",
     "STARMS",
@@ -174,8 +175,10 @@ DEATHMATCH_ITEM_ANIMATION_FRAMES = (
 )
 
 
-def _compile_projectile_additive_luts(playpal: np.ndarray) -> np.ndarray:
-    """Build the indexed-color tables used by ZDoom-style additive missiles."""
+def _compile_sprite_blend_luts(
+    playpal: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build ZDoom's indexed additive and half-translucent sprite tables."""
 
     palette = playpal.astype(np.int64)
     palette_candidates = palette[1:255]
@@ -216,7 +219,11 @@ def _compile_projectile_additive_luts(playpal: np.ndarray) -> np.ndarray:
         clamped |= overflow - (overflow >> 5)
         rgb32k_index = (clamped & (clamped >> 15)).astype(np.int64)
         tables[style] = rgb32k[rgb32k_index]
-    return tables
+    foreground = col2rgb8(32)[None, :]
+    background = col2rgb8(32)[:, None]
+    blended = (foreground + background) | 0x01F07C1F
+    translucent = rgb32k[blended & (blended >> 15)]
+    return tables, translucent
 
 
 @dataclass(frozen=True)
@@ -285,6 +292,8 @@ class CompiledScenario:
     projectile_explosion_frame_durations: np.ndarray | None = None
     projectile_explosion_total_tics: np.ndarray | None = None
     projectile_additive_luts: np.ndarray | None = None
+    sprite_translucent_lut: np.ndarray | None = None
+    raw_bullet_puff_sprite_ids: np.ndarray | None = None
     raw_static_sprite_ids: np.ndarray | None = None
     raw_item_animation_sprite_ids: np.ndarray | None = None
     native_weapon_screen_values: np.ndarray | None = None
@@ -559,6 +568,10 @@ def compile_deathmatch_scenario(
         [request_raw_sprite(name) for name in DEATHMATCH_TELEPORT_FOG_FRAMES],
         dtype=np.int32,
     )
+    raw_bullet_puff_sprite_ids = np.asarray(
+        [request_raw_sprite(name) for name in DEATHMATCH_BULLET_PUFF_FRAMES],
+        dtype=np.int32,
+    )
     raw_static_sprite_ids = np.asarray(
         [request_raw_sprite(name) for name in DEATHMATCH_SPRITE_FRAMES[6:]],
         dtype=np.int32,
@@ -798,7 +811,7 @@ def compile_deathmatch_scenario(
     if len(playpal_bytes) < 256 * 3:
         raise ValueError("IWAD PLAYPAL lump is too small")
     playpal = np.frombuffer(playpal_bytes[: 256 * 3], dtype=np.uint8).reshape(256, 3).copy()
-    projectile_additive_luts = _compile_projectile_additive_luts(playpal)
+    projectile_additive_luts, sprite_translucent_lut = _compile_sprite_blend_luts(playpal)
     colormap_bytes = game.read("COLORMAP")
     if len(colormap_bytes) < 34 * 256:
         raise ValueError("IWAD COLORMAP lump is too small")
@@ -866,6 +879,8 @@ def compile_deathmatch_scenario(
         projectile_explosion_frame_durations=projectile_explosion_frame_durations,
         projectile_explosion_total_tics=projectile_explosion_total_tics,
         projectile_additive_luts=projectile_additive_luts,
+        sprite_translucent_lut=sprite_translucent_lut,
+        raw_bullet_puff_sprite_ids=raw_bullet_puff_sprite_ids,
         raw_static_sprite_ids=raw_static_sprite_ids,
         raw_item_animation_sprite_ids=raw_item_animation_sprite_ids,
         native_weapon_screen_values=native_weapon_screen_values,

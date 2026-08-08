@@ -102,6 +102,8 @@ _WEAPON_AMMO_SLOT = (-1, -1, 1, 2, 2, 1, 4, 5)
 _WEAPON_AMMO_COST = (0.0, 0.0, 1.0, 1.0, 2.0, 1.0, 1.0, 1.0)
 _HITSCAN_PELLET_COUNTS = (0, 0, 1, 7, 20, 1, 0, 0)
 _HITSCAN_MAX_PELLETS = 20
+_BULLET_PUFF_TOTAL_TICS = 16
+_BULLET_PUFF_FRAME_TICS = 4
 _BULLET_AUTOAIM_RANGE = 1024.0
 _PLAYER_HITSCAN_RANGE = 8192.0
 _BULLET_AUTOAIM_OFFSET = 2.0 * math.pi / 64.0
@@ -474,6 +476,8 @@ class DeviceScenario:
     projectile_explosion_frame_durations: torch.Tensor
     projectile_explosion_total_tics: torch.Tensor
     projectile_additive_luts: torch.Tensor
+    sprite_translucent_lut: torch.Tensor
+    raw_bullet_puff_sprite_ids: torch.Tensor
     raw_static_sprite_ids: torch.Tensor
     raw_item_animation_sprite_ids: torch.Tensor
     native_weapon_screen_values: torch.Tensor
@@ -728,6 +732,19 @@ class DeviceScenario:
             if scenario.projectile_additive_luts is None
             else scenario.projectile_additive_luts
         )
+        sprite_translucent_lut = (
+            np.broadcast_to(
+                np.arange(256, dtype=np.uint8)[:, None],
+                (256, 256),
+            ).copy()
+            if scenario.sprite_translucent_lut is None
+            else scenario.sprite_translucent_lut
+        )
+        raw_bullet_puff_sprite_ids = (
+            np.zeros(4, dtype=np.int32)
+            if scenario.raw_bullet_puff_sprite_ids is None
+            else scenario.raw_bullet_puff_sprite_ids
+        )
         if scenario.raw_static_sprite_ids is None:
             last_sprite = max(len(raw_sprite_atlas) - 1, 0)
             raw_static_sprite_ids = np.asarray(
@@ -976,6 +993,12 @@ class DeviceScenario:
             projectile_additive_luts=torch.as_tensor(
                 projectile_additive_luts, device=device, dtype=torch.uint8
             ),
+            sprite_translucent_lut=torch.as_tensor(
+                sprite_translucent_lut, device=device, dtype=torch.uint8
+            ),
+            raw_bullet_puff_sprite_ids=torch.as_tensor(
+                raw_bullet_puff_sprite_ids, device=device, dtype=torch.int64
+            ),
             raw_static_sprite_ids=torch.as_tensor(
                 raw_static_sprite_ids, device=device, dtype=torch.int64
             ),
@@ -1022,6 +1045,7 @@ class TorchDeathmatchEngine:
     enemy_slots = 64
     enemy_projectile_slots = 64
     player_projectile_slots = 32
+    hitscan_puff_slots = _HITSCAN_MAX_PELLETS
 
     def __init__(
         self,
@@ -1066,6 +1090,7 @@ class TorchDeathmatchEngine:
         n = num_envs
         self.rng_state = torch.ones(n, device=device, dtype=torch.int64)
         self.enemy_chase_rng_state = torch.ones(n, device=device, dtype=torch.int64)
+        self.hitscan_puff_rng_state = torch.ones(n, device=device, dtype=torch.int64)
         self.episode_time = torch.zeros(n, device=device, dtype=torch.int32)
         self.episode_return = torch.zeros(n, device=device)
         self.pending_reset = torch.ones(n, device=device, dtype=torch.bool)
@@ -1278,6 +1303,12 @@ class TorchDeathmatchEngine:
         self.projectile_impact_tics = torch.zeros(
             (n, self.player_projectile_slots), device=device, dtype=torch.int32
         )
+        self.hitscan_puff_x = torch.zeros((n, self.hitscan_puff_slots), device=device)
+        self.hitscan_puff_y = torch.zeros((n, self.hitscan_puff_slots), device=device)
+        self.hitscan_puff_z = torch.zeros((n, self.hitscan_puff_slots), device=device)
+        self.hitscan_puff_tics = torch.zeros(
+            (n, self.hitscan_puff_slots), device=device, dtype=torch.int32
+        )
         self.enemy_projectile_x = torch.zeros((n, self.enemy_projectile_slots), device=device)
         self.enemy_projectile_y = torch.zeros((n, self.enemy_projectile_slots), device=device)
         self.enemy_projectile_z = torch.zeros((n, self.enemy_projectile_slots), device=device)
@@ -1456,6 +1487,17 @@ class TorchDeathmatchEngine:
     def _random_unit(self, mask: torch.Tensor | None = None) -> torch.Tensor:
         return self._random_u32(mask).to(torch.float32) * (1.0 / 4294967296.0)
 
+    def _hitscan_puff_random_u32(self, mask: torch.Tensor) -> torch.Tensor:
+        """Advance the visual-only BulletPuff stream independently of gameplay RNG."""
+
+        value = self.hitscan_puff_rng_state
+        updated = torch.bitwise_xor(value, torch.bitwise_and(value << 13, _UINT32_MASK))
+        updated = torch.bitwise_xor(updated, updated >> 17)
+        updated = torch.bitwise_xor(updated, torch.bitwise_and(updated << 5, _UINT32_MASK))
+        updated = torch.bitwise_and(updated, _UINT32_MASK)
+        self.hitscan_puff_rng_state.copy_(torch.where(mask, updated, value))
+        return self.hitscan_puff_rng_state
+
     @staticmethod
     def _public_or_retained_fixed(
         public: torch.Tensor,
@@ -1609,6 +1651,15 @@ class TorchDeathmatchEngine:
         )
         self.enemy_chase_rng_state.copy_(
             torch.where(mask, chase_seeds, self.enemy_chase_rng_state)
+        )
+        puff_seeds = torch.bitwise_and(safe_seeds ^ 0x7F4A7C15, _UINT32_MASK)
+        puff_seeds = torch.where(
+            puff_seeds == 0,
+            torch.full_like(puff_seeds, 0x6C8E9CF5),
+            puff_seeds,
+        )
+        self.hitscan_puff_rng_state.copy_(
+            torch.where(mask, puff_seeds, self.hitscan_puff_rng_state)
         )
         self.mugshot_rng_state.copy_(
             torch.where(mask, safe_seeds, self.mugshot_rng_state)
@@ -1797,6 +1848,10 @@ class TorchDeathmatchEngine:
         self.projectile_alive[mask] = False
         self.projectile_impact_type[mask] = -1
         self.projectile_impact_tics[mask] = 0
+        self.hitscan_puff_x[mask] = 0
+        self.hitscan_puff_y[mask] = 0
+        self.hitscan_puff_z[mask] = 0
+        self.hitscan_puff_tics[mask] = 0
         self.enemy_projectile_x[mask] = 0
         self.enemy_projectile_y[mask] = 0
         self.enemy_projectile_z[mask] = 0
@@ -4941,6 +4996,103 @@ class TorchDeathmatchEngine:
         )
         return selected_angle, selected_pitch, has_autoaim
 
+    def _spawn_player_hitscan_puffs(
+        self,
+        pellet_damage: torch.Tensor,
+        pellet_angle: torch.Tensor,
+        vertical_slope: torch.Tensor,
+        nearest_blocking_wall: torch.Tensor,
+        hit_actor: torch.Tensor,
+    ) -> None:
+        """Spawn ZDoom BulletPuff actors four units before wall impacts."""
+
+        wall_hit = (pellet_damage > 0) & ~hit_actor & torch.isfinite(nearest_blocking_wall)
+        puff_rng_consumed = (pellet_damage > 0) & (
+            hit_actor | torch.isfinite(nearest_blocking_wall)
+        )
+        ray_cosine, ray_sine = self._fine_direction(pellet_angle)
+        closer_distance = torch.clamp_min(nearest_blocking_wall - 4.0, 0.0)
+        puff_x = self.x[:, None] + ray_cosine * closer_distance
+        puff_y = self.y[:, None] + ray_sine * closer_distance
+        base_z = self.z[:, None] + 36.0 + vertical_slope * closer_distance
+        pellet = torch.arange(
+            1,
+            _HITSCAN_MAX_PELLETS + 1,
+            device=self.device,
+            dtype=torch.int64,
+        )[None, :]
+        random_key = self.hitscan_puff_rng_state[:, None] ^ (
+            pellet * _HASH_GOLDEN_RATIO_SIGNED
+        )
+
+        def mix_u32(value: torch.Tensor) -> torch.Tensor:
+            value ^= value >> 16
+            value = torch.bitwise_and(value * 0x7FEB352D, _UINT32_MASK)
+            value ^= value >> 15
+            value = torch.bitwise_and(value * 0x846CA68B, _UINT32_MASK)
+            return torch.bitwise_and(value ^ (value >> 16), _UINT32_MASK)
+
+        first_random = torch.bitwise_and(mix_u32(random_key ^ 0xA511E9B3), 255)
+        second_random = torch.bitwise_and(mix_u32(random_key ^ 0x63D83595), 255)
+        randomized_tics = torch.bitwise_and(
+            mix_u32(random_key ^ 0xB5297A4D),
+            3,
+        ).to(torch.int32)
+        random_z = (first_random - second_random).to(torch.float32) / 64.0
+        self._hitscan_puff_random_u32(torch.any(puff_rng_consumed, dim=1))
+
+        free = self.hitscan_puff_tics <= 0
+        wall_hit_rank = torch.cumsum(wall_hit.to(torch.int32), dim=1) - 1
+        free_rank = torch.cumsum(free.to(torch.int32), dim=1) - 1
+        selected = (
+            wall_hit[:, :, None]
+            & free[:, None, :]
+            & (wall_hit_rank[:, :, None] == free_rank[:, None, :])
+        )
+        selected_slot = torch.any(selected, dim=1)
+        next_x = torch.sum(
+            torch.where(selected, puff_x[:, :, None], 0.0),
+            dim=1,
+        )
+        next_y = torch.sum(
+            torch.where(selected, puff_y[:, :, None], 0.0),
+            dim=1,
+        )
+        next_z = torch.sum(
+            torch.where(selected, (base_z + random_z)[:, :, None], 0.0),
+            dim=1,
+        )
+        initial_tics = _BULLET_PUFF_TOTAL_TICS - randomized_tics
+        next_tics = torch.sum(
+            torch.where(selected, initial_tics[:, :, None], 0),
+            dim=1,
+        )
+        self.hitscan_puff_x.copy_(
+            torch.where(selected_slot, next_x, self.hitscan_puff_x)
+        )
+        self.hitscan_puff_y.copy_(
+            torch.where(selected_slot, next_y, self.hitscan_puff_y)
+        )
+        self.hitscan_puff_z.copy_(
+            torch.where(selected_slot, next_z, self.hitscan_puff_z)
+        )
+        self.hitscan_puff_tics.copy_(
+            torch.where(selected_slot, next_tics, self.hitscan_puff_tics)
+        )
+
+    def _hitscan_puff_tick(self, active: torch.Tensor) -> None:
+        """Run BulletPuff's NOGRAVITY VSpeed and state-tic thinker."""
+
+        moving = active[:, None] & (self.hitscan_puff_tics > 0)
+        self.hitscan_puff_z.add_(moving.to(torch.float32))
+        self.hitscan_puff_tics.copy_(
+            torch.where(
+                moving,
+                torch.clamp_min(self.hitscan_puff_tics - 1, 0),
+                self.hitscan_puff_tics,
+            )
+        )
+
     def _apply_player_hitscan(
         self,
         weapon: torch.Tensor,
@@ -5077,6 +5229,7 @@ class TorchDeathmatchEngine:
         damage_by_enemy_pellet: list[torch.Tensor] = []
         damage_by_doll_pellet: list[torch.Tensor] = []
         hurt_by_enemy_pellet: list[torch.Tensor] = []
+        hit_actor_by_pellet: list[torch.Tensor] = []
         target_count = target_x.shape[1]
         for pellet_index in range(_HITSCAN_MAX_PELLETS):
             candidate_distance = torch.where(
@@ -5088,6 +5241,7 @@ class TorchDeathmatchEngine:
             has_target = (pellet_damage[:, pellet_index] > 0) & torch.isfinite(
                 candidate_distance.gather(1, target[:, None]).squeeze(1)
             )
+            hit_actor_by_pellet.append(has_target)
             damage_by_target = torch.zeros(
                 (self.num_envs, target_count),
                 device=self.device,
@@ -5114,6 +5268,13 @@ class TorchDeathmatchEngine:
         damage_by_enemy = torch.stack(damage_by_enemy_pellet, dim=1)
         damage_by_doll = torch.stack(damage_by_doll_pellet, dim=1)
         hurt_by_enemy = torch.stack(hurt_by_enemy_pellet, dim=1)
+        self._spawn_player_hitscan_puffs(
+            pellet_damage,
+            pellet_angle,
+            vertical_slope,
+            nearest_blocking_wall,
+            torch.stack(hit_actor_by_pellet, dim=1),
+        )
         self._apply_player_damage(
             torch.sum(damage_by_doll, dim=1),
             armor_absorb_request=torch.sum(
@@ -7833,6 +7994,7 @@ class TorchDeathmatchEngine:
             self._move_player(active_buttons)
             self._vertical_player_tick(active)
             reward.add_(self._player_attack(active_buttons))
+            self._hitscan_puff_tick(active)
             weapon_ready = (
                 active
                 & (self.weapon_state_cooldown <= 0)
@@ -9999,6 +10161,39 @@ class TorchDeathmatchEngine:
                 dim=1,
             )
 
+        puff_slots = torch.nonzero(
+            torch.any(self.hitscan_puff_tics > 0, dim=0),
+        ).flatten()
+        if puff_slots.numel():
+            puff_tics = self.hitscan_puff_tics[:, puff_slots]
+            puff_frame = torch.where(
+                puff_tics > 3 * _BULLET_PUFF_FRAME_TICS,
+                torch.zeros_like(puff_tics),
+                torch.where(
+                    puff_tics > 2 * _BULLET_PUFF_FRAME_TICS,
+                    torch.ones_like(puff_tics),
+                    torch.where(
+                        puff_tics > _BULLET_PUFF_FRAME_TICS,
+                        torch.full_like(puff_tics, 2),
+                        torch.full_like(puff_tics, 3),
+                    ),
+                ),
+            ).to(torch.int64)
+            puff_sprite = self.map.raw_bullet_puff_sprite_ids[puff_frame]
+            actor_x = torch.cat((actor_x, self.hitscan_puff_x[:, puff_slots]), dim=1)
+            actor_y = torch.cat((actor_y, self.hitscan_puff_y[:, puff_slots]), dim=1)
+            actor_z = torch.cat((actor_z, self.hitscan_puff_z[:, puff_slots]), dim=1)
+            actor_alive = torch.cat((actor_alive, puff_tics > 0), dim=1)
+            actor_sprite = torch.cat((actor_sprite, puff_sprite), dim=1)
+            actor_fullbright = torch.cat((actor_fullbright, puff_frame == 0), dim=1)
+            actor_additive_style = torch.cat(
+                (
+                    actor_additive_style,
+                    torch.full_like(puff_sprite, -2, dtype=torch.int64),
+                ),
+                dim=1,
+            )
+
         map_item_x = self.map.item_spawns[None, :, 0].expand(self.num_envs, -1)
         map_item_y = self.map.item_spawns[None, :, 1].expand(self.num_envs, -1)
         map_item_z = self._item_z[None, :].expand(self.num_envs, -1)
@@ -10221,10 +10416,18 @@ class TorchDeathmatchEngine:
                 composited.to(torch.int64),
                 lit_sprite.to(torch.int64),
             ]
+            translucent_sprite = self.map.sprite_translucent_lut[
+                composited.to(torch.int64),
+                lit_sprite.to(torch.int64),
+            ]
             rendered_sprite = torch.where(
-                selected_additive_style >= 0,
-                additive_sprite,
-                lit_sprite,
+                selected_additive_style == -2,
+                translucent_sprite,
+                torch.where(
+                    selected_additive_style >= 0,
+                    additive_sprite,
+                    lit_sprite,
+                ),
             )
             composited = torch.where(
                 inside_sprite & sprite_opaque,

@@ -146,6 +146,12 @@ def test_pinned_deathmatch_compiles_external_doom2_data() -> None:
     assert scenario.raw_projectile_explosion_sprite_ids.shape == (3, 5)
     assert scenario.raw_teleport_fog_sprite_ids is not None
     assert scenario.raw_teleport_fog_sprite_ids.shape == (12,)
+    assert scenario.raw_bullet_puff_sprite_ids is not None
+    assert scenario.raw_bullet_puff_sprite_ids.shape == (4,)
+    assert tuple(
+        scenario.raw_sprite_names[index]
+        for index in scenario.raw_bullet_puff_sprite_ids
+    ) == ("PUFFA0", "PUFFB0", "PUFFC0", "PUFFD0")
     assert scenario.projectile_explosion_frame_counts is not None
     assert scenario.projectile_explosion_frame_counts.tolist() == [3, 5, 3]
     assert scenario.projectile_explosion_frame_durations is not None
@@ -157,6 +163,10 @@ def test_pinned_deathmatch_compiles_external_doom2_data() -> None:
     assert scenario.projectile_additive_luts[1, 0, 3] == 3
     assert scenario.projectile_additive_luts[0, 71, 73] == 62
     assert scenario.projectile_additive_luts[1, 71, 73] == 213
+    assert scenario.sprite_translucent_lut is not None
+    assert scenario.sprite_translucent_lut.shape == (256, 256)
+    assert scenario.sprite_translucent_lut[0, 3] == 111
+    assert scenario.sprite_translucent_lut[71, 73] == 72
     assert scenario.hud_patch_names[0:2] == ("STBAR", "STARMS")
     assert scenario.hud_patch_names[44:49] == tuple(
         f"STFTR{pain}0" for pain in range(5)

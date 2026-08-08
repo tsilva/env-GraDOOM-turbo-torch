@@ -102,6 +102,37 @@ def test_screen_flashes_follow_vizdoom_render_option(
     assert not torch.equal(flash_engine.render_frame(), training_without_flash)
 
 
+def test_native_hitscan_puff_renders_all_translucent_animation_frames(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([1337]))
+    engine.enemy_alive.zero_()
+    engine.item_available.zero_()
+    baseline = engine.render_native_frame(include_hud=False)
+    direction_x, direction_y = engine._fine_direction(engine.angle)
+    engine.hitscan_puff_x[:, 0] = engine.x + direction_x * 64
+    engine.hitscan_puff_y[:, 0] = engine.y + direction_y * 64
+    engine.hitscan_puff_z[:, 0] = engine.z + 36
+
+    frames = []
+    for remaining_tics in (13, 12, 8, 4):
+        engine.hitscan_puff_tics[:, 0] = remaining_tics
+        frames.append(engine.render_native_frame(include_hud=False))
+
+    assert all(not torch.equal(frame, baseline) for frame in frames)
+    assert all(
+        not torch.equal(frames[index], frames[index + 1])
+        for index in range(len(frames) - 1)
+    )
+    engine.hitscan_puff_tics.zero_()
+    assert torch.equal(engine.render_native_frame(include_hud=False), baseline)
+
+
 def test_native_flats_match_reference_span_sampling(
     pinned_deathmatch_scenario,
 ) -> None:
