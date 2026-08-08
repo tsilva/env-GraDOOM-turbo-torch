@@ -77,7 +77,7 @@ def test_native_flats_match_reference_span_sampling(
     engine.angle.fill_(math.radians(341.29028328258784))
     engine.episode_time.fill_(17)
 
-    frame, surface_depth = engine._native_render_flats(
+    frame, surface_depth, scene_surface_depth = engine._native_render_flats(
         engine._current_sector(),
         engine.view_z,
     )
@@ -85,6 +85,7 @@ def test_native_flats_match_reference_span_sampling(
         frame,
         engine.view_z,
         surface_depth,
+        scene_surface_depth,
     )
     rgb = engine.map.playpal[frame.to(torch.int64)]
 
@@ -113,7 +114,7 @@ def test_native_walls_use_reference_rounded_texel_length(
     engine.angle.fill_(math.radians(348.81591804996503))
     engine.episode_time.fill_(17)
 
-    frame, surface_depth = engine._native_render_flats(
+    frame, surface_depth, scene_surface_depth = engine._native_render_flats(
         engine._current_sector(),
         engine.view_z,
     )
@@ -121,6 +122,7 @@ def test_native_walls_use_reference_rounded_texel_length(
         frame,
         engine.view_z,
         surface_depth,
+        scene_surface_depth,
     )
     rgb = engine.map.playpal[frame.to(torch.int64)]
 
@@ -145,7 +147,7 @@ def test_native_walls_use_reference_fine_angle_rays(
     engine.angle.fill_(math.radians(102.16735842222519))
     engine.episode_time.fill_(17)
 
-    frame, surface_depth = engine._native_render_flats(
+    frame, surface_depth, scene_surface_depth = engine._native_render_flats(
         engine._current_sector(),
         engine.view_z,
     )
@@ -153,6 +155,7 @@ def test_native_walls_use_reference_fine_angle_rays(
         frame,
         engine.view_z,
         surface_depth,
+        scene_surface_depth,
     )
     rgb = engine.map.playpal[frame.to(torch.int64)]
 
@@ -188,17 +191,18 @@ def test_native_portal_clips_bound_solid_wall_against_planes(
     engine.angle.fill_(math.radians(165.67382816357394))
     engine.episode_time.fill_(17)
 
-    flat_frame, surface_depth = engine._native_render_flats(
+    flat_frame, surface_depth, scene_surface_depth = engine._native_render_flats(
         engine._current_sector(),
         engine.view_z,
     )
     wall_distance, _wall_along, _geometric_intersections, _wall_visibility = (
         engine._native_portal_intersections()
     )
-    frame, _scene_depth = engine._native_render_portal_walls(
+    frame, scene_depth = engine._native_render_portal_walls(
         flat_frame.clone(),
         engine.view_z,
         surface_depth,
+        scene_surface_depth,
     )
     flat_rgb = engine.map.playpal[flat_frame.to(torch.int64)]
     rgb = engine.map.playpal[frame.to(torch.int64)]
@@ -219,6 +223,76 @@ def test_native_portal_clips_bound_solid_wall_against_planes(
     # surrounding span anchors still assign sector 10's BLOOD1 floor.
     assert flat_rgb[0, 124, 290].tolist() == [79, 0, 0]
     assert rgb[0, 124, 290].tolist() == [79, 0, 0]
+    # Wall ordering retains the unresolved polygon-ray depth, while sprites
+    # see the repaired visplane depth and cannot leak through this pixel.
+    assert torch.isinf(surface_depth[0, 124, 290])
+    assert scene_surface_depth[0, 124, 290].item() == pytest.approx(458.92681884765625)
+    assert scene_depth[0, 124, 290].item() == pytest.approx(458.92681884765625)
+
+
+def test_native_repaired_visplane_depth_occludes_drops(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([456]))
+    engine.x.fill_(752.9335632324219)
+    engine.y.fill_(49.700897216796875)
+    engine.z.zero_()
+    engine.view_z.fill_(41)
+    engine.angle.fill_(math.radians(165.67382816357394))
+    engine.episode_time.fill_(17)
+    engine.item_available.zero_()
+    engine.enemy_alive.zero_()
+    engine.enemy_death_tics.zero_()
+    engine.projectile_alive.zero_()
+    engine.enemy_projectile_alive.zero_()
+    engine.projectile_impact_tics.zero_()
+    engine.enemy_projectile_impact_tics.zero_()
+    engine.teleport_fog_tics.zero_()
+    engine.drop_type.fill_(-1)
+    engine.drop_spawned.zero_()
+    engine.player_dead.fill_(True)
+
+    # Put a clip sprite behind the repaired floor span at screen column 290.
+    # Its opaque texels reproduce the item leak that an infinite scene depth
+    # permitted even after the floor color itself had been repaired.
+    ray = engine._native_wall_ray_directions()[0, 290]
+    engine.drop_type[0, 0] = 2007
+    engine.drop_spawned[0, 0] = True
+    engine.drop_x[0, 0] = engine.x[0] + ray[0] * 600.0
+    engine.drop_y[0, 0] = engine.y[0] + ray[1] * 600.0
+    engine.drop_z[0, 0] = -32.0
+
+    wall_distance = engine._native_raycast()
+    flat_frame, surface_depth, scene_surface_depth = engine._native_render_flats(
+        engine._current_sector(), engine.view_z
+    )
+    portal_frame, scene_depth = engine._native_render_portal_walls(
+        flat_frame,
+        engine.view_z,
+        surface_depth,
+        scene_surface_depth,
+    )
+    with_unrepaired_depth = engine._native_render_sprites(
+        portal_frame.clone(),
+        wall_distance,
+        engine.view_z,
+        surface_depth,
+    )
+    with_repaired_depth = engine._native_render_sprites(
+        portal_frame.clone(),
+        wall_distance,
+        engine.view_z,
+        scene_depth,
+    )
+
+    assert torch.isinf(surface_depth[0, 124, 290])
+    assert with_unrepaired_depth[0, 124, 290] != portal_frame[0, 124, 290]
+    assert torch.equal(with_repaired_depth, portal_frame)
 
 
 def test_native_walls_use_reference_fixed_vertical_sampling(
@@ -237,7 +311,7 @@ def test_native_walls_use_reference_fixed_vertical_sampling(
     engine.angle.fill_(math.radians(165.67382816357394))
     engine.episode_time.fill_(17)
 
-    frame, surface_depth = engine._native_render_flats(
+    frame, surface_depth, scene_surface_depth = engine._native_render_flats(
         engine._current_sector(),
         engine.view_z,
     )
@@ -245,6 +319,7 @@ def test_native_walls_use_reference_fixed_vertical_sampling(
         frame,
         engine.view_z,
         surface_depth,
+        scene_surface_depth,
     )
     rgb = engine.map.playpal[frame.to(torch.int64)]
 
@@ -272,7 +347,7 @@ def test_native_walls_use_reference_half_open_screen_bounds(
     wall_distance, _wall_along, geometric_intersections, _wall_visibility = (
         engine._native_portal_intersections()
     )
-    frame, surface_depth = engine._native_render_flats(
+    frame, surface_depth, scene_surface_depth = engine._native_render_flats(
         engine._current_sector(),
         engine.view_z,
     )
@@ -280,6 +355,7 @@ def test_native_walls_use_reference_half_open_screen_bounds(
         frame,
         engine.view_z,
         surface_depth,
+        scene_surface_depth,
     )
     rgb = engine.map.playpal[frame.to(torch.int64)]
 
@@ -848,11 +924,11 @@ def test_native_renderer_preserves_rgb_hud_and_enemy_animation(
     engine.z.zero_()
     engine.angle.fill_(math.radians(145.95336917460742))
     engine.episode_time.fill_(56)
-    flat_frame, surface_depth = engine._native_render_flats(
+    flat_frame, surface_depth, scene_surface_depth = engine._native_render_flats(
         engine._current_sector(), engine.z + 41.0
     )
     pit_frame, _scene_depth = engine._native_render_portal_walls(
-        flat_frame.clone(), engine.z + 41.0, surface_depth
+        flat_frame.clone(), engine.z + 41.0, surface_depth, scene_surface_depth
     )
     assert torch.isinf(surface_depth[0, 131, 160])
     assert pit_frame[0, 131, 160] != flat_frame[0, 131, 160]
@@ -1002,11 +1078,11 @@ def test_native_pit_depth_occludes_map_items(pinned_deathmatch_scenario) -> None
         engine.z.fill_(player_z)
         view_z = engine.z + 41.0
         wall_distance = engine._native_raycast()
-        flat_frame, surface_depth = engine._native_render_flats(
+        flat_frame, surface_depth, scene_surface_depth = engine._native_render_flats(
             engine._current_sector(), view_z
         )
         portal_frame, scene_depth = engine._native_render_portal_walls(
-            flat_frame, view_z, surface_depth
+            flat_frame, view_z, surface_depth, scene_surface_depth
         )
         without_scene_depth = engine._native_render_sprites(
             portal_frame.clone(),
@@ -1081,9 +1157,11 @@ def test_native_renderer_includes_voodoo_dolls(pinned_deathmatch_scenario) -> No
 
     view_z = engine.view_z
     wall_distance = engine._native_raycast()
-    flat_frame, surface_depth = engine._native_render_flats(engine._current_sector(), view_z)
+    flat_frame, surface_depth, scene_surface_depth = engine._native_render_flats(
+        engine._current_sector(), view_z
+    )
     portal_frame, scene_depth = engine._native_render_portal_walls(
-        flat_frame, view_z, surface_depth
+        flat_frame, view_z, surface_depth, scene_surface_depth
     )
     with_dolls = engine._native_render_sprites(
         portal_frame.clone(), wall_distance, view_z, scene_depth

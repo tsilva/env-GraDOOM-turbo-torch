@@ -8367,7 +8367,7 @@ class TorchDeathmatchEngine:
         self,
         current_sector: torch.Tensor,
         view_z: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         focal_length = self.native_screen_width / 2.0 * self.native_vertical_aspect
         # R_SetupFreelook builds yslope through pixel centers, subtracting or
         # adding FRACUNIT/2 around centeryfrac. Walls and sprites retain their
@@ -8542,7 +8542,14 @@ class TorchDeathmatchEngine:
         _weapon_frame, _weapon_flash, flash_light = self._native_weapon_frame_selection()
         light = self.map.sector_lights[sectors] + flash_light[:, None, None] * 16
         frame = self._native_apply_plane_colormap(indices, light, selected_plane_height)
-        return frame, surface_depth
+        visplane_span = vertical_floor_span | horizontal_floor_span
+        visplane_depth = selected_plane_height * focal_length / denominator
+        scene_surface_depth = torch.where(
+            visplane_span,
+            visplane_depth,
+            surface_depth,
+        )
+        return frame, surface_depth, scene_surface_depth
 
     def _native_portal_intersections(
         self,
@@ -8758,6 +8765,7 @@ class TorchDeathmatchEngine:
         frame: torch.Tensor,
         view_z: torch.Tensor,
         surface_depth: torch.Tensor,
+        scene_surface_depth: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         focal_length = self.native_screen_width / 2.0 * self.native_vertical_aspect
         center = self.native_view_height / 2.0 - 1.0 + self._pitch_projection_offset(
@@ -8769,7 +8777,9 @@ class TorchDeathmatchEngine:
         )
         wall_vertical_steps = self._native_wall_vertical_steps()
         filled = torch.zeros_like(frame, dtype=torch.bool)
-        scene_depth = surface_depth.clone()
+        scene_depth = (
+            surface_depth if scene_surface_depth is None else scene_surface_depth
+        ).clone()
         pixel_y = self._native_pixel_y.to(torch.float32)
         ceiling_pixels = pixel_y <= flat_center[:, None, None]
         current_sector = (
@@ -10125,8 +10135,16 @@ class TorchDeathmatchEngine:
         wall_distance = self._native_raycast()
         sector = self._current_sector()
         view_z = self.view_z
-        frame, surface_depth = self._native_render_flats(sector, view_z)
-        frame, scene_depth = self._native_render_portal_walls(frame, view_z, surface_depth)
+        frame, surface_depth, scene_surface_depth = self._native_render_flats(
+            sector,
+            view_z,
+        )
+        frame, scene_depth = self._native_render_portal_walls(
+            frame,
+            view_z,
+            surface_depth,
+            scene_surface_depth,
+        )
         frame = self._native_render_sprites(frame, wall_distance, view_z, scene_depth)
         frame = self._native_render_weapon(frame)
         if include_hud:
