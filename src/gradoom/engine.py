@@ -8611,6 +8611,10 @@ class TorchDeathmatchEngine:
             other_floor = self.map.sector_heights[safe_other, 0]
             other_ceiling = self.map.sector_heights[safe_other, 1]
             one_sided = other_sector < 0
+            side_textures = self.map.portal_side_texture_ids[wall_index, side_index]
+            middle_texture_id = side_textures[..., 0]
+            safe_middle_texture_id = middle_texture_id.clamp_min(0)
+            middle_texture_height = self.map.texture_heights[safe_middle_texture_id]
 
             def project(
                 world_z: torch.Tensor,
@@ -8624,6 +8628,14 @@ class TorchDeathmatchEngine:
             one_bottom = project(view_floor)
             lower_top = project(other_floor)
             upper_bottom = project(other_ceiling)
+            # The certified map's two-sided BIGBRIK1 midtexture uses Doom's
+            # default top peg: one texture height down from the lower ceiling.
+            # It is a visual tier only and must not close the portal.
+            middle_world_top = torch.minimum(view_ceiling, other_ceiling)
+            middle_top = project(middle_world_top)
+            middle_bottom = project(
+                middle_world_top - middle_texture_height.to(torch.float32)
+            )
             clipped_top = torch.maximum(one_top, ceiling_clip)
             clipped_bottom = torch.minimum(one_bottom, floor_clip)
             clipped_upper_bottom = torch.maximum(
@@ -8634,6 +8646,8 @@ class TorchDeathmatchEngine:
                 torch.maximum(lower_top, ceiling_clip),
                 clipped_bottom,
             )
+            clipped_middle_top = torch.maximum(middle_top, ceiling_clip)
+            clipped_middle_bottom = torch.minimum(middle_bottom, floor_clip)
             one_span = (
                 (one_sided & valid)[:, None, :]
                 & (pixel_y >= clipped_top[:, None, :])
@@ -8649,14 +8663,22 @@ class TorchDeathmatchEngine:
                 & (pixel_y >= clipped_top[:, None, :])
                 & (pixel_y <= clipped_upper_bottom[:, None, :])
             )
-            side_textures = self.map.portal_side_texture_ids[wall_index, side_index]
+            middle_span = (
+                (~one_sided & valid & (middle_texture_id >= 0))[:, None, :]
+                & (pixel_y >= clipped_middle_top[:, None, :])
+                & (pixel_y <= clipped_middle_bottom[:, None, :])
+            )
             texture_id = torch.where(
                 one_span,
                 side_textures[..., 0][:, None, :],
                 torch.where(
-                    lower_span,
-                    side_textures[..., 1][:, None, :],
-                    side_textures[..., 2][:, None, :],
+                    middle_span,
+                    middle_texture_id[:, None, :],
+                    torch.where(
+                        lower_span,
+                        side_textures[..., 1][:, None, :],
+                        side_textures[..., 2][:, None, :],
+                    ),
                 ),
             )
             in_front_of_surface = distance[:, None, :] <= surface_depth + 1e-3
@@ -8665,7 +8687,7 @@ class TorchDeathmatchEngine:
             # so its approximate depth can otherwise punch holes along the
             # projected top edge of the wall.
             span = (
-                (one_span | lower_span | upper_span)
+                (one_span | middle_span | lower_span | upper_span)
                 & (texture_id >= 0)
                 & (in_front_of_surface | (one_span & ceiling_pixels))
                 & ~filled
@@ -8686,9 +8708,13 @@ class TorchDeathmatchEngine:
                 one_span,
                 view_ceiling[:, None, :],
                 torch.where(
-                    lower_span,
-                    other_floor[:, None, :],
-                    other_ceiling[:, None, :],
+                    middle_span,
+                    middle_world_top[:, None, :],
+                    torch.where(
+                        lower_span,
+                        other_floor[:, None, :],
+                        other_ceiling[:, None, :],
+                    ),
                 ),
             )
             height_bits = torch.floor(torch.log2(texture_height.to(torch.float32))).to(

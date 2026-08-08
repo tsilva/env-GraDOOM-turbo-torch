@@ -300,6 +300,13 @@ def test_native_walls_use_reference_half_open_screen_bounds(
     assert geometric_intersections[0, 86, 163]
     assert not geometric_intersections[0, 86, 168]
     assert rgb[0, 82, 86].tolist() == [0, 0, 71]
+    # Same-sector portal 52 carries a default-pegged BIGBRIK1 middle texture.
+    # It starts at the shared ceiling and covers one texture height without
+    # terminating traversal like a solid wall.
+    assert engine.map.portal_wall_sectors[52].tolist() == [11, 11]
+    assert engine.map.portal_side_texture_ids[52, 0, 0] >= 0
+    assert rgb[0, 38, 143].tolist() == [55, 35, 19]
+    assert rgb[0, 50, 148].tolist() == [51, 43, 19]
     assert rgb[0, 40, 90].tolist() == [95, 75, 55]
 
 
