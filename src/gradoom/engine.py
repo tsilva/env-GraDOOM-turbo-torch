@@ -486,9 +486,14 @@ class DeviceScenario:
         ).astype(np.float32)
         portal_sector_indices = scenario.wall_sectors[:, 0].clip(min=0)
         portal_wall_lights = scenario.sector_lights[portal_sector_indices].astype("float32")
-        portal_wall_lengths = np.sqrt(
-            np.square(scenario.wall_segments[:, 2] - scenario.wall_segments[:, 0])
-            + np.square(scenario.wall_segments[:, 3] - scenario.wall_segments[:, 1])
+        # P_FinishLoadingLineDef stores sidedef TexelLength as sqrt(dx²+dy²)
+        # rounded to the nearest integer before any wall-column mapping.
+        portal_wall_lengths = np.floor(
+            np.sqrt(
+                np.square(scenario.wall_segments[:, 2] - scenario.wall_segments[:, 0])
+                + np.square(scenario.wall_segments[:, 3] - scenario.wall_segments[:, 1])
+            )
+            + 0.5
         ).astype(np.float32)
         bounds = scenario.bounds
         if scenario.scenario_sha256 == (

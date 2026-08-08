@@ -97,6 +97,38 @@ def test_native_flats_match_reference_span_sampling(
     assert rgb[0, 127, 141].tolist() == [79, 59, 43]
 
 
+def test_native_walls_use_reference_rounded_texel_length(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([789]))
+    engine.x.fill_(569.3474273681641)
+    engine.y.fill_(515.9971313476562)
+    engine.z.fill_(-64)
+    engine.view_z.fill_(-27)
+    engine.angle.fill_(math.radians(348.81591804996503))
+    engine.episode_time.fill_(17)
+
+    frame, surface_depth = engine._native_render_flats(
+        engine._current_sector(),
+        engine.view_z,
+    )
+    frame, _scene_depth = engine._native_render_portal_walls(
+        frame,
+        engine.view_z,
+        surface_depth,
+    )
+    rgb = engine.map.playpal[frame.to(torch.int64)]
+
+    # P_FinishLoadingLineDef rounds this diagonal wall's TexelLength. Keeping
+    # its exact Euclidean length selects the neighboring red-rock column.
+    assert rgb[0, 0, 2].tolist() == [127, 0, 0]
+
+
 def test_enemy_fullbright_matches_actor_attack_states() -> None:
     enemy_type = torch.tensor((0, 1, 1, 3, 3, 3, 3, 3, 3))
     attack_phase = torch.tensor((2, 2, 2, 2, 3, 3, 4, 1, 1))
