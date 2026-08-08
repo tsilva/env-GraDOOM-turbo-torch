@@ -159,6 +159,10 @@ def test_native_walls_use_reference_fine_angle_rays(
     # R_RenderBSPNode transforms walls through the 8192-entry fine-angle
     # basis. Continuous sin/cos intersects the neighboring stone column.
     assert rgb[0, 0, 272].tolist() == [43, 35, 15]
+    # wallscan interpolates 16.16 visibility between FWallCoords' 20.12
+    # endpoint depths. A direct floating-point 1280/distance lookup selects
+    # the next brighter colormap at this threshold.
+    assert rgb[0, 20, 255].tolist() == [87, 67, 51]
     # R_MapPlane lights against the integer row edge even though its texture
     # lookup uses a half-pixel yslope. Reusing the sampling distance chooses
     # the next brighter colormap and produces [83, 63, 47] here.
@@ -185,7 +189,7 @@ def test_native_portal_clips_bound_solid_wall_against_planes(
         engine._current_sector(),
         engine.view_z,
     )
-    wall_distance, _wall_along, _geometric_intersections = (
+    wall_distance, _wall_along, _geometric_intersections, _wall_visibility = (
         engine._native_portal_intersections()
     )
     frame, _scene_depth = engine._native_render_portal_walls(
@@ -257,7 +261,7 @@ def test_native_walls_use_reference_half_open_screen_bounds(
     engine.angle.fill_(math.radians(165.67382816357394))
     engine.episode_time.fill_(17)
 
-    wall_distance, _wall_along, geometric_intersections = (
+    wall_distance, _wall_along, geometric_intersections, _wall_visibility = (
         engine._native_portal_intersections()
     )
     frame, surface_depth = engine._native_render_flats(

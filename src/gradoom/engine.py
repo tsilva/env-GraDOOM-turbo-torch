@@ -115,6 +115,12 @@ _NATIVE_FOCAL_Y_FIXED = 160 * _NATIVE_Y_ASPECT_FIXED
 _NATIVE_FLOOR_VISIBILITY_FIXED = (
     160 * _FIXED_UNIT * (8 * _FIXED_UNIT)
 ) // _NATIVE_FOCAL_Y_FIXED
+# R_SetVisibility scales the same default visibility through the 4:3 wall
+# projection. The result is 16.16; FWallCoords depths use 20.12.
+_NATIVE_WALL_VISIBILITY_FIXED = (
+    (_NATIVE_FOCAL_Y_FIXED * (320 * 600) // (320 * 240 * 3))
+    * (8 * _FIXED_UNIT)
+) >> 16
 _NATIVE_SPRITE_MIN_DEPTH_FIXED = 2048 * 4
 _FIST_RANGE = 64.0
 _CHAINSAW_RANGE = 65.0
@@ -8158,6 +8164,23 @@ class TorchDeathmatchEngine:
         shade = torch.bitwise_right_shift(plane_shade - visibility, 16).clamp(0, 31)
         return self.map.colormap[shade, indices.to(torch.int64)]
 
+    def _native_apply_wall_colormap(
+        self,
+        indices: torch.Tensor,
+        light: torch.Tensor,
+        visibility: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply wallscan's fixed-point, screen-column light selection."""
+
+        wall_shade = (
+            64 * _FIXED_UNIT - (light.to(torch.int64) + 12) * (_FIXED_UNIT // 4)
+        )
+        shade = torch.bitwise_right_shift(
+            wall_shade - visibility.to(torch.int64).clamp_max(24 * _FIXED_UNIT),
+            16,
+        ).clamp(0, 31)
+        return self.map.colormap[shade, indices.to(torch.int64)]
+
     def _native_animated_texture_ids(self, texture_ids: torch.Tensor) -> torch.Tensor:
         # ViZDoom's certified deathmatch runtime never advances texture
         # translations: BFALL1 remains BFALL1 across consecutive rendered
@@ -8445,7 +8468,7 @@ class TorchDeathmatchEngine:
 
     def _native_portal_intersections(
         self,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         direction = self._native_wall_ray_directions()
         origin = torch.stack((self.x, self.y), dim=-1)[:, None, None, :]
         start = self.map.portal_walls[None, None, :, :2]
@@ -8506,12 +8529,104 @@ class TorchDeathmatchEngine:
         transformed_y = (
             relative_x * view_cosine + relative_y * view_sine
         ) >> 20
+
+        center_fixed = (self.native_screen_width // 2) * _FIXED_UNIT
+
+        def interpolate_wall_visibility(
+            ordered_x: torch.Tensor,
+            ordered_y: torch.Tensor,
+        ) -> torch.Tensor:
+            tx1, tx2 = ordered_x[..., 0], ordered_x[..., 1]
+            ty1, ty2 = ordered_y[..., 0], ordered_y[..., 1]
+            safe_ty1 = torch.where(ty1 == 0, torch.ones_like(ty1), ty1)
+            safe_ty2 = torch.where(ty2 == 0, torch.ones_like(ty2), ty2)
+            left_projected = torch.bitwise_right_shift(
+                center_fixed
+                + self._trunc_divide(tx1 * center_fixed, safe_ty1),
+                16,
+            ) + (tx1 >= 0).to(torch.int64)
+            right_projected = torch.bitwise_right_shift(
+                center_fixed
+                + self._trunc_divide(tx2 * center_fixed, safe_ty2),
+                16,
+            ) + (tx2 >= 0).to(torch.int64)
+            left_clip_denominator = tx1 - tx2 - ty2 + ty1
+            safe_left_clip_denominator = torch.where(
+                left_clip_denominator == 0,
+                torch.ones_like(left_clip_denominator),
+                left_clip_denominator,
+            )
+            right_clip_denominator = ty2 - ty1 - tx2 + tx1
+            safe_right_clip_denominator = torch.where(
+                right_clip_denominator == 0,
+                torch.ones_like(right_clip_denominator),
+                right_clip_denominator,
+            )
+            left_inside = tx1 >= -ty1
+            right_inside = tx2 <= ty2
+            wall_screen_left = torch.where(left_inside, left_projected, 0)
+            wall_screen_right = torch.where(
+                right_inside,
+                right_projected,
+                self.native_screen_width,
+            )
+            wall_depth_left = torch.where(
+                left_inside,
+                ty1,
+                ty1
+                + self._trunc_divide(
+                    (ty2 - ty1) * (tx1 + ty1),
+                    safe_left_clip_denominator,
+                ),
+            )
+            wall_depth_right = torch.where(
+                right_inside,
+                ty2,
+                ty1
+                + self._trunc_divide(
+                    (ty2 - ty1) * (tx1 - ty1),
+                    safe_right_clip_denominator,
+                ),
+            )
+            light_left = self._trunc_divide(
+                torch.full_like(
+                    wall_depth_left,
+                    _NATIVE_WALL_VISIBILITY_FIXED << 12,
+                ),
+                wall_depth_left.clamp_min(1),
+            )
+            light_right = self._trunc_divide(
+                torch.full_like(
+                    wall_depth_right,
+                    _NATIVE_WALL_VISIBILITY_FIXED << 12,
+                ),
+                wall_depth_right.clamp_min(1),
+            )
+            light_step = self._trunc_divide(
+                light_right - light_left,
+                (wall_screen_right - wall_screen_left).clamp_min(1),
+            )
+            return light_left[:, None, :] + (
+                self._native_pixel_x[0, 0].to(torch.int64)[None, :, None]
+                - wall_screen_left[:, None, :]
+            ) * light_step[:, None, :]
+
+        wall_visibility = torch.stack(
+            (
+                interpolate_wall_visibility(transformed_x, transformed_y),
+                interpolate_wall_visibility(
+                    torch.flip(transformed_x, dims=(2,)),
+                    torch.flip(transformed_y, dims=(2,)),
+                ),
+            ),
+            dim=3,
+        )
+
         safe_transformed_y = torch.where(
             transformed_y == 0,
             torch.ones_like(transformed_y),
             transformed_y,
         )
-        center_fixed = (self.native_screen_width // 2) * _FIXED_UNIT
         projected_fixed = center_fixed + self._trunc_divide(
             transformed_x * center_fixed,
             safe_transformed_y,
@@ -8558,7 +8673,7 @@ class TorchDeathmatchEngine:
             geometric_valid | projected_valid,
         )
         distance = torch.where(valid, distance, torch.full_like(distance, torch.inf))
-        return distance, along.clamp(0, 1), geometric_valid
+        return distance, along.clamp(0, 1), geometric_valid, wall_visibility
 
     def _native_render_portal_walls(
         self,
@@ -8571,7 +8686,7 @@ class TorchDeathmatchEngine:
             focal_length
         )
         flat_center = center + 0.5
-        distances, wall_along, geometric_intersections = (
+        distances, wall_along, geometric_intersections, wall_visibility = (
             self._native_portal_intersections()
         )
         wall_vertical_steps = self._native_wall_vertical_steps()
@@ -8644,6 +8759,14 @@ class TorchDeathmatchEngine:
             back = sectors[..., 1]
             from_front = current_sector == front
             side_index = (~from_front).to(torch.int64)
+            visibility_by_side = wall_visibility.gather(
+                2,
+                wall_index[:, :, None, None].expand(-1, -1, 1, 2),
+            ).squeeze(2)
+            visibility = visibility_by_side.gather(
+                2,
+                side_index[:, :, None],
+            ).squeeze(2)
             other_sector = torch.where(from_front, back, front)
             safe_other = other_sector.clamp_min(0)
             view_floor = self.map.sector_heights[current, 0]
@@ -8813,10 +8936,10 @@ class TorchDeathmatchEngine:
                 torch.where(horizontal, -16.0, 0.0),
             )
             light = light + fake_contrast[:, None, :]
-            wall_value = self._native_apply_colormap(
+            wall_value = self._native_apply_wall_colormap(
                 texture,
                 light,
-                distance[:, None, :],
+                visibility[:, None, :],
             )
             frame = torch.where(span, wall_value, frame)
             scene_depth = torch.where(span, distance[:, None, :], scene_depth)
