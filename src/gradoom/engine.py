@@ -9085,31 +9085,32 @@ class TorchDeathmatchEngine:
             ray_distance = torch.where(nearer, candidate_distance, ray_distance)
 
         unresolved = ~torch.isfinite(ray_distance)
-        # Doom emits horizontal floor spans from vertically continuous
-        # visplane columns. Preserve exact ray hits, but let the next resolved
-        # floor below own cracks where plane intersections fall between the
-        # nested sector polygons.
+        # Doom emits horizontal spans from vertically continuous visplane
+        # columns. Preserve exact ray hits, but let the next resolved plane of
+        # the same orientation below own cracks where independent plane rays
+        # fall between sector polygons. Ceilings need the same repair as
+        # floors: their visplanes extend upward from the first resolved row.
         unresolved_row = torch.full_like(
             self._native_pixel_y,
             self.native_view_height,
             dtype=torch.int64,
         )
-        resolved_row = torch.where(
-            ~unresolved,
+        resolved_floor_row = torch.where(
+            ~unresolved & floor_pixels,
             self._native_pixel_y.to(torch.int64),
             unresolved_row,
         )
-        next_resolved_row = torch.flip(
+        next_resolved_floor_row = torch.flip(
             torch.cummin(
-                torch.flip(resolved_row, dims=(1,)),
+                torch.flip(resolved_floor_row, dims=(1,)),
                 dim=1,
             ).values,
             dims=(1,),
         )
-        has_resolved_floor_below = next_resolved_row < self.native_view_height
+        has_resolved_floor_below = next_resolved_floor_row < self.native_view_height
         floor_span_sector = sectors.gather(
             1,
-            next_resolved_row.clamp_max(self.native_view_height - 1),
+            next_resolved_floor_row.clamp_max(self.native_view_height - 1),
         )
         vertical_floor_span = unresolved & floor_pixels & has_resolved_floor_below
         sectors = torch.where(
@@ -9117,8 +9118,39 @@ class TorchDeathmatchEngine:
             floor_span_sector,
             sectors,
         )
-        vertical_span_anchor = vertical_floor_span & (
-            floor_span_sector != current_sector[:, None, None]
+
+        resolved_ceiling_row = torch.where(
+            ~unresolved & ~floor_pixels,
+            self._native_pixel_y.to(torch.int64),
+            unresolved_row,
+        )
+        next_resolved_ceiling_row = torch.flip(
+            torch.cummin(
+                torch.flip(resolved_ceiling_row, dims=(1,)),
+                dim=1,
+            ).values,
+            dims=(1,),
+        )
+        has_resolved_ceiling_below = next_resolved_ceiling_row < self.native_view_height
+        ceiling_span_sector = sectors.gather(
+            1,
+            next_resolved_ceiling_row.clamp_max(self.native_view_height - 1),
+        )
+        vertical_ceiling_span = unresolved & ~floor_pixels & has_resolved_ceiling_below
+        sectors = torch.where(
+            vertical_ceiling_span,
+            ceiling_span_sector,
+            sectors,
+        )
+
+        vertical_visplane_span = vertical_floor_span | vertical_ceiling_span
+        vertical_span_sector = torch.where(
+            vertical_floor_span,
+            floor_span_sector,
+            ceiling_span_sector,
+        )
+        vertical_span_anchor = vertical_visplane_span & (
+            vertical_span_sector != current_sector[:, None, None]
         )
         horizontal_span_anchor = ~unresolved | vertical_span_anchor
         screen_column = self._native_pixel_x.to(torch.int64)
@@ -9151,15 +9183,14 @@ class TorchDeathmatchEngine:
             2,
             right_anchor_column.clamp_max(self.native_screen_width - 1),
         )
-        horizontal_floor_span = (
+        horizontal_visplane_span = (
             unresolved
-            & floor_pixels
             & has_left_anchor
             & has_right_anchor
             & (left_span_sector == right_span_sector)
         )
         sectors = torch.where(
-            horizontal_floor_span,
+            horizontal_visplane_span,
             left_span_sector,
             sectors,
         )
@@ -9191,7 +9222,7 @@ class TorchDeathmatchEngine:
         _weapon_frame, _weapon_flash, flash_light = self._native_weapon_frame_selection()
         light = self.map.sector_lights[sectors] + flash_light[:, None, None] * 16
         frame = self._native_apply_plane_colormap(indices, light, selected_plane_height)
-        visplane_span = vertical_floor_span | horizontal_floor_span
+        visplane_span = vertical_visplane_span | horizontal_visplane_span
         visplane_depth = selected_plane_height * focal_length / denominator
         scene_surface_depth = torch.where(
             visplane_span,

@@ -277,6 +277,45 @@ def test_native_flats_match_reference_span_sampling(
     assert rgb[0, 127, 141].tolist() == [79, 59, 43]
 
 
+def test_native_ceiling_visplane_repairs_unresolved_columns(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([1337]))
+    engine.x.fill_(337.0191345214844)
+    engine.y.fill_(1007.9921722412109)
+    engine.z.zero_()
+    engine.view_z.fill_(41)
+    engine.angle.fill_(math.radians(341.29028328258784))
+    engine.episode_time.fill_(101)
+
+    frame, surface_depth, scene_surface_depth = engine._native_render_flats(
+        engine._current_sector(),
+        engine.view_z,
+    )
+    frame, _scene_depth = engine._native_render_portal_walls(
+        frame,
+        engine.view_z,
+        surface_depth,
+        scene_surface_depth,
+    )
+    rgb = engine.map.playpal[frame.to(torch.int64)]
+
+    # These independent ceiling rays miss every map polygon, but the reference
+    # renderer keeps sector 0's lower ceiling visplane continuous above its
+    # first resolved row. Falling back to the player's sector instead shifts
+    # CEIL4_1 because that ceiling is 32 map units higher.
+    assert torch.isinf(surface_depth[0, 11, 158])
+    assert torch.isfinite(scene_surface_depth[0, 11, 158])
+    assert rgb[0, 11, 158].tolist() == [0, 0, 35]
+    assert rgb[0, 20, 146].tolist() == [0, 0, 23]
+    assert rgb[0, 27, 129].tolist() == [0, 0, 0]
+
+
 def test_native_walls_use_reference_rounded_texel_length(
     pinned_deathmatch_scenario,
 ) -> None:
