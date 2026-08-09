@@ -1761,6 +1761,49 @@ def test_native_fixed_wall_projection_clips_item_at_pit_step(
 
 
 @pytest.mark.skipif(not SCENARIO.is_file() or not DOOM2.is_file(), reason="operator WADs absent")
+def test_native_portal_clips_mark_foreground_floor_visplane(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([123]))
+    engine.x.fill_(650.5361785888672)
+    engine.y.fill_(351.4964141845703)
+    engine.z.zero_()
+    engine.view_z.fill_(41.0)
+    engine.view_height.fill_(41.0)
+    engine.angle.fill_(math.radians(102.16735842222519))
+    engine.episode_time.fill_(41)
+    engine.player_dead.fill_(True)
+    engine.enemy_alive.zero_()
+    engine.enemy_death_tics.zero_()
+    engine.projectile_alive.zero_()
+    engine.enemy_projectile_alive.zero_()
+    engine.projectile_impact_tics.zero_()
+    engine.enemy_projectile_impact_tics.zero_()
+    engine.teleport_fog_tics.zero_()
+    engine.drop_type.fill_(-1)
+    engine.item_available.zero_()
+
+    current_sector = engine._current_sector()
+    approximate_indices, _surface_depth, _scene_depth = engine._native_render_flats(
+        current_sector,
+        engine.view_z,
+    )
+    approximate = engine.map.playpal[approximate_indices.to(torch.int64)]
+    frame = engine.render_native_frame(include_hud=False)
+
+    # The independent plane rays put this boundary pixel on the -8 pit floor.
+    # R_RenderSegLoop instead marks the foreground sector 0 visplane through
+    # its exact floorclip span, matching the raw ViZDoom RGB value.
+    assert approximate[0, 183, 115].tolist() == [115, 0, 0]
+    assert frame[0, 183, 115].tolist() == [95, 75, 55]
+
+
+@pytest.mark.skipif(not SCENARIO.is_file() or not DOOM2.is_file(), reason="operator WADs absent")
 def test_native_fixed_sprite_posts_do_not_start_one_row_early(
     pinned_deathmatch_scenario,
 ) -> None:

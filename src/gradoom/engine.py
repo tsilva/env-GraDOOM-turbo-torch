@@ -9612,6 +9612,8 @@ class TorchDeathmatchEngine:
             wall_depth_right,
         ) = self._native_wall_projection_geometry()
         filled = torch.zeros_like(frame, dtype=torch.bool)
+        plane_sector = torch.full_like(frame, -1, dtype=torch.int64)
+        plane_is_floor = torch.zeros_like(frame, dtype=torch.bool)
         scene_depth = (
             surface_depth if scene_surface_depth is None else scene_surface_depth
         ).clone()
@@ -9934,6 +9936,47 @@ class TorchDeathmatchEngine:
             )
             clipped_middle_top = torch.maximum(middle_top, ceiling_clip)
             clipped_middle_bottom = torch.minimum(middle_bottom, floor_clip)
+            mark_ceiling = one_sided | (
+                (view_ceiling != other_ceiling)
+                | (
+                    self.map.sector_ceiling_texture_ids[current]
+                    != self.map.sector_ceiling_texture_ids[safe_other]
+                )
+                | (
+                    self.map.sector_lights[current]
+                    != self.map.sector_lights[safe_other]
+                )
+            )
+            mark_floor = one_sided | (
+                (view_floor != other_floor)
+                | (
+                    self.map.sector_floor_texture_ids[current]
+                    != self.map.sector_floor_texture_ids[safe_other]
+                )
+                | (
+                    self.map.sector_lights[current]
+                    != self.map.sector_lights[safe_other]
+                )
+            )
+            ceiling_plane_bottom = torch.minimum(clipped_top, floor_clip)
+            floor_plane_top = torch.maximum(clipped_bottom, ceiling_clip)
+            ceiling_plane_span = (
+                (valid & mark_ceiling)[:, None, :]
+                & (pixel_y >= ceiling_clip[:, None, :])
+                & (pixel_y < ceiling_plane_bottom[:, None, :])
+            )
+            floor_plane_span = (
+                (valid & mark_floor)[:, None, :]
+                & (pixel_y >= floor_plane_top[:, None, :])
+                & (pixel_y < floor_clip[:, None, :])
+            )
+            unowned_plane = plane_sector < 0
+            plane_sector = torch.where(
+                unowned_plane & (ceiling_plane_span | floor_plane_span),
+                current[:, None, :],
+                plane_sector,
+            )
+            plane_is_floor |= unowned_plane & floor_plane_span
             one_span = (
                 (one_sided & valid)[:, None, :]
                 & (pixel_y >= clipped_top[:, None, :])
@@ -10072,17 +10115,6 @@ class TorchDeathmatchEngine:
             # wall from leaking above the nearer sector's ceiling boundary.
             has_upper_texture = side_textures[..., 2] >= 0
             draws_upper = (view_ceiling > other_ceiling) & has_upper_texture
-            mark_ceiling = (
-                (view_ceiling != other_ceiling)
-                | (
-                    self.map.sector_ceiling_texture_ids[current]
-                    != self.map.sector_ceiling_texture_ids[safe_other]
-                )
-                | (
-                    self.map.sector_lights[current]
-                    != self.map.sector_lights[safe_other]
-                )
-            )
             ceiling_update = torch.where(
                 draws_upper,
                 clipped_upper_bottom,
@@ -10097,17 +10129,6 @@ class TorchDeathmatchEngine:
             # a nearer portal from bleeding over the front sector's flat.
             has_lower_texture = side_textures[..., 1] >= 0
             draws_lower = (view_floor < other_floor) & has_lower_texture
-            mark_floor = (
-                (view_floor != other_floor)
-                | (
-                    self.map.sector_floor_texture_ids[current]
-                    != self.map.sector_floor_texture_ids[safe_other]
-                )
-                | (
-                    self.map.sector_lights[current]
-                    != self.map.sector_lights[safe_other]
-                )
-            )
             floor_update = torch.where(
                 draws_lower,
                 clipped_lower_top,
@@ -10360,6 +10381,54 @@ class TorchDeathmatchEngine:
                     ),
                 ),
             )
+        exact_plane = (plane_sector >= 0) & ~filled
+        safe_plane_sector = plane_sector.clamp_min(0)
+        floor_height = (
+            view_z[:, None, None]
+            - self.map.sector_heights[safe_plane_sector, 0]
+        )
+        ceiling_height = (
+            self.map.sector_heights[safe_plane_sector, 1]
+            - view_z[:, None, None]
+        )
+        plane_height = torch.where(
+            plane_is_floor,
+            floor_height,
+            ceiling_height,
+        )
+        floor_texture = self.map.sector_floor_texture_ids[safe_plane_sector]
+        ceiling_texture = self.map.sector_ceiling_texture_ids[safe_plane_sector]
+        plane_texture = torch.where(
+            plane_is_floor,
+            floor_texture,
+            ceiling_texture,
+        )
+        plane_texture = self._native_animated_texture_ids(plane_texture)
+        plane_u, plane_v = self._native_flat_texture_coordinates(
+            plane_texture,
+            plane_height,
+        )
+        plane_indices = self.map.texture_index_atlas[
+            plane_texture,
+            plane_v,
+            plane_u,
+        ]
+        _weapon_frame, _weapon_flash, flash_light = self._native_weapon_frame_selection()
+        plane_light = (
+            self.map.sector_lights[safe_plane_sector]
+            + flash_light[:, None, None] * 16
+        )
+        plane_value = self._native_apply_plane_colormap(
+            plane_indices,
+            plane_light,
+            plane_height,
+        )
+        frame = torch.where(exact_plane, plane_value, frame)
+        plane_denominator = (
+            self._native_pixel_y.to(torch.float32) - flat_center[:, None, None]
+        ).abs().clamp_min(0.5)
+        plane_depth = plane_height * focal_length / plane_denominator
+        scene_depth = torch.where(exact_plane, plane_depth, scene_depth)
         return frame, scene_depth
 
     def _native_render_hitscan_decals(
