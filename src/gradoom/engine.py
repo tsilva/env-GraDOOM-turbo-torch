@@ -12295,11 +12295,13 @@ class TorchDeathmatchEngine:
         if blocking_wall is not None:
             wall_projection_geometry = self._native_wall_projection_geometry()
             (
-                _blocking_screen_left,
-                _blocking_screen_right,
+                blocking_screen_left,
+                blocking_screen_right,
                 blocking_depth_left,
                 blocking_depth_right,
             ) = wall_projection_geometry
+            blocking_screen_left = blocking_screen_left.gather(1, blocking_wall)
+            blocking_screen_right = blocking_screen_right.gather(1, blocking_wall)
             blocking_depth_left = blocking_depth_left.gather(1, blocking_wall)
             blocking_depth_right = blocking_depth_right.gather(1, blocking_wall)
             blocking_near_depth = torch.minimum(
@@ -12327,7 +12329,15 @@ class TorchDeathmatchEngine:
                 (blocking_far_depth[:, None, :] > actor_depth_fixed[:, :, None])
                 & (blocking_side <= 0)
             )
-            ray_visible |= blocking_drawseg_behind_sprite
+            pixel_x = self._native_pixel_x[:, 0, :].to(torch.int64)
+            blocking_owns_column = (
+                (pixel_x >= blocking_screen_left)
+                & (pixel_x < blocking_screen_right)
+            )
+            ray_visible |= (
+                ~blocking_owns_column[:, None, :]
+                | blocking_drawseg_behind_sprite
+            )
         sprite_width = self.map.raw_sprite_widths[actor_sprite].to(torch.float32)
         sprite_height = self.map.raw_sprite_heights[actor_sprite].to(torch.float32)
         sprite_left, sprite_right, horizontal_step_fixed = (

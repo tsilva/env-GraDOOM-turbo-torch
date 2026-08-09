@@ -2703,6 +2703,68 @@ def test_native_drawseg_side_keeps_sprite_edges_past_nearest_ray(
 
 
 @pytest.mark.skipif(not SCENARIO.is_file() or not DOOM2.is_file(), reason="operator WADs absent")
+def test_native_blocking_drawseg_excludes_right_endpoint_from_sprite_clip(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([123]))
+    engine.x.fill_(496.6570129394531)
+    engine.y.fill_(318.4211883544922)
+    engine.z.zero_()
+    engine.view_z.fill_(41)
+    engine.angle.fill_(math.radians(102.16735842222519))
+    engine.episode_time.fill_(61)
+    engine.weapon_raise_cooldown.zero_()
+    engine.player_dead.fill_(True)
+    engine.enemy_alive.zero_()
+    engine.enemy_death_tics.zero_()
+    engine.projectile_alive.zero_()
+    engine.enemy_projectile_alive.zero_()
+    engine.projectile_impact_tics.zero_()
+    engine.enemy_projectile_impact_tics.zero_()
+    engine.teleport_fog_tics.zero_()
+    engine.hitscan_puff_tics.zero_()
+    engine.drop_type.fill_(-1)
+    engine.drop_spawned.zero_()
+    engine.item_available.zero_()
+
+    item_index = 28
+    assert engine.map.item_spawns[item_index].tolist() == [-228.0, 950.0, 0.0]
+    sprite = engine.map.item_raw_visual_types[item_index].reshape(1, 1)
+    sprite_left, sprite_right, _texture_step = (
+        engine._native_sprite_horizontal_projection(
+            engine.map.item_spawns[None, item_index, 0].reshape(1, 1),
+            engine.map.item_spawns[None, item_index, 1].reshape(1, 1),
+            sprite,
+        )
+    )
+    assert (sprite_left.item(), sprite_right.item()) == (34, 45)
+    _blocking_distance, blocking_wall = engine._native_blocking_raycast()
+    wall_screen_left, wall_screen_right, _depth_left, _depth_right = (
+        engine._native_wall_projection_geometry()
+    )
+    assert blocking_wall[0, 44].item() == 54
+    assert wall_screen_left[0, 54].item() == 0
+    assert wall_screen_right[0, 54].item() == 44
+
+    without_item = engine.render_native_frame(include_hud=False)
+    engine.item_available[0, item_index] = True
+    with_item = engine.render_native_frame(include_hud=False)
+
+    # The mathematical ray at column 44 still intersects wall 54, but Doom's
+    # FWallCoords span is half-open and excludes that right endpoint. The
+    # RocketBox therefore contributes its last projected sprite column there,
+    # while the adjacent owned wall column remains occluded.
+    assert torch.equal(with_item[0, 109:114, 43], without_item[0, 109:114, 43])
+    assert with_item[0, 109, 44].tolist() == [111, 87, 67]
+    assert with_item[0, 110:114, 44].tolist() == [[103, 83, 63]] * 4
+
+
+@pytest.mark.skipif(not SCENARIO.is_file() or not DOOM2.is_file(), reason="operator WADs absent")
 def test_native_blocking_drawseg_rejects_occluded_offscreen_item(
     pinned_deathmatch_scenario,
 ) -> None:
