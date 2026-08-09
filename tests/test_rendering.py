@@ -703,6 +703,56 @@ def test_native_projected_portal_keeps_geometric_sector_path(
     assert rgb[0, 100, 50].tolist() == [119, 95, 75]
 
 
+def test_native_projected_portal_prefers_same_depth_geometric_path(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([123]))
+    engine.x.fill_(1007.9770812988281)
+    engine.y.fill_(453.31781005859375)
+    engine.z.zero_()
+    engine.view_z.fill_(41)
+    engine.angle.fill_(math.radians(102.16735842222519))
+    engine.episode_time.fill_(61)
+
+    (
+        _wall_distance,
+        _wall_along,
+        geometric_intersections,
+        projected_intersections,
+        _projected_left_edges,
+        _wall_visibility,
+    ) = engine._native_portal_intersections()
+    frame, surface_depth, scene_surface_depth = engine._native_render_flats(
+        engine._current_sector(),
+        engine.view_z,
+    )
+    frame, _scene_depth = engine._native_render_portal_walls(
+        frame,
+        engine.view_z,
+        surface_depth,
+        scene_surface_depth,
+    )
+    rgb = engine.map.playpal[frame.to(torch.int64)]
+
+    # Projected portal 207 owns column 109, but the ray crosses portal 203 at
+    # the same shared depth. Portal 207's other sector also has a continuation,
+    # yet following it reverses the nested-sector order and drops solid wall 56.
+    # Raster ownership must not override the geometric subsector path.
+    assert projected_intersections[0, 109, 207]
+    assert not geometric_intersections[0, 109, 207]
+    assert not projected_intersections[0, 109, 203]
+    assert geometric_intersections[0, 109, 203]
+    assert rgb[0, 24, 109].tolist() == [123, 99, 79]
+    assert rgb[0, 40, 109].tolist() == [95, 75, 55]
+    assert rgb[0, 80, 109].tolist() == [95, 75, 55]
+    assert rgb[0, 100, 109].tolist() == [87, 67, 51]
+
+
 def test_native_projected_solid_owns_shared_portal_endpoint(
     pinned_deathmatch_scenario,
 ) -> None:

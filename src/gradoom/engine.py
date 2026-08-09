@@ -10141,8 +10141,6 @@ class TorchDeathmatchEngine:
             )
             endpoint_uses_geometric_path = (
                 endpoint_only_portal
-                & ~endpoint_enters_other
-                & ~endpoint_enters_shared
                 & torch.isfinite(geometric_portal_distance)
                 & (geometric_portal_other >= 0)
             )
