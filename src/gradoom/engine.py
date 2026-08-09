@@ -8874,8 +8874,8 @@ class TorchDeathmatchEngine:
         direction_y = view_sine[:, None] - view_cosine[:, None] * columns[None, :]
         return torch.stack((direction_x, direction_y), dim=-1)
 
-    def _native_wall_vertical_steps(self) -> torch.Tensor:
-        """Build PrepWall's per-column fixed-point vertical texture steps."""
+    def _native_wall_texture_mapping(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build PrepWall's fixed-point horizontal offsets and vertical steps."""
 
         walls_fixed = torch.round(self.map.portal_walls * _FIXED_UNIT).to(torch.int64)
         visible_x_fixed = self._x_fixed.to(torch.float32) / _FIXED_UNIT
@@ -8927,6 +8927,22 @@ class TorchDeathmatchEngine:
         safe_bottom = torch.where(bottom == 0, torch.ones_like(bottom), bottom)
         fraction = top / safe_bottom
 
+        horizontal_repeat_fixed = torch.round(
+            self.map.portal_wall_lengths * _FIXED_UNIT
+        ).to(torch.int64)
+        horizontal_offset_fixed = torch.floor(
+            fraction * horizontal_repeat_fixed[None, None, :].to(torch.float64)
+            + 0.5
+        ).to(torch.int64)
+        # PrepWallRoundFix repairs numerical spill at the projected endpoints
+        # before wallscan applies the sidedef offset. Clamping is equivalent
+        # for the monotonic mapping of the certified static walls.
+        horizontal_offset_fixed = horizontal_offset_fixed.clamp_min(0)
+        horizontal_offset_fixed = torch.minimum(
+            horizontal_offset_fixed,
+            horizontal_repeat_fixed[None, None, :] - 1,
+        )
+
         inverse_vertical_aspect = torch.tensor(
             self.native_screen_width * 200.0,
             device=self.device,
@@ -8941,9 +8957,16 @@ class TorchDeathmatchEngine:
         depth_origin = (-u_over_z_step.to(torch.float32) * wall_map_scale).to(
             torch.float64
         )
-        return torch.floor(
+        vertical_step = torch.floor(
             fraction * depth_scale[:, None, :] + depth_origin[:, None, :] + 0.5
         ).to(torch.int64)
+        return horizontal_offset_fixed, vertical_step
+
+    def _native_wall_vertical_steps(self) -> torch.Tensor:
+        """Build PrepWall's per-column fixed-point vertical texture steps."""
+
+        _horizontal_offset_fixed, vertical_step = self._native_wall_texture_mapping()
+        return vertical_step
 
     def _native_wall_projection_geometry(
         self,
@@ -9637,7 +9660,7 @@ class TorchDeathmatchEngine:
             projected_left_edges,
             wall_visibility,
         ) = self._native_portal_intersections(wall_projection_geometry)
-        wall_vertical_steps = self._native_wall_vertical_steps()
+        wall_horizontal_offsets, wall_vertical_steps = self._native_wall_texture_mapping()
         filled = torch.zeros_like(frame, dtype=torch.bool)
         plane_sector = torch.full_like(frame, -1, dtype=torch.int64)
         plane_is_floor = torch.zeros_like(frame, dtype=torch.bool)
@@ -9847,7 +9870,6 @@ class TorchDeathmatchEngine:
                 wall_index,
             )
             valid = torch.isfinite(distance)
-            along = wall_along.gather(2, wall_index[:, :, None]).squeeze(2)
             geometric_intersection = geometric_intersections.gather(
                 2,
                 wall_index[:, :, None],
@@ -10058,12 +10080,30 @@ class TorchDeathmatchEngine:
             texture_width = self.map.texture_widths[safe_texture_id]
             texture_height = self.map.texture_heights[safe_texture_id]
             texture_offset = self.map.portal_side_texture_offsets[wall_index, side_index]
-            texture_along = torch.where(side_index == 0, along, 1.0 - along)
+            horizontal_offset_fixed = wall_horizontal_offsets.gather(
+                2,
+                wall_index[:, :, None],
+            ).squeeze(2)
+            horizontal_repeat_fixed = torch.round(
+                self.map.portal_wall_lengths[wall_index] * _FIXED_UNIT
+            ).to(torch.int64)
+            horizontal_offset_fixed = torch.where(
+                side_index == 0,
+                horizontal_offset_fixed,
+                horizontal_repeat_fixed - horizontal_offset_fixed,
+            )
+            horizontal_offset_fixed = torch.minimum(
+                horizontal_offset_fixed.clamp_min(0),
+                horizontal_repeat_fixed - 1,
+            )
+            texture_offset_x_fixed = torch.round(
+                texture_offset[..., 0] * _FIXED_UNIT
+            ).to(torch.int64)
             texture_u = torch.remainder(
-                torch.floor(
-                    texture_along * self.map.portal_wall_lengths[wall_index]
-                    + texture_offset[..., 0]
-                ).to(torch.int64)[:, None, :],
+                torch.bitwise_right_shift(
+                    horizontal_offset_fixed + texture_offset_x_fixed,
+                    16,
+                )[:, None, :],
                 texture_width,
             ).expand(-1, self.native_view_height, -1)
             texture_origin_z = torch.where(

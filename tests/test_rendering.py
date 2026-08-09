@@ -608,6 +608,44 @@ def test_native_walls_use_reference_fixed_vertical_sampling(
     assert rgb[0, 1, 40].tolist() == [131, 107, 87]
 
 
+def test_native_walls_use_reference_fixed_horizontal_sampling(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([456]))
+    engine.x.fill_(660.5986785888672)
+    engine.y.fill_(16.022705078125)
+    engine.z.zero_()
+    engine.view_z.fill_(41)
+    engine.angle.fill_(math.radians(165.67382816357394))
+    engine.episode_time.fill_(81)
+
+    horizontal_offset_fixed, _vertical_step = engine._native_wall_texture_mapping()
+    frame, surface_depth, scene_surface_depth = engine._native_render_flats(
+        engine._current_sector(),
+        engine.view_z,
+    )
+    frame, _scene_depth, _sprite_clip_depth, _sprite_clip_wall = (
+        engine._native_render_portal_walls(
+            frame,
+            engine.view_z,
+            surface_depth,
+            scene_surface_depth,
+        )
+    )
+    rgb = engine.map.playpal[frame.to(torch.int64)]
+
+    # The continuous column ray reaches wall 17 just below map offset 160.
+    # PrepWall instead evaluates its float t-map coefficients in double and
+    # rounds the result in 16.16 space before wallscan selects the texel.
+    assert (horizontal_offset_fixed[0, 63, 17] >> 16).item() == 160
+    assert rgb[0, 5, 63].tolist() == [123, 99, 79]
+
+
 def test_native_walls_use_reference_half_open_screen_bounds(
     pinned_deathmatch_scenario,
 ) -> None:
