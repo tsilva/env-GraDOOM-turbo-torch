@@ -424,6 +424,10 @@ class DeviceScenario:
     portal_endpoint_neighbors: torch.Tensor
     portal_endpoint_neighbor_starts: torch.Tensor
     portal_endpoint_neighbor_ends: torch.Tensor
+    portal_endpoint_solid_bridge_start_indices: torch.Tensor
+    portal_endpoint_solid_bridge_start_mask: torch.Tensor
+    portal_endpoint_solid_bridge_end_indices: torch.Tensor
+    portal_endpoint_solid_bridge_end_mask: torch.Tensor
     portal_wall_blocks_sight: torch.Tensor
     portal_wall_lights: torch.Tensor
     portal_texture_ids: torch.Tensor
@@ -555,6 +559,63 @@ class DeviceScenario:
             same_sector_pair
             & (shares_start | shares_end)
             & ~np.eye(len(portal_walls), dtype=np.bool_)
+        )
+        # A one-sided seg can collapse to zero projected width between a
+        # portal endpoint and the next solid owner. Precompute that one-hop
+        # bridge and compact its at-most-few candidates for the render loop.
+        one_sided_portal_wall = portal_sectors[:, 1] < 0
+        same_solid_sector = (
+            portal_sectors[:, None, 0] == portal_sectors[None, :, 0]
+        )
+        solid_endpoint_adjacency = (
+            (shares_start | shares_end)
+            & one_sided_portal_wall[:, None]
+            & one_sided_portal_wall[None, :]
+            & same_solid_sector
+            & ~np.eye(len(portal_walls), dtype=np.bool_)
+        )
+        selected_solid_sector = (
+            (portal_sectors[:, None, 0] == portal_sectors[None, :, 0])
+            | (portal_sectors[:, None, 1] == portal_sectors[None, :, 0])
+        )
+        solid_bridge_starts = (
+            (
+                shares_start
+                & one_sided_portal_wall[None, :]
+                & selected_solid_sector
+            ).astype(np.int16)
+            @ solid_endpoint_adjacency.astype(np.int16)
+        ) > 0
+        solid_bridge_ends = (
+            (
+                shares_end
+                & one_sided_portal_wall[None, :]
+                & selected_solid_sector
+            ).astype(np.int16)
+            @ solid_endpoint_adjacency.astype(np.int16)
+        ) > 0
+
+        def compact_solid_bridges(
+            bridge_mask: np.ndarray,
+        ) -> tuple[np.ndarray, np.ndarray]:
+            bridge_count = bridge_mask.sum(axis=1)
+            max_bridges = max(1, int(bridge_count.max(initial=0)))
+            bridge_indices = np.broadcast_to(
+                np.arange(len(portal_walls), dtype=np.int64)[:, None],
+                (len(portal_walls), max_bridges),
+            ).copy()
+            compact_mask = np.zeros_like(bridge_indices, dtype=np.bool_)
+            for wall_index, count in enumerate(bridge_count):
+                indices = np.flatnonzero(bridge_mask[wall_index])
+                bridge_indices[wall_index, :count] = indices
+                compact_mask[wall_index, :count] = True
+            return bridge_indices, compact_mask
+
+        solid_bridge_start_indices, solid_bridge_start_mask = (
+            compact_solid_bridges(solid_bridge_starts)
+        )
+        solid_bridge_end_indices, solid_bridge_end_mask = compact_solid_bridges(
+            solid_bridge_ends
         )
         endpoint_neighbor_count = endpoint_neighbor_mask.sum(axis=1)
         max_endpoint_neighbors = max(1, int(endpoint_neighbor_count.max(initial=0)))
@@ -947,6 +1008,24 @@ class DeviceScenario:
             ),
             portal_endpoint_neighbor_ends=torch.as_tensor(
                 endpoint_neighbor_ends,
+                device=device,
+            ),
+            portal_endpoint_solid_bridge_start_indices=torch.as_tensor(
+                solid_bridge_start_indices,
+                device=device,
+                dtype=torch.int64,
+            ),
+            portal_endpoint_solid_bridge_start_mask=torch.as_tensor(
+                solid_bridge_start_mask,
+                device=device,
+            ),
+            portal_endpoint_solid_bridge_end_indices=torch.as_tensor(
+                solid_bridge_end_indices,
+                device=device,
+                dtype=torch.int64,
+            ),
+            portal_endpoint_solid_bridge_end_mask=torch.as_tensor(
+                solid_bridge_end_mask,
                 device=device,
             ),
             portal_wall_blocks_sight=torch.as_tensor(
@@ -9790,11 +9869,12 @@ class TorchDeathmatchEngine:
                 wall_index,
             )
             # A column ray can intersect a portal just beyond the half-open
-            # screen range assigned to its seg. When a one-sided seg meeting
-            # that endpoint owns the projected left edge, Doom's solid BSP
-            # clip wins even if its infinite-line distance is slightly farther
-            # than the portal ray hit. Keep this cross-sector ownership rule
-            # separate from the same-sector texture-seam correction below.
+            # screen range assigned to its seg. When a one-sided seg owns the
+            # coincident projected left edge, Doom's solid BSP clip wins even
+            # if a zero-width intermediary seg separates their map endpoints
+            # and its infinite-line distance is slightly farther than the
+            # portal ray hit. Keep this cross-sector ownership rule separate
+            # from the same-sector texture-seam correction below.
             selected_along = wall_along.gather(
                 2,
                 wall_index[:, :, None],
@@ -9819,6 +9899,20 @@ class TorchDeathmatchEngine:
                 2,
                 wall_index[:, :, None],
             ).squeeze(2)
+            selected_excluded_right_edge = (
+                wall_screen_right.gather(1, wall_index)
+                == self._native_pixel_x[0, 0].to(torch.int64)[None, :]
+            )
+            selected_solid_bridge_indices = torch.where(
+                (selected_along <= 0.5)[:, :, None],
+                self.map.portal_endpoint_solid_bridge_start_indices[wall_index],
+                self.map.portal_endpoint_solid_bridge_end_indices[wall_index],
+            )
+            selected_solid_bridge_mask = torch.where(
+                (selected_along <= 0.5)[:, :, None],
+                self.map.portal_endpoint_solid_bridge_start_mask[wall_index],
+                self.map.portal_endpoint_solid_bridge_end_mask[wall_index],
+            )
             projected_solid_path_distance = distance
             projected_solid_path_index = wall_index
             projected_solid_owner = (
@@ -9837,6 +9931,57 @@ class TorchDeathmatchEngine:
                     torch.full_like(distances, torch.inf),
                 ),
                 dim=2,
+            )
+            solid_bridge_distances = distances.gather(
+                2,
+                selected_solid_bridge_indices,
+            )
+            solid_bridge_owner = (
+                selected_solid_bridge_mask
+                & selected_excluded_right_edge[:, :, None]
+                & incident.gather(2, selected_solid_bridge_indices)
+                & (
+                    all_sectors[selected_solid_bridge_indices, 1]
+                    < 0
+                )
+                & projected_intersections.gather(
+                    2,
+                    selected_solid_bridge_indices,
+                )
+                & projected_left_edges.gather(
+                    2,
+                    selected_solid_bridge_indices,
+                )
+                & ~selected_is_projected[:, :, None]
+                & (
+                    solid_bridge_distances
+                    > previous_distance[:, :, None] + 1e-3
+                )
+            )
+            solid_bridge_distance, solid_bridge_slot = torch.min(
+                torch.where(
+                    solid_bridge_owner,
+                    solid_bridge_distances,
+                    torch.full_like(solid_bridge_distances, torch.inf),
+                ),
+                dim=2,
+            )
+            solid_bridge_index = selected_solid_bridge_indices.gather(
+                2,
+                solid_bridge_slot[:, :, None],
+            ).squeeze(2)
+            bridge_precedes_direct_owner = (
+                solid_bridge_distance < projected_solid_distance
+            )
+            projected_solid_distance = torch.where(
+                bridge_precedes_direct_owner,
+                solid_bridge_distance,
+                projected_solid_distance,
+            )
+            projected_solid_index = torch.where(
+                bridge_precedes_direct_owner,
+                solid_bridge_index,
+                projected_solid_index,
             )
             has_projected_solid_owner = torch.isfinite(projected_solid_distance)
             distance = torch.where(

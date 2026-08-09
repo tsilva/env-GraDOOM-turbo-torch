@@ -1205,6 +1205,74 @@ def test_native_projected_solid_chain_clips_endpoint_portal(
     assert rgb[0, 112, 45].tolist() == [83, 7, 7]
 
 
+def test_native_projected_solid_chain_clips_geometric_endpoint_portal(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([123]))
+    engine.x.fill_(835.9440307617188)
+    engine.y.fill_(391.3482971191406)
+    engine.z.zero_()
+    engine.view_z.fill_(41)
+    engine.angle.fill_(math.radians(69.12048341453087))
+    engine.episode_time.fill_(101)
+
+    wall_projection_geometry = engine._native_wall_projection_geometry()
+    screen_left, screen_right, _depth_left, _depth_right = wall_projection_geometry
+    (
+        _wall_distance,
+        _wall_along,
+        geometric_intersections,
+        projected_intersections,
+        projected_left_edges,
+        _wall_visibility,
+    ) = engine._native_portal_intersections(wall_projection_geometry)
+    frame, surface_depth, scene_surface_depth = engine._native_render_flats(
+        engine._current_sector(),
+        engine.view_z,
+    )
+    frame, _scene_depth, _sprite_clip_depth, _sprite_clip_wall = (
+        engine._native_render_portal_walls(
+            frame,
+            engine.view_z,
+            surface_depth,
+            scene_surface_depth,
+        )
+    )
+    rgb = engine.map.playpal[frame.to(torch.int64)]
+
+    # Portal 208 ends its half-open span at column 146. Solid 169 shares its
+    # map endpoint but collapses to [146, 146), while the next solid, 170,
+    # starts [146, 147). Wall 170 therefore owns rasterization even though the
+    # mathematical ray crosses portal 208 and the two do not share a vertex.
+    assert geometric_intersections[0, 146, 208]
+    assert not projected_intersections[0, 146, 208]
+    assert not geometric_intersections[0, 146, 170]
+    assert projected_intersections[0, 146, 170]
+    assert projected_left_edges[0, 146, 170]
+    assert screen_right[0, 208] == 146
+    assert screen_left[0, 169] == screen_right[0, 169] == 146
+    assert screen_left[0, 170] == 146
+    bridge_indices = engine.map.portal_endpoint_solid_bridge_end_indices[208]
+    bridge_mask = engine.map.portal_endpoint_solid_bridge_end_mask[208]
+    assert 170 in bridge_indices[bridge_mask].tolist()
+    assert not torch.any(
+        torch.all(
+            engine.map.portal_walls[208, 2:]
+            == engine.map.portal_walls[170].reshape(2, 2),
+            dim=1,
+        )
+    )
+    assert rgb[0, 35, 146].tolist() == [67, 0, 0]
+    assert rgb[0, 40, 146].tolist() == [107, 15, 15]
+    assert rgb[0, 80, 146].tolist() == [67, 0, 0]
+    assert rgb[0, 115, 146].tolist() == [91, 7, 7]
+
+
 def test_native_weapon_uses_reference_fixed_point_vertical_sampling(
     pinned_deathmatch_scenario,
 ) -> None:
