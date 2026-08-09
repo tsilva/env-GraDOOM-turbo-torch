@@ -564,9 +564,8 @@ def test_native_wall_planes_clip_before_fixed_projection(
     assert frame[23, 200].tolist() == [0, 0, 23]
     assert frame[24, 200].tolist() == [119, 95, 75]
 
-    # Right-frustum and portal projections require clipped BSP-seg endpoint
-    # depths that the static whole-linedef inventory does not retain. Keep the
-    # established interpolation for those incomplete fragments.
+    # Generated BSP fragments preserve the reference projection at the right
+    # frustum and across portal boundaries.
     engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([456]))
     engine.x.fill_(370.07318115234375)
     engine.y.fill_(147.17359924316406)
@@ -586,9 +585,8 @@ def test_native_wall_planes_clip_before_fixed_projection(
     frame = engine.render_native_frame(include_hud=False)[0]
     assert frame[2, 177].tolist() == [0, 0, 35]
 
-    # A terminal wall behind two portals must use the same uncut projection as
-    # those portal clips. Mixing exact terminal OWallMost with approximate
-    # portal endpoints leaves a diagonal strip of sky above the far wall.
+    # A terminal wall behind two portals uses its generated BSP fragment. The
+    # fragment projection keeps the diagonal sky/wall boundary continuous.
     engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([123]))
     engine.x.fill_(340.60516357421875)
     engine.y.fill_(284.878662109375)
@@ -597,6 +595,42 @@ def test_native_wall_planes_clip_before_fixed_projection(
     engine.episode_time.fill_(81)
     frame = engine.render_native_frame(include_hud=False)[0]
     assert frame[0, 78].tolist() == [147, 123, 99]
+
+    # ViZDoom splits linedef 54 at y=667.428558 before projection. Reusing the
+    # full linedef moves this distant wall above the sky boundary by one row.
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([123]))
+    engine.x.fill_(496.656982421875)
+    engine.y.fill_(318.42120361328125)
+    engine.view_z.fill_(41)
+    engine.angle.fill_(math.radians(102.16735842222519))
+    engine.episode_time.fill_(61)
+    frame = engine.render_native_frame(include_hud=False)[0]
+    assert frame[0, 25].tolist() == [0, 0, 0]
+    assert frame[1, 27].tolist() == [0, 0, 0]
+    assert frame[3, 30].tolist() == [0, 0, 35]
+    assert frame[6, 35].tolist() == [0, 0, 0]
+
+    # Linedef 41's first generated fragment lies behind the near plane from
+    # this view. FWallCoords rejects it, leaving the second fragment to own
+    # x=0..56; accepting its unbounded projection paints over the sky opening.
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([123]))
+    engine.x.fill_(835.9440307617188)
+    engine.y.fill_(391.3482971191406)
+    engine.view_z.fill_(41)
+    engine.angle.fill_(math.radians(288.4954834656081))
+    engine.episode_time.fill_(61)
+    fragment_geometry = engine._native_projection_geometry_for_fixed_walls(
+        engine.map.portal_projection_fragments_fixed
+    )
+    fragment_left, fragment_right = fragment_geometry[:2]
+    assert fragment_left[0, 41, 0].item() == 0
+    assert fragment_right[0, 41, 0].item() == 0
+    assert fragment_left[0, 41, 1].item() == 0
+    assert fragment_right[0, 41, 1].item() == 57
+    frame = engine.render_native_frame(include_hud=False)[0]
+    assert frame[0, 44].tolist() == [0, 0, 0]
+    assert frame[1, 53].tolist() == [0, 0, 35]
+    assert frame[2, 54].tolist() == [0, 0, 0]
 
 
 def test_native_sector_lookup_ignores_self_referencing_linedef(

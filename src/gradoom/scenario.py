@@ -22,6 +22,40 @@ from .wad import UdmfDocument, WadArchive, parse_udmf
 
 PINNED_DEATHMATCH_WAD_SHA256 = "1d06c2113f2c1546062635ad599f49cd852287a08b7b07b26d30b8f4c362a42d"
 KNOWN_DOOM2_WAD_SHA256 = "10d67824b11025ddd9198e8cfc87ca335ee6e2d3e63af4180fa9b8a471893255"
+# The certified UDMF map has no serialized BSP. ViZDoom's runtime node builder
+# splits these linedefs at the following exact 16.16 vertices before software
+# rendering. Retaining the generated fragments makes FWallCoords/OWallMost use
+# the same endpoints without changing the map's collision geometry.
+_PINNED_DEATHMATCH_BSP_SPLIT_VERTICES_FIXED = {
+    10: ((-4194304, 44489582),),
+    14: ((56623104, -16777216), (36569088, -16777216)),
+    41: ((83886080, 35651584),),
+    48: ((-16777216, 46736530),),
+    54: ((0, 43740598),),
+    60: ((36569088, 0),),
+    69: ((29806825, 37096978),),
+    71: ((38232267, 31459133),),
+    78: ((27338382, 33041676),),
+    82: ((35388378, 28884660),),
+    87: ((27885125, 38761112),),
+    90: ((35499075, 27792981),),
+    96: ((30442657, 40290428), (29462734, 39849462)),
+    99: ((40556156, 31423626),),
+    103: ((31007890, 39452137), (29277072, 38512550)),
+    106: ((28960708, 31317676),),
+    111: ((31197219, 38169666),),
+    115: ((36569088, 30848731),),
+    116: ((38721052, 33258925),),
+    118: ((36569088, 29502123),),
+    119: ((36569088, 28186823),),
+    120: ((37001130, 27064179),),
+    126: ((26815500, 36597276),),
+    136: ((36252167, 26790529),),
+    167: ((36569088, -4194304),),
+    194: ((39015765, 39277909), (41703834, 41965978)),
+    207: ((56623104, 56360960),),
+    213: ((56623104, 56885248),),
+}
 DEATHMATCH_SPRITE_FRAMES = (
     "POSSA1",
     "SPOSA1",
@@ -363,6 +397,8 @@ class CompiledScenario:
     hud_patch_top_offsets: np.ndarray | None = None
     texture_animation_ids: np.ndarray | None = None
     texture_animation_counts: np.ndarray | None = None
+    wall_projection_fragments_fixed: np.ndarray | None = None
+    wall_projection_fragment_mask: np.ndarray | None = None
 
     @property
     def bounds(self) -> tuple[float, float, float, float]:
@@ -379,6 +415,45 @@ def _required_blocks(document: UdmfDocument, name: str):
         return document.blocks[name]
     except KeyError as exc:
         raise ValueError(f"deathmatch TEXTMAP has no {name!r} blocks") from exc
+
+
+def _compile_wall_projection_fragments_fixed(
+    wall_segments: np.ndarray,
+    scenario_sha256: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return the software renderer's fixed-point BSP fragments by linedef."""
+
+    walls_fixed = np.rint(
+        wall_segments.astype(np.float64) * 65536.0
+    ).astype(np.int64)
+    split_vertices = (
+        _PINNED_DEATHMATCH_BSP_SPLIT_VERTICES_FIXED
+        if scenario_sha256 == PINNED_DEATHMATCH_WAD_SHA256
+        else {}
+    )
+    max_fragments = max(
+        (len(vertices) + 1 for vertices in split_vertices.values()),
+        default=1,
+    )
+    fragments = np.zeros(
+        (len(walls_fixed), max_fragments, 4),
+        dtype=np.int64,
+    )
+    fragment_mask = np.zeros(
+        (len(walls_fixed), max_fragments),
+        dtype=np.bool_,
+    )
+    for wall_index, wall in enumerate(walls_fixed):
+        vertices = (
+            (int(wall[0]), int(wall[1])),
+            *split_vertices.get(wall_index, ()),
+            (int(wall[2]), int(wall[3])),
+        )
+        fragment_count = len(vertices) - 1
+        fragments[wall_index, :fragment_count, :2] = vertices[:-1]
+        fragments[wall_index, :fragment_count, 2:] = vertices[1:]
+        fragment_mask[wall_index, :fragment_count] = True
+    return fragments, fragment_mask
 
 
 def compile_deathmatch_scenario(
@@ -892,6 +967,9 @@ def compile_deathmatch_scenario(
     if len(colormap_bytes) < 34 * 256:
         raise ValueError("IWAD COLORMAP lump is too small")
     colormap = np.frombuffer(colormap_bytes[: 34 * 256], dtype=np.uint8).reshape(34, 256).copy()
+    wall_projection_fragments_fixed, wall_projection_fragment_mask = (
+        _compile_wall_projection_fragments_fixed(wall_segments, scenario.sha256)
+    )
     return CompiledScenario(
         scenario_sha256=scenario.sha256,
         iwad_sha256=game.sha256,
@@ -987,4 +1065,6 @@ def compile_deathmatch_scenario(
         hud_patch_top_offsets=hud_patch_top_offsets,
         texture_animation_ids=texture_animation_ids,
         texture_animation_counts=texture_animation_counts,
+        wall_projection_fragments_fixed=wall_projection_fragments_fixed,
+        wall_projection_fragment_mask=wall_projection_fragment_mask,
     )

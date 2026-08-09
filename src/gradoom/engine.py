@@ -420,6 +420,8 @@ class DeviceScenario:
     texture_animation_ids: torch.Tensor
     texture_animation_counts: torch.Tensor
     portal_walls: torch.Tensor
+    portal_projection_fragments_fixed: torch.Tensor
+    portal_projection_fragment_mask: torch.Tensor
     portal_wall_sectors: torch.Tensor
     portal_endpoint_neighbors: torch.Tensor
     portal_endpoint_neighbor_starts: torch.Tensor
@@ -539,6 +541,33 @@ class DeviceScenario:
             + 0.5
         ).astype(np.float32)
         portal_walls = scenario.wall_segments
+        if (
+            scenario.wall_projection_fragments_fixed is None
+            and scenario.wall_projection_fragment_mask is None
+        ):
+            portal_projection_fragments_fixed = np.rint(
+                portal_walls.astype(np.float64) * _FIXED_UNIT
+            ).astype(np.int64)[:, None, :]
+            portal_projection_fragment_mask = np.ones(
+                portal_projection_fragments_fixed.shape[:2],
+                dtype=np.bool_,
+            )
+        elif (
+            scenario.wall_projection_fragments_fixed is None
+            or scenario.wall_projection_fragment_mask is None
+        ):
+            raise ValueError(
+                "wall projection fragments and their mask must be provided together"
+            )
+        else:
+            portal_projection_fragments_fixed = (
+                scenario.wall_projection_fragments_fixed
+            )
+            portal_projection_fragment_mask = scenario.wall_projection_fragment_mask
+            if portal_projection_fragments_fixed.shape[:2] != (
+                portal_projection_fragment_mask.shape
+            ) or portal_projection_fragments_fixed.shape[2:] != (4,):
+                raise ValueError("invalid wall projection fragment arrays")
         portal_sectors = scenario.wall_sectors
         same_sector_pair = (
             (portal_sectors[:, None, 0] == portal_sectors[None, :, 0])
@@ -994,6 +1023,15 @@ class DeviceScenario:
                 texture_animation_counts, device=device, dtype=torch.int64
             ),
             portal_walls=torch.as_tensor(scenario.wall_segments, device=device),
+            portal_projection_fragments_fixed=torch.as_tensor(
+                portal_projection_fragments_fixed,
+                device=device,
+                dtype=torch.int64,
+            ),
+            portal_projection_fragment_mask=torch.as_tensor(
+                portal_projection_fragment_mask,
+                device=device,
+            ),
             portal_wall_sectors=torch.as_tensor(
                 scenario.wall_sectors, device=device, dtype=torch.int64
             ),
@@ -9055,22 +9093,23 @@ class TorchDeathmatchEngine:
         _horizontal_offset_fixed, vertical_step = self._native_wall_texture_mapping()
         return vertical_step
 
-    def _native_wall_projection_geometry(
+    def _native_projection_geometry_for_fixed_walls(
         self,
+        walls_fixed: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Build FWallCoords' clipped screen span and endpoint depths."""
+        """Build FWallCoords geometry for fixed-point walls of any batch shape."""
 
-        walls_fixed = torch.round(self.map.portal_walls * _FIXED_UNIT).to(torch.int64)
         view_x_fixed = self._public_or_retained_fixed(self.x, self._x_fixed)
         view_y_fixed = self._public_or_retained_fixed(self.y, self._y_fixed)
-        relative_x = walls_fixed[None, :, 0::2] - view_x_fixed[:, None, None]
-        relative_y = walls_fixed[None, :, 1::2] - view_y_fixed[:, None, None]
+        view_shape = (-1,) + (1,) * walls_fixed.ndim
+        relative_x = walls_fixed[None, ..., 0::2] - view_x_fixed.reshape(view_shape)
+        relative_y = walls_fixed[None, ..., 1::2] - view_y_fixed.reshape(view_shape)
 
         fine_angle = self._native_view_angle_bam() >> _ANGLE_TO_FINE_SHIFT
-        view_sine = self._fine_sine_fixed[fine_angle][:, None, None]
+        view_sine = self._fine_sine_fixed[fine_angle].reshape(view_shape)
         view_cosine = self._fine_sine_fixed[
             (fine_angle + _FINE_ANGLES // 4) & (_FINE_ANGLES - 1)
-        ][:, None, None]
+        ].reshape(view_shape)
         transformed_x = (
             relative_x * view_sine - relative_y * view_cosine
         ) >> 20
@@ -9078,22 +9117,26 @@ class TorchDeathmatchEngine:
             relative_x * view_cosine + relative_y * view_sine
         ) >> 20
 
-        wall_start = self.map.portal_walls[None, :, :2]
-        wall_vector = self.map.portal_walls[None, :, 2:] - wall_start
-        viewer_from_start = torch.stack((self.x, self.y), dim=1)[:, None, :] - wall_start
+        wall_start = walls_fixed[None, ..., :2]
+        wall_vector = walls_fixed[None, ..., 2:] - wall_start
+        viewer_shape = (-1,) + (1,) * (walls_fixed.ndim - 1) + (2,)
+        viewer_from_start = torch.stack(
+            (view_x_fixed, view_y_fixed),
+            dim=1,
+        ).reshape(viewer_shape) - wall_start
         front_facing = (
             wall_vector[..., 0] * viewer_from_start[..., 1]
             - wall_vector[..., 1] * viewer_from_start[..., 0]
         ) < 0
         ordered_x = torch.where(
-            front_facing[:, :, None],
+            front_facing[..., None],
             transformed_x,
-            torch.flip(transformed_x, dims=(2,)),
+            torch.flip(transformed_x, dims=(-1,)),
         )
         ordered_y = torch.where(
-            front_facing[:, :, None],
+            front_facing[..., None],
             transformed_y,
-            torch.flip(transformed_y, dims=(2,)),
+            torch.flip(transformed_y, dims=(-1,)),
         )
         tx1, tx2 = ordered_x[..., 0], ordered_x[..., 1]
         ty1, ty2 = ordered_y[..., 0], ordered_y[..., 1]
@@ -9104,10 +9147,20 @@ class TorchDeathmatchEngine:
             center_fixed + self._trunc_divide(tx1 * center_fixed, safe_ty1)
         ) >> 16
         left_projected += (tx1 >= 0).to(torch.int64)
+        left_projected = torch.where(
+            tx1 >= 0,
+            left_projected.clamp_max(self.native_screen_width),
+            left_projected,
+        )
         right_projected = (
             center_fixed + self._trunc_divide(tx2 * center_fixed, safe_ty2)
         ) >> 16
         right_projected += (tx2 >= 0).to(torch.int64)
+        right_projected = torch.where(
+            tx2 >= 0,
+            right_projected.clamp_max(self.native_screen_width),
+            right_projected,
+        )
 
         left_denominator = tx1 - tx2 - ty2 + ty1
         right_denominator = ty2 - ty1 - tx2 + tx1
@@ -9151,7 +9204,31 @@ class TorchDeathmatchEngine:
                 safe_right_denominator,
             ),
         )
+        # FWallCoords::Init rejects a seg before R_AddLine whenever either
+        # clipped endpoint lies behind the near plane or the frustum tests
+        # collapse its half-open span. Mark rejected fragments as empty so a
+        # different BSP fragment of the same linedef can own the column.
+        invalid_left = torch.where(
+            left_inside,
+            (tx1 > ty1) | (ty1 == 0),
+            (tx2 < -ty2) | (left_denominator == 0),
+        ) | (depth_left < 32)
+        invalid_right = torch.where(
+            right_inside,
+            (tx2 < -ty2) | (ty2 == 0),
+            (tx1 > ty1) | (right_denominator == 0),
+        ) | (depth_right < 32)
+        invalid = invalid_left | invalid_right | (screen_right <= screen_left)
+        screen_right = torch.where(invalid, screen_left, screen_right)
         return screen_left, screen_right, depth_left, depth_right
+
+    def _native_wall_projection_geometry(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build FWallCoords' clipped screen span and endpoint depths."""
+
+        walls_fixed = torch.round(self.map.portal_walls * _FIXED_UNIT).to(torch.int64)
+        return self._native_projection_geometry_for_fixed_walls(walls_fixed)
 
     def _native_flat_texture_coordinates(
         self,
@@ -9740,6 +9817,14 @@ class TorchDeathmatchEngine:
             wall_depth_right,
         ) = self._native_wall_projection_geometry()
         (
+            fragment_screen_left,
+            fragment_screen_right,
+            fragment_depth_left,
+            fragment_depth_right,
+        ) = self._native_projection_geometry_for_fixed_walls(
+            self.map.portal_projection_fragments_fixed
+        )
+        (
             distances,
             wall_along,
             geometric_intersections,
@@ -9772,7 +9857,6 @@ class TorchDeathmatchEngine:
             float(self.native_view_height),
         )
         previous_distance = torch.zeros_like(current_sector, dtype=torch.float32)
-        traversed_portal = torch.zeros_like(current_sector, dtype=torch.bool)
         all_sectors = self.map.portal_wall_sectors
         all_wall_starts = self.map.portal_walls[None, None, :, :2]
         all_wall_ends = self.map.portal_walls[None, None, :, 2:]
@@ -10085,14 +10169,81 @@ class TorchDeathmatchEngine:
             def project(
                 world_z: torch.Tensor,
                 layer_wall_index: torch.Tensor = wall_index,
-                portal_already_crossed: torch.Tensor = traversed_portal,
             ) -> torch.Tensor:
                 """Replay OWallMost's fixed-point horizontal-plane projection."""
 
-                screen_left = wall_screen_left.gather(1, layer_wall_index)
-                screen_right = wall_screen_right.gather(1, layer_wall_index)
-                depth_left = wall_depth_left.gather(1, layer_wall_index).clamp_min(1)
-                depth_right = wall_depth_right.gather(1, layer_wall_index).clamp_min(1)
+                whole_screen_left = wall_screen_left.gather(1, layer_wall_index)
+                whole_screen_right = wall_screen_right.gather(1, layer_wall_index)
+                whole_depth_left = wall_depth_left.gather(
+                    1,
+                    layer_wall_index,
+                ).clamp_min(1)
+                whole_depth_right = wall_depth_right.gather(
+                    1,
+                    layer_wall_index,
+                ).clamp_min(1)
+                fragment_count = fragment_screen_left.shape[2]
+                fragment_indices = layer_wall_index[:, :, None].expand(
+                    -1,
+                    -1,
+                    fragment_count,
+                )
+                layer_fragment_left = fragment_screen_left.gather(
+                    1,
+                    fragment_indices,
+                )
+                layer_fragment_right = fragment_screen_right.gather(
+                    1,
+                    fragment_indices,
+                )
+                layer_fragment_mask = self.map.portal_projection_fragment_mask[
+                    layer_wall_index
+                ]
+                pixel_x = self._native_pixel_x[0, 0].to(torch.int64)[None, :]
+                owns_column = (
+                    layer_fragment_mask
+                    & (layer_fragment_right > layer_fragment_left)
+                    & (pixel_x[:, :, None] >= layer_fragment_left)
+                    & (pixel_x[:, :, None] < layer_fragment_right)
+                )
+                has_projection_fragment = torch.any(owns_column, dim=2)
+                fragment_slot = torch.argmax(owns_column.to(torch.int64), dim=2)
+                screen_left = layer_fragment_left.gather(
+                    2,
+                    fragment_slot[:, :, None],
+                ).squeeze(2)
+                screen_right = layer_fragment_right.gather(
+                    2,
+                    fragment_slot[:, :, None],
+                ).squeeze(2)
+                depth_left = fragment_depth_left.gather(
+                    1,
+                    fragment_indices,
+                ).gather(2, fragment_slot[:, :, None]).squeeze(2).clamp_min(1)
+                depth_right = fragment_depth_right.gather(
+                    1,
+                    fragment_indices,
+                ).gather(2, fragment_slot[:, :, None]).squeeze(2).clamp_min(1)
+                screen_left = torch.where(
+                    has_projection_fragment,
+                    screen_left,
+                    whole_screen_left,
+                )
+                screen_right = torch.where(
+                    has_projection_fragment,
+                    screen_right,
+                    whole_screen_right,
+                )
+                depth_left = torch.where(
+                    has_projection_fragment,
+                    depth_left,
+                    whole_depth_left,
+                )
+                depth_right = torch.where(
+                    has_projection_fragment,
+                    depth_right,
+                    whole_depth_right,
+                )
                 relative_z_fixed = torch.round(
                     (world_z - view_z[:, None]) * _FIXED_UNIT
                 ).to(torch.int64)
@@ -10107,15 +10258,16 @@ class TorchDeathmatchEngine:
                 center_fixed = (
                     self.native_view_height // 2 * _FIXED_UNIT + pitch_offset_fixed
                 )
-                pixel_x = self._native_pixel_x[0, 0].to(torch.int64)[None, :]
-                original_span = (screen_right - screen_left).clamp_min(1)
+                original_span = (
+                    whole_screen_right - whole_screen_left
+                ).clamp_min(1)
                 original_projected_left = self._trunc_divide(
                     projection_z * _NATIVE_FOCAL_Y_FIXED,
-                    depth_left,
+                    whole_depth_left,
                 )
                 original_projected_right = self._trunc_divide(
                     projection_z * _NATIVE_FOCAL_Y_FIXED,
-                    depth_right,
+                    whole_depth_right,
                 )
                 original_projected_step = self._trunc_divide(
                     original_projected_right - original_projected_left,
@@ -10124,7 +10276,7 @@ class TorchDeathmatchEngine:
                 original_projected = torch.bitwise_right_shift(
                     center_fixed[:, None]
                     + original_projected_left
-                    + (pixel_x - screen_left) * original_projected_step,
+                    + (pixel_x - whole_screen_left) * original_projected_step,
                     16,
                 ).clamp(0, self.native_view_height)
                 upper_clip = self._trunc_divide(
@@ -10316,24 +10468,12 @@ class TorchDeathmatchEngine:
                         projected,
                     ),
                 )
-                terminal_wall = (
-                    self.map.portal_wall_sectors[layer_wall_index, 1] < 0
-                )
-                # Direct terminal walls retain their complete visible seg, so
-                # the OWallMost crossing can be reconstructed exactly. Once a
-                # column has crossed a portal, its terminal wall must retain
-                # the same projection convention as that uncut portal clip;
-                # mixing the two moves the far wall one row past the opening.
-                # Right-edge fragments likewise need the source BSP seg's
-                # clipped endpoint depth, while this static inventory retains
-                # only the whole linedef.
-                use_exact_terminal = (
-                    terminal_wall
-                    & ~portal_already_crossed
-                    & (screen_right != self.native_screen_width)
-                )
+                # OWallMost uses the BSP seg's endpoints, not its parent
+                # linedef. Fall back only when a ray-owned wall lies outside
+                # every projected fragment because of shared-endpoint raster
+                # ownership; the usual path now uses ViZDoom's exact fragment.
                 projected = torch.where(
-                    use_exact_terminal,
+                    has_projection_fragment,
                     projected,
                     original_projected,
                 )
@@ -10924,12 +11064,6 @@ class TorchDeathmatchEngine:
                         ),
                     ),
                 ),
-            )
-            traversed_portal = traversed_portal | (
-                valid
-                & (current_sector >= 0)
-                & (next_sector >= 0)
-                & (next_sector != current_sector)
             )
             current_sector = next_sector
         exact_plane = (plane_sector >= 0) & ~filled

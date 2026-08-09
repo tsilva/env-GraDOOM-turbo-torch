@@ -23,6 +23,15 @@ def test_pinned_deathmatch_compiles_external_doom2_data() -> None:
     assert scenario.namespace == "zdoom"
     assert scenario.vertices.shape == (198, 2)
     assert scenario.wall_segments.shape == (215, 4)
+    assert scenario.wall_projection_fragments_fixed is not None
+    assert scenario.wall_projection_fragment_mask is not None
+    assert scenario.wall_projection_fragments_fixed.shape == (215, 3, 4)
+    assert scenario.wall_projection_fragment_mask.shape == (215, 3)
+    assert scenario.wall_projection_fragment_mask[54].tolist() == [True, True, False]
+    assert scenario.wall_projection_fragments_fixed[54, :2].tolist() == [
+        [0, 37748736, 0, 43740598],
+        [0, 43740598, 0, 50331648],
+    ]
     assert scenario.blocking_segments.shape == (88, 4)
     assert scenario.blocking_wall_indices.shape == (88,)
     assert (scenario.wall_sectors[scenario.blocking_wall_indices, 1] < 0).all()
