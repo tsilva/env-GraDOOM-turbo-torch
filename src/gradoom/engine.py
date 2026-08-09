@@ -9888,7 +9888,6 @@ class TorchDeathmatchEngine:
         sprite_clip_depth = torch.full_like(scene_depth, torch.inf)
         sprite_clip_wall = torch.full_like(scene_depth, -1, dtype=torch.int64)
         pixel_y = self._native_pixel_y.to(torch.float32)
-        ceiling_pixels = pixel_y <= flat_center[:, None, None]
         current_sector = (
             self._current_sector()[:, None].expand(-1, self.native_screen_width).clone()
         )
@@ -10645,6 +10644,88 @@ class TorchDeathmatchEngine:
                 )
                 & ~filled
             )
+            # wallscan batches aligned groups of four columns. Its shared
+            # bottom-tail path deliberately passes palookupoffse[0] to every
+            # column, so uneven tier bottoms inherit the first column's light
+            # table after the group's common span. Match that reference raster
+            # rule; the top tail and groups containing an empty column retain
+            # their per-column lighting.
+            wall_groups = wall_index.reshape(self.num_envs, -1, 4)
+            side_groups = side_index.reshape(self.num_envs, -1, 4)
+            same_drawseg_group = torch.all(
+                wall_groups == wall_groups[..., :1],
+                dim=2,
+            ) & torch.all(
+                side_groups == side_groups[..., :1],
+                dim=2,
+            )
+            first_group_visibility = visibility[:, ::4].repeat_interleave(4, dim=1)
+            tier_tops = torch.stack(
+                (
+                    clipped_top,
+                    clipped_middle_top,
+                    clipped_lower_top,
+                    clipped_top,
+                ),
+                dim=1,
+            )
+            tier_bottoms = torch.stack(
+                (
+                    clipped_bottom,
+                    clipped_middle_bottom,
+                    clipped_bottom,
+                    clipped_upper_bottom,
+                ),
+                dim=1,
+            )
+            tier_columns = torch.stack(
+                (
+                    one_sided
+                    & valid
+                    & (side_textures[..., 0] >= 0)
+                    & (clipped_top < clipped_bottom),
+                    ~one_sided
+                    & valid
+                    & (middle_texture_id >= 0)
+                    & (clipped_middle_top < clipped_middle_bottom),
+                    ~one_sided
+                    & valid
+                    & (view_floor < other_floor)
+                    & (side_textures[..., 1] >= 0)
+                    & (clipped_lower_top < clipped_bottom),
+                    ~one_sided
+                    & valid
+                    & (view_ceiling > other_ceiling)
+                    & (side_textures[..., 2] >= 0)
+                    & (clipped_top < clipped_upper_bottom),
+                ),
+                dim=1,
+            )
+            tier_top_groups = tier_tops.reshape(self.num_envs, 4, -1, 4)
+            tier_bottom_groups = tier_bottoms.reshape(self.num_envs, 4, -1, 4)
+            tier_column_groups = tier_columns.reshape(self.num_envs, 4, -1, 4)
+            common_top = torch.max(tier_top_groups, dim=3).values
+            common_bottom = torch.min(tier_bottom_groups, dim=3).values
+            vector_group = (
+                same_drawseg_group[:, None, :]
+                & torch.all(tier_column_groups, dim=3)
+                & (common_top < common_bottom)
+            )
+            group_bottom = common_bottom.repeat_interleave(4, dim=2)
+            group_valid = vector_group.repeat_interleave(4, dim=2)
+            bottom_tail = (
+                (one_span & group_valid[:, 0, None, :])
+                & (pixel_y >= group_bottom[:, 0, None, :])
+            ) | (
+                (middle_span & group_valid[:, 1, None, :])
+                & (pixel_y >= group_bottom[:, 1, None, :])
+            ) | (
+                (lower_span & group_valid[:, 2, None, :])
+                & (pixel_y >= group_bottom[:, 2, None, :])
+            ) | (
+                (upper_span & group_valid[:, 3, None, :])
+                & (pixel_y >= group_bottom[:, 3, None, :])
+            )
             safe_texture_id = self._native_animated_texture_ids(texture_id.clamp_min(0))
             texture_width = self.map.texture_widths[safe_texture_id]
             texture_height = self.map.texture_heights[safe_texture_id]
@@ -10747,7 +10828,11 @@ class TorchDeathmatchEngine:
             wall_value = self._native_apply_wall_colormap(
                 texture,
                 light,
-                visibility[:, None, :],
+                torch.where(
+                    bottom_tail,
+                    first_group_visibility[:, None, :],
+                    visibility[:, None, :],
+                ),
             )
             frame = torch.where(span, wall_value, frame)
             scene_depth = torch.where(span, distance[:, None, :], scene_depth)

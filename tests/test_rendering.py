@@ -2672,6 +2672,76 @@ def test_native_portal_clips_mark_foreground_floor_visplane(
 
 
 @pytest.mark.skipif(not SCENARIO.is_file() or not DOOM2.is_file(), reason="operator WADs absent")
+def test_native_solid_wall_bottom_and_wallscan_tail_match_reference(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([789]))
+    engine._x_fixed.fill_(29_837_736)
+    engine._y_fixed.fill_(1_050_082)
+    engine.x.fill_(29_837_736 / 65_536)
+    engine.y.fill_(1_050_082 / 65_536)
+    engine._angle_bam.fill_(4_161_536_001)
+    engine.angle.fill_(4_161_536_001 * (2.0 * math.pi / float(1 << 32)))
+    engine.z.zero_()
+    engine.view_z.fill_(41.0)
+    engine.view_height.fill_(41.0)
+    engine.episode_time.fill_(101)
+
+    flat_frame, surface_depth, scene_surface_depth = engine._native_render_flats(
+        engine._current_sector(),
+        engine.view_z,
+    )
+    portal_frame, scene_depth, _sprite_clip_depth, _sprite_clip_wall = (
+        engine._native_render_portal_walls(
+            flat_frame,
+            engine.view_z,
+            surface_depth,
+            scene_surface_depth,
+        )
+    )
+    wall17_distance = engine._native_portal_intersections(
+        engine._native_wall_projection_geometry()
+    )[0][0, :, 17]
+
+    # ViZDoom's wallbottom is exclusive: wall 17 owns both final projected
+    # rows in these columns, while the immediately following row is a plane.
+    for y, x in ((127, 136), (128, 136), (163, 148), (164, 148)):
+        assert scene_depth[0, y, x].item() == pytest.approx(
+            wall17_distance[x].item(),
+            abs=1e-3,
+        )
+    assert scene_depth[0, 129, 136].item() != pytest.approx(
+        wall17_distance[136].item(),
+        abs=1e-3,
+    )
+    assert scene_depth[0, 165, 148].item() != pytest.approx(
+        wall17_distance[148].item(),
+        abs=1e-3,
+    )
+
+    rgb = engine.map.playpal[portal_frame.to(torch.int64)]
+    assert rgb[0, 127, 136].tolist() == [95, 75, 55]
+    assert rgb[0, 128, 136].tolist() == [103, 83, 63]
+    # wallscan's aligned four-column path reuses the first column's colormap
+    # for uneven bottom tails. These raw ViZDoom samples cover three groups.
+    expected_tail = {
+        (129, 137): [103, 83, 63],
+        (129, 138): [83, 63, 47],
+        (130, 139): [95, 75, 55],
+        (145, 143): [67, 47, 27],
+        (153, 145): [119, 95, 75],
+        (154, 147): [63, 43, 27],
+    }
+    for (y, x), expected in expected_tail.items():
+        assert rgb[0, y, x].tolist() == expected
+
+
+@pytest.mark.skipif(not SCENARIO.is_file() or not DOOM2.is_file(), reason="operator WADs absent")
 def test_native_fixed_sprite_posts_do_not_start_one_row_early(
     pinned_deathmatch_scenario,
 ) -> None:
