@@ -9588,6 +9588,66 @@ class TorchDeathmatchEngine:
                 solid_wall_index,
                 wall_index,
             )
+            # A column ray can intersect a portal just beyond the half-open
+            # screen range assigned to its seg. When a one-sided seg meeting
+            # that endpoint owns the projected left edge, Doom's solid BSP
+            # clip wins even if its infinite-line distance is slightly farther
+            # than the portal ray hit. Keep this cross-sector ownership rule
+            # separate from the same-sector texture-seam correction below.
+            selected_along = wall_along.gather(
+                2,
+                wall_index[:, :, None],
+            ).squeeze(2)
+            selected_wall = self.map.portal_walls[wall_index]
+            selected_endpoint = torch.where(
+                (selected_along <= 0.5)[:, :, None],
+                selected_wall[..., :2],
+                selected_wall[..., 2:],
+            )
+            shares_selected_endpoint = (
+                torch.all(
+                    all_wall_starts == selected_endpoint[:, :, None, :],
+                    dim=3,
+                )
+                | torch.all(
+                    all_wall_ends == selected_endpoint[:, :, None, :],
+                    dim=3,
+                )
+            )
+            selected_is_projected = projected_intersections.gather(
+                2,
+                wall_index[:, :, None],
+            ).squeeze(2)
+            projected_solid_path_distance = distance
+            projected_solid_path_index = wall_index
+            projected_solid_owner = (
+                incident
+                & (all_sectors[None, None, :, 1] < 0)
+                & projected_intersections
+                & projected_left_edges
+                & shares_selected_endpoint
+                & ~selected_is_projected[:, :, None]
+                & (distances > previous_distance[:, :, None] + 1e-3)
+            )
+            projected_solid_distance, projected_solid_index = torch.min(
+                torch.where(
+                    projected_solid_owner,
+                    distances,
+                    torch.full_like(distances, torch.inf),
+                ),
+                dim=2,
+            )
+            has_projected_solid_owner = torch.isfinite(projected_solid_distance)
+            distance = torch.where(
+                has_projected_solid_owner,
+                projected_solid_distance,
+                distance,
+            )
+            wall_index = torch.where(
+                has_projected_solid_owner,
+                projected_solid_index,
+                wall_index,
+            )
             # BSP rasterization assigns a shared endpoint column to the seg
             # whose projected [sx1, sx2) range contains it. A mathematical ray
             # can still hit the excluded neighbor slightly sooner. The static
@@ -9635,6 +9695,26 @@ class TorchDeathmatchEngine:
                 side_index[:, :, None],
             ).squeeze(2)
             other_sector = torch.where(from_front, back, front)
+            projected_solid_path_sectors = all_sectors[
+                projected_solid_path_index
+            ]
+            projected_solid_path_from_front = (
+                current_sector == projected_solid_path_sectors[..., 0]
+            )
+            projected_solid_path_other = torch.where(
+                projected_solid_path_from_front,
+                projected_solid_path_sectors[..., 1],
+                projected_solid_path_sectors[..., 0],
+            )
+            projected_solid_path_is_geometric = geometric_intersections.gather(
+                2,
+                projected_solid_path_index[:, :, None],
+            ).squeeze(2)
+            projected_solid_keeps_portal_path = (
+                has_projected_solid_owner
+                & projected_solid_path_is_geometric
+                & (projected_solid_path_other >= 0)
+            )
             safe_other = other_sector.clamp_min(0)
             view_floor = self.map.sector_heights[current, 0]
             view_ceiling = self.map.sector_heights[current, 1]
@@ -9862,6 +9942,90 @@ class TorchDeathmatchEngine:
                 floor_update,
                 floor_clip,
             )
+            # The projected solid owns only its wall span. Preserve the plane
+            # clips that the geometrically crossed portal contributes before
+            # continuing into its farther sector; otherwise that background
+            # wall can bleed above or below the portal opening.
+            path_safe_other = projected_solid_path_other.clamp_min(0)
+            path_other_floor = self.map.sector_heights[path_safe_other, 0]
+            path_other_ceiling = self.map.sector_heights[path_safe_other, 1]
+            path_side_index = (~projected_solid_path_from_front).to(torch.int64)
+            path_side_textures = self.map.portal_side_texture_ids[
+                projected_solid_path_index,
+                path_side_index,
+            ]
+            path_top = project(view_ceiling, projected_solid_path_distance)
+            path_bottom = project(view_floor, projected_solid_path_distance)
+            path_lower_top = project(
+                path_other_floor,
+                projected_solid_path_distance,
+            )
+            path_upper_bottom = project(
+                path_other_ceiling,
+                projected_solid_path_distance,
+            )
+            path_clipped_top = torch.maximum(path_top, ceiling_clip)
+            path_clipped_bottom = torch.minimum(path_bottom, floor_clip)
+            path_clipped_upper_bottom = torch.maximum(
+                torch.minimum(path_upper_bottom, floor_clip),
+                path_clipped_top,
+            )
+            path_clipped_lower_top = torch.minimum(
+                torch.maximum(path_lower_top, ceiling_clip),
+                path_clipped_bottom,
+            )
+            path_draws_upper = (
+                (view_ceiling > path_other_ceiling)
+                & (path_side_textures[..., 2] >= 0)
+            )
+            path_marks_ceiling = (
+                (view_ceiling != path_other_ceiling)
+                | (
+                    self.map.sector_ceiling_texture_ids[current]
+                    != self.map.sector_ceiling_texture_ids[path_safe_other]
+                )
+                | (
+                    self.map.sector_lights[current]
+                    != self.map.sector_lights[path_safe_other]
+                )
+            )
+            path_ceiling_update = torch.where(
+                path_draws_upper,
+                path_clipped_upper_bottom,
+                path_clipped_top,
+            )
+            ceiling_clip = torch.where(
+                projected_solid_keeps_portal_path
+                & (path_draws_upper | path_marks_ceiling),
+                path_ceiling_update,
+                ceiling_clip,
+            )
+            path_draws_lower = (
+                (view_floor < path_other_floor)
+                & (path_side_textures[..., 1] >= 0)
+            )
+            path_marks_floor = (
+                (view_floor != path_other_floor)
+                | (
+                    self.map.sector_floor_texture_ids[current]
+                    != self.map.sector_floor_texture_ids[path_safe_other]
+                )
+                | (
+                    self.map.sector_lights[current]
+                    != self.map.sector_lights[path_safe_other]
+                )
+            )
+            path_floor_update = torch.where(
+                path_draws_lower,
+                path_clipped_lower_top,
+                path_clipped_bottom,
+            )
+            floor_clip = torch.where(
+                projected_solid_keeps_portal_path
+                & (path_draws_lower | path_marks_floor),
+                path_floor_update,
+                floor_clip,
+            )
             prior_distance = previous_distance
             endpoint_only_portal = valid & ~one_sided & ~geometric_intersection
             # A projected endpoint can reveal the adjacent sector without the
@@ -9985,32 +10149,40 @@ class TorchDeathmatchEngine:
             previous_distance = torch.where(
                 valid,
                 torch.where(
-                    endpoint_enters_shared & (other_shared_distance < distance),
-                    prior_distance,
+                    projected_solid_keeps_portal_path,
+                    projected_solid_path_distance,
                     torch.where(
-                        endpoint_uses_geometric_path,
-                        geometric_portal_distance,
-                        distance,
+                        endpoint_enters_shared & (other_shared_distance < distance),
+                        prior_distance,
+                        torch.where(
+                            endpoint_uses_geometric_path,
+                            geometric_portal_distance,
+                            distance,
+                        ),
                     ),
                 ),
                 prior_distance,
             )
             current_sector = torch.where(
-                endpoint_uses_geometric_path,
-                geometric_portal_other,
+                projected_solid_keeps_portal_path,
+                projected_solid_path_other,
                 torch.where(
-                    valid
-                    & ~one_sided
-                    & (
-                        geometric_intersection
-                        | endpoint_enters_other
-                        | endpoint_enters_shared
-                    ),
-                    other_sector,
+                    endpoint_uses_geometric_path,
+                    geometric_portal_other,
                     torch.where(
-                        endpoint_only_portal,
-                        current_sector,
-                        torch.full_like(current_sector, -1),
+                        valid
+                        & ~one_sided
+                        & (
+                            geometric_intersection
+                            | endpoint_enters_other
+                            | endpoint_enters_shared
+                        ),
+                        other_sector,
+                        torch.where(
+                            endpoint_only_portal,
+                            current_sector,
+                            torch.full_like(current_sector, -1),
+                        ),
                     ),
                 ),
             )

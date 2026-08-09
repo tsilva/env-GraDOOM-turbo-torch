@@ -703,6 +703,108 @@ def test_native_projected_portal_keeps_geometric_sector_path(
     assert rgb[0, 100, 50].tolist() == [119, 95, 75]
 
 
+def test_native_projected_solid_owns_shared_portal_endpoint(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([1337]))
+    engine.x.fill_(940.9204254150391)
+    engine.y.fill_(826.7186584472656)
+    engine.z.zero_()
+    engine.view_z.fill_(41)
+    engine.angle.fill_(math.radians(26.993408209409893))
+    engine.episode_time.fill_(21)
+
+    (
+        _wall_distance,
+        _wall_along,
+        geometric_intersections,
+        projected_intersections,
+        projected_left_edges,
+        _wall_visibility,
+    ) = engine._native_portal_intersections()
+    frame, surface_depth, scene_surface_depth = engine._native_render_flats(
+        engine._current_sector(),
+        engine.view_z,
+    )
+    frame, _scene_depth = engine._native_render_portal_walls(
+        frame,
+        engine.view_z,
+        surface_depth,
+        scene_surface_depth,
+    )
+    rgb = engine.map.playpal[frame.to(torch.int64)]
+
+    # The rays hit portals 208 and 173 just outside those segs' projected
+    # ranges. Adjacent solid segs 169 and 195 own the shared columns through
+    # their projected left edges, so they must clip the portals rather than
+    # leaving two full-height sky leaks through the surrounding walls.
+    for column, portal, solid in ((15, 208, 169), (28, 173, 195)):
+        assert geometric_intersections[0, column, portal]
+        assert not projected_intersections[0, column, portal]
+        assert not geometric_intersections[0, column, solid]
+        assert projected_intersections[0, column, solid]
+        assert projected_left_edges[0, column, solid]
+    assert rgb[0, 0, 15].tolist() == [83, 7, 7]
+    assert rgb[0, 80, 15].tolist() == [79, 0, 0]
+    assert rgb[0, 0, 28].tolist() == [103, 83, 63]
+    assert rgb[0, 80, 28].tolist() == [95, 75, 55]
+
+
+def test_native_projected_solid_retains_portal_plane_clips(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([789]))
+    engine.x.fill_(569.3474273681641)
+    engine.y.fill_(515.9971313476562)
+    engine.z.fill_(-64)
+    engine.view_z.fill_(-23)
+    engine.angle.fill_(math.radians(175.1440430095289))
+    engine.episode_time.fill_(61)
+
+    (
+        _wall_distance,
+        _wall_along,
+        geometric_intersections,
+        projected_intersections,
+        projected_left_edges,
+        _wall_visibility,
+    ) = engine._native_portal_intersections()
+    frame, surface_depth, scene_surface_depth = engine._native_render_flats(
+        engine._current_sector(),
+        engine.view_z,
+    )
+    frame, _scene_depth = engine._native_render_portal_walls(
+        frame,
+        engine.view_z,
+        surface_depth,
+        scene_surface_depth,
+    )
+    rgb = engine.map.playpal[frame.to(torch.int64)]
+
+    # Solid 145 owns portal 146's projected endpoint column, but it spans only
+    # sector 5's short wall height. The geometric portal must still contribute
+    # its ceiling clip and farther-sector path outside that solid span.
+    assert geometric_intersections[0, 153, 146]
+    assert not projected_intersections[0, 153, 146]
+    assert not geometric_intersections[0, 153, 145]
+    assert projected_intersections[0, 153, 145]
+    assert projected_left_edges[0, 153, 145]
+    assert rgb[0, 72, 153].tolist() == [0, 0, 0]
+    assert rgb[0, 74, 153].tolist() == [0, 0, 23]
+    assert rgb[0, 75, 153].tolist() == [31, 23, 11]
+    assert rgb[0, 76, 153].tolist() == [31, 23, 11]
+
+
 def test_native_weapon_uses_reference_fixed_point_vertical_sampling(
     pinned_deathmatch_scenario,
 ) -> None:
