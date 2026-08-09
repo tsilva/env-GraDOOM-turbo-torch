@@ -9772,6 +9772,7 @@ class TorchDeathmatchEngine:
             float(self.native_view_height),
         )
         previous_distance = torch.zeros_like(current_sector, dtype=torch.float32)
+        traversed_portal = torch.zeros_like(current_sector, dtype=torch.bool)
         all_sectors = self.map.portal_wall_sectors
         all_wall_starts = self.map.portal_walls[None, None, :, :2]
         all_wall_ends = self.map.portal_walls[None, None, :, 2:]
@@ -10084,6 +10085,7 @@ class TorchDeathmatchEngine:
             def project(
                 world_z: torch.Tensor,
                 layer_wall_index: torch.Tensor = wall_index,
+                portal_already_crossed: torch.Tensor = traversed_portal,
             ) -> torch.Tensor:
                 """Replay OWallMost's fixed-point horizontal-plane projection."""
 
@@ -10091,23 +10093,10 @@ class TorchDeathmatchEngine:
                 screen_right = wall_screen_right.gather(1, layer_wall_index)
                 depth_left = wall_depth_left.gather(1, layer_wall_index).clamp_min(1)
                 depth_right = wall_depth_right.gather(1, layer_wall_index).clamp_min(1)
-                span = (screen_right - screen_left).clamp_min(1)
                 relative_z_fixed = torch.round(
                     (world_z - view_z[:, None]) * _FIXED_UNIT
                 ).to(torch.int64)
                 projection_z = -torch.bitwise_right_shift(relative_z_fixed, 4)
-                projected_left = self._trunc_divide(
-                    projection_z * _NATIVE_FOCAL_Y_FIXED,
-                    depth_left,
-                )
-                projected_right = self._trunc_divide(
-                    projection_z * _NATIVE_FOCAL_Y_FIXED,
-                    depth_right,
-                )
-                projected_step = self._trunc_divide(
-                    projected_right - projected_left,
-                    span,
-                )
                 tangent_index = torch.bitwise_right_shift(
                     _ANGLE_90 - self._pitch_bam,
                     _ANGLE_TO_FINE_SHIFT,
@@ -10119,15 +10108,236 @@ class TorchDeathmatchEngine:
                     self.native_view_height // 2 * _FIXED_UNIT + pitch_offset_fixed
                 )
                 pixel_x = self._native_pixel_x[0, 0].to(torch.int64)[None, :]
+                original_span = (screen_right - screen_left).clamp_min(1)
+                original_projected_left = self._trunc_divide(
+                    projection_z * _NATIVE_FOCAL_Y_FIXED,
+                    depth_left,
+                )
+                original_projected_right = self._trunc_divide(
+                    projection_z * _NATIVE_FOCAL_Y_FIXED,
+                    depth_right,
+                )
+                original_projected_step = self._trunc_divide(
+                    original_projected_right - original_projected_left,
+                    original_span,
+                )
+                original_projected = torch.bitwise_right_shift(
+                    center_fixed[:, None]
+                    + original_projected_left
+                    + (pixel_x - screen_left) * original_projected_step,
+                    16,
+                ).clamp(0, self.native_view_height)
+                upper_clip = self._trunc_divide(
+                    torch.bitwise_left_shift(-center_fixed, 16),
+                    torch.full_like(center_fixed, _NATIVE_FOCAL_Y_FIXED),
+                )[:, None]
+                lower_clip = self._trunc_divide(
+                    torch.bitwise_left_shift(
+                        self.native_view_height * _FIXED_UNIT - center_fixed,
+                        16,
+                    ),
+                    torch.full_like(center_fixed, _NATIVE_FOCAL_Y_FIXED),
+                )[:, None]
+                upper_left = torch.bitwise_right_shift(
+                    upper_clip * depth_left,
+                    16,
+                )
+                upper_right = torch.bitwise_right_shift(
+                    upper_clip * depth_right,
+                    16,
+                )
+                lower_left = torch.bitwise_right_shift(
+                    lower_clip * depth_left,
+                    16,
+                )
+                lower_right = torch.bitwise_right_shift(
+                    lower_clip * depth_right,
+                    16,
+                )
+                above_left = projection_z < upper_left
+                above_right = projection_z < upper_right
+                below_left = projection_z > lower_left
+                below_right = projection_z > lower_right
+                entirely_above = above_left & above_right
+                entirely_below = below_left & below_right
+
+                clipped_left = screen_left
+                clipped_right = screen_right
+                clipped_depth_left = depth_left
+                clipped_depth_right = depth_right
+                outside_top = torch.zeros_like(above_left)
+                outside_bottom = torch.zeros_like(below_left)
+
+                crosses_top = above_left ^ above_right
+                safe_upper_delta = torch.where(
+                    upper_right != upper_left,
+                    upper_right - upper_left,
+                    torch.ones_like(upper_left),
+                )
+                top_fraction = self._trunc_divide(
+                    torch.bitwise_left_shift(projection_z - upper_left, 30),
+                    safe_upper_delta,
+                )
+                top_depth = depth_left + torch.bitwise_right_shift(
+                    (depth_right - depth_left) * top_fraction,
+                    30,
+                )
+                top_cross = screen_left + self._trunc_divide(
+                    torch.bitwise_right_shift(depth_right * top_fraction, 30)
+                    * (screen_right - screen_left),
+                    top_depth.clamp_min(1),
+                )
+                clip_top_right = crosses_top & above_right & (screen_left <= top_cross)
+                clipped_right = torch.where(clip_top_right, top_cross, clipped_right)
+                clipped_depth_right = torch.where(
+                    clip_top_right,
+                    top_depth,
+                    clipped_depth_right,
+                )
+                outside_top |= (
+                    crosses_top
+                    & above_right
+                    & (screen_right > top_cross)
+                    & (pixel_x >= top_cross)
+                    & (pixel_x < screen_right)
+                )
+                clip_top_left = crosses_top & above_left & (top_cross <= screen_right)
+                clipped_left = torch.where(clip_top_left, top_cross, clipped_left)
+                clipped_depth_left = torch.where(
+                    clip_top_left,
+                    top_depth,
+                    clipped_depth_left,
+                )
+                outside_top |= (
+                    crosses_top
+                    & above_left
+                    & (top_cross > screen_left)
+                    & (pixel_x >= screen_left)
+                    & (pixel_x < top_cross)
+                )
+
+                crosses_bottom = below_left ^ below_right
+                safe_lower_delta = torch.where(
+                    lower_right != lower_left,
+                    lower_right - lower_left,
+                    torch.ones_like(lower_left),
+                )
+                bottom_fraction = self._trunc_divide(
+                    torch.bitwise_left_shift(projection_z - lower_left, 30),
+                    safe_lower_delta,
+                )
+                bottom_depth = depth_left + torch.bitwise_right_shift(
+                    (depth_right - depth_left) * bottom_fraction,
+                    30,
+                )
+                bottom_cross = screen_left + self._trunc_divide(
+                    torch.bitwise_right_shift(depth_right * bottom_fraction, 30)
+                    * (screen_right - screen_left),
+                    bottom_depth.clamp_min(1),
+                )
+                clip_bottom_right = (
+                    crosses_bottom & below_right & (screen_left <= bottom_cross)
+                )
+                clipped_right = torch.where(
+                    clip_bottom_right,
+                    bottom_cross,
+                    clipped_right,
+                )
+                clipped_depth_right = torch.where(
+                    clip_bottom_right,
+                    bottom_depth,
+                    clipped_depth_right,
+                )
+                outside_bottom |= (
+                    crosses_bottom
+                    & below_right
+                    & (screen_right > bottom_cross)
+                    & (pixel_x >= bottom_cross)
+                    & (pixel_x < screen_right)
+                )
+                clip_bottom_left = (
+                    crosses_bottom & below_left & (bottom_cross <= screen_right)
+                )
+                clipped_left = torch.where(
+                    clip_bottom_left,
+                    bottom_cross,
+                    clipped_left,
+                )
+                clipped_depth_left = torch.where(
+                    clip_bottom_left,
+                    bottom_depth,
+                    clipped_depth_left,
+                )
+                outside_bottom |= (
+                    crosses_bottom
+                    & below_left
+                    & (bottom_cross > screen_left)
+                    & (pixel_x >= screen_left)
+                    & (pixel_x < bottom_cross)
+                )
+
+                projected_left = self._trunc_divide(
+                    projection_z * _NATIVE_FOCAL_Y_FIXED,
+                    clipped_depth_left.clamp_min(1),
+                )
+                projected_right = self._trunc_divide(
+                    projection_z * _NATIVE_FOCAL_Y_FIXED,
+                    clipped_depth_right.clamp_min(1),
+                )
+                span = (clipped_right - clipped_left).clamp_min(1)
+                projected_step = self._trunc_divide(
+                    projected_right - projected_left,
+                    span,
+                )
                 projected = (
                     center_fixed[:, None]
                     + projected_left
-                    + (pixel_x - screen_left) * projected_step
+                    + (pixel_x - clipped_left) * projected_step
                 )
-                return torch.bitwise_right_shift(projected, 16).clamp(
+                projected = torch.bitwise_right_shift(projected, 16).clamp(
                     0,
                     self.native_view_height,
-                ).to(torch.float32)
+                )
+                # qinterpolatedown16short normally follows the clipped clear.
+                # When a right-side crossing collapses ix2 onto ix1, OWallMost
+                # instead takes its ix2 == ix1 branch and writes that endpoint
+                # back over the just-cleared column.
+                collapsed_sample = (
+                    (clipped_right == clipped_left)
+                    & (pixel_x == clipped_left)
+                    & ~(entirely_above | entirely_below)
+                )
+                projected = torch.where(
+                    entirely_above | (outside_top & ~collapsed_sample),
+                    torch.zeros_like(projected),
+                    torch.where(
+                        entirely_below | (outside_bottom & ~collapsed_sample),
+                        torch.full_like(projected, self.native_view_height),
+                        projected,
+                    ),
+                )
+                terminal_wall = (
+                    self.map.portal_wall_sectors[layer_wall_index, 1] < 0
+                )
+                # Direct terminal walls retain their complete visible seg, so
+                # the OWallMost crossing can be reconstructed exactly. Once a
+                # column has crossed a portal, its terminal wall must retain
+                # the same projection convention as that uncut portal clip;
+                # mixing the two moves the far wall one row past the opening.
+                # Right-edge fragments likewise need the source BSP seg's
+                # clipped endpoint depth, while this static inventory retains
+                # only the whole linedef.
+                use_exact_terminal = (
+                    terminal_wall
+                    & ~portal_already_crossed
+                    & (screen_right != self.native_screen_width)
+                )
+                projected = torch.where(
+                    use_exact_terminal,
+                    projected,
+                    original_projected,
+                )
+                return projected.to(torch.float32)
 
             one_top = project(view_ceiling)
             one_bottom = project(view_floor)
@@ -10692,7 +10902,7 @@ class TorchDeathmatchEngine:
                 ),
                 prior_distance,
             )
-            current_sector = torch.where(
+            next_sector = torch.where(
                 projected_solid_keeps_portal_path,
                 projected_solid_path_other,
                 torch.where(
@@ -10715,6 +10925,13 @@ class TorchDeathmatchEngine:
                     ),
                 ),
             )
+            traversed_portal = traversed_portal | (
+                valid
+                & (current_sector >= 0)
+                & (next_sector >= 0)
+                & (next_sector != current_sector)
+            )
+            current_sector = next_sector
         exact_plane = (plane_sector >= 0) & ~filled
         safe_plane_sector = plane_sector.clamp_min(0)
         floor_height = (

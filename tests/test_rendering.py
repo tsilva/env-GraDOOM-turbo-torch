@@ -521,6 +521,84 @@ def test_native_two_sided_wall_top_edges_own_flat_boundary(
     assert rgb[0, 47, 202].tolist() == [115, 19, 19]
 
 
+def test_native_wall_planes_clip_before_fixed_projection(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([456]))
+    engine.x.fill_(801.5532989501953)
+    engine.y.fill_(37.320770263671875)
+    engine.z.zero_()
+    engine.view_z.fill_(41)
+    engine.angle.fill_(math.radians(165.67382816357394))
+    engine.episode_time.fill_(21)
+
+    frame = engine.render_native_frame(include_hud=False)[0]
+
+    # OWallMost clips a horizontal plane against globaluclip/globaldclip and
+    # recomputes the crossing depth and screen column before interpolating.
+    # Clamping an uncut projection instead exposes BIGBRIK1 above the ceiling
+    # at x=104..106 and shifts wall 17's diagonal floor edge by one row.
+    assert frame[0, 104].tolist() == [0, 0, 35]
+    assert frame[5, 104].tolist() == [63, 43, 27]
+    assert frame[9, 105].tolist() == [0, 0, 0]
+    assert frame[10, 105].tolist() == [79, 59, 43]
+    assert frame[14, 106].tolist() == [0, 0, 35]
+    assert frame[15, 106].tolist() == [87, 67, 51]
+    assert frame[147, 84].tolist() == [91, 71, 43]
+
+    # A one-column right-side crossing clears xcross, then OWallMost's
+    # ix2 == ix1 branch writes the surviving endpoint projection over it.
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([123]))
+    engine.x.fill_(1007.9770812988281)
+    engine.y.fill_(453.31781005859375)
+    engine.view_z.fill_(41)
+    engine.angle.fill_(math.radians(102.16735842222519))
+    engine.episode_time.fill_(61)
+    frame = engine.render_native_frame(include_hud=False)[0]
+    assert frame[0, 200].tolist() == [0, 0, 35]
+    assert frame[23, 200].tolist() == [0, 0, 23]
+    assert frame[24, 200].tolist() == [119, 95, 75]
+
+    # Right-frustum and portal projections require clipped BSP-seg endpoint
+    # depths that the static whole-linedef inventory does not retain. Keep the
+    # established interpolation for those incomplete fragments.
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([456]))
+    engine.x.fill_(370.07318115234375)
+    engine.y.fill_(147.17359924316406)
+    engine.view_z.fill_(41)
+    engine.angle.fill_(math.radians(165.67382816357394))
+    engine.episode_time.fill_(41)
+    frame = engine.render_native_frame(include_hud=False)[0]
+    assert frame[0, 291].tolist() == [79, 59, 35]
+    assert frame[5, 316].tolist() == [79, 59, 35]
+
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([123]))
+    engine.x.fill_(883.0337219238281)
+    engine.y.fill_(401.4684143066406)
+    engine.view_z.fill_(41)
+    engine.angle.fill_(math.radians(102.16735842222519))
+    engine.episode_time.fill_(21)
+    frame = engine.render_native_frame(include_hud=False)[0]
+    assert frame[2, 177].tolist() == [0, 0, 35]
+
+    # A terminal wall behind two portals must use the same uncut projection as
+    # those portal clips. Mixing exact terminal OWallMost with approximate
+    # portal endpoints leaves a diagonal strip of sky above the far wall.
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([123]))
+    engine.x.fill_(340.60516357421875)
+    engine.y.fill_(284.878662109375)
+    engine.view_z.fill_(41)
+    engine.angle.fill_(math.radians(102.16735842222519))
+    engine.episode_time.fill_(81)
+    frame = engine.render_native_frame(include_hud=False)[0]
+    assert frame[0, 78].tolist() == [147, 123, 99]
+
+
 def test_native_sector_lookup_ignores_self_referencing_linedef(
     pinned_deathmatch_scenario,
 ) -> None:
