@@ -10629,17 +10629,18 @@ class TorchDeathmatchEngine:
                 | (lower_span & (pixel_y == clipped_lower_top[:, None, :]))
                 | (upper_span & (pixel_y == clipped_top[:, None, :]))
             )
-            # Doom draws a solid one-sided wall before marking its front-sector
-            # ceiling visplane, and wallscan includes every tier's integer top
-            # row before visplanes are drawn. Our flat prepass samples through
-            # pixel centers, so its approximate depth can otherwise punch holes
-            # through solid walls or reject a two-sided tier's exact top edge.
+            # Doom draws a solid one-sided wall before marking either adjacent
+            # visplane, so its already-clipped wallscan span owns every row. Our
+            # flat prepass samples through pixel centers and is only an
+            # approximation at sloped screen-space boundaries; consulting it
+            # there can punch holes through the final solid-wall rows. Two-sided
+            # tiers still need its depth guard, apart from their exact top edge.
             span = (
                 (one_span | middle_span | lower_span | upper_span)
                 & (texture_id >= 0)
                 & (
                     in_front_of_surface
-                    | (one_span & ceiling_pixels)
+                    | one_span
                     | tier_top_edge
                 )
                 & ~filled
