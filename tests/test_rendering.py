@@ -736,6 +736,135 @@ def test_native_walls_use_reference_half_open_screen_bounds(
     assert rgb[0, 40, 90].tolist() == [95, 75, 55]
 
 
+def test_native_projected_endpoint_owner_selects_nested_pit_texture_columns(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([789]))
+    engine.x.fill_(569.3474273681641)
+    engine.y.fill_(515.9971313476562)
+    engine.z.fill_(-64)
+    engine.view_z.fill_(-23)
+    engine.angle.fill_(math.radians(162.48779300658214))
+    engine.episode_time.fill_(61)
+
+    (
+        wall_distance,
+        _wall_along,
+        geometric_intersections,
+        projected_intersections,
+        projected_left_edges,
+        _wall_visibility,
+    ) = engine._native_portal_intersections()
+    frame, surface_depth, scene_surface_depth = engine._native_render_flats(
+        engine._current_sector(),
+        engine.view_z,
+    )
+    frame, _scene_depth, _sprite_clip_depth, _sprite_clip_wall = (
+        engine._native_render_portal_walls(
+            frame,
+            engine.view_z,
+            surface_depth,
+            scene_surface_depth,
+        )
+    )
+    rgb = engine.map.playpal[frame.to(torch.int64)]
+
+    # At these nested-pit corners, the mathematical ray hits one seg just
+    # outside its half-open screen span. The adjacent seg's projected left
+    # edge owns the column even when the two infinite-line depths differ by
+    # more than 1/16 map unit. It therefore supplies the REDWALL texture U.
+    for column, ray_wall, projected_owner in (
+        (57, 106, 77),
+        (104, 77, 108),
+        (146, 108, 69),
+        (60, 105, 78),
+        (104, 78, 104),
+        (147, 104, 65),
+        (105, 88, 125),
+    ):
+        assert geometric_intersections[0, column, ray_wall]
+        assert not projected_intersections[0, column, ray_wall]
+        assert not geometric_intersections[0, column, projected_owner]
+        assert projected_intersections[0, column, projected_owner]
+        assert projected_left_edges[0, column, projected_owner]
+        assert (
+            wall_distance[0, column, projected_owner]
+            - wall_distance[0, column, ray_wall]
+            > 1.0 / 16.0
+        )
+    for x, y, expected in (
+        (57, 110, [79, 0, 0]),
+        (104, 90, [115, 0, 0]),
+        (104, 110, [91, 0, 0]),
+        (146, 120, [79, 0, 0]),
+        (59, 160, [79, 0, 0]),
+        (103, 155, [115, 0, 0]),
+        (143, 155, [79, 0, 0]),
+        (60, 90, [91, 0, 0]),
+        (147, 95, [107, 15, 15]),
+        (105, 80, [115, 0, 0]),
+    ):
+        assert rgb[0, y, x].tolist() == expected
+
+
+def test_native_projected_endpoint_owner_preserves_geometric_portal_path(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([123]))
+    engine.x.fill_(835.9440307617188)
+    engine.y.fill_(391.3482971191406)
+    engine.z.zero_()
+    engine.view_z.fill_(41)
+    engine.angle.fill_(math.radians(102.16735842222519))
+    engine.episode_time.fill_(1)
+
+    (
+        wall_distance,
+        _wall_along,
+        geometric_intersections,
+        projected_intersections,
+        projected_left_edges,
+        _wall_visibility,
+    ) = engine._native_portal_intersections()
+    frame, surface_depth, scene_surface_depth = engine._native_render_flats(
+        engine._current_sector(),
+        engine.view_z,
+    )
+    frame, _scene_depth, _sprite_clip_depth, _sprite_clip_wall = (
+        engine._native_render_portal_walls(
+            frame,
+            engine.view_z,
+            surface_depth,
+            scene_surface_depth,
+        )
+    )
+    rgb = engine.map.playpal[frame.to(torch.int64)]
+
+    # Portal 101 remains the geometric sector path while projected-only seg
+    # 191 owns its raster column. Treating the owner as the path terminates
+    # traversal and leaves a full-height sky/flat hole at column 21.
+    assert geometric_intersections[0, 21, 101]
+    assert not projected_intersections[0, 21, 101]
+    assert not geometric_intersections[0, 21, 191]
+    assert projected_intersections[0, 21, 191]
+    assert projected_left_edges[0, 21, 191]
+    assert wall_distance[0, 21, 191] - wall_distance[0, 21, 101] > 1.0 / 16.0
+    assert rgb[0, 60, 21].tolist() == [79, 59, 43]
+    assert rgb[0, 80, 21].tolist() == [103, 83, 63]
+    assert rgb[0, 100, 21].tolist() == [119, 95, 75]
+    assert rgb[0, 140, 21].tolist() == [71, 0, 0]
+
+
 def test_native_walls_reject_collapsed_screen_edge_span(
     pinned_deathmatch_scenario,
 ) -> None:

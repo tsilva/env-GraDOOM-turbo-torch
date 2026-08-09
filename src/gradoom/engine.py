@@ -9725,13 +9725,12 @@ class TorchDeathmatchEngine:
             3,
             endpoint_owner_slot[:, :, :, None],
         ).squeeze(3)
+        # Infinite-line ray depths diverge at angled shared vertices even when
+        # FWallCoords assigns the integer column unambiguously. Projected span
+        # ownership therefore cannot be bounded by an arbitrary depth delta.
         has_endpoint_owner = (
             ~projected_intersections
             & torch.isfinite(endpoint_owner_distance)
-            & (
-                endpoint_owner_distance
-                <= distances + _NATIVE_SHARED_ENDPOINT_DEPTH_TOLERANCE
-            )
         )
         endpoint_owner_index = torch.where(
             has_endpoint_owner,
@@ -9863,6 +9862,10 @@ class TorchDeathmatchEngine:
                 2,
                 wall_index[:, :, None],
             ).squeeze(2)
+            endpoint_owner_path_is_geometric = geometric_intersections.gather(
+                2,
+                wall_index[:, :, None],
+            ).squeeze(2)
             replace_with_endpoint_owner = (
                 (selected_endpoint_owner != wall_index)
                 & (selected_endpoint_distance > previous_distance + 1e-3)
@@ -9878,10 +9881,16 @@ class TorchDeathmatchEngine:
                 wall_index,
             )
             valid = torch.isfinite(distance)
-            geometric_intersection = geometric_intersections.gather(
-                2,
-                wall_index[:, :, None],
-            ).squeeze(2)
+            # The projected neighbor owns wallscan, but a geometric hit on the
+            # excluded seg still determines the subsector path behind it.
+            geometric_intersection = torch.where(
+                replace_with_endpoint_owner,
+                endpoint_owner_path_is_geometric,
+                geometric_intersections.gather(
+                    2,
+                    wall_index[:, :, None],
+                ).squeeze(2),
+            )
             sectors = self.map.portal_wall_sectors[wall_index]
             front = sectors[..., 0]
             back = sectors[..., 1]
