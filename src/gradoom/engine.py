@@ -1315,6 +1315,41 @@ class TorchDeathmatchEngine:
         self.render_screen_flashes = render_screen_flashes
         self.debug_checks = device.type == "cpu" if debug_checks is None else debug_checks
         self.map = DeviceScenario.from_host(scenario, device)
+        portal_walls = self.map.portal_walls
+        portal_starts = portal_walls[:, :2]
+        portal_ends = portal_walls[:, 2:]
+        shares_portal_endpoint = (
+            torch.all(portal_starts[:, None] == portal_starts[None, :], dim=2)
+            | torch.all(portal_starts[:, None] == portal_ends[None, :], dim=2)
+            | torch.all(portal_ends[:, None] == portal_starts[None, :], dim=2)
+            | torch.all(portal_ends[:, None] == portal_ends[None, :], dim=2)
+        )
+        portal_directions = portal_ends - portal_starts
+        portal_direction_dot = torch.sum(
+            portal_directions[:, None] * portal_directions[None, :],
+            dim=2,
+        )
+        portal_direction_cross = (
+            portal_directions[:, None, 0] * portal_directions[None, :, 1]
+            - portal_directions[:, None, 1] * portal_directions[None, :, 0]
+        )
+        portal_sectors = self.map.portal_wall_sectors
+        same_portal_sector_pair = (
+            (
+                (portal_sectors[:, None, 0] == portal_sectors[None, :, 0])
+                & (portal_sectors[:, None, 1] == portal_sectors[None, :, 1])
+            )
+            | (
+                (portal_sectors[:, None, 0] == portal_sectors[None, :, 1])
+                & (portal_sectors[:, None, 1] == portal_sectors[None, :, 0])
+            )
+        )
+        self._native_opposing_portal_pairs = (
+            same_portal_sector_pair
+            & ~shares_portal_endpoint
+            & (portal_direction_dot < 0)
+            & (torch.abs(portal_direction_cross) < 1e-6)
+        )
         (
             self._rocket_wall_grid_minimum_x,
             self._rocket_wall_grid_minimum_y,
@@ -10930,26 +10965,45 @@ class TorchDeathmatchEngine:
             other_incident = (
                 all_sectors[None, None, :, 0] == other_sector[:, :, None]
             ) | (all_sectors[None, None, :, 1] == other_sector[:, :, None])
-            current_next_distance = torch.min(
+            current_next_distance, current_next_index = torch.min(
                 torch.where(
                     incident & future_boundary,
                     distances,
                     torch.full_like(distances, torch.inf),
                 ),
                 dim=2,
-            ).values
-            other_next_distance = torch.min(
+            )
+            other_next_distance, other_next_index = torch.min(
                 torch.where(
                     other_incident & future_boundary,
                     distances,
                     torch.full_like(distances, torch.inf),
                 ),
                 dim=2,
-            ).values
+            )
+            # When both sectors lead to the same non-touching portal, the
+            # projected-only owner is the near side of a finite-width sector
+            # strip and the tied portal is its far side. Enter the strip so
+            # that crossing the far side returns to the original sector.
+            # A tied portal sharing the selected map vertex or continuing in
+            # the same direction is instead one boundary-chain raster corner
+            # and retains the current sector.
+            endpoint_enters_tied_strip = (
+                endpoint_only_portal
+                & torch.isfinite(current_next_distance)
+                & (current_next_index == other_next_index)
+                & self._native_opposing_portal_pairs[
+                    wall_index,
+                    current_next_index,
+                ]
+            )
             endpoint_enters_other = (
                 endpoint_only_portal
                 & (other_sector >= 0)
-                & (other_next_distance < current_next_distance)
+                & (
+                    (other_next_distance < current_next_distance)
+                    | endpoint_enters_tied_strip
+                )
             )
             # Two projected spans meeting at one map vertex can straddle in
             # infinite-line depth even though Doom clips them as one corner.

@@ -1265,6 +1265,122 @@ def test_native_projected_portal_keeps_geometric_sector_path(
     assert rgb[0, 100, 50].tolist() == [119, 95, 75]
 
 
+def test_native_projected_portal_enters_non_touching_tied_sector_strip(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([789]))
+    engine.x.fill_(262.93389892578125)
+    engine.y.fill_(576.4520263671875)
+    engine.z.zero_()
+    engine.view_z.fill_(41)
+    engine.angle.fill_(math.radians(348.81591804996503))
+    engine.episode_time.fill_(61)
+
+    (
+        wall_distance,
+        _wall_along,
+        geometric_intersections,
+        projected_intersections,
+        projected_left_edges,
+        _wall_visibility,
+    ) = engine._native_portal_intersections()
+    frame, surface_depth, scene_surface_depth = engine._native_render_flats(
+        engine._current_sector(),
+        engine.view_z,
+    )
+    frame, scene_depth, _sprite_clip_depth, _sprite_clip_wall = (
+        engine._native_render_portal_walls(
+            frame,
+            engine.view_z,
+            surface_depth,
+            scene_surface_depth,
+        )
+    )
+    rgb = engine.map.playpal[frame.to(torch.int64)]
+
+    # Projected-only portal 149 and geometric portal 151 bound opposite sides
+    # of sector 6 without sharing a map vertex. Both sector paths therefore
+    # name portal 151 as their equal-depth continuation. Wallscan enters sector
+    # 6 through 149, exits through 151, and reaches solid BIGBRIK1 wall 41.
+    assert engine._native_opposing_portal_pairs[149, 151]
+    assert not geometric_intersections[0, 135, 149]
+    assert projected_intersections[0, 135, 149]
+    assert projected_left_edges[0, 135, 149]
+    assert geometric_intersections[0, 135, 151]
+    assert projected_intersections[0, 135, 151]
+    assert geometric_intersections[0, 135, 41]
+    assert projected_intersections[0, 135, 41]
+    assert wall_distance[0, 135, 149] < wall_distance[0, 135, 151]
+    assert wall_distance[0, 135, 151] < wall_distance[0, 135, 41]
+    torch.testing.assert_close(scene_depth[0, 97, 135], wall_distance[0, 135, 41])
+    assert rgb[0, 96, 135].tolist() == [0, 0, 0]
+    assert rgb[0, 97, 135].tolist() == [31, 23, 11]
+    assert rgb[0, 103, 135].tolist() == [55, 35, 19]
+    assert rgb[0, 108, 135].tolist() == [43, 35, 15]
+
+
+def test_native_projected_portal_tie_retains_same_direction_boundary_chain(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([123]))
+    engine.x.fill_(788.8523559570312)
+    engine.y.fill_(381.226318359375)
+    engine.z.zero_()
+    engine.view_z.fill_(41)
+    engine.angle.fill_(math.radians(102.16735842222519))
+    engine.episode_time.fill_(21)
+
+    (
+        wall_distance,
+        _wall_along,
+        geometric_intersections,
+        projected_intersections,
+        projected_left_edges,
+        _wall_visibility,
+    ) = engine._native_portal_intersections()
+    frame, surface_depth, scene_surface_depth = engine._native_render_flats(
+        engine._current_sector(),
+        engine.view_z,
+    )
+    frame, _scene_depth, _sprite_clip_depth, _sprite_clip_wall = (
+        engine._native_render_portal_walls(
+            frame,
+            engine.view_z,
+            surface_depth,
+            scene_surface_depth,
+        )
+    )
+    rgb = engine.map.playpal[frame.to(torch.int64)]
+
+    # Projected-only portal 190 and its tied continuation 73 separate the same
+    # sectors but point along the same boundary chain. They do not form the
+    # opposing sides of a strip, so entering sector 4 through 190 would turn
+    # the farther brick wall into a full-height sky leak at column 21.
+    assert not engine._native_opposing_portal_pairs[190, 73]
+    assert not geometric_intersections[0, 21, 190]
+    assert projected_intersections[0, 21, 190]
+    assert projected_left_edges[0, 21, 190]
+    assert geometric_intersections[0, 21, 73]
+    assert projected_intersections[0, 21, 73]
+    assert wall_distance[0, 21, 190] < wall_distance[0, 21, 73]
+    first_direction = engine.map.portal_walls[190, 2:] - engine.map.portal_walls[190, :2]
+    second_direction = engine.map.portal_walls[73, 2:] - engine.map.portal_walls[73, :2]
+    assert torch.dot(first_direction, second_direction) > 0
+    assert rgb[0, 40, 21].tolist() == [119, 95, 75]
+    assert rgb[0, 60, 21].tolist() == [79, 59, 43]
+    assert rgb[0, 100, 21].tolist() == [119, 95, 75]
+
+
 def test_native_projected_portal_prefers_same_depth_geometric_path(
     pinned_deathmatch_scenario,
 ) -> None:
