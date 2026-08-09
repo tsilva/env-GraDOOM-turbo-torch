@@ -1722,6 +1722,87 @@ def test_native_pit_depth_occludes_map_items(pinned_deathmatch_scenario) -> None
 
 
 @pytest.mark.skipif(not SCENARIO.is_file() or not DOOM2.is_file(), reason="operator WADs absent")
+def test_native_fixed_wall_projection_clips_item_at_pit_step(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([246]))
+    engine.x.fill_(567.9317626953125)
+    engine.y.fill_(547.9797973632812)
+    engine.z.fill_(-24.0)
+    engine.view_z.fill_(-1.0313720703125)
+    engine.view_height.copy_(engine.view_z - engine.z)
+    engine.angle.fill_(math.radians(28.630371100416028))
+    engine.episode_time.fill_(50)
+    engine.player_dead.fill_(True)
+    engine.enemy_alive.zero_()
+    engine.enemy_death_tics.zero_()
+    engine.projectile_alive.zero_()
+    engine.enemy_projectile_alive.zero_()
+    engine.projectile_impact_tics.zero_()
+    engine.enemy_projectile_impact_tics.zero_()
+    engine.teleport_fog_tics.zero_()
+    engine.drop_type.fill_(-1)
+    engine.item_available.zero_()
+
+    without_item = engine.render_native_frame(include_hud=False)
+    assert engine.map.item_types[80].item() == 2046
+    engine.item_available[:, 80] = True
+    with_item = engine.render_native_frame(include_hud=False)
+
+    # ViZDoom's OWallMost puts the near red pit wall on row 99. The distant
+    # RocketBox remains visible immediately above it, but not through it.
+    assert not torch.equal(with_item[:, 98, 153], without_item[:, 98, 153])
+    assert torch.equal(with_item[:, 99, 153], without_item[:, 99, 153])
+
+
+@pytest.mark.skipif(not SCENARIO.is_file() or not DOOM2.is_file(), reason="operator WADs absent")
+def test_native_fixed_sprite_posts_do_not_start_one_row_early(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([789]))
+    engine.x.fill_(569.3474273681641)
+    engine.y.fill_(515.9971313476562)
+    engine.z.fill_(-28.0)
+    engine.view_z.fill_(20.0)
+    engine.view_height.copy_(engine.view_z - engine.z)
+    engine.angle.fill_(math.radians(348.81591804996503))
+    engine.episode_time.fill_(9)
+    engine.player_dead.fill_(True)
+    engine.enemy_alive.zero_()
+    engine.enemy_death_tics.zero_()
+    engine.projectile_alive.zero_()
+    engine.enemy_projectile_alive.zero_()
+    engine.projectile_impact_tics.zero_()
+    engine.enemy_projectile_impact_tics.zero_()
+    engine.teleport_fog_tics.zero_()
+    engine.drop_type.fill_(-1)
+    engine.item_available.zero_()
+
+    without_items = engine.render_native_frame(include_hud=False)
+    assert engine.map.item_types[75].item() == 2046
+    assert engine.map.item_types[51].item() == 2005
+    engine.item_available[:, (75, 51)] = True
+    with_items = engine.render_native_frame(include_hud=False)
+
+    # R_DrawMaskedColumn begins these opaque posts on row 104. Sampling the
+    # post through centery - 1 without its projected bound exposed row 103.
+    assert torch.equal(with_items[:, 103, 11], without_items[:, 103, 11])
+    assert torch.equal(with_items[:, 103, 125], without_items[:, 103, 125])
+    assert not torch.equal(with_items[:, 104, 11], without_items[:, 104, 11])
+    assert not torch.equal(with_items[:, 104, 125], without_items[:, 104, 125])
+
+
+@pytest.mark.skipif(not SCENARIO.is_file() or not DOOM2.is_file(), reason="operator WADs absent")
 def test_native_item_uses_fixed_point_sprite_projection(
     pinned_deathmatch_scenario,
 ) -> None:

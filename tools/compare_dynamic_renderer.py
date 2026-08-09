@@ -32,6 +32,7 @@ NON_FIRING_PROGRAMS = (
     "turn-left",
     "turn-right",
 )
+ITEM_LABEL_CATEGORIES = frozenset(("Ammo", "Armor", "Health", "Powerup", "Weapon"))
 
 
 def _write_comparison(
@@ -73,6 +74,7 @@ def _run_case(
     program: str,
     sample_steps: tuple[int, ...],
     frame_skip: int,
+    compare_item_occlusion: bool,
 ) -> tuple[list[dict[str, Any]], list[tuple[float, dict[str, Any], torch.Tensor, torch.Tensor]]]:
     try:
         import vizdoom as vzd
@@ -87,6 +89,7 @@ def _run_case(
     game.set_screen_resolution(vzd.ScreenResolution.RES_320X240)
     game.set_screen_format(vzd.ScreenFormat.RGB24)
     game.set_render_hud(True)
+    game.set_labels_buffer_enabled(compare_item_occlusion)
     variables = (
         vzd.GameVariable.POSITION_X,
         vzd.GameVariable.POSITION_Y,
@@ -143,6 +146,49 @@ def _run_case(
                     "y": float(game.get_game_variable(variables[1])),
                     "z": float(game.get_game_variable(variables[2])),
                 }
+                if compare_item_occlusion:
+                    label_values = [
+                        int(label.value)
+                        for label in state.labels
+                        if label.object_category in ITEM_LABEL_CATEGORIES
+                    ]
+                    labels = np.asarray(state.labels_buffer)
+                    reference_item_mask = torch.from_numpy(
+                        np.isin(labels, label_values)
+                        if label_values
+                        else np.zeros(labels.shape, dtype=np.bool_)
+                    )
+                    saved_item_available = engine.item_available.clone()
+                    engine.item_available.zero_()
+                    without_items = engine.render_native_frame(include_hud=True)[0]
+                    engine.item_available.copy_(saved_item_available)
+                    actual_item_mask = torch.any(
+                        actual.to(torch.uint8) != without_items,
+                        dim=2,
+                    )
+                    intersection = actual_item_mask & reference_item_mask
+                    union = actual_item_mask | reference_item_mask
+                    intersection_pixels = torch.sum(intersection)
+                    union_pixels = torch.sum(union)
+                    record.update(
+                        {
+                            "item_actual_only_pixels": int(
+                                torch.sum(actual_item_mask & ~reference_item_mask)
+                            ),
+                            "item_actual_pixels": int(torch.sum(actual_item_mask)),
+                            "item_intersection_over_union": float(
+                                torch.where(
+                                    union_pixels > 0,
+                                    intersection_pixels / union_pixels.clamp_min(1),
+                                    torch.ones_like(union_pixels),
+                                )
+                            ),
+                            "item_reference_only_pixels": int(
+                                torch.sum(reference_item_mask & ~actual_item_mask)
+                            ),
+                            "item_reference_pixels": int(torch.sum(reference_item_mask)),
+                        }
+                    )
                 records.append(record)
                 ranked.append((record["mae"], record, reference, actual))
             if step == last_step:
@@ -174,6 +220,11 @@ def main() -> int:
         default=(0, 10, 20, 30, 40, 50),
     )
     parser.add_argument("--frame-skip", type=int, default=2)
+    parser.add_argument(
+        "--compare-item-occlusion",
+        action="store_true",
+        help="compare isolated GraDOOM item pixels with ViZDoom's label buffer",
+    )
     parser.add_argument("--top-k", type=int, default=8)
     parser.add_argument("--output-dir", type=Path)
     args = parser.parse_args()
@@ -214,6 +265,7 @@ def main() -> int:
                 program=program,
                 sample_steps=sample_steps,
                 frame_skip=args.frame_skip,
+                compare_item_occlusion=args.compare_item_occlusion,
             )
             records.extend(case_records)
             ranked.extend(case_ranked)
@@ -253,6 +305,26 @@ def main() -> int:
         "stochastic_state_alignment": ["mugshot_face_index"],
         "top": [record for _mae, record, _reference, _actual in top],
     }
+    if args.compare_item_occlusion:
+        result["item_occlusion"] = {
+            "max_actual_only_pixels": max(
+                record["item_actual_only_pixels"] for record in records
+            ),
+            "max_reference_only_pixels": max(
+                record["item_reference_only_pixels"] for record in records
+            ),
+            "mean_intersection_over_union": float(
+                np.mean(
+                    [record["item_intersection_over_union"] for record in records]
+                )
+            ),
+            "total_actual_only_pixels": sum(
+                record["item_actual_only_pixels"] for record in records
+            ),
+            "total_reference_only_pixels": sum(
+                record["item_reference_only_pixels"] for record in records
+            ),
+        }
     print(json.dumps(result, sort_keys=True))
     return 0
 

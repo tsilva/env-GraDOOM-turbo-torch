@@ -1610,6 +1610,7 @@ class TorchDeathmatchEngine:
         )
         self._native_pixel_x = torch.arange(self.native_screen_width, device=device).view(1, 1, -1)
         self._native_pixel_y = torch.arange(self.native_view_height, device=device).view(1, -1, 1)
+        self._raw_sprite_post_tops: torch.Tensor | None = None
         player_start_sectors = self._sector_at(
             self.map.player_starts[:, 0], self.map.player_starts[:, 1]
         )
@@ -8931,6 +8932,104 @@ class TorchDeathmatchEngine:
             fraction * depth_scale[:, None, :] + depth_origin[:, None, :] + 0.5
         ).to(torch.int64)
 
+    def _native_wall_projection_geometry(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build FWallCoords' clipped screen span and endpoint depths."""
+
+        walls_fixed = torch.round(self.map.portal_walls * _FIXED_UNIT).to(torch.int64)
+        view_x_fixed = self._public_or_retained_fixed(self.x, self._x_fixed)
+        view_y_fixed = self._public_or_retained_fixed(self.y, self._y_fixed)
+        relative_x = walls_fixed[None, :, 0::2] - view_x_fixed[:, None, None]
+        relative_y = walls_fixed[None, :, 1::2] - view_y_fixed[:, None, None]
+
+        fine_angle = self._native_view_angle_bam() >> _ANGLE_TO_FINE_SHIFT
+        view_sine = self._fine_sine_fixed[fine_angle][:, None, None]
+        view_cosine = self._fine_sine_fixed[
+            (fine_angle + _FINE_ANGLES // 4) & (_FINE_ANGLES - 1)
+        ][:, None, None]
+        transformed_x = (
+            relative_x * view_sine - relative_y * view_cosine
+        ) >> 20
+        transformed_y = (
+            relative_x * view_cosine + relative_y * view_sine
+        ) >> 20
+
+        wall_start = self.map.portal_walls[None, :, :2]
+        wall_vector = self.map.portal_walls[None, :, 2:] - wall_start
+        viewer_from_start = torch.stack((self.x, self.y), dim=1)[:, None, :] - wall_start
+        front_facing = (
+            wall_vector[..., 0] * viewer_from_start[..., 1]
+            - wall_vector[..., 1] * viewer_from_start[..., 0]
+        ) < 0
+        ordered_x = torch.where(
+            front_facing[:, :, None],
+            transformed_x,
+            torch.flip(transformed_x, dims=(2,)),
+        )
+        ordered_y = torch.where(
+            front_facing[:, :, None],
+            transformed_y,
+            torch.flip(transformed_y, dims=(2,)),
+        )
+        tx1, tx2 = ordered_x[..., 0], ordered_x[..., 1]
+        ty1, ty2 = ordered_y[..., 0], ordered_y[..., 1]
+        center_fixed = (self.native_screen_width // 2) * _FIXED_UNIT
+        safe_ty1 = torch.where(ty1 == 0, torch.ones_like(ty1), ty1)
+        safe_ty2 = torch.where(ty2 == 0, torch.ones_like(ty2), ty2)
+        left_projected = (
+            center_fixed + self._trunc_divide(tx1 * center_fixed, safe_ty1)
+        ) >> 16
+        left_projected += (tx1 >= 0).to(torch.int64)
+        right_projected = (
+            center_fixed + self._trunc_divide(tx2 * center_fixed, safe_ty2)
+        ) >> 16
+        right_projected += (tx2 >= 0).to(torch.int64)
+
+        left_denominator = tx1 - tx2 - ty2 + ty1
+        right_denominator = ty2 - ty1 - tx2 + tx1
+        safe_left_denominator = torch.where(
+            left_denominator == 0,
+            torch.ones_like(left_denominator),
+            left_denominator,
+        )
+        safe_right_denominator = torch.where(
+            right_denominator == 0,
+            torch.ones_like(right_denominator),
+            right_denominator,
+        )
+        left_inside = tx1 >= -ty1
+        right_inside = tx2 <= ty2
+        screen_left = torch.where(
+            left_inside,
+            left_projected,
+            torch.zeros_like(left_projected),
+        )
+        screen_right = torch.where(
+            right_inside,
+            right_projected,
+            torch.full_like(right_projected, self.native_screen_width),
+        )
+        depth_left = torch.where(
+            left_inside,
+            ty1,
+            ty1
+            + self._trunc_divide(
+                (ty2 - ty1) * (tx1 + ty1),
+                safe_left_denominator,
+            ),
+        )
+        depth_right = torch.where(
+            right_inside,
+            ty2,
+            ty1
+            + self._trunc_divide(
+                (ty2 - ty1) * (tx1 - ty1),
+                safe_right_denominator,
+            ),
+        )
+        return screen_left, screen_right, depth_left, depth_right
+
     def _native_flat_texture_coordinates(
         self,
         texture_ids: torch.Tensor,
@@ -9506,6 +9605,12 @@ class TorchDeathmatchEngine:
             wall_visibility,
         ) = self._native_portal_intersections()
         wall_vertical_steps = self._native_wall_vertical_steps()
+        (
+            wall_screen_left,
+            wall_screen_right,
+            wall_depth_left,
+            wall_depth_right,
+        ) = self._native_wall_projection_geometry()
         filled = torch.zeros_like(frame, dtype=torch.bool)
         scene_depth = (
             surface_depth if scene_surface_depth is None else scene_surface_depth
@@ -9759,11 +9864,51 @@ class TorchDeathmatchEngine:
 
             def project(
                 world_z: torch.Tensor,
-                layer_distance: torch.Tensor = distance,
+                layer_wall_index: torch.Tensor = wall_index,
             ) -> torch.Tensor:
-                return center[:, None] - (
-                    (world_z - view_z[:, None]) * focal_length / layer_distance
+                """Replay OWallMost's fixed-point horizontal-plane projection."""
+
+                screen_left = wall_screen_left.gather(1, layer_wall_index)
+                screen_right = wall_screen_right.gather(1, layer_wall_index)
+                depth_left = wall_depth_left.gather(1, layer_wall_index).clamp_min(1)
+                depth_right = wall_depth_right.gather(1, layer_wall_index).clamp_min(1)
+                span = (screen_right - screen_left).clamp_min(1)
+                relative_z_fixed = torch.round(
+                    (world_z - view_z[:, None]) * _FIXED_UNIT
+                ).to(torch.int64)
+                projection_z = -torch.bitwise_right_shift(relative_z_fixed, 4)
+                projected_left = self._trunc_divide(
+                    projection_z * _NATIVE_FOCAL_Y_FIXED,
+                    depth_left,
                 )
+                projected_right = self._trunc_divide(
+                    projection_z * _NATIVE_FOCAL_Y_FIXED,
+                    depth_right,
+                )
+                projected_step = self._trunc_divide(
+                    projected_right - projected_left,
+                    span,
+                )
+                tangent_index = torch.bitwise_right_shift(
+                    _ANGLE_90 - self._pitch_bam,
+                    _ANGLE_TO_FINE_SHIFT,
+                ).clamp(0, _FINE_ANGLES // 2 - 1)
+                pitch_offset_fixed = (
+                    _NATIVE_FOCAL_Y_FIXED * self._fine_tangent_fixed[tangent_index]
+                ) >> 16
+                center_fixed = (
+                    self.native_view_height // 2 * _FIXED_UNIT + pitch_offset_fixed
+                )
+                pixel_x = self._native_pixel_x[0, 0].to(torch.int64)[None, :]
+                projected = (
+                    center_fixed[:, None]
+                    + projected_left
+                    + (pixel_x - screen_left) * projected_step
+                )
+                return torch.bitwise_right_shift(projected, 16).clamp(
+                    0,
+                    self.native_view_height,
+                ).to(torch.float32)
 
             one_top = project(view_ceiling)
             one_bottom = project(view_floor)
@@ -9792,22 +9937,22 @@ class TorchDeathmatchEngine:
             one_span = (
                 (one_sided & valid)[:, None, :]
                 & (pixel_y >= clipped_top[:, None, :])
-                & (pixel_y <= clipped_bottom[:, None, :])
+                & (pixel_y < clipped_bottom[:, None, :])
             )
             lower_span = (
                 (~one_sided & valid & (view_floor < other_floor))[:, None, :]
                 & (pixel_y >= clipped_lower_top[:, None, :])
-                & (pixel_y <= clipped_bottom[:, None, :])
+                & (pixel_y < clipped_bottom[:, None, :])
             )
             upper_span = (
                 (~one_sided & valid & (view_ceiling > other_ceiling))[:, None, :]
                 & (pixel_y >= clipped_top[:, None, :])
-                & (pixel_y <= clipped_upper_bottom[:, None, :])
+                & (pixel_y < clipped_upper_bottom[:, None, :])
             )
             middle_span = (
                 (~one_sided & valid & (middle_texture_id >= 0))[:, None, :]
                 & (pixel_y >= clipped_middle_top[:, None, :])
-                & (pixel_y <= clipped_middle_bottom[:, None, :])
+                & (pixel_y < clipped_middle_bottom[:, None, :])
             )
             texture_id = torch.where(
                 one_span,
@@ -9985,15 +10130,15 @@ class TorchDeathmatchEngine:
                 projected_solid_path_index,
                 path_side_index,
             ]
-            path_top = project(view_ceiling, projected_solid_path_distance)
-            path_bottom = project(view_floor, projected_solid_path_distance)
+            path_top = project(view_ceiling, projected_solid_path_index)
+            path_bottom = project(view_floor, projected_solid_path_index)
             path_lower_top = project(
                 path_other_floor,
-                projected_solid_path_distance,
+                projected_solid_path_index,
             )
             path_upper_bottom = project(
                 path_other_ceiling,
-                projected_solid_path_distance,
+                projected_solid_path_index,
             )
             path_clipped_top = torch.maximum(path_top, ceiling_clip)
             path_clipped_bottom = torch.minimum(path_bottom, floor_clip)
@@ -10638,25 +10783,10 @@ class TorchDeathmatchEngine:
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Replay R_ProjectSprite's fixed-point horizontal screen mapping."""
 
-        view_x_fixed = self._public_or_retained_fixed(self.x, self._x_fixed)
-        view_y_fixed = self._public_or_retained_fixed(self.y, self._y_fixed)
-        actor_x_fixed = torch.round(actor_x * _FIXED_UNIT).to(torch.int64)
-        actor_y_fixed = torch.round(actor_y * _FIXED_UNIT).to(torch.int64)
-        relative_x_fixed = actor_x_fixed - view_x_fixed[:, None]
-        relative_y_fixed = actor_y_fixed - view_y_fixed[:, None]
-        fine_angle = self._native_view_angle_bam() >> _ANGLE_TO_FINE_SHIFT
-        view_sine_fixed = self._fine_sine_fixed[fine_angle][:, None]
-        view_cosine_fixed = self._fine_sine_fixed[
-            (fine_angle + _FINE_ANGLES // 4) & (_FINE_ANGLES - 1)
-        ][:, None]
-        sprite_depth_fixed = (
-            relative_x_fixed * view_cosine_fixed
-            + relative_y_fixed * view_sine_fixed
-        ) >> 20
-        sprite_side_fixed = (
-            relative_x_fixed * view_sine_fixed
-            - relative_y_fixed * view_cosine_fixed
-        ) >> 16
+        sprite_depth_fixed, sprite_side_fixed = self._native_sprite_view_coordinates(
+            actor_x,
+            actor_y,
+        )
         sprite_xscale_fixed = self._trunc_divide(
             torch.full_like(sprite_depth_fixed, _NATIVE_FOCAL_X_FIXED << 12),
             sprite_depth_fixed.clamp_min(_NATIVE_SPRITE_MIN_DEPTH_FIXED),
@@ -10681,6 +10811,97 @@ class TorchDeathmatchEngine:
             sprite_span,
         )
         return sprite_left, sprite_right, horizontal_step_fixed
+
+    def _native_sprite_view_coordinates(
+        self,
+        actor_x: torch.Tensor,
+        actor_y: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Transform sprite origins to R_ProjectSprite's fixed view space."""
+
+        view_x_fixed = self._public_or_retained_fixed(self.x, self._x_fixed)
+        view_y_fixed = self._public_or_retained_fixed(self.y, self._y_fixed)
+        actor_x_fixed = torch.round(actor_x * _FIXED_UNIT).to(torch.int64)
+        actor_y_fixed = torch.round(actor_y * _FIXED_UNIT).to(torch.int64)
+        relative_x_fixed = actor_x_fixed - view_x_fixed[:, None]
+        relative_y_fixed = actor_y_fixed - view_y_fixed[:, None]
+        fine_angle = self._native_view_angle_bam() >> _ANGLE_TO_FINE_SHIFT
+        view_sine_fixed = self._fine_sine_fixed[fine_angle][:, None]
+        view_cosine_fixed = self._fine_sine_fixed[
+            (fine_angle + _FINE_ANGLES // 4) & (_FINE_ANGLES - 1)
+        ][:, None]
+        sprite_depth_fixed = (
+            relative_x_fixed * view_cosine_fixed
+            + relative_y_fixed * view_sine_fixed
+        ) >> 20
+        sprite_side_fixed = (
+            relative_x_fixed * view_sine_fixed
+            - relative_y_fixed * view_cosine_fixed
+        ) >> 16
+        return sprite_depth_fixed, sprite_side_fixed
+
+    def _native_sprite_vertical_projection(
+        self,
+        actor_x: torch.Tensor,
+        actor_y: torch.Tensor,
+        actor_z: torch.Tensor,
+        actor_sprite: torch.Tensor,
+        view_z: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return R_ProjectSprite's fixed y scale and top-screen origin."""
+
+        sprite_depth_fixed, _sprite_side_fixed = self._native_sprite_view_coordinates(
+            actor_x,
+            actor_y,
+        )
+        sprite_yscale_fixed = self._trunc_divide(
+            torch.full_like(sprite_depth_fixed, _NATIVE_FOCAL_Y_FIXED << 12),
+            sprite_depth_fixed.clamp_min(_NATIVE_SPRITE_MIN_DEPTH_FIXED),
+        )
+        texture_mid_fixed = (
+            self.map.raw_sprite_top_offsets[actor_sprite].to(torch.int64) * _FIXED_UNIT
+            - torch.round((view_z[:, None] - actor_z) * _FIXED_UNIT).to(torch.int64)
+        )
+        tangent_index = torch.bitwise_right_shift(
+            _ANGLE_90 - self._pitch_bam,
+            _ANGLE_TO_FINE_SHIFT,
+        ).clamp(0, _FINE_ANGLES // 2 - 1)
+        pitch_offset_fixed = (
+            _NATIVE_FOCAL_Y_FIXED * self._fine_tangent_fixed[tangent_index]
+        ) >> 16
+        center_fixed = self.native_view_height // 2 * _FIXED_UNIT + pitch_offset_fixed
+        sprite_top_fixed = center_fixed[:, None] - (
+            texture_mid_fixed * sprite_yscale_fixed >> 16
+        )
+        return sprite_yscale_fixed, sprite_top_fixed
+
+    def _native_raw_sprite_post_top_rows(self) -> torch.Tensor:
+        """Lazily cache each opaque patch post's first source row."""
+
+        if self._raw_sprite_post_tops is None:
+            raw_sprite_opaque = self.map.raw_sprite_opaque
+            prior_opaque = torch.cat(
+                (
+                    torch.zeros_like(raw_sprite_opaque[:, :1]),
+                    raw_sprite_opaque[:, :-1],
+                ),
+                dim=1,
+            )
+            post_starts = raw_sprite_opaque & ~prior_opaque
+            raw_sprite_rows = torch.arange(
+                raw_sprite_opaque.shape[1],
+                device=self.device,
+                dtype=torch.int64,
+            )[None, :, None]
+            self._raw_sprite_post_tops = torch.cummax(
+                torch.where(
+                    post_starts,
+                    raw_sprite_rows,
+                    torch.zeros_like(raw_sprite_rows),
+                ),
+                dim=1,
+            ).values.to(torch.uint8)
+        return self._raw_sprite_post_tops
 
     def _native_render_sprites(
         self,
@@ -11119,6 +11340,13 @@ class TorchDeathmatchEngine:
                 actor_sprite,
             )
         )
+        sprite_yscale_fixed, sprite_top_fixed = self._native_sprite_vertical_projection(
+            actor_x,
+            actor_y,
+            actor_z,
+            actor_sprite,
+            view_z,
+        )
         sprite_top = (
             center[:, None]
             + (view_z[:, None] - actor_z) * vertical_scale
@@ -11166,6 +11394,8 @@ class TorchDeathmatchEngine:
                 1, selected_actor
             )
             selected_vertical_scale = vertical_scale.gather(1, selected_actor)
+            selected_yscale_fixed = sprite_yscale_fixed.gather(1, selected_actor)
+            selected_top_fixed = sprite_top_fixed.gather(1, selected_actor)
             selected_left = sprite_left.gather(1, selected_actor)
             selected_top = sprite_top.gather(1, selected_actor)
             selected_width = sprite_width.gather(1, selected_actor).to(torch.int64)
@@ -11196,6 +11426,16 @@ class TorchDeathmatchEngine:
                 -1, self.native_view_height, -1
             )
             sprite_opaque = self.map.raw_sprite_opaque[sprite_type, sprite_v, sprite_u]
+            sprite_post_top = self._native_raw_sprite_post_top_rows()[
+                sprite_type,
+                sprite_v,
+                sprite_u,
+            ].to(torch.int64)
+            post_screen_top = torch.bitwise_right_shift(
+                selected_top_fixed[:, None, :]
+                + selected_yscale_fixed[:, None, :] * sprite_post_top,
+                16,
+            )
             sprite_value = self.map.raw_sprite_atlas[sprite_type, sprite_v, sprite_u]
             selected_light = actor_light.gather(1, selected_actor)[:, None, :]
             selected_light = selected_light + flash_light[:, None, None] * 16
@@ -11233,7 +11473,9 @@ class TorchDeathmatchEngine:
                 ),
             )
             composited = torch.where(
-                inside_sprite & sprite_opaque,
+                inside_sprite
+                & sprite_opaque
+                & (self._native_pixel_y.to(torch.int64) >= post_screen_top),
                 rendered_sprite,
                 composited,
             )
