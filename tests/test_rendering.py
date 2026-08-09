@@ -2110,6 +2110,118 @@ def test_native_item_uses_fixed_point_sprite_projection(
 
 
 @pytest.mark.skipif(not SCENARIO.is_file() or not DOOM2.is_file(), reason="operator WADs absent")
+def test_native_drawseg_side_keeps_sprite_edges_past_nearest_ray(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([1337]))
+    engine.x.fill_(940.9204254150391)
+    engine.y.fill_(826.7186584472656)
+    engine.z.zero_()
+    engine.view_z.fill_(41)
+    engine.angle.fill_(math.radians(154.96215823920494))
+    engine.episode_time.fill_(61)
+    engine.weapon_raise_cooldown.zero_()
+    engine.player_dead.fill_(True)
+    engine.enemy_alive.zero_()
+    engine.enemy_death_tics.zero_()
+    engine.projectile_alive.zero_()
+    engine.enemy_projectile_alive.zero_()
+    engine.projectile_impact_tics.zero_()
+    engine.enemy_projectile_impact_tics.zero_()
+    engine.teleport_fog_tics.zero_()
+    engine.hitscan_puff_tics.zero_()
+    engine.drop_type.fill_(-1)
+    engine.drop_spawned.zero_()
+    engine.item_available.zero_()
+
+    medikits = torch.tensor((119, 120, 121, 122))
+    expected_spawns = torch.tensor(
+        ((646, 1273), (679, 1272), (715, 1272), (746, 1272)),
+        dtype=torch.float32,
+    )
+    assert torch.equal(engine.map.item_spawns[medikits, :2], expected_spawns)
+    without_items = engine.render_native_frame(include_hud=False)
+    engine.item_available[0, medikits] = True
+    with_items = engine.render_native_frame(include_hud=False)
+
+    actor_depth_fixed, _actor_side_fixed = engine._native_sprite_view_coordinates(
+        engine.map.item_spawns[None, medikits, 0],
+        engine.map.item_spawns[None, medikits, 1],
+    )
+    ray_distance = engine._native_raycast()
+    edge_columns = torch.tensor((262, 274, 290, 306))
+    # Each mathematical column ray reaches a nearby wall just before the
+    # sprite center depth. Doom does not reject the sprite here: R_DrawSprite
+    # resolves the owning drawseg endpoint and wall side per pixel.
+    assert torch.all(
+        ray_distance[0, edge_columns] * 4096 < actor_depth_fixed[0]
+    )
+    assert with_items[0, 113, 262].tolist() == [119, 119, 119]
+    assert with_items[0, 114, 274].tolist() == [119, 119, 119]
+    assert with_items[0, 115, 290].tolist() == [119, 119, 119]
+    assert with_items[0, 116, 306].tolist() == [119, 119, 119]
+    for y, x in ((113, 262), (114, 274), (115, 290), (116, 306)):
+        assert not torch.equal(with_items[0, y, x], without_items[0, y, x])
+
+
+@pytest.mark.skipif(not SCENARIO.is_file() or not DOOM2.is_file(), reason="operator WADs absent")
+def test_native_blocking_drawseg_rejects_occluded_offscreen_item(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([456]))
+    engine.x.fill_(752.9335632324219)
+    engine.y.fill_(49.700897216796875)
+    engine.z.zero_()
+    engine.view_z.fill_(41)
+    engine.angle.fill_(math.radians(119.97070315293286))
+    engine.episode_time.fill_(21)
+    engine.weapon_raise_cooldown.zero_()
+    engine.player_dead.fill_(True)
+    engine.enemy_alive.zero_()
+    engine.enemy_death_tics.zero_()
+    engine.projectile_alive.zero_()
+    engine.enemy_projectile_alive.zero_()
+    engine.projectile_impact_tics.zero_()
+    engine.enemy_projectile_impact_tics.zero_()
+    engine.teleport_fog_tics.zero_()
+    engine.hitscan_puff_tics.zero_()
+    engine.drop_type.fill_(-1)
+    engine.drop_spawned.zero_()
+    engine.item_available.zero_()
+
+    item_index = 38
+    assert engine.map.item_spawns[item_index].tolist() == [-99.0, 277.0, 0.0]
+    sprite = engine.map.item_raw_visual_types[item_index].reshape(1, 1)
+    sprite_left, sprite_right, _texture_step = (
+        engine._native_sprite_horizontal_projection(
+            engine.map.item_spawns[None, item_index, 0].reshape(1, 1),
+            engine.map.item_spawns[None, item_index, 1].reshape(1, 1),
+            sprite,
+        )
+    )
+    assert sprite_left.item() <= 0 < sprite_right.item()
+    _blocking_distance, blocking_wall = engine._native_blocking_raycast()
+    assert blocking_wall[0, 0].item() == 6
+
+    without_item = engine.render_native_frame(include_hud=False)
+    engine.item_available[0, item_index] = True
+    with_item = engine.render_native_frame(include_hud=False)
+    # Both endpoints of blocking wall 6 are nearer than the clip box center,
+    # so R_DrawSprite keeps the wall in front at the left screen edge.
+    assert torch.equal(with_item[0, 111:116, 0], without_item[0, 111:116, 0])
+
+
+@pytest.mark.skipif(not SCENARIO.is_file() or not DOOM2.is_file(), reason="operator WADs absent")
 def test_native_sprites_keep_offcenter_spans_that_cross_view(
     pinned_deathmatch_scenario,
 ) -> None:

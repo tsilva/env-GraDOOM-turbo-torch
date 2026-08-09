@@ -8725,7 +8725,9 @@ class TorchDeathmatchEngine:
             frame[:, -11:, :] = 0
         return frame.clamp(0, 255).to(torch.uint8)
 
-    def _native_raycast(self) -> torch.Tensor:
+    def _native_blocking_raycast(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return nearest blocking-line depth and its portal wall index."""
+
         direction = self._native_wall_ray_directions()
         origin = torch.stack((self.x, self.y), dim=-1)[:, None, None, :]
         start = self.map.walls[None, None, :, :2]
@@ -8742,8 +8744,19 @@ class TorchDeathmatchEngine:
         along = (offset[..., 0] * ray[..., 1] - offset[..., 1] * ray[..., 0]) / safe
         valid = (denominator.abs() >= 1e-6) & (distance > 0) & (along >= 0) & (along <= 1)
         distance = torch.where(valid, distance, torch.full_like(distance, torch.inf))
-        nearest_distance = torch.min(distance, dim=2).values
-        return nearest_distance.clamp(1, 4096)
+        nearest_distance, nearest_blocking_slot = torch.min(distance, dim=2)
+        # blocking_segments retains linedef order, so the true entries in this
+        # static mask map each compact raycast slot back to portal_walls.
+        blocking_wall_indices = torch.nonzero(
+            self.map.portal_wall_blocks_sight,
+            as_tuple=False,
+        ).flatten()
+        nearest_wall = blocking_wall_indices[nearest_blocking_slot]
+        return nearest_distance.clamp(1, 4096), nearest_wall
+
+    def _native_raycast(self) -> torch.Tensor:
+        nearest_distance, _nearest_wall = self._native_blocking_raycast()
+        return nearest_distance
 
     def _native_sector_grid(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         flat_x = x.reshape(-1)
@@ -11094,6 +11107,7 @@ class TorchDeathmatchEngine:
         view_z: torch.Tensor,
         scene_depth: torch.Tensor,
         sprite_clip_wall: torch.Tensor | None = None,
+        blocking_wall: torch.Tensor | None = None,
     ) -> torch.Tensor:
         enemy_sprite = self._native_enemy_sprite_ids()
         static = self.map.raw_static_sprite_ids
@@ -11514,6 +11528,44 @@ class TorchDeathmatchEngine:
             actor_x,
             actor_y,
         )
+        wall_projection_geometry = None
+        ray_visible = actor_depth[:, :, None] < wall_distance[:, None, :]
+        if blocking_wall is not None:
+            wall_projection_geometry = self._native_wall_projection_geometry()
+            (
+                _blocking_screen_left,
+                _blocking_screen_right,
+                blocking_depth_left,
+                blocking_depth_right,
+            ) = wall_projection_geometry
+            blocking_depth_left = blocking_depth_left.gather(1, blocking_wall)
+            blocking_depth_right = blocking_depth_right.gather(1, blocking_wall)
+            blocking_near_depth = torch.minimum(
+                blocking_depth_left,
+                blocking_depth_right,
+            )
+            blocking_far_depth = torch.maximum(
+                blocking_depth_left,
+                blocking_depth_right,
+            )
+            blocking_geometry = self.map.portal_walls[blocking_wall]
+            blocking_start_x = blocking_geometry[..., 0]
+            blocking_start_y = blocking_geometry[..., 1]
+            blocking_dx = blocking_geometry[..., 2] - blocking_start_x
+            blocking_dy = blocking_geometry[..., 3] - blocking_start_y
+            blocking_side = (
+                blocking_dx[:, None, :]
+                * (actor_y[:, :, None] - blocking_start_y[:, None, :])
+                - blocking_dy[:, None, :]
+                * (actor_x[:, :, None] - blocking_start_x[:, None, :])
+            )
+            blocking_drawseg_behind_sprite = (
+                blocking_near_depth[:, None, :] > actor_depth_fixed[:, :, None]
+            ) | (
+                (blocking_far_depth[:, None, :] > actor_depth_fixed[:, :, None])
+                & (blocking_side <= 0)
+            )
+            ray_visible |= blocking_drawseg_behind_sprite
         sprite_width = self.map.raw_sprite_widths[actor_sprite].to(torch.float32)
         sprite_height = self.map.raw_sprite_heights[actor_sprite].to(torch.float32)
         sprite_left, sprite_right, horizontal_step_fixed = (
@@ -11545,7 +11597,7 @@ class TorchDeathmatchEngine:
             column_inside
             & actor_alive[:, :, None]
             & (actor_depth[:, :, None] > 0)
-            & (actor_depth[:, :, None] < wall_distance[:, None, :])
+            & ray_visible
         )
         candidate_distance = torch.where(
             candidate,
@@ -11572,12 +11624,11 @@ class TorchDeathmatchEngine:
         composited = frame
         if sprite_clip_wall is not None:
             safe_clip_wall = sprite_clip_wall.clamp_min(0)
-            (
-                _wall_screen_left,
-                _wall_screen_right,
-                wall_depth_left,
-                wall_depth_right,
-            ) = self._native_wall_projection_geometry()
+            if wall_projection_geometry is None:
+                wall_projection_geometry = self._native_wall_projection_geometry()
+            _wall_screen_left, _wall_screen_right, wall_depth_left, wall_depth_right = (
+                wall_projection_geometry
+            )
             wall_depth_left = torch.gather(
                 wall_depth_left[:, None, :].expand(
                     -1,
@@ -12074,7 +12125,7 @@ class TorchDeathmatchEngine:
     def render_native_frame(self, *, include_hud: bool = True) -> torch.Tensor:
         """Render the unprocessed ViZDoom-compatible 320x240 RGB24 view."""
 
-        wall_distance = self._native_raycast()
+        wall_distance, blocking_wall = self._native_blocking_raycast()
         sector = self._current_sector()
         view_z = self.view_z
         frame, surface_depth, scene_surface_depth = self._native_render_flats(
@@ -12099,6 +12150,7 @@ class TorchDeathmatchEngine:
             view_z,
             sprite_clip_depth,
             sprite_clip_wall,
+            blocking_wall,
         )
         frame = self._native_render_weapon(frame)
         if include_hud:
