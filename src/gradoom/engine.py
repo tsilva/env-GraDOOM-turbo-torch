@@ -11131,6 +11131,194 @@ class TorchDeathmatchEngine:
             scene_depth,
             sprite_clip_depth,
         )
+
+        # Doom defers two-sided middle textures to R_DrawMasked instead of
+        # treating them as opaque tiers during the front-to-back wall pass.
+        # Most columns above were already painted with the same texture math,
+        # but a projected shared endpoint can terminate on a nearer solid
+        # before this wall is visited. Replay the masked draw after planes so
+        # that endpoint receives the drawseg's texture just as ViZDoom does.
+        wall_count = self.map.portal_walls.shape[0]
+        wall_ids = torch.arange(
+            wall_count,
+            device=self.device,
+            dtype=torch.int64,
+        )[None, :].expand(self.num_envs, -1)
+        masked_walls = self.map.portal_walls[None, :, :]
+        masked_wall_start = masked_walls[..., :2]
+        masked_wall_vector = masked_walls[..., 2:] - masked_wall_start
+        masked_viewer = (
+            torch.stack((self.x, self.y), dim=1)[:, None, :] - masked_wall_start
+        )
+        masked_from_front = (
+            masked_wall_vector[..., 0] * masked_viewer[..., 1]
+            - masked_wall_vector[..., 1] * masked_viewer[..., 0]
+        ) < 0
+        masked_side_by_wall = (~masked_from_front).to(torch.int64)
+        masked_texture_by_wall = self.map.portal_side_texture_ids[
+            wall_ids,
+            masked_side_by_wall,
+            0,
+        ]
+        masked_candidate = (
+            projected_intersections
+            & (self.map.portal_wall_sectors[None, None, :, 1] >= 0)
+            & (masked_texture_by_wall[:, None, :] >= 0)
+        )
+        masked_distance, masked_wall_index = torch.min(
+            torch.where(
+                masked_candidate,
+                distances,
+                torch.full_like(distances, torch.inf),
+            ),
+            dim=2,
+        )
+        masked_valid = torch.isfinite(masked_distance)
+        masked_side_index = masked_side_by_wall.gather(1, masked_wall_index)
+        masked_texture_id = masked_texture_by_wall.gather(1, masked_wall_index)
+        safe_masked_texture_id = self._native_animated_texture_ids(
+            masked_texture_id.clamp_min(0)
+        )
+        masked_sectors = self.map.portal_wall_sectors[masked_wall_index]
+        masked_front_sector = masked_sectors[..., 0]
+        masked_back_sector = masked_sectors[..., 1].clamp_min(0)
+        masked_light_sector = torch.where(
+            masked_side_index == 0,
+            masked_front_sector,
+            masked_back_sector,
+        )
+        masked_world_top = torch.minimum(
+            self.map.sector_heights[masked_front_sector, 1],
+            self.map.sector_heights[masked_back_sector, 1],
+        )
+        masked_texture_width = self.map.texture_widths[safe_masked_texture_id]
+        masked_texture_height = self.map.texture_heights[safe_masked_texture_id]
+        masked_top = project(masked_world_top, masked_wall_index)
+        masked_bottom = project(
+            masked_world_top - masked_texture_height.to(torch.float32),
+            masked_wall_index,
+        )
+        masked_left_edge = projected_left_edges.gather(
+            2,
+            masked_wall_index[:, :, None],
+        ).squeeze(2)
+        masked_span = (
+            masked_valid[:, None, :]
+            & (pixel_y >= masked_top[:, None, :])
+            & (pixel_y < masked_bottom[:, None, :])
+            & (
+                (masked_distance[:, None, :] <= scene_depth + 1e-3)
+                | masked_left_edge[:, None, :]
+            )
+        )
+
+        masked_texture_offset = self.map.portal_side_texture_offsets[
+            masked_wall_index,
+            masked_side_index,
+        ]
+        masked_horizontal_offset = wall_horizontal_offsets.gather(
+            2,
+            masked_wall_index[:, :, None],
+        ).squeeze(2)
+        masked_horizontal_repeat = torch.round(
+            self.map.portal_wall_lengths[masked_wall_index] * _FIXED_UNIT
+        ).to(torch.int64)
+        masked_horizontal_offset = torch.where(
+            masked_side_index == 0,
+            masked_horizontal_offset,
+            masked_horizontal_repeat - masked_horizontal_offset,
+        )
+        masked_horizontal_offset = torch.minimum(
+            masked_horizontal_offset.clamp_min(0),
+            masked_horizontal_repeat - 1,
+        )
+        masked_offset_x = torch.round(
+            masked_texture_offset[..., 0] * _FIXED_UNIT
+        ).to(torch.int64)
+        masked_u = torch.remainder(
+            torch.bitwise_right_shift(
+                masked_horizontal_offset + masked_offset_x,
+                16,
+            )[:, None, :],
+            masked_texture_width[:, None, :],
+        ).expand(-1, self.native_view_height, -1)
+        masked_height_bits = torch.floor(
+            torch.log2(masked_texture_height.to(torch.float32))
+        ).to(torch.int64)
+        masked_vertical_step = wall_vertical_steps.gather(
+            2,
+            masked_wall_index[:, :, None],
+        ).squeeze(2)[:, None, :] * torch.bitwise_left_shift(
+            torch.ones_like(masked_height_bits),
+            14 - masked_height_bits,
+        )[:, None, :]
+        tangent_index = torch.bitwise_right_shift(
+            _ANGLE_90 - self._pitch_bam,
+            _ANGLE_TO_FINE_SHIFT,
+        ).clamp(0, _FINE_ANGLES // 2 - 1)
+        pitch_offset_fixed = (
+            _NATIVE_FOCAL_Y_FIXED * self._fine_tangent_fixed[tangent_index]
+        ) >> 16
+        center_fixed = (
+            self.native_view_height // 2 * _FIXED_UNIT + pitch_offset_fixed
+        )
+        masked_screen_delta = (
+            self._native_pixel_y.to(torch.int64) * _FIXED_UNIT
+            - center_fixed[:, None, None]
+            + _FIXED_UNIT
+        )
+        masked_texture_mid = torch.round(
+            (masked_world_top - view_z[:, None]) * _FIXED_UNIT
+            + masked_texture_offset[..., 1] * _FIXED_UNIT
+        ).to(torch.int64)[:, None, :]
+        masked_fraction = torch.bitwise_left_shift(
+            masked_texture_mid,
+            16 - masked_height_bits[:, None, :],
+        ) + torch.bitwise_right_shift(
+            masked_vertical_step * masked_screen_delta,
+            16,
+        )
+        masked_v = torch.bitwise_right_shift(
+            torch.bitwise_and(masked_fraction, _UINT32_MASK),
+            32 - masked_height_bits[:, None, :],
+        )
+        masked_texture = self.map.texture_index_atlas[
+            safe_masked_texture_id[:, None, :],
+            masked_v,
+            masked_u,
+        ]
+        masked_wall = self.map.portal_walls[masked_wall_index]
+        masked_horizontal = (masked_wall[..., 3] - masked_wall[..., 1]).abs() < 1e-6
+        masked_vertical = (masked_wall[..., 2] - masked_wall[..., 0]).abs() < 1e-6
+        masked_contrast = torch.where(
+            masked_vertical,
+            16.0,
+            torch.where(masked_horizontal, -16.0, 0.0),
+        )
+        masked_light = (
+            self.map.sector_lights[masked_light_sector][:, None, :]
+            + flash_light[:, None, None] * 16
+            + masked_contrast[:, None, :]
+        )
+        masked_visibility_by_side = wall_visibility.gather(
+            2,
+            masked_wall_index[:, :, None, None].expand(-1, -1, 1, 2),
+        ).squeeze(2)
+        masked_visibility = masked_visibility_by_side.gather(
+            2,
+            masked_side_index[:, :, None],
+        ).squeeze(2)
+        masked_value = self._native_apply_wall_colormap(
+            masked_texture,
+            masked_light,
+            masked_visibility[:, None, :],
+        )
+        frame = torch.where(masked_span, masked_value, frame)
+        scene_depth = torch.where(
+            masked_span,
+            masked_distance[:, None, :],
+            scene_depth,
+        )
         return frame, scene_depth, sprite_clip_depth, sprite_clip_wall
 
     def _native_render_hitscan_decals(

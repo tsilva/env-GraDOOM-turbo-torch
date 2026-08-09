@@ -1121,6 +1121,59 @@ def test_native_partially_clipped_solid_owns_left_frustum_column(
     assert rgb[0, 116, 0].tolist() == [31, 23, 11]
 
 
+def test_native_deferred_masked_middle_texture_owns_shared_endpoint_column(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([456]))
+    engine.x.fill_(838.550537109375)
+    engine.y.fill_(385.9864501953125)
+    engine.z.zero_()
+    engine.view_z.fill_(41)
+    engine.angle.fill_(math.radians(165.67382816357394))
+    engine.episode_time.fill_(61)
+
+    (
+        wall_distance,
+        _wall_along,
+        _geometric_intersections,
+        _projected_intersections,
+        projected_left_edges,
+        _wall_visibility,
+    ) = engine._native_portal_intersections()
+    frame, surface_depth, scene_surface_depth = engine._native_render_flats(
+        engine._current_sector(),
+        engine.view_z,
+    )
+    frame, scene_depth, _sprite_clip_depth, _sprite_clip_wall = (
+        engine._native_render_portal_walls(
+            frame,
+            engine.view_z,
+            surface_depth,
+            scene_surface_depth,
+        )
+    )
+    rgb = engine.map.playpal[frame.to(torch.int64)]
+
+    # Doom records two-sided BIGBRIK1 wall 52 as a masked drawseg and paints
+    # it after the opaque pass. At its projected left endpoint it therefore
+    # overlays nearer solid wall 51 even though the mathematical column ray
+    # reaches wall 51 first. The masked texture remains half-open at row 70.
+    assert projected_left_edges[0, 69, 52]
+    assert wall_distance[0, 69, 52] > wall_distance[0, 69, 51]
+    torch.testing.assert_close(
+        scene_depth[0, 38, 69],
+        wall_distance[0, 69, 52],
+    )
+    assert rgb[0, 38, 69].tolist() == [63, 43, 27]
+    assert rgb[0, 69, 69].tolist() == [43, 35, 15]
+    assert rgb[0, 70, 69].tolist() == [31, 23, 11]
+
+
 def test_native_same_column_portal_layers_retain_nested_wall(
     pinned_deathmatch_scenario,
 ) -> None:
