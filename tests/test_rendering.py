@@ -1646,6 +1646,41 @@ def test_native_renderer_preserves_rgb_hud_and_enemy_animation(
     engine.step(torch.zeros_like(attack))
     assert engine.hud_ready_ammo.item() == 49
 
+    # ViZDoom's status bar is painted from state captured at the start of each
+    # game tic. A pickup on the first internal tic reaches a frame-skip-2 HUD;
+    # one on the final internal tic remains one rendered frame behind.
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([1337]))
+    before_cell_pickup = engine._native_render_hud()
+    original_collect_items = engine._collect_items
+    collect_calls = 0
+
+    def collect_cell_on_first_tic() -> None:
+        nonlocal collect_calls
+        if collect_calls == 0:
+            engine.ammo[0, 5] = 100
+        collect_calls += 1
+
+    engine._collect_items = collect_cell_on_first_tic
+    engine.step(noop)
+    assert engine.hud_ammo_counts.tolist() == [[50.0, 0.0, 0.0, 100.0]]
+    assert not torch.equal(engine._native_render_hud(), before_cell_pickup)
+
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([1337]))
+    collect_calls = 0
+
+    def collect_cell_on_second_tic() -> None:
+        nonlocal collect_calls
+        if collect_calls == 1:
+            engine.ammo[0, 5] = 100
+        collect_calls += 1
+
+    engine._collect_items = collect_cell_on_second_tic
+    engine.step(noop)
+    engine._collect_items = original_collect_items
+    assert engine.ammo[0, 5].item() == 100
+    assert engine.hud_ammo_counts.tolist() == [[50.0, 0.0, 0.0, 0.0]]
+    assert torch.equal(engine._native_render_hud(), before_cell_pickup)
+
     engine.x.zero_()
     engine.y.zero_()
     engine.angle.zero_()

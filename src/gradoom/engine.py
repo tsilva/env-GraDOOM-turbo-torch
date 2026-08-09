@@ -1270,6 +1270,7 @@ class TorchDeathmatchEngine:
         # cache on the next status-bar Tick.  The large current-ammo number is
         # therefore one rendered observation behind inventory/game variables.
         self.hud_ready_ammo = torch.zeros(n, device=device)
+        self.hud_ammo_counts = torch.zeros((n, 4), device=device)
         self.attack_cooldown = torch.zeros(n, device=device, dtype=torch.int32)
         self.weapon_state_cooldown = torch.zeros(n, device=device, dtype=torch.int32)
         self.pending_attack_weapon = torch.full((n,), -1, device=device, dtype=torch.int64)
@@ -1949,6 +1950,7 @@ class TorchDeathmatchEngine:
         self.ammo[mask, 1] = 50
         self.ammo[mask, 3] = 50
         self.hud_ready_ammo.masked_fill_(mask, 50)
+        self.hud_ammo_counts[mask] = self.ammo[mask][:, (1, 2, 4, 5)]
         self.item_available[mask] = True
         frame = self.render_frame()
         self.frames[mask] = frame[mask, None].expand(-1, self.frame_stack, -1, -1)
@@ -8172,6 +8174,12 @@ class TorchDeathmatchEngine:
         )
         reward = torch.zeros(self.num_envs, device=self.device)
         for _ in range(self.frame_skip):
+            # The four inventory counters read the ammo visible at the start
+            # of each game tic. With frame skipping, a pickup on an earlier
+            # internal tic must reach the final HUD, while a pickup on the
+            # last internal tic remains one rendered frame behind. The large
+            # ready-ammo widget has its own Draw/Tick cache above.
+            self.hud_ammo_counts.copy_(self.ammo[:, (1, 2, 4, 5)])
             self.player_dead |= self.health <= 0
             active = ~self.player_dead & (self.episode_time < self.episode_timeout)
             previous_mugshot_override = (self.mugshot_pain_tics > 0) | (
@@ -12148,11 +12156,8 @@ class TorchDeathmatchEngine:
                 owned = weapon_index < 5 and bool(self.weapons[lane, weapon_index + 1])
                 patch = 28 + weapon_index + 2 if owned else 38 + weapon_index
                 self._native_draw_hud_patch(canvas, patch, x, y)
-            ammo_values = (
-                int(self.ammo[lane, 1].item()),
-                int(self.ammo[lane, 2].item()),
-                int(self.ammo[lane, 4].item()),
-                int(self.ammo[lane, 5].item()),
+            ammo_values = tuple(
+                int(value.item()) for value in self.hud_ammo_counts[lane]
             )
             for row, (value, maximum) in enumerate(
                 zip(ammo_values, (200, 50, 50, 300), strict=True)
