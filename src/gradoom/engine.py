@@ -9590,7 +9590,7 @@ class TorchDeathmatchEngine:
         view_z: torch.Tensor,
         surface_depth: torch.Tensor,
         scene_surface_depth: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         focal_length = self.native_screen_width / 2.0 * self.native_vertical_aspect
         center = self.native_view_height / 2.0 - 1.0 + self._pitch_projection_offset(
             focal_length
@@ -9617,6 +9617,12 @@ class TorchDeathmatchEngine:
         scene_depth = (
             surface_depth if scene_surface_depth is None else scene_surface_depth
         ).clone()
+        # Floors and ceilings do not z-test sprites pixel by pixel. Doom clips
+        # them with the integer silhouettes saved on nearer drawsegs instead.
+        # Keep that mask separate from scene_depth, which remains the true
+        # surface buffer used by decals and renderer diagnostics.
+        sprite_clip_depth = torch.full_like(scene_depth, torch.inf)
+        sprite_clip_wall = torch.full_like(scene_depth, -1, dtype=torch.int64)
         pixel_y = self._native_pixel_y.to(torch.float32)
         ceiling_pixels = pixel_y <= flat_center[:, None, None]
         current_sector = (
@@ -10109,6 +10115,19 @@ class TorchDeathmatchEngine:
             )
             frame = torch.where(span, wall_value, frame)
             scene_depth = torch.where(span, distance[:, None, :], scene_depth)
+            nearer_sprite_wall = span & (
+                distance[:, None, :] < sprite_clip_depth
+            )
+            sprite_clip_depth = torch.where(
+                nearer_sprite_wall,
+                distance[:, None, :],
+                sprite_clip_depth,
+            )
+            sprite_clip_wall = torch.where(
+                nearer_sprite_wall,
+                wall_index[:, None, :],
+                sprite_clip_wall,
+            )
             filled |= span
             # R_RenderSegLoop tightens ceilingclip at every marked portal, even
             # if that portal has no upper texture. This keeps a farther solid
@@ -10138,6 +10157,47 @@ class TorchDeathmatchEngine:
                 valid & ~one_sided & (draws_lower | mark_floor),
                 floor_update,
                 floor_clip,
+            )
+            # R_StoreWallRange saves the updated ceilingclip/floorclip arrays
+            # on this drawseg. R_DrawSprite later applies those integer
+            # silhouettes only when the drawseg is nearer than the sprite.
+            masked_texture = middle_texture_id >= 0
+            bottom_silhouette = (
+                ~one_sided
+                & (
+                    (view_floor > other_floor)
+                    | (view_z[:, None] < other_floor)
+                    | masked_texture
+                )
+            )
+            top_silhouette = (
+                ~one_sided
+                & (
+                    (view_ceiling < other_ceiling)
+                    | (view_z[:, None] > other_ceiling)
+                    | masked_texture
+                )
+            )
+            sprite_clip_span = (
+                bottom_silhouette[:, None, :]
+                & (pixel_y >= floor_clip[:, None, :])
+            ) | (
+                top_silhouette[:, None, :]
+                & (pixel_y < ceiling_clip[:, None, :])
+            )
+            sprite_clip_span &= valid[:, None, :]
+            nearer_sprite_silhouette = sprite_clip_span & (
+                distance[:, None, :] < sprite_clip_depth
+            )
+            sprite_clip_depth = torch.where(
+                nearer_sprite_silhouette,
+                distance[:, None, :],
+                sprite_clip_depth,
+            )
+            sprite_clip_wall = torch.where(
+                nearer_sprite_silhouette,
+                wall_index[:, None, :],
+                sprite_clip_wall,
             )
             # The projected solid owns only its wall span. Preserve the plane
             # clips that the geometrically crossed portal contributes before
@@ -10222,6 +10282,37 @@ class TorchDeathmatchEngine:
                 & (path_draws_lower | path_marks_floor),
                 path_floor_update,
                 floor_clip,
+            )
+            path_masked_texture = path_side_textures[..., 0] >= 0
+            path_bottom_silhouette = projected_solid_keeps_portal_path & (
+                (view_floor > path_other_floor)
+                | (view_z[:, None] < path_other_floor)
+                | path_masked_texture
+            )
+            path_top_silhouette = projected_solid_keeps_portal_path & (
+                (view_ceiling < path_other_ceiling)
+                | (view_z[:, None] > path_other_ceiling)
+                | path_masked_texture
+            )
+            path_sprite_clip_span = (
+                path_bottom_silhouette[:, None, :]
+                & (pixel_y >= floor_clip[:, None, :])
+            ) | (
+                path_top_silhouette[:, None, :]
+                & (pixel_y < ceiling_clip[:, None, :])
+            )
+            nearer_path_silhouette = path_sprite_clip_span & (
+                projected_solid_path_distance[:, None, :] < sprite_clip_depth
+            )
+            sprite_clip_depth = torch.where(
+                nearer_path_silhouette,
+                projected_solid_path_distance[:, None, :],
+                sprite_clip_depth,
+            )
+            sprite_clip_wall = torch.where(
+                nearer_path_silhouette,
+                projected_solid_path_index[:, None, :],
+                sprite_clip_wall,
             )
             prior_distance = previous_distance
             endpoint_only_portal = valid & ~one_sided & ~geometric_intersection
@@ -10429,7 +10520,17 @@ class TorchDeathmatchEngine:
         ).abs().clamp_min(0.5)
         plane_depth = plane_height * focal_length / plane_denominator
         scene_depth = torch.where(exact_plane, plane_depth, scene_depth)
-        return frame, scene_depth
+        # A projected endpoint can leave the independent polygon ray
+        # unresolved even though Doom's visplane span still owns the pixel.
+        # Those rare repaired columns have no geometric drawseg event to
+        # encode above, so retain their proven plane occluder as a fallback.
+        unresolved_plane = exact_plane & torch.isinf(surface_depth)
+        sprite_clip_depth = torch.where(
+            unresolved_plane & torch.isinf(sprite_clip_depth),
+            scene_depth,
+            sprite_clip_depth,
+        )
+        return frame, scene_depth, sprite_clip_depth, sprite_clip_wall
 
     def _native_render_hitscan_decals(
         self,
@@ -10916,8 +11017,8 @@ class TorchDeathmatchEngine:
         actor_z: torch.Tensor,
         actor_sprite: torch.Tensor,
         view_z: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return R_ProjectSprite's fixed y scale and top-screen origin."""
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return R_ProjectSprite's fixed y scale, screen top, and texture mid."""
 
         sprite_depth_fixed, _sprite_side_fixed = self._native_sprite_view_coordinates(
             actor_x,
@@ -10942,7 +11043,7 @@ class TorchDeathmatchEngine:
         sprite_top_fixed = center_fixed[:, None] - (
             texture_mid_fixed * sprite_yscale_fixed >> 16
         )
-        return sprite_yscale_fixed, sprite_top_fixed
+        return sprite_yscale_fixed, sprite_top_fixed, texture_mid_fixed
 
     def _native_raw_sprite_post_top_rows(self) -> torch.Tensor:
         """Lazily cache each opaque patch post's first source row."""
@@ -10978,12 +11079,8 @@ class TorchDeathmatchEngine:
         wall_distance: torch.Tensor,
         view_z: torch.Tensor,
         scene_depth: torch.Tensor,
+        sprite_clip_wall: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        horizontal_focal_length = self.native_screen_width / 2.0
-        vertical_focal_length = horizontal_focal_length * self.native_vertical_aspect
-        center = self.native_view_height / 2.0 - 1.0 + self._pitch_projection_offset(
-            vertical_focal_length
-        )
         enemy_sprite = self._native_enemy_sprite_ids()
         static = self.map.raw_static_sprite_ids
         enemy_slots = torch.nonzero(torch.any(self.enemy_alive, dim=0)).flatten()
@@ -11399,7 +11496,10 @@ class TorchDeathmatchEngine:
         actor_distance = torch.sqrt(dx * dx + dy * dy).clamp_min_(1)
         relative = self._wrap_angle(torch.atan2(dy, dx) - self.angle[:, None])
         actor_depth = actor_distance * torch.cos(relative)
-        vertical_scale = vertical_focal_length / actor_depth.clamp_min(1)
+        actor_depth_fixed, _actor_side_fixed = self._native_sprite_view_coordinates(
+            actor_x,
+            actor_y,
+        )
         sprite_width = self.map.raw_sprite_widths[actor_sprite].to(torch.float32)
         sprite_height = self.map.raw_sprite_heights[actor_sprite].to(torch.float32)
         sprite_left, sprite_right, horizontal_step_fixed = (
@@ -11409,17 +11509,20 @@ class TorchDeathmatchEngine:
                 actor_sprite,
             )
         )
-        sprite_yscale_fixed, sprite_top_fixed = self._native_sprite_vertical_projection(
+        (
+            sprite_yscale_fixed,
+            sprite_top_fixed,
+            sprite_texture_mid_fixed,
+        ) = self._native_sprite_vertical_projection(
             actor_x,
             actor_y,
             actor_z,
             actor_sprite,
             view_z,
         )
-        sprite_top = (
-            center[:, None]
-            + (view_z[:, None] - actor_z) * vertical_scale
-            - self.map.raw_sprite_top_offsets[actor_sprite] * vertical_scale
+        sprite_iscale_fixed = self._trunc_divide(
+            torch.full_like(sprite_yscale_fixed, _UINT32_MASK),
+            sprite_yscale_fixed.clamp_min(1),
         )
         column_inside = (self._native_pixel_x >= sprite_left[:, :, None]) & (
             self._native_pixel_x < sprite_right[:, :, None]
@@ -11453,33 +11556,115 @@ class TorchDeathmatchEngine:
             sorted=True,
         )
         composited = frame
+        if sprite_clip_wall is not None:
+            safe_clip_wall = sprite_clip_wall.clamp_min(0)
+            (
+                _wall_screen_left,
+                _wall_screen_right,
+                wall_depth_left,
+                wall_depth_right,
+            ) = self._native_wall_projection_geometry()
+            wall_depth_left = torch.gather(
+                wall_depth_left[:, None, :].expand(
+                    -1,
+                    self.native_view_height,
+                    -1,
+                ),
+                2,
+                safe_clip_wall,
+            )
+            wall_depth_right = torch.gather(
+                wall_depth_right[:, None, :].expand(
+                    -1,
+                    self.native_view_height,
+                    -1,
+                ),
+                2,
+                safe_clip_wall,
+            )
+            clip_wall_near_depth = torch.minimum(
+                wall_depth_left,
+                wall_depth_right,
+            )
+            clip_wall_far_depth = torch.maximum(
+                wall_depth_left,
+                wall_depth_right,
+            )
+            clip_wall_geometry = self.map.portal_walls[safe_clip_wall]
+            clip_wall_start_x = clip_wall_geometry[..., 0]
+            clip_wall_start_y = clip_wall_geometry[..., 1]
+            clip_wall_dx = clip_wall_geometry[..., 2] - clip_wall_start_x
+            clip_wall_dy = clip_wall_geometry[..., 3] - clip_wall_start_y
         # Paint far-to-near so transparent texels reveal the next valid sprite
         # and additive missiles blend over any sprite behind them.
         for layer in range(layer_count - 1, -1, -1):
             selected_actor = nearest_actors[:, layer, :]
             selected_distance = nearest_distances[:, layer, :]
+            selected_depth_fixed = actor_depth_fixed.gather(1, selected_actor)
+            selected_actor_x = actor_x.gather(1, selected_actor)
+            selected_actor_y = actor_y.gather(1, selected_actor)
             selected_sprite = actor_sprite.gather(1, selected_actor)
             selected_horizontal_step_fixed = horizontal_step_fixed.gather(
                 1, selected_actor
             )
-            selected_vertical_scale = vertical_scale.gather(1, selected_actor)
             selected_yscale_fixed = sprite_yscale_fixed.gather(1, selected_actor)
             selected_top_fixed = sprite_top_fixed.gather(1, selected_actor)
+            selected_texture_mid_fixed = sprite_texture_mid_fixed.gather(
+                1,
+                selected_actor,
+            )
+            selected_iscale_fixed = sprite_iscale_fixed.gather(1, selected_actor)
             selected_left = sprite_left.gather(1, selected_actor)
-            selected_top = sprite_top.gather(1, selected_actor)
             selected_width = sprite_width.gather(1, selected_actor).to(torch.int64)
             selected_height = sprite_height.gather(1, selected_actor).to(torch.int64)
             sprite_u = (
                 (self._native_pixel_x[:, 0, :] - selected_left)
                 * selected_horizontal_step_fixed
             ) >> 16
-            sprite_v = torch.floor(
-                (self._native_pixel_y - selected_top[:, None, :])
-                / selected_vertical_scale[:, None, :]
-            ).to(torch.int64)
+            tangent_index = torch.bitwise_right_shift(
+                _ANGLE_90 - self._pitch_bam,
+                _ANGLE_TO_FINE_SHIFT,
+            ).clamp(0, _FINE_ANGLES // 2 - 1)
+            pitch_offset_fixed = (
+                _NATIVE_FOCAL_Y_FIXED * self._fine_tangent_fixed[tangent_index]
+            ) >> 16
+            center_fixed = (
+                self.native_view_height // 2 * _FIXED_UNIT + pitch_offset_fixed
+            )
+            sprite_fraction = (
+                selected_texture_mid_fixed[:, None, :]
+                + self._native_pixel_y.to(torch.int64)
+                * selected_iscale_fixed[:, None, :]
+                - (
+                    (center_fixed[:, None, None] - _FIXED_UNIT)
+                    * selected_iscale_fixed[:, None, :]
+                    >> 16
+                )
+            )
+            sprite_v = torch.bitwise_right_shift(sprite_fraction, 16)
+            if sprite_clip_wall is None:
+                visible_against_scene = selected_distance[:, None, :] < scene_depth
+            else:
+                selected_wall_side = (
+                    clip_wall_dx
+                    * (selected_actor_y[:, None, :] - clip_wall_start_y)
+                    - clip_wall_dy
+                    * (selected_actor_x[:, None, :] - clip_wall_start_x)
+                )
+                drawseg_behind_sprite = (
+                    clip_wall_near_depth > selected_depth_fixed[:, None, :]
+                ) | (
+                    (clip_wall_far_depth > selected_depth_fixed[:, None, :])
+                    & (selected_wall_side <= 0)
+                )
+                visible_against_scene = torch.where(
+                    sprite_clip_wall >= 0,
+                    drawseg_behind_sprite,
+                    selected_distance[:, None, :] < scene_depth,
+                )
             inside_sprite = (
                 torch.isfinite(selected_distance)[:, None, :]
-                & (selected_distance[:, None, :] < scene_depth)
+                & visible_against_scene
                 & (sprite_u[:, None, :] >= 0)
                 & (sprite_u[:, None, :] < selected_width[:, None, :])
                 & (sprite_v >= 0)
@@ -11882,14 +12067,25 @@ class TorchDeathmatchEngine:
             sector,
             view_z,
         )
-        frame, scene_depth = self._native_render_portal_walls(
+        (
+            frame,
+            scene_depth,
+            sprite_clip_depth,
+            sprite_clip_wall,
+        ) = self._native_render_portal_walls(
             frame,
             view_z,
             surface_depth,
             scene_surface_depth,
         )
         frame = self._native_render_hitscan_decals(frame, view_z, scene_depth)
-        frame = self._native_render_sprites(frame, wall_distance, view_z, scene_depth)
+        frame = self._native_render_sprites(
+            frame,
+            wall_distance,
+            view_z,
+            sprite_clip_depth,
+            sprite_clip_wall,
+        )
         frame = self._native_render_weapon(frame)
         if include_hud:
             frame = torch.cat((frame, self._native_render_hud()), dim=1)
