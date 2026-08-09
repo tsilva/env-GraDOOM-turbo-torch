@@ -9711,7 +9711,7 @@ class TorchDeathmatchEngine:
             candidates = torch.where(
                 incident
                 & (current_sector[:, :, None] >= 0)
-                & (distances > previous_distance[:, :, None] + 1e-3),
+                & (distances > previous_distance[:, :, None]),
                 distances,
                 torch.full_like(distances, torch.inf),
             )

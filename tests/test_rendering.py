@@ -744,6 +744,48 @@ def test_native_walls_reject_collapsed_screen_edge_span(
     assert rgb[0, 113, 0].tolist() == [71, 51, 35]
 
 
+def test_native_same_column_portal_layers_retain_nested_wall(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([123]))
+    engine.x.fill_(835.9440307617188)
+    engine.y.fill_(391.3482971191406)
+    engine.z.zero_()
+    engine.view_z.fill_(41)
+    engine.angle.fill_(math.radians(205.52673344629042))
+    engine.episode_time.fill_(81)
+
+    wall_distance, *_rest = engine._native_portal_intersections()
+    frame, surface_depth, scene_surface_depth = engine._native_render_flats(
+        engine._current_sector(),
+        engine.view_z,
+    )
+    frame, _scene_depth, _sprite_clip_depth, _sprite_clip_wall = (
+        engine._native_render_portal_walls(
+            frame,
+            engine.view_z,
+            surface_depth,
+            scene_surface_depth,
+        )
+    )
+    rgb = engine.map.playpal[frame.to(torch.int64)]
+
+    # Portals 210 and 209 form successive BSP layers in column 172, but their
+    # float ray depths differ by less than the old arbitrary 0.001 cutoff.
+    # Both must be crossed to reach BRICK12 wall 196 instead of terminating in
+    # sector 12's sky.
+    portal_depth_delta = wall_distance[0, 172, 209] - wall_distance[0, 172, 210]
+    assert 0 < portal_depth_delta < 1e-3
+    assert rgb[0, 48, 172].tolist() == [111, 87, 67]
+    assert rgb[0, 90, 172].tolist() == [103, 83, 63]
+    assert rgb[0, 106, 172].tolist() == [111, 87, 67]
+
+
 def test_native_projected_portal_keeps_geometric_sector_path(
     pinned_deathmatch_scenario,
 ) -> None:
