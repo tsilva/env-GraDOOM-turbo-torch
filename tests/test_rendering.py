@@ -1066,6 +1066,61 @@ def test_native_walls_reject_collapsed_screen_edge_span(
     assert rgb[0, 113, 0].tolist() == [71, 51, 35]
 
 
+def test_native_partially_clipped_solid_owns_left_frustum_column(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([456]))
+    engine.x.fill_(752.9335632324219)
+    engine.y.fill_(49.700897216796875)
+    engine.z.zero_()
+    engine.view_z.fill_(41)
+    engine.angle.fill_(math.radians(119.97070315293286))
+    engine.episode_time.fill_(21)
+
+    wall_projection_geometry = engine._native_wall_projection_geometry()
+    screen_left, screen_right, _depth_left, _depth_right = wall_projection_geometry
+    (
+        wall_distance,
+        _wall_along,
+        geometric_intersections,
+        projected_intersections,
+        _projected_left_edges,
+        _wall_visibility,
+    ) = engine._native_portal_intersections(wall_projection_geometry)
+    frame, surface_depth, scene_surface_depth = engine._native_render_flats(
+        engine._current_sector(),
+        engine.view_z,
+    )
+    frame, _scene_depth, _sprite_clip_depth, sprite_clip_wall = (
+        engine._native_render_portal_walls(
+            frame,
+            engine.view_z,
+            surface_depth,
+            scene_surface_depth,
+        )
+    )
+    rgb = engine.map.playpal[frame.to(torch.int64)]
+
+    # Solid 6 enters from beyond the left frustum and ends at column 1, so
+    # FWallCoords clips it to [0, 1). The surviving right endpoint must not be
+    # mistaken for a new left bound: wall 6 closes column 0 before farther
+    # solid 48 can leak through sector 11.
+    assert screen_left[0, 6] == 0
+    assert screen_right[0, 6] == 1
+    assert geometric_intersections[0, 0, 6]
+    assert projected_intersections[0, 0, 6]
+    assert torch.isfinite(wall_distance[0, 0, 6])
+    assert sprite_clip_wall[0, 58, 0] == 6
+    assert rgb[0, 58, 0].tolist() == [23, 15, 7]
+    assert rgb[0, 86, 0].tolist() == [39, 39, 39]
+    assert rgb[0, 116, 0].tolist() == [31, 23, 11]
+
+
 def test_native_same_column_portal_layers_retain_nested_wall(
     pinned_deathmatch_scenario,
 ) -> None:

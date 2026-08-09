@@ -9720,11 +9720,19 @@ class TorchDeathmatchEngine:
             segment[..., 0] * viewer_from_start[..., 1]
             - segment[..., 1] * viewer_from_start[..., 0]
         ) < 0
+        front_facing_by_wall = front_facing.squeeze(1)
         for endpoint in range(2):
             column = endpoint_columns[..., endpoint]
             visible = endpoint_visible[..., endpoint] & has_columns
-            owns_left = torch.abs(column - screen_left) <= torch.abs(
-                column - screen_right
+            # FWallCoords preserves the seg's directed endpoint order when it
+            # clips one endpoint against the horizontal view frustum. Inferring
+            # the surviving endpoint's side from its distance to the geometric
+            # ray bounds fails on ties: a right endpoint at column 1 can move
+            # the left bound from 0 to 1 and erase the clipped solid column.
+            owns_left = torch.where(
+                front_facing_by_wall,
+                torch.full_like(front_facing_by_wall, endpoint == 0),
+                torch.full_like(front_facing_by_wall, endpoint == 1),
             )
             screen_left = torch.where(visible & owns_left, column, screen_left)
             screen_right = torch.where(visible & ~owns_left, column, screen_right)
@@ -9732,7 +9740,6 @@ class TorchDeathmatchEngine:
         # A fully visible seg uses FWallCoords' exact fixed-point [sx1, sx2)
         # bounds. Do not let the geometric ray fallback shift that range across
         # a shared endpoint; the adjacent seg owns the next integer column.
-        front_facing_by_wall = front_facing.squeeze(1)
         ordered_endpoint_columns = torch.where(
             front_facing_by_wall[..., None],
             endpoint_columns,
