@@ -9332,6 +9332,9 @@ class TorchDeathmatchEngine:
 
     def _native_portal_intersections(
         self,
+        wall_projection_geometry: (
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None
+        ) = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -9558,6 +9561,17 @@ class TorchDeathmatchEngine:
             has_columns,
         )
 
+        # FWallCoords also clips endpoints that lie outside the horizontal
+        # view frustum before accepting its half-open raster span. Reuse that
+        # exact result here: the ray fallback must not resurrect a segment
+        # whose clipped endpoints collapse to an empty [sx1, sx2) range.
+        if wall_projection_geometry is None:
+            wall_projection_geometry = self._native_wall_projection_geometry()
+        clipped_screen_left, clipped_screen_right, _depth_left, _depth_right = (
+            wall_projection_geometry
+        )
+        has_columns &= clipped_screen_right > clipped_screen_left
+
         pixel_x = self._native_pixel_x[0, 0].to(torch.int64)[None, :, None]
         screen_valid = (
             has_columns[:, None, :]
@@ -9596,6 +9610,12 @@ class TorchDeathmatchEngine:
             focal_length
         )
         flat_center = center + 0.5
+        wall_projection_geometry = (
+            wall_screen_left,
+            wall_screen_right,
+            wall_depth_left,
+            wall_depth_right,
+        ) = self._native_wall_projection_geometry()
         (
             distances,
             wall_along,
@@ -9603,14 +9623,8 @@ class TorchDeathmatchEngine:
             projected_intersections,
             projected_left_edges,
             wall_visibility,
-        ) = self._native_portal_intersections()
+        ) = self._native_portal_intersections(wall_projection_geometry)
         wall_vertical_steps = self._native_wall_vertical_steps()
-        (
-            wall_screen_left,
-            wall_screen_right,
-            wall_depth_left,
-            wall_depth_right,
-        ) = self._native_wall_projection_geometry()
         filled = torch.zeros_like(frame, dtype=torch.bool)
         plane_sector = torch.full_like(frame, -1, dtype=torch.int64)
         plane_is_floor = torch.zeros_like(frame, dtype=torch.bool)

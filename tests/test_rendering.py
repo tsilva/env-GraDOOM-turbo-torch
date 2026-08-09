@@ -698,6 +698,52 @@ def test_native_walls_use_reference_half_open_screen_bounds(
     assert rgb[0, 40, 90].tolist() == [95, 75, 55]
 
 
+def test_native_walls_reject_collapsed_screen_edge_span(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([123]))
+    engine.x.fill_(877.4517669677734)
+    engine.y.fill_(198.21546936035156)
+    engine.z.zero_()
+    engine.view_z.fill_(41)
+    engine.angle.fill_(math.radians(102.16735842222519))
+    engine.episode_time.fill_(41)
+
+    wall_distance, *_rest = engine._native_portal_intersections()
+    screen_left, screen_right, _depth_left, _depth_right = (
+        engine._native_wall_projection_geometry()
+    )
+    frame, surface_depth, scene_surface_depth = engine._native_render_flats(
+        engine._current_sector(),
+        engine.view_z,
+    )
+    frame, _scene_depth, _sprite_clip_depth, _sprite_clip_wall = (
+        engine._native_render_portal_walls(
+            frame,
+            engine.view_z,
+            surface_depth,
+            scene_surface_depth,
+        )
+    )
+    rgb = engine.map.playpal[frame.to(torch.int64)]
+
+    # FWallCoords clips solid 54 to [0, 0), so R_AddLine rejects it before
+    # BSP clipping. The ray still meets its mathematical segment at column 0,
+    # but must continue to visible wall 48 rather than painting BRICK12 there.
+    assert screen_left[0, 54] == screen_right[0, 54] == 0
+    assert torch.isinf(wall_distance[0, 0, 54])
+    assert torch.isfinite(wall_distance[0, 0, 48])
+    assert rgb[0, 36, 0].tolist() == [0, 0, 0]
+    assert rgb[0, 38, 0].tolist() == [0, 0, 23]
+    assert rgb[0, 51, 0].tolist() == [43, 35, 15]
+    assert rgb[0, 113, 0].tolist() == [71, 51, 35]
+
+
 def test_native_projected_portal_keeps_geometric_sector_path(
     pinned_deathmatch_scenario,
 ) -> None:
