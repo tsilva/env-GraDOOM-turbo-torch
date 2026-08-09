@@ -10079,7 +10079,7 @@ class TorchDeathmatchEngine:
             shared_solid = (
                 torch.isfinite(distances)
                 & (all_sectors[None, None, :, 1] < 0)
-                & shares_endpoint
+                & (shares_endpoint | projected_left_edges)
                 & (distances > prior_distance[:, :, None] + 1e-3)
                 & (distances <= distance[:, :, None] + 1e-3)
             )

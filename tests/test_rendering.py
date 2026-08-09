@@ -855,6 +855,57 @@ def test_native_projected_solid_retains_portal_plane_clips(
     assert rgb[0, 76, 153].tolist() == [31, 23, 11]
 
 
+def test_native_projected_solid_chain_clips_endpoint_portal(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([789]))
+    engine.x.fill_(100.23959350585938)
+    engine.y.fill_(608.5520172119141)
+    engine.z.zero_()
+    engine.view_z.fill_(41)
+    engine.angle.fill_(math.radians(348.81591804996503))
+    engine.episode_time.fill_(81)
+
+    (
+        _wall_distance,
+        _wall_along,
+        geometric_intersections,
+        projected_intersections,
+        projected_left_edges,
+        _wall_visibility,
+    ) = engine._native_portal_intersections()
+    frame, surface_depth, scene_surface_depth = engine._native_render_flats(
+        engine._current_sector(),
+        engine.view_z,
+    )
+    frame, _scene_depth = engine._native_render_portal_walls(
+        frame,
+        engine.view_z,
+        surface_depth,
+        scene_surface_depth,
+    )
+    rgb = engine.map.playpal[frame.to(torch.int64)]
+
+    # Tiny collinear solids 169 and 170 extend beyond portal 208's endpoint,
+    # but their map vertices collapse into the same projected column. Solid
+    # 170's left edge must rewind traversal into sector 9 and clip the portal
+    # even though it is not an immediate map-endpoint neighbor of wall 208.
+    assert not geometric_intersections[0, 45, 208]
+    assert projected_intersections[0, 45, 208]
+    assert not geometric_intersections[0, 45, 170]
+    assert projected_intersections[0, 45, 170]
+    assert projected_left_edges[0, 45, 170]
+    assert rgb[0, 43, 45].tolist() == [67, 0, 0]
+    assert rgb[0, 60, 45].tolist() == [83, 7, 7]
+    assert rgb[0, 80, 45].tolist() == [67, 0, 0]
+    assert rgb[0, 112, 45].tolist() == [83, 7, 7]
+
+
 def test_native_weapon_uses_reference_fixed_point_vertical_sampling(
     pinned_deathmatch_scenario,
 ) -> None:
