@@ -10228,14 +10228,28 @@ class TorchDeathmatchEngine:
                 ),
             )
             in_front_of_surface = distance[:, None, :] <= surface_depth + 1e-3
+            tier_top_edge = (
+                (one_span & (pixel_y == clipped_top[:, None, :]))
+                | (
+                    middle_span
+                    & (pixel_y == clipped_middle_top[:, None, :])
+                )
+                | (lower_span & (pixel_y == clipped_lower_top[:, None, :]))
+                | (upper_span & (pixel_y == clipped_top[:, None, :]))
+            )
             # Doom draws a solid one-sided wall before marking its front-sector
-            # ceiling visplane. Our flat prepass samples through pixel centers,
-            # so its approximate depth can otherwise punch holes along the
-            # projected top edge of the wall.
+            # ceiling visplane, and wallscan includes every tier's integer top
+            # row before visplanes are drawn. Our flat prepass samples through
+            # pixel centers, so its approximate depth can otherwise punch holes
+            # through solid walls or reject a two-sided tier's exact top edge.
             span = (
                 (one_span | middle_span | lower_span | upper_span)
                 & (texture_id >= 0)
-                & (in_front_of_surface | (one_span & ceiling_pixels))
+                & (
+                    in_front_of_surface
+                    | (one_span & ceiling_pixels)
+                    | tier_top_edge
+                )
                 & ~filled
             )
             safe_texture_id = self._native_animated_texture_ids(texture_id.clamp_min(0))

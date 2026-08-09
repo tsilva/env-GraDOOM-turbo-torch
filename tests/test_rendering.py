@@ -478,6 +478,49 @@ def test_native_portal_clips_bound_solid_wall_against_planes(
     assert scene_depth[0, 124, 290].item() == pytest.approx(458.92681884765625)
 
 
+def test_native_two_sided_wall_top_edges_own_flat_boundary(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([456]))
+    engine.x.fill_(801.5532989501953)
+    engine.y.fill_(37.320770263671875)
+    engine.z.zero_()
+    engine.view_z.fill_(41)
+    engine.angle.fill_(math.radians(165.67382816357394))
+    engine.episode_time.fill_(21)
+
+    flat_frame, surface_depth, scene_surface_depth = engine._native_render_flats(
+        engine._current_sector(),
+        engine.view_z,
+    )
+    frame, _scene_depth, _sprite_clip_depth, _sprite_clip_wall = (
+        engine._native_render_portal_walls(
+            flat_frame.clone(),
+            engine.view_z,
+            surface_depth,
+            scene_surface_depth,
+        )
+    )
+    flat_rgb = engine.map.playpal[flat_frame.to(torch.int64)]
+    rgb = engine.map.playpal[frame.to(torch.int64)]
+
+    # R_RenderSegLoop passes wallscan each tier's inclusive integer top row.
+    # The independent flat prepass intersects a ceiling slightly nearer here,
+    # but it must not punch holes in same-sector BIGBRIK1 or the REDWALL upper
+    # tier along their projected top boundaries.
+    assert surface_depth[0, 42, 149] < 813.0478515625
+    assert flat_rgb[0, 42, 149].tolist() == [0, 0, 23]
+    assert rgb[0, 42, 149].tolist() == [43, 35, 15]
+    assert surface_depth[0, 47, 202] < 886.530029296875
+    assert flat_rgb[0, 47, 202].tolist() == [0, 0, 0]
+    assert rgb[0, 47, 202].tolist() == [115, 19, 19]
+
+
 def test_native_sector_lookup_ignores_self_referencing_linedef(
     pinned_deathmatch_scenario,
 ) -> None:
