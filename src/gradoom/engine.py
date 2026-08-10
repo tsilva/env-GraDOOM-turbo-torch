@@ -10117,6 +10117,16 @@ class TorchDeathmatchEngine:
             ceiling_clip,
             float(self.native_view_height),
         )
+        # R_StoreWallRange snapshots these silhouettes on every masked
+        # drawseg. R_DrawMasked later clips the middle texture against that
+        # drawseg-local state, not the final scene depth buffer.
+        masked_drawseg_ceiling_clip = torch.zeros_like(ceiling_clip)
+        masked_drawseg_floor_clip = torch.full_like(
+            floor_clip,
+            float(self.native_view_height),
+        )
+        masked_drawseg_distance = torch.full_like(ceiling_clip, torch.inf)
+        masked_drawseg_wall = torch.full_like(current_sector, -1)
         previous_distance = torch.zeros_like(current_sector, dtype=torch.float32)
         all_sectors = self.map.portal_wall_sectors
         all_wall_starts = self.map.portal_walls[None, None, :, :2]
@@ -10282,13 +10292,6 @@ class TorchDeathmatchEngine:
         boundary_has_projected_owner = torch.any(
             projected_left_edges & torch.isfinite(distances),
             dim=2,
-        )
-        # Wide endpoint correction is local to Doom's short boundary-chain
-        # fragments. Extending it across long linedefs can jump to an unrelated
-        # projected span that happens to share the same map vertex.
-        projected_wall_is_short = (
-            self.map.portal_wall_lengths[None, None, :]
-            <= _NATIVE_PROJECTED_OWNER_MAX_WALL_LENGTH
         )
         pending_wide_projected_boundary = torch.zeros_like(
             current_sector,
@@ -10606,7 +10609,6 @@ class TorchDeathmatchEngine:
                             | (
                                 shares_selected_endpoint
                                 & selected_owner_is_short[:, :, None]
-                                & projected_wall_is_short
                             )
                         )
                     )
@@ -10768,8 +10770,6 @@ class TorchDeathmatchEngine:
             one_sided = other_sector < 0
             side_textures = self.map.portal_side_texture_ids[wall_index, side_index]
             middle_texture_id = side_textures[..., 0]
-            safe_middle_texture_id = middle_texture_id.clamp_min(0)
-            middle_texture_height = self.map.texture_heights[safe_middle_texture_id]
 
             def project(
                 world_z: torch.Tensor,
@@ -11088,14 +11088,6 @@ class TorchDeathmatchEngine:
             one_bottom = project(view_floor)
             lower_top = project(other_floor)
             upper_bottom = project(other_ceiling)
-            # The certified map's two-sided BIGBRIK1 midtexture uses Doom's
-            # default top peg: one texture height down from the lower ceiling.
-            # It is a visual tier only and must not close the portal.
-            middle_world_top = torch.minimum(view_ceiling, other_ceiling)
-            middle_top = project(middle_world_top)
-            middle_bottom = project(
-                middle_world_top - middle_texture_height.to(torch.float32)
-            )
             clipped_top = torch.maximum(one_top, ceiling_clip)
             clipped_bottom = torch.minimum(one_bottom, floor_clip)
             clipped_upper_bottom = torch.maximum(
@@ -11106,8 +11098,6 @@ class TorchDeathmatchEngine:
                 torch.maximum(lower_top, ceiling_clip),
                 clipped_bottom,
             )
-            clipped_middle_top = torch.maximum(middle_top, ceiling_clip)
-            clipped_middle_bottom = torch.minimum(middle_bottom, floor_clip)
             mark_ceiling = one_sided | (
                 (view_ceiling != other_ceiling)
                 | (
@@ -11168,33 +11158,24 @@ class TorchDeathmatchEngine:
                 & (pixel_y >= clipped_top[:, None, :])
                 & (pixel_y < clipped_upper_bottom[:, None, :])
             )
-            middle_span = (
-                (~one_sided & raster_valid & (middle_texture_id >= 0))[:, None, :]
-                & (pixel_y >= clipped_middle_top[:, None, :])
-                & (pixel_y < clipped_middle_bottom[:, None, :])
-            )
             texture_id = torch.where(
                 one_span,
                 side_textures[..., 0][:, None, :],
                 torch.where(
-                    middle_span,
-                    middle_texture_id[:, None, :],
-                    torch.where(
-                        lower_span,
-                        side_textures[..., 1][:, None, :],
-                        side_textures[..., 2][:, None, :],
-                    ),
+                    lower_span,
+                    side_textures[..., 1][:, None, :],
+                    side_textures[..., 2][:, None, :],
                 ),
             )
-            # Doom's BSP clips every wall tier against the accumulated integer
-            # ceiling/floor silhouettes; it does not z-test two-sided tiers
-            # against a separately sampled flat. The flat prepass is only an
-            # approximation near height transitions, so using its ray depth here
-            # can suppress an entire lower tier and leave floor texels showing
-            # through the pit wall. Raster ownership and the saved clips are the
-            # authoritative visibility test for all wall tiers.
+            # Doom's BSP clips every opaque wall tier against the accumulated
+            # integer ceiling/floor silhouettes; it does not z-test those tiers
+            # against a separately sampled flat. Two-sided middle textures are
+            # the exception: R_RenderSegLoop records them as masked drawsegs and
+            # R_DrawMasked paints them later from the saved sprite clips. Do not
+            # let them claim opaque ownership here or they can leak through a
+            # nearer drawseg before the masked replay applies its clipping.
             span = (
-                (one_span | middle_span | lower_span | upper_span)
+                (one_span | lower_span | upper_span)
                 & (texture_id >= 0)
                 & ~filled
             )
@@ -11217,7 +11198,6 @@ class TorchDeathmatchEngine:
             tier_tops = torch.stack(
                 (
                     clipped_top,
-                    clipped_middle_top,
                     clipped_lower_top,
                     clipped_top,
                 ),
@@ -11226,7 +11206,6 @@ class TorchDeathmatchEngine:
             tier_bottoms = torch.stack(
                 (
                     clipped_bottom,
-                    clipped_middle_bottom,
                     clipped_bottom,
                     clipped_upper_bottom,
                 ),
@@ -11240,10 +11219,6 @@ class TorchDeathmatchEngine:
                     & (clipped_top < clipped_bottom),
                     ~one_sided
                     & raster_valid
-                    & (middle_texture_id >= 0)
-                    & (clipped_middle_top < clipped_middle_bottom),
-                    ~one_sided
-                    & raster_valid
                     & (view_floor < other_floor)
                     & (side_textures[..., 1] >= 0)
                     & (clipped_lower_top < clipped_bottom),
@@ -11255,9 +11230,9 @@ class TorchDeathmatchEngine:
                 ),
                 dim=1,
             )
-            tier_top_groups = tier_tops.reshape(self.num_envs, 4, -1, 4)
-            tier_bottom_groups = tier_bottoms.reshape(self.num_envs, 4, -1, 4)
-            tier_column_groups = tier_columns.reshape(self.num_envs, 4, -1, 4)
+            tier_top_groups = tier_tops.reshape(self.num_envs, 3, -1, 4)
+            tier_bottom_groups = tier_bottoms.reshape(self.num_envs, 3, -1, 4)
+            tier_column_groups = tier_columns.reshape(self.num_envs, 3, -1, 4)
             common_top = torch.max(tier_top_groups, dim=3).values
             common_bottom = torch.min(tier_bottom_groups, dim=3).values
             vector_group = (
@@ -11271,14 +11246,11 @@ class TorchDeathmatchEngine:
                 (one_span & group_valid[:, 0, None, :])
                 & (pixel_y >= group_bottom[:, 0, None, :])
             ) | (
-                (middle_span & group_valid[:, 1, None, :])
+                (lower_span & group_valid[:, 1, None, :])
                 & (pixel_y >= group_bottom[:, 1, None, :])
             ) | (
-                (lower_span & group_valid[:, 2, None, :])
+                (upper_span & group_valid[:, 2, None, :])
                 & (pixel_y >= group_bottom[:, 2, None, :])
-            ) | (
-                (upper_span & group_valid[:, 3, None, :])
-                & (pixel_y >= group_bottom[:, 3, None, :])
             )
             safe_texture_id = self._native_animated_texture_ids(texture_id.clamp_min(0))
             texture_width = self.map.texture_widths[safe_texture_id]
@@ -11321,13 +11293,9 @@ class TorchDeathmatchEngine:
                 one_span,
                 view_ceiling[:, None, :],
                 torch.where(
-                    middle_span,
-                    middle_world_top[:, None, :],
-                    torch.where(
-                        lower_span,
-                        other_floor[:, None, :],
-                        other_ceiling[:, None, :],
-                    ),
+                    lower_span,
+                    other_floor[:, None, :],
+                    other_ceiling[:, None, :],
                 ),
             )
             height_bits = torch.floor(torch.log2(texture_height.to(torch.float32))).to(
@@ -11442,6 +11410,32 @@ class TorchDeathmatchEngine:
                 raster_valid & ~one_sided & (draws_lower | mark_floor),
                 floor_update,
                 floor_clip,
+            )
+            saves_masked_drawseg = (
+                raster_valid
+                & ~one_sided
+                & (middle_texture_id >= 0)
+                & (distance < masked_drawseg_distance)
+            )
+            masked_drawseg_ceiling_clip = torch.where(
+                saves_masked_drawseg,
+                ceiling_clip,
+                masked_drawseg_ceiling_clip,
+            )
+            masked_drawseg_floor_clip = torch.where(
+                saves_masked_drawseg,
+                floor_clip,
+                masked_drawseg_floor_clip,
+            )
+            masked_drawseg_distance = torch.where(
+                saves_masked_drawseg,
+                distance,
+                masked_drawseg_distance,
+            )
+            masked_drawseg_wall = torch.where(
+                saves_masked_drawseg,
+                wall_index,
+                masked_drawseg_wall,
             )
             # R_StoreWallRange saves the updated ceilingclip/floorclip arrays
             # on this drawseg. R_DrawSprite later applies those integer
@@ -11983,10 +11977,10 @@ class TorchDeathmatchEngine:
 
         # Doom defers two-sided middle textures to R_DrawMasked instead of
         # treating them as opaque tiers during the front-to-back wall pass.
-        # Most columns above were already painted with the same texture math,
-        # but a projected shared endpoint can terminate on a nearer solid
-        # before this wall is visited. Replay the masked draw after planes so
-        # that endpoint receives the drawseg's texture just as ViZDoom does.
+        # Replay the masked draw after planes so ordinary columns use the
+        # drawseg-local clips saved during traversal while a projected shared
+        # endpoint that terminated on a nearer solid retains the historical
+        # endpoint fallback.
         wall_count = self.map.portal_walls.shape[0]
         wall_ids = torch.arange(
             wall_count,
@@ -12042,8 +12036,8 @@ class TorchDeathmatchEngine:
         )
         masked_texture_width = self.map.texture_widths[safe_masked_texture_id]
         masked_texture_height = self.map.texture_heights[safe_masked_texture_id]
-        masked_top = project(masked_world_top, masked_wall_index)
-        masked_bottom = project(
+        masked_owall_top = project(masked_world_top, masked_wall_index)
+        masked_owall_bottom = project(
             masked_world_top - masked_texture_height.to(torch.float32),
             masked_wall_index,
         )
@@ -12051,16 +12045,26 @@ class TorchDeathmatchEngine:
             2,
             masked_wall_index[:, :, None],
         ).squeeze(2)
-        masked_span = (
-            masked_valid[:, None, :]
-            & (pixel_y >= masked_top[:, None, :])
-            & (pixel_y < masked_bottom[:, None, :])
-            & (
-                (masked_distance[:, None, :] <= scene_depth + 1e-3)
-                | masked_left_edge[:, None, :]
-            )
+        has_saved_masked_drawseg = masked_drawseg_wall == masked_wall_index
+        masked_ceiling_clip = torch.maximum(
+            masked_owall_top,
+            torch.where(
+                has_saved_masked_drawseg,
+                masked_drawseg_ceiling_clip,
+                torch.zeros_like(masked_drawseg_ceiling_clip),
+            ),
         )
-
+        masked_floor_clip = torch.minimum(
+            masked_owall_bottom,
+            torch.where(
+                has_saved_masked_drawseg,
+                masked_drawseg_floor_clip,
+                torch.full_like(
+                    masked_drawseg_floor_clip,
+                    float(self.native_view_height),
+                ),
+            ),
+        )
         masked_texture_offset = self.map.portal_side_texture_offsets[
             masked_wall_index,
             masked_side_index,
@@ -12078,6 +12082,7 @@ class TorchDeathmatchEngine:
             masked_horizontal_repeat - masked_horizontal_offset,
         )
         masked_screen_left = wall_screen_left.gather(1, masked_wall_index)
+        masked_screen_right = wall_screen_right.gather(1, masked_wall_index)
         masked_horizontal_offset = torch.where(
             (masked_screen_left > 0) & (masked_horizontal_offset < 0),
             torch.zeros_like(masked_horizontal_offset),
@@ -12127,6 +12132,135 @@ class TorchDeathmatchEngine:
             (masked_world_top - view_z[:, None]) * _FIXED_UNIT
             + masked_texture_offset[..., 1] * _FIXED_UNIT
         ).to(torch.int64)[:, None, :]
+        # R_DrawMaskedColumn projects each opaque texture post through the
+        # drawseg's linearly interpolated reciprocal scale. Its integer bottom
+        # can differ from OWallMost's portal bound by one row, especially where
+        # a middle texture barely touches the top of the screen.
+        batch_index = torch.arange(
+            self.num_envs,
+            device=self.device,
+            dtype=torch.int64,
+        )[:, None]
+        safe_masked_screen_left = masked_screen_left.clamp(
+            0,
+            self.native_screen_width - 1,
+        )
+        safe_masked_screen_last = (masked_screen_right - 1).clamp(
+            0,
+            self.native_screen_width - 1,
+        )
+        masked_start_swall = wall_vertical_steps[
+            batch_index,
+            safe_masked_screen_left,
+            masked_wall_index,
+        ]
+        masked_end_swall = wall_vertical_steps[
+            batch_index,
+            safe_masked_screen_last,
+            masked_wall_index,
+        ]
+        masked_start_iscale = torch.bitwise_right_shift(
+            masked_start_swall * _FIXED_UNIT,
+            18,
+        )
+        masked_end_iscale = torch.bitwise_right_shift(
+            masked_end_swall * _FIXED_UNIT,
+            18,
+        )
+        masked_start_iscale = torch.where(
+            (masked_start_iscale >= 0) & (masked_start_iscale < 3),
+            torch.full_like(masked_start_iscale, 3),
+            torch.where(
+                (masked_start_iscale > -3) & (masked_start_iscale < 0),
+                torch.full_like(masked_start_iscale, -3),
+                masked_start_iscale,
+            ),
+        )
+        masked_end_iscale = torch.where(
+            (masked_end_iscale >= 0) & (masked_end_iscale < 3),
+            torch.full_like(masked_end_iscale, 3),
+            torch.where(
+                (masked_end_iscale > -3) & (masked_end_iscale < 0),
+                torch.full_like(masked_end_iscale, -3),
+                masked_end_iscale,
+            ),
+        )
+        masked_start_scale = self._trunc_divide(
+            torch.full_like(masked_start_iscale, 1 << 32),
+            masked_start_iscale,
+        )
+        masked_end_scale = self._trunc_divide(
+            torch.full_like(masked_end_iscale, 1 << 32),
+            masked_end_iscale,
+        )
+        masked_screen_span = (masked_screen_right - masked_screen_left).clamp_min(
+            1
+        )
+        masked_scale_step = self._trunc_divide(
+            masked_end_scale - masked_start_scale,
+            masked_screen_span,
+        )
+        masked_column = self._native_pixel_x[0, 0].to(torch.int64)[None, :]
+        masked_sprite_scale = masked_start_scale + masked_scale_step * (
+            masked_column - masked_screen_left
+        )
+        masked_top_screen = center_fixed[:, None] - torch.bitwise_right_shift(
+            masked_texture_mid.squeeze(1) * masked_sprite_scale,
+            16,
+        )
+        masked_post_top = torch.bitwise_right_shift(masked_top_screen, 16)
+        masked_post_bottom = (
+            torch.bitwise_right_shift(
+                masked_top_screen
+                + masked_sprite_scale * masked_texture_height
+                - _FIXED_UNIT,
+                16,
+            )
+            + 1
+        )
+        masked_clipped_top = torch.maximum(
+            masked_post_top,
+            masked_ceiling_clip.to(torch.int64),
+        )
+        masked_clipped_bottom = torch.minimum(
+            masked_post_bottom,
+            masked_floor_clip.to(torch.int64),
+        )
+        masked_current_swall = wall_vertical_steps.gather(
+            2,
+            masked_wall_index[:, :, None],
+        ).squeeze(2)
+        masked_dc_iscale = torch.bitwise_right_shift(
+            masked_current_swall * _FIXED_UNIT,
+            18,
+        )
+        masked_initial_post = masked_clipped_top < masked_clipped_bottom
+        masked_texture_fraction_start = (
+            masked_texture_mid.squeeze(1)
+            + masked_clipped_top * masked_dc_iscale
+            - torch.bitwise_right_shift(
+                (center_fixed[:, None] - _FIXED_UNIT) * masked_dc_iscale,
+                16,
+            )
+        )
+        masked_texture_fraction_end = masked_texture_fraction_start + (
+            masked_clipped_bottom - masked_clipped_top - 1
+        ) * masked_dc_iscale
+        masked_extends_bottom_post = (
+            masked_initial_post
+            & (masked_clipped_bottom < masked_floor_clip)
+            & (
+                masked_texture_fraction_end
+                < masked_texture_height * _FIXED_UNIT - masked_dc_iscale
+            )
+        )
+        masked_clipped_bottom += masked_extends_bottom_post.to(torch.int64)
+        masked_span = (
+            masked_valid[:, None, :]
+            & (pixel_y >= masked_clipped_top[:, None, :])
+            & (pixel_y < masked_clipped_bottom[:, None, :])
+            & (has_saved_masked_drawseg[:, None, :] | masked_left_edge[:, None, :])
+        )
         masked_fraction = torch.bitwise_left_shift(
             masked_texture_mid,
             16 - masked_height_bits[:, None, :],

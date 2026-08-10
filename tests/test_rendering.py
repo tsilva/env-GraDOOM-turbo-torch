@@ -561,6 +561,64 @@ def test_native_two_sided_wall_top_edges_own_flat_boundary(
     assert rgb[0, 47, 202].tolist() == [115, 19, 19]
 
 
+def test_native_masked_posts_and_projected_owner_match_top_screen_boundary(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([456]))
+    engine.x.fill_(241.5029296875)
+    engine.y.fill_(179.90249633789062)
+    engine.z.zero_()
+    engine.view_z.fill_(41)
+    engine.angle.fill_(math.radians(165.67382816357394))
+    engine.episode_time.fill_(81)
+
+    (
+        _wall_distance,
+        _wall_along,
+        geometric_intersections,
+        projected_intersections,
+        projected_left_edges,
+        _wall_visibility,
+    ) = engine._native_portal_intersections()
+    flat_frame, surface_depth, scene_surface_depth = engine._native_render_flats(
+        engine._current_sector(),
+        engine.view_z,
+    )
+    frame, *_depths = engine._native_render_portal_walls(
+        flat_frame,
+        engine.view_z,
+        surface_depth,
+        scene_surface_depth,
+    )
+    rgb = engine.map.playpal[frame.to(torch.int64)]
+
+    # R_DrawMaskedColumn projects the full-height BIGBRIK1 post with the
+    # drawseg's interpolated reciprocal scale. The texture misses x=147/153,
+    # then its bottom-post correction supplies exactly one extra row in the
+    # following columns.
+    assert rgb[0, 0, 147].tolist() == [0, 0, 0]
+    assert rgb[0, 1, 153].tolist() == [0, 0, 0]
+    assert rgb[0, 1, 154].tolist() == [31, 23, 11]
+    assert rgb[0, 2, 160].tolist() == [31, 23, 11]
+    assert rgb[0, 3, 166].tolist() == [23, 15, 7]
+
+    # The short vertical portal's mathematical ray reaches its excluded right
+    # edge first, while the long diagonal portal owns the coincident projected
+    # left edge. Its uncontrasted light table therefore shades the pit wall.
+    assert geometric_intersections[0, 23, 197]
+    assert not projected_intersections[0, 23, 197]
+    assert projected_intersections[0, 23, 202]
+    assert projected_left_edges[0, 23, 202]
+    assert rgb[0, 182, 23].tolist() == [139, 0, 0]
+    assert rgb[0, 183, 23].tolist() == [139, 0, 0]
+    assert rgb[0, 184, 23].tolist() == [127, 0, 0]
+
+
 def test_native_two_sided_wall_tiers_own_full_clipped_span(
     pinned_deathmatch_scenario,
 ) -> None:
