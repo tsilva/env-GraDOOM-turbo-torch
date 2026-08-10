@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import operator
 import os
 import re
@@ -55,6 +56,38 @@ def _positive_int(value: Any, name: str) -> int:
     return int(result)
 
 
+def _normalize_seed(
+    seed: int | Sequence[int | None] | None,
+    num_envs: int,
+) -> list[int | None]:
+    if seed is None:
+        return [None] * num_envs
+    if isinstance(seed, Sequence) and not isinstance(seed, (str, bytes, bytearray)):
+        result = [None if value is None else int(value) for value in seed]
+        if len(result) != num_envs:
+            raise ValueError("seed sequence length must match num_envs")
+        return result
+    base = int(seed)
+    return [base + lane for lane in range(num_envs)]
+
+
+def _validate_deathmatch_request(game: Any, scenario: Any) -> None:
+    requested = scenario if scenario not in (None, "scenario") else game
+    if requested is None:
+        return
+    candidate = Path(str(requested)).expanduser()
+    if candidate.is_file():
+        if candidate.suffix.casefold() not in {".cfg", ".wad"}:
+            raise ValueError("GraDOOM scenarios must be a ViZDoom .cfg or Doom .wad file")
+        return
+    alias = str(requested).strip().casefold().removesuffix(".cfg")
+    if alias not in {"deathmatch", "vizdoomdeathmatch-v1"}:
+        raise ValueError(
+            f"unsupported GraDOOM game/scenario {requested!r}; "
+            "only VizdoomDeathmatch-v1 is supported"
+        )
+
+
 def _resolve_scenario_wad(game: Any, scenario: Any) -> Path:
     requested = scenario if scenario not in (None, "scenario") else game
     candidate = Path(str(requested)).expanduser() if requested is not None else None
@@ -97,7 +130,7 @@ def scenario_buttons(
     *,
     scenario: str | Path | None = None,
 ) -> tuple[str, ...]:
-    del game, scenario
+    _validate_deathmatch_request(game, scenario)
     return DEATHMATCH_BUTTONS
 
 
@@ -131,8 +164,8 @@ class DeviceAutoResetTransition:
 class GraDoomVecEnv(VectorEnv):
     """Device-resident vector deathmatch environment.
 
-    Torch tensors are the certified transport. NumPy transport exists for CPU
-    contract tests and diagnostics and is not part of the performance path.
+    Torch tensors are the only transition transport. NumPy is limited to the
+    Turbo API's host-side state-index and RGB rendering surfaces.
     """
 
     metadata: ClassVar[dict[str, Any]] = {
@@ -164,7 +197,7 @@ class GraDoomVecEnv(VectorEnv):
         num_threads: int | None = None,
         rom_path: str | None = None,
         device: str | torch.device | None = None,
-        transport: Literal["torch", "numpy"] = "torch",
+        transport: Literal["torch"] = "torch",
         obs_copy: Literal["copy", "safe_view", "unsafe_view"] = "unsafe_view",
         obs_resize: tuple[int, int] | None = (84, 84),
         obs_crop: tuple[int, int, int, int] | None = (0, 32, 0, 0),
@@ -198,6 +231,7 @@ class GraDoomVecEnv(VectorEnv):
     ) -> None:
         if unsupported:
             raise TypeError(f"unsupported option(s): {', '.join(sorted(unsupported))}")
+        _validate_deathmatch_request(game, scenario)
         if info not in (None, "data"):
             raise ValueError("info must be None or 'data'")
         if record:
@@ -214,8 +248,8 @@ class GraDoomVecEnv(VectorEnv):
             value is not None for value in (doom_map, game_args, enemy_variants, surface_variants)
         ):
             raise ValueError("custom maps, game args, and variants are not yet supported")
-        if doom_skill not in (None, 1, 3):
-            raise ValueError("deathmatch-p1-v1 supports the configured Doom skill only")
+        if doom_skill not in (None, 3):
+            raise ValueError("deathmatch-p1-v1 requires Doom skill 3")
         if use_fire_reset or noop_reset_max or sticky_action_prob:
             raise ValueError(
                 "fire reset, no-op reset, and sticky actions are not in deathmatch-p1-v1"
@@ -228,23 +262,40 @@ class GraDoomVecEnv(VectorEnv):
             raise ValueError("deathmatch-p1-v1 supports no crop or the pinned bottom-32 mask")
         if obs_crop is not None and (obs_crop_mode != "mask" or obs_crop_fill != 0):
             raise ValueError("the pinned deathmatch crop is a zero-filled mask")
+        if obs_crop is None and obs_crop_mode not in {"remove", "mask"}:
+            raise ValueError("obs_crop_mode must be 'remove' or 'mask'")
+        if obs_crop_fill != 0:
+            raise ValueError("deathmatch-p1-v1 requires obs_crop_fill=0")
         if obs_layout not in {"chw", "hwc"}:
             raise ValueError("obs_layout must be 'chw' or 'hwc'")
-        if obs_resize_algorithm not in {"nearest", "bilinear", "area"}:
-            raise ValueError("unknown resize algorithm")
-        if transport not in {"torch", "numpy"}:
-            raise ValueError("transport must be 'torch' or 'numpy'")
+        if obs_resize_algorithm != "area":
+            raise ValueError("deathmatch-p1-v1 supports obs_resize_algorithm='area' only")
+        if transport != "torch":
+            raise ValueError("transport must be 'torch'; NumPy transition transport is unsupported")
         if obs_copy not in {"copy", "safe_view", "unsafe_view"}:
             raise ValueError("obs_copy must be copy, safe_view, or unsafe_view")
         del inttype
 
         self.num_envs = _positive_int(num_envs, "num_envs")
-        self.num_threads = 0 if num_threads is None else _positive_int(num_threads, "num_threads")
+        self.num_threads = (
+            self.num_envs
+            if num_threads is None
+            else min(_positive_int(num_threads, "num_threads"), self.num_envs)
+        )
         self.frame_skip = _positive_int(frame_skip, "frame_skip")
         self.frame_stack = frame_stack
-        self.device_info_history_names = tuple(
-            str(name).casefold() for name in (info_frame_stack_keys or ())
-        )
+        if info_frame_stack_keys is None:
+            history_names: tuple[str, ...] = ()
+        else:
+            if isinstance(info_frame_stack_keys, (str, bytes, bytearray)) or not isinstance(
+                info_frame_stack_keys, Sequence
+            ):
+                raise TypeError("info_frame_stack_keys must be a sequence of signal names or None")
+            if any(not isinstance(name, str) for name in info_frame_stack_keys):
+                raise TypeError("info_frame_stack_keys must contain only strings")
+            history_names = tuple(name.casefold() for name in info_frame_stack_keys)
+        self.info_frame_stack_keys = history_names
+        self.device_info_history_names = history_names
         if len(self.device_info_history_names) != len(set(self.device_info_history_names)):
             raise ValueError("info_frame_stack_keys must not contain duplicates")
         unknown_history_names = set(self.device_info_history_names) - set(DEVICE_SIGNAL_NAMES)
@@ -268,13 +319,15 @@ class GraDoomVecEnv(VectorEnv):
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         if compile_engine and self.device.type != "cuda":
             raise ValueError("compile_engine=True requires a CUDA device")
-        if transport == "numpy" and self.device.type != "cpu":
-            raise ValueError("NumPy transport is diagnostic-only and requires device='cpu'")
         self.state_catalog = ("default",)
-        self._active_state_indices = torch.zeros(
+        self._active_state_indices = np.zeros(self.num_envs, dtype=np.int32)
+        self._active_state_indices.setflags(write=False)
+        self._device_state_indices = torch.zeros(
             self.num_envs, device=self.device, dtype=torch.int32
         )
-        self._seed_base = 0
+        self._initialized = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+        self._seed_values: list[int | None] = [None] * self.num_envs
+        self._reset_rngs = [np.random.default_rng(lane) for lane in range(self.num_envs)]
         self._reward_clip = self._normalize_reward_clip(reward_clip)
         self.treat_episode_timeout_as_truncation = bool(treat_episode_timeout_as_truncation)
         if not self.treat_episode_timeout_as_truncation:
@@ -293,8 +346,17 @@ class GraDoomVecEnv(VectorEnv):
         self.compiled_scenario = compiled_scenario
         self.scenario_sha256 = compiled_scenario.scenario_sha256
         self.iwad_sha256 = compiled_scenario.iwad_sha256
-        vizdoom_options = vizdoom_config or {}
-        episode_timeout = int(vizdoom_options.get("episode_timeout", 4200))
+        vizdoom_options = dict(vizdoom_config or {})
+        unknown_vizdoom_options = set(vizdoom_options) - {
+            "episode_timeout",
+            "render_screen_flashes",
+        }
+        if unknown_vizdoom_options:
+            raise ValueError(f"unsupported vizdoom_config keys: {sorted(unknown_vizdoom_options)}")
+        episode_timeout = _positive_int(
+            vizdoom_options.get("episode_timeout", 4200),
+            "episode_timeout",
+        )
         render_screen_flashes = vizdoom_options.get("render_screen_flashes", False)
         if not isinstance(render_screen_flashes, bool):
             raise ValueError("render_screen_flashes must be a boolean")
@@ -319,6 +381,20 @@ class GraDoomVecEnv(VectorEnv):
             device=self.device,
             dtype=torch.float32,
         )
+        obs_tensor_shape = (4, 84, 84) if obs_layout == "chw" else (84, 84, 4)
+        self._safe_obs_buffers = (
+            tuple(
+                torch.empty(
+                    (self.num_envs, *obs_tensor_shape),
+                    device=self.device,
+                    dtype=torch.uint8,
+                )
+                for _ in range(2)
+            )
+            if obs_copy == "safe_view"
+            else ()
+        )
+        self._safe_obs_index = 0
         self.compile_engine = bool(compile_engine)
         self.engine_backend = "torch-compiled" if self.compile_engine else "torch-eager"
         self._step_engine = (
@@ -339,12 +415,13 @@ class GraDoomVecEnv(VectorEnv):
                 "string action modes are not supported"
             )
         action_value = use_restricted_actions
+        uses_default_action_preset = action_value is DEATHMATCH_ACTIONS
         self.action_table, self.action_meanings, self.action_table_hash = normalize_action_table(
             action_value,
             buttons=self.buttons,
         )
         self.action_mode = "custom_discrete"
-        self.action_preset = "deathmatch-p1-v1" if action_value == DEATHMATCH_ACTIONS else None
+        self.action_preset = "deathmatch-p1-v1" if uses_default_action_preset else None
         self.use_restricted_actions = use_restricted_actions
         action_matrix = torch.zeros(
             (len(self.action_table), len(self.buttons)), device=self.device, dtype=torch.bool
@@ -362,26 +439,42 @@ class GraDoomVecEnv(VectorEnv):
         self.single_observation_space = gym.spaces.Box(0, 255, single_shape, dtype=np.uint8)
         self.observation_space = batch_space(self.single_observation_space, self.num_envs)
 
+        if isinstance(game_variables, (str, bytes, bytearray)):
+            raise TypeError("game_variables must be a sequence of signal names or None")
         self.game_variable_names = tuple(
             str(value).casefold() for value in (game_variables or _DEFAULT_SIGNALS)
         )
+        if len(self.game_variable_names) != len(set(self.game_variable_names)):
+            raise ValueError("game_variables must not contain duplicates")
         unknown = set(self.game_variable_names) - set(_DEFAULT_SIGNALS)
         if unknown:
             raise ValueError(f"unknown deathmatch game variables: {sorted(unknown)}")
         self._configure_info_filter(info_filter)
-        if self.device_info_history_names and self._info_mode != "all":
-            raise ValueError("device info frame stacks require info_filter mode='all'")
-        signal_schema = {
-            name: MappingProxyType(
-                {
-                    "dtype": np.dtype(np.float64),
-                    "shape": (),
-                    "available_on_reset": self._info_mode == "all",
-                    "available_on_step": self._info_mode != "none",
-                }
+        history_not_selected = set(self.device_info_history_names) - set(self._info_keys)
+        if history_not_selected:
+            raise ValueError(
+                "info_frame_stack_keys must be included by info_filter: "
+                f"{sorted(history_not_selected)}"
             )
-            for name in self._info_keys
-        }
+        if self.device_info_history_names and self._info_mode != "all":
+            raise ValueError(
+                "info_frame_stack_keys must be available on reset and every step"
+            )
+        signal_schema = (
+            {
+                name: MappingProxyType(
+                    {
+                        "dtype": np.dtype(np.float64),
+                        "shape": (),
+                        "available_on_reset": self._info_mode == "all",
+                        "available_on_step": self._info_mode != "none",
+                    }
+                )
+                for name in self._info_keys
+            }
+            if self._info_mode != "none"
+            else {}
+        )
         for name in self.device_info_history_names:
             signal_schema[f"{name}_frame_stack"] = MappingProxyType(
                 {
@@ -396,7 +489,7 @@ class GraDoomVecEnv(VectorEnv):
             {
                 "supported_action_modes": ("custom_discrete",),
                 "supported_observation_layouts": ("chw", "hwc"),
-                "supported_resize_algorithms": ("area", "nearest", "bilinear"),
+                "supported_resize_algorithms": ("area",),
                 "supported_observation_copy_modes": ("copy", "safe_view", "unsafe_view"),
                 "supports_maxpool_last_two": False,
                 "supports_sticky_action_prob": False,
@@ -405,9 +498,6 @@ class GraDoomVecEnv(VectorEnv):
                 "supports_state_catalog": False,
                 "supports_live_snapshots": False,
                 "supports_per_lane_rgb": True,
-                "native_render_shape": (240, 320, 3),
-                "native_render_format": "RGB24",
-                "native_render_includes_hud": True,
                 "supports_enemy_variants": False,
                 "supports_surface_variants": False,
                 "supports_info_frame_stack": True,
@@ -420,44 +510,54 @@ class GraDoomVecEnv(VectorEnv):
             return None
         if value is True:
             return (-1.0, 1.0)
-        low, high = (float(item) for item in value)
-        if low > high:
-            raise ValueError("reward clip low must not exceed high")
+        try:
+            low, high = (float(item) for item in value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("reward_clip must be a bool or a (low, high) pair") from exc
+        if not math.isfinite(low) or not math.isfinite(high) or low > high:
+            raise ValueError("reward_clip bounds must be finite with low <= high")
         return low, high
 
     def _configure_info_filter(self, value: str | Mapping[str, Any]) -> None:
         signal_names = (*self.game_variable_names, *_DERIVED_SIGNALS)
         if isinstance(value, Mapping):
+            unknown_options = set(value) - {"mode", "keys"}
+            if unknown_options:
+                raise ValueError(f"unknown info_filter keys: {sorted(unknown_options)}")
             mode = str(value.get("mode", "all"))
             keys = value.get("keys")
-            selected = signal_names if keys is None else tuple(str(key).casefold() for key in keys)
+            if isinstance(keys, (str, bytes, bytearray)):
+                raise TypeError("info_filter keys must be a sequence of signal names")
+            selected = (
+                signal_names if keys is None else tuple(str(key).casefold() for key in keys)
+            )
         else:
             mode = str(value)
             selected = signal_names
         if mode not in {"all", "terminal", "none"}:
-            raise ValueError("info_filter mode must be all, terminal, or none")
-        unknown = set(selected) - set((*_DEFAULT_SIGNALS, *_DERIVED_SIGNALS))
+            raise ValueError("info_filter mode must be 'all', 'terminal', or 'none'")
+        if len(selected) != len(set(selected)):
+            raise ValueError("info_filter keys must not contain duplicates")
+        unknown = set(selected) - set(signal_names)
         if unknown:
             raise ValueError(f"unknown info signals: {sorted(unknown)}")
         self._info_mode = mode
         self._info_keys = tuple(selected)
 
-    def _observations(self, values: torch.Tensor):
+    def _observations(self, values: torch.Tensor) -> torch.Tensor:
         if self.obs_layout == "hwc":
             values = values.permute(0, 2, 3, 1)
-        if self.obs_copy in {"copy", "safe_view"}:
-            values = values.clone()
-        if self.transport == "numpy":
-            return values.numpy()
+        if self.obs_copy == "copy":
+            return values.clone()
+        if self.obs_copy == "safe_view":
+            buffer = self._safe_obs_buffers[self._safe_obs_index]
+            self._safe_obs_index = (self._safe_obs_index + 1) % len(self._safe_obs_buffers)
+            buffer.copy_(values)
+            return buffer
         return values
 
     def _device_observations(self, values: torch.Tensor) -> torch.Tensor:
         return values if self.obs_layout == "chw" else values.permute(0, 2, 3, 1)
-
-    def _value(self, value: torch.Tensor):
-        if self.transport == "numpy":
-            return value.numpy()
-        return value
 
     def _infos(self, availability: torch.Tensor | None = None) -> dict[str, Any]:
         if self._info_mode == "none":
@@ -469,13 +569,32 @@ class GraDoomVecEnv(VectorEnv):
         signals = self._engine.signals()
         result: dict[str, Any] = {}
         for name in self._info_keys:
-            result[name] = self._value(signals[name])
-            result[f"_{name}"] = self._value(availability.clone())
+            result[name] = signals[name]
+            result[f"_{name}"] = availability.clone()
         for index, name in enumerate(self.device_info_history_names):
             history_name = f"{name}_frame_stack"
-            result[history_name] = self._value(self._info_history[:, index])
-            result[f"_{history_name}"] = self._value(availability.clone())
+            result[history_name] = self._info_history[:, index].to(torch.float64)
+            result[f"_{history_name}"] = availability.clone()
         return result
+
+    def _require_device_tensor(
+        self,
+        value: Any,
+        name: str,
+        *,
+        shape: tuple[int, ...],
+        dtypes: tuple[torch.dtype, ...],
+    ) -> torch.Tensor:
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(f"{name} must be a Torch tensor")
+        if value.device != self.device:
+            raise TypeError(f"{name} must be on device {self.device}")
+        if value.shape != shape:
+            raise ValueError(f"{name} must have shape {shape}")
+        if value.dtype not in dtypes:
+            expected = ", ".join(str(dtype) for dtype in dtypes)
+            raise TypeError(f"{name} must have dtype {expected}")
+        return value
 
     def _reset_info_histories(self, mask: torch.Tensor) -> None:
         if not self.device_info_history_names:
@@ -493,6 +612,10 @@ class GraDoomVecEnv(VectorEnv):
         )
         self._info_history.copy_(history)
 
+    def seed(self, seed: int | None = None) -> list[int | None]:
+        self._seed_values = _normalize_seed(seed, self.num_envs)
+        return list(self._seed_values)
+
     def reset(
         self,
         *,
@@ -506,61 +629,79 @@ class GraDoomVecEnv(VectorEnv):
         if raw_mask is None:
             mask = torch.ones(self.num_envs, device=self.device, dtype=torch.bool)
         else:
-            mask = torch.as_tensor(raw_mask, device=self.device)
-            if mask.dtype != torch.bool or mask.shape != (self.num_envs,):
-                raise TypeError("options['reset_mask'] must be bool with shape (num_envs,)")
+            mask = self._require_device_tensor(
+                raw_mask,
+                "options['reset_mask']",
+                shape=(self.num_envs,),
+                dtypes=(torch.bool,),
+            )
+        if not bool(torch.any(mask)):
+            raise ValueError("options['reset_mask'] must select at least one lane")
         state_indices = reset_options.pop("state_indices", None)
-        if state_indices is not None and bool(torch.any(torch.as_tensor(state_indices) != 0)):
-            raise ValueError("deathmatch-p1-v1 has only state index 0")
+        if state_indices is not None:
+            selected_states = self._require_device_tensor(
+                state_indices,
+                "options['state_indices']",
+                shape=(self.num_envs,),
+                dtypes=(torch.int32,),
+            )
+            if bool(torch.any(selected_states[mask] != 0)):
+                raise ValueError("deathmatch-p1-v1 has only state index 0")
         if reset_options:
             raise ValueError(f"unsupported reset options: {sorted(reset_options)}")
-        if seed is None:
-            seeds = torch.arange(
-                self._seed_base,
-                self._seed_base + self.num_envs,
-                device=self.device,
-                dtype=torch.int64,
+        seed_values = (
+            _normalize_seed(seed, self.num_envs) if seed is not None else self._seed_values
+        )
+        game_seeds = [0] * self.num_envs
+        for lane in torch.nonzero(mask, as_tuple=False).flatten().to("cpu").tolist():
+            lane_seed = seed_values[lane]
+            if lane_seed is not None:
+                self._reset_rngs[lane] = np.random.default_rng(lane_seed)
+            game_seeds[lane] = int(
+                self._reset_rngs[lane].integers(
+                    0,
+                    np.iinfo(np.uint32).max + 1,
+                    dtype=np.uint32,
+                )
             )
-            self._seed_base += self.num_envs
-        elif isinstance(seed, Sequence) and not isinstance(seed, (str, bytes, bytearray)):
-            if len(seed) != self.num_envs:
-                raise ValueError("seed sequence length must match num_envs")
-            seeds = torch.tensor(
-                [
-                    self._seed_base + index if value is None else int(value)
-                    for index, value in enumerate(seed)
-                ],
-                device=self.device,
-                dtype=torch.int64,
-            )
-            self._seed_base += self.num_envs
-        else:
-            seeds = torch.arange(int(seed), int(seed) + self.num_envs, device=self.device)
+        seeds = torch.tensor(game_seeds, device=self.device, dtype=torch.int64)
+        self._seed_values = [None] * self.num_envs
         observations = self._engine.reset(mask, seeds)
+        self._initialized |= mask
         self._reset_info_histories(mask)
         infos = self._infos(mask)
-        infos["state_index"] = self._value(self._active_state_indices.clone())
-        infos["_state_index"] = self._value(mask.clone())
+        infos["state_index"] = self._device_state_indices.clone()
+        infos["_state_index"] = mask.clone()
         infos["start_source"] = np.full(self.num_envs, "environment", dtype=object)
-        infos["_start_source"] = self._value(mask.clone())
+        infos["_start_source"] = mask.clone()
+        infos["noop_reset_count"] = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.int64
+        )
+        infos["_noop_reset_count"] = mask.clone()
         return self._observations(observations), infos
 
-    def step(self, actions: Any):
+    def step(self, actions: torch.Tensor):
         if self.closed:
             raise RuntimeError("cannot step a closed environment")
-        indices = torch.as_tensor(actions, device=self.device, dtype=torch.int64)
-        if indices.shape != (self.num_envs,):
-            raise ValueError(f"actions must have shape ({self.num_envs},)")
-        if self.device.type == "cpu" and bool(
-            torch.any((indices < 0) | (indices >= len(self.action_table)))
-        ):
+        if not bool(torch.all(self._initialized)):
+            raise RuntimeError("all lanes must be reset before the first step")
+        if bool(torch.any(self._engine.pending_reset)):
+            lanes = torch.nonzero(self._engine.pending_reset).flatten().to("cpu").tolist()
+            raise RuntimeError(f"terminal lanes must be reset before step: {lanes}")
+        indices = self._require_device_tensor(
+            actions,
+            "actions",
+            shape=(self.num_envs,),
+            dtypes=(torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8),
+        ).to(torch.int64)
+        if bool(torch.any((indices < 0) | (indices >= len(self.action_table)))):
             raise ValueError("actions fall outside the declared action space")
         transition = self.step_device(indices)
         return (
             self._observations(transition.observations),
-            self._value(transition.rewards),
-            self._value(transition.terminated),
-            self._value(transition.truncated),
+            transition.rewards,
+            transition.terminated,
+            transition.truncated,
             self._infos(),
         )
 
@@ -569,14 +710,20 @@ class GraDoomVecEnv(VectorEnv):
 
         if self.closed:
             raise RuntimeError("cannot step a closed environment")
-        indices = actions.to(device=self.device, dtype=torch.int64)
-        if indices.shape != (self.num_envs,):
-            raise ValueError(f"actions must have shape ({self.num_envs},)")
+        indices = self._require_device_tensor(
+            actions,
+            "actions",
+            shape=(self.num_envs,),
+            dtypes=(torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8),
+        ).to(torch.int64)
         buttons = self._action_matrix[indices]
         observations, rewards, terminated, truncated = self._step_engine(buttons)
         self._advance_info_histories()
         if self._reward_clip is not None:
+            raw_rewards = rewards.clone()
             rewards.clamp_(self._reward_clip[0], self._reward_clip[1])
+            self._engine.episode_return.add_(rewards - raw_rewards)
+            self._engine.signal_buffer[:, 18].copy_(self._engine.episode_return)
         return DeviceTransition(
             observations=self._device_observations(observations),
             rewards=rewards,
@@ -593,11 +740,23 @@ class GraDoomVecEnv(VectorEnv):
 
         if self.closed:
             raise RuntimeError("cannot reset a closed environment")
-        device_mask = mask.to(device=self.device, dtype=torch.bool)
+        device_mask = self._require_device_tensor(
+            mask,
+            "mask",
+            shape=(self.num_envs,),
+            dtypes=(torch.bool,),
+        )
+        device_seeds = self._require_device_tensor(
+            seeds,
+            "seeds",
+            shape=(self.num_envs,),
+            dtypes=(torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8),
+        ).to(torch.int64)
         observations = self._engine.reset(
             device_mask,
-            seeds.to(device=self.device, dtype=torch.int64),
+            device_seeds,
         )
+        self._initialized |= device_mask
         self._reset_info_histories(device_mask)
         return self._device_observations(observations), self._engine.signal_buffer
 
@@ -632,14 +791,14 @@ class GraDoomVecEnv(VectorEnv):
     def device_info_histories(self) -> torch.Tensor:
         return self._info_history
 
-    def active_state_indices(self):
-        values = self._active_state_indices.detach().to("cpu").numpy().copy()
-        values.setflags(write=False)
-        return values
+    def active_state_indices(self) -> np.ndarray:
+        return self._active_state_indices
 
     def render_lane(self, lane: int) -> np.ndarray:
         if self.closed:
             raise RuntimeError("cannot render a closed environment")
+        if isinstance(lane, (bool, np.bool_)):
+            raise TypeError("lane must be an integer")
         lane_index = operator.index(lane)
         if not 0 <= lane_index < self.num_envs:
             raise IndexError(f"lane must be in [0, {self.num_envs - 1}]")
@@ -648,13 +807,17 @@ class GraDoomVecEnv(VectorEnv):
             .detach()
             .to("cpu")
             .numpy()
+            .copy()
         )
 
     def render(self) -> np.ndarray:
         return self.render_lane(0)
 
     def get_images(self) -> list[np.ndarray]:
-        return [self.render_lane(lane) for lane in range(self.num_envs)]
+        if self.closed:
+            raise RuntimeError("cannot render a closed environment")
+        frames = self._engine.render_native_frame(include_hud=True).detach().to("cpu").numpy()
+        return [frame.copy() for frame in frames]
 
     def close(self) -> None:
         self.closed = True

@@ -24,6 +24,7 @@ GraDOOM is a GPU-native Doom reinforcement-learning environment whose primary ou
 ### Compatibility and content
 
 - GraDOOM must provide the supported deathmatch API exposed by vizdoom-turbo.
+- GraDOOM’s Turbo-compatible reset and step data plane must accept and return Torch tensors; it must not provide a NumPy transition transport.
 - The first certified environment is the ViZDoom deathmatch scenario.
 - Certified environments must support user-supplied Doom II and Freedoom WADs.
 - Future releases must support multiple certified deathmatch WADs without slowing the initial single-scenario fast path.

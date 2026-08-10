@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Sequence
+from typing import Any
 
 DEATHMATCH_BUTTONS = (
     "ATTACK",
@@ -51,12 +52,14 @@ DEATHMATCH_ACTIONS = (
 
 
 def normalize_action_table(
-    actions: Sequence[Sequence[str]],
+    actions: Any,
     *,
     buttons: Sequence[str] = DEATHMATCH_BUTTONS,
 ) -> tuple[tuple[tuple[str, ...], ...], tuple[str, ...], str]:
     """Normalize and hash actions exactly like the Turbo Vector API v1 contract."""
 
+    if isinstance(actions, (str, bytes, bytearray)) or not isinstance(actions, Sequence):
+        raise ValueError("action table must be a non-empty sequence of actions")
     if not actions:
         raise ValueError("action table must contain at least one action")
     indices = {name: index for index, name in enumerate(buttons)}
@@ -65,9 +68,13 @@ def normalize_action_table(
     masks: list[tuple[int]] = []
     seen: set[int] = set()
     for action_index, raw_action in enumerate(actions):
-        if isinstance(raw_action, (str, bytes, bytearray)):
-            raise TypeError(f"action {action_index} must be a sequence of button labels")
-        labels = tuple(str(label) for label in raw_action)
+        if isinstance(raw_action, (str, bytes, bytearray)) or not isinstance(
+            raw_action, Sequence
+        ):
+            raise ValueError(f"action {action_index} must be a sequence of button labels")
+        if any(not isinstance(label, str) for label in raw_action):
+            raise ValueError(f"action {action_index} labels must be strings")
+        labels = tuple(raw_action)
         if len(labels) != len(set(labels)):
             raise ValueError(f"action {action_index} contains duplicate buttons")
         try:

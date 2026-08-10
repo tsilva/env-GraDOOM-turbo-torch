@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import numpy as np
 import pytest
 import torch
 
@@ -60,12 +59,13 @@ def test_vizdoom_screen_flash_option_is_static_and_validated(square_scenario) ->
         )
 
 
-def test_turbo_shaped_api_contract_and_numpy_transport(square_scenario) -> None:
-    env = _env(square_scenario, transport="numpy", obs_copy="safe_view")
+def test_turbo_api_contract_and_torch_transport(square_scenario) -> None:
+    env = _env(square_scenario, obs_copy="safe_view")
     try:
         observations, infos = env.reset(seed=[1, 2])
         assert observations.shape == (2, 4, 84, 84)
-        assert observations.dtype == np.uint8
+        assert observations.dtype == torch.uint8
+        assert observations.device.type == "cpu"
         assert env.action_table_hash == DEATHMATCH_ACTION_TABLE_SHA256
         assert env.metadata["turbo_api_version"] == 1
         assert env.metadata["gradoom_device_api_version"] == 1
@@ -74,17 +74,16 @@ def test_turbo_shaped_api_contract_and_numpy_transport(square_scenario) -> None:
         assert env.capabilities["supports_enemy_variants"] is False
         assert env.capabilities["supports_surface_variants"] is False
         assert env.capabilities["supports_info_frame_stack"] is True
-        assert env.capabilities["native_render_shape"] == (240, 320, 3)
-        assert env.capabilities["native_render_format"] == "RGB24"
-        assert env.capabilities["native_render_includes_hud"] is True
+        assert not any(key.startswith("native_render_") for key in env.capabilities)
         assert env.observation_ownership == "safe_view"
         assert env.observation_buffer_depth == 2
         assert infos["health"].tolist() == [100.0, 100.0]
-        result = env.step(np.asarray([0, 2], dtype=np.int64))
+        assert infos["noop_reset_count"].tolist() == [0, 0]
+        result = env.step(torch.tensor([0, 2], dtype=torch.int64))
         assert result[0].shape == observations.shape
-        assert result[1].dtype == np.float32
-        assert result[2].dtype == np.bool_
-        assert result[3].dtype == np.bool_
+        assert result[1].dtype == torch.float32
+        assert result[2].dtype == torch.bool
+        assert result[3].dtype == torch.bool
         assert env.render_lane(1).shape == (240, 320, 3)
     finally:
         env.close()

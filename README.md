@@ -6,7 +6,7 @@
 
 GraDOOM is a Python library for reinforcement-learning researchers and engineers who need to train Doom policies at high throughput. It runs batched deathmatch simulation, rendering, rewards, and resets in PyTorch on the same device as the learner, then targets zero-shot evaluation in comparable ViZDoom environments.
 
-Use `GraDoomVecEnv` with an operator-supplied Doom II or Freedoom IWAD and the pinned ViZDoom deathmatch scenario. The current alpha provides a device-tensor API, a `vizdoom-turbo`-shaped vector API, a scenario compiler, and a vectorized Torch execution model.
+Use `GraDoomVecEnv` with an operator-supplied Doom II or Freedoom IWAD and the pinned ViZDoom deathmatch scenario. The current alpha implements the supported deathmatch surface of Turbo Vector API v1 with Torch-only transition tensors, alongside a synchronization-free device API, scenario compiler, and vectorized Torch execution model.
 
 ## Install
 
@@ -67,7 +67,7 @@ uv run python tools/cuda_correctness_smoke.py --compile-engine   # check CUDA re
 - `render()` and `render_lane()` expose the unprocessed 320×240 RGB24 comparison view with the full Doom HUD; observation preprocessing remains separate from this diagnostic render path.
 - The initial certification hardware target is one NVIDIA RTX 4090 integrated with GradLab.
 - Pass asset paths directly or set `GRADOOM_IWAD` and `GRADOOM_DEATHMATCH_WAD`. WADs and other game data are not distributed with this repository.
-- Torch tensors are the performance transport. NumPy transport is available only for CPU diagnostics and compatibility testing.
+- Torch tensors are the only reset/step transition transport. The Turbo control and rendering surfaces still use NumPy where required for read-only state indices and RGB arrays.
 - Operator-run benchmarks require a controlled quiet window and matched reference evidence; see [deathmatch parity](./docs/deathmatch-parity.md).
 - See [third-party notices](./THIRD_PARTY_NOTICES.md) for source and game-data policy.
 

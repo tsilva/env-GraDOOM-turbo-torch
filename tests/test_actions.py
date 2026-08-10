@@ -25,3 +25,7 @@ def test_action_table_rejects_unknown_and_duplicate_actions() -> None:
         normalize_action_table(((), ("RIP_AND_TEAR",)))
     with pytest.raises(ValueError, match="duplicates"):
         normalize_action_table(((), ()))
+    with pytest.raises(ValueError, match="labels must be strings"):
+        normalize_action_table(((), (1,)))
+    with pytest.raises(ValueError, match="non-empty sequence"):
+        normalize_action_table("minimal")
