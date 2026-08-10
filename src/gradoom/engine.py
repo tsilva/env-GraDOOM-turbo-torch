@@ -1438,6 +1438,8 @@ class TorchDeathmatchEngine:
         self._native_same_portal_sector_pairs = same_portal_sector_pair
         self._native_opposing_portal_pairs = (
             same_portal_sector_pair
+            & (portal_sectors[:, None, 1] >= 0)
+            & (portal_sectors[None, :, 1] >= 0)
             & ~shares_portal_endpoint
             & (portal_direction_dot < 0)
             & (torch.abs(portal_direction_cross) < 1e-6)
@@ -10597,18 +10599,22 @@ class TorchDeathmatchEngine:
                 incident
                 & (all_sectors[None, None, :, 1] >= 0)
                 & projected_intersections
-                & projected_left_edges
                 & (
-                    (selected_owner_span[:, :, None] <= 2)
+                    same_selected_owner_sector_pair
                     | (
-                        shares_selected_endpoint
-                        & selected_owner_is_short[:, :, None]
-                        & projected_wall_is_short
+                        projected_left_edges
+                        & selected_owner_excluded_right_edge[:, :, None]
+                        & (
+                            (selected_owner_span[:, :, None] <= 2)
+                            | (
+                                shares_selected_endpoint
+                                & selected_owner_is_short[:, :, None]
+                                & projected_wall_is_short
+                            )
+                        )
                     )
-                    | same_selected_owner_sector_pair
                 )
                 & ~selected_owner_is_projected[:, :, None]
-                & selected_owner_excluded_right_edge[:, :, None]
                 & (distances > previous_distance[:, :, None] + 1e-3)
                 & (
                     torch.abs(distances - distance[:, :, None])
@@ -10639,6 +10645,23 @@ class TorchDeathmatchEngine:
                 replace_with_near_projected_owner,
                 near_projected_index,
                 wall_index,
+            )
+            final_owner_is_projected = projected_intersections.gather(
+                2,
+                wall_index[:, :, None],
+            ).squeeze(2)
+            final_owner_is_geometric = geometric_intersections.gather(
+                2,
+                wall_index[:, :, None],
+            ).squeeze(2)
+            completes_projected_opposing_boundary = (
+                pending_endpoint_projected_boundary
+                & self._native_opposing_portal_pairs[
+                    pending_endpoint_projected_wall,
+                    wall_index,
+                ]
+                & final_owner_is_projected
+                & ~final_owner_is_geometric
             )
             valid = torch.isfinite(distance)
             # A mathematical ray hit can lie exactly on the excluded right
@@ -10699,7 +10722,19 @@ class TorchDeathmatchEngine:
             front = sectors[..., 0]
             back = sectors[..., 1]
             from_front = current_sector == front
-            side_index = (~from_front).to(torch.int64)
+            other_sector = torch.where(from_front, back, front)
+            # A projected-only far strip boundary immediately following its
+            # opposing near endpoint is stored from inside the strip. Keep the
+            # mathematical traversal on its original side, but use the far
+            # drawseg's reference-facing sector for tiers, planes, and light.
+            render_current = torch.where(
+                completes_projected_opposing_boundary,
+                other_sector,
+                current,
+            )
+            render_from_front = render_current == front
+            render_other = torch.where(render_from_front, back, front)
+            side_index = (~render_from_front).to(torch.int64)
             visibility_by_side = wall_visibility.gather(
                 2,
                 wall_index[:, :, None, None].expand(-1, -1, 1, 2),
@@ -10708,7 +10743,6 @@ class TorchDeathmatchEngine:
                 2,
                 side_index[:, :, None],
             ).squeeze(2)
-            other_sector = torch.where(from_front, back, front)
             projected_solid_path_sectors = all_sectors[
                 projected_solid_path_index
             ]
@@ -10729,9 +10763,9 @@ class TorchDeathmatchEngine:
                 & projected_solid_path_is_geometric
                 & (projected_solid_path_other >= 0)
             )
-            safe_other = other_sector.clamp_min(0)
-            view_floor = self.map.sector_heights[current, 0]
-            view_ceiling = self.map.sector_heights[current, 1]
+            safe_other = render_other.clamp_min(0)
+            view_floor = self.map.sector_heights[render_current, 0]
+            view_ceiling = self.map.sector_heights[render_current, 1]
             other_floor = self.map.sector_heights[safe_other, 0]
             other_ceiling = self.map.sector_heights[safe_other, 1]
             one_sided = other_sector < 0
@@ -11080,22 +11114,22 @@ class TorchDeathmatchEngine:
             mark_ceiling = one_sided | (
                 (view_ceiling != other_ceiling)
                 | (
-                    self.map.sector_ceiling_texture_ids[current]
+                    self.map.sector_ceiling_texture_ids[render_current]
                     != self.map.sector_ceiling_texture_ids[safe_other]
                 )
                 | (
-                    self.map.sector_lights[current]
+                    self.map.sector_lights[render_current]
                     != self.map.sector_lights[safe_other]
                 )
             )
             mark_floor = one_sided | (
                 (view_floor != other_floor)
                 | (
-                    self.map.sector_floor_texture_ids[current]
+                    self.map.sector_floor_texture_ids[render_current]
                     != self.map.sector_floor_texture_ids[safe_other]
                 )
                 | (
-                    self.map.sector_lights[current]
+                    self.map.sector_lights[render_current]
                     != self.map.sector_lights[safe_other]
                 )
             )
@@ -11114,7 +11148,7 @@ class TorchDeathmatchEngine:
             unowned_plane = plane_sector < 0
             plane_sector = torch.where(
                 unowned_plane & (ceiling_plane_span | floor_plane_span),
-                current[:, None, :],
+                render_current[:, None, :],
                 plane_sector,
             )
             plane_is_floor |= unowned_plane & floor_plane_span
@@ -11362,7 +11396,10 @@ class TorchDeathmatchEngine:
                 texture_u,
             ]
             _weapon_frame, _weapon_flash, flash_light = self._native_weapon_frame_selection()
-            light = self.map.sector_lights[current][:, None, :] + flash_light[:, None, None] * 16
+            light = (
+                self.map.sector_lights[render_current][:, None, :]
+                + flash_light[:, None, None] * 16
+            )
             wall = self.map.portal_walls[wall_index]
             horizontal = (wall[..., 3] - wall[..., 1]).abs() < 1e-6
             vertical = (wall[..., 2] - wall[..., 0]).abs() < 1e-6
@@ -11506,11 +11543,11 @@ class TorchDeathmatchEngine:
             path_marks_ceiling = (
                 (view_ceiling != path_other_ceiling)
                 | (
-                    self.map.sector_ceiling_texture_ids[current]
+                    self.map.sector_ceiling_texture_ids[render_current]
                     != self.map.sector_ceiling_texture_ids[path_safe_other]
                 )
                 | (
-                    self.map.sector_lights[current]
+                    self.map.sector_lights[render_current]
                     != self.map.sector_lights[path_safe_other]
                 )
             )
@@ -11532,11 +11569,11 @@ class TorchDeathmatchEngine:
             path_marks_floor = (
                 (view_floor != path_other_floor)
                 | (
-                    self.map.sector_floor_texture_ids[current]
+                    self.map.sector_floor_texture_ids[render_current]
                     != self.map.sector_floor_texture_ids[path_safe_other]
                 )
                 | (
-                    self.map.sector_lights[current]
+                    self.map.sector_lights[render_current]
                     != self.map.sector_lights[path_safe_other]
                 )
             )

@@ -1182,6 +1182,69 @@ def test_native_projected_owner_resolves_short_opposite_endpoint_hit(
     assert rgb[0, 144, 254].tolist() == [79, 0, 0]
 
 
+def test_native_same_sector_fragments_own_projected_interior_and_opposing_strip(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([789]))
+    x = 574.5066528320312
+    y = 542.143310546875
+    engine._x_fixed.fill_(round(x * (1 << 16)))
+    engine._y_fixed.fill_(round(y * (1 << 16)))
+    engine.x.fill_(x)
+    engine.y.fill_(y)
+    engine.z.fill_(-24)
+    engine.view_z.fill_(8.40625)
+    engine.view_height.fill_(32.40625)
+    angle_bam = round(348.81591804996503 / 360.0 * (1 << 32))
+    engine._angle_bam.fill_(angle_bam)
+    engine.angle.fill_(angle_bam * (2.0 * math.pi / float(1 << 32)))
+    engine.episode_time.fill_(21)
+
+    (
+        _wall_distance,
+        _wall_along,
+        geometric_intersections,
+        projected_intersections,
+        projected_left_edges,
+        _wall_visibility,
+    ) = engine._native_portal_intersections()
+    rgb = engine.render_native_frame(include_hud=False)
+
+    # Fragment 98's mathematical endpoint ray lies two columns beyond its
+    # half-open span. Fragment 132 owns the interior projected column for the
+    # same sector pair, rather than merely owning its first projected column.
+    assert geometric_intersections[0, 66, 98]
+    assert not projected_intersections[0, 66, 98]
+    assert not geometric_intersections[0, 66, 132]
+    assert projected_intersections[0, 66, 132]
+    assert not projected_left_edges[0, 66, 132]
+    assert engine._native_same_portal_sector_pairs[98, 132]
+    assert rgb[0, 145:165, 66].tolist() == (
+        [[103, 0, 0]] * 5
+        + [[79, 0, 0]] * 5
+        + [[103, 0, 0]] * 10
+    )
+
+    # Projected-only portals 149 and 151 are the near and far sides of one
+    # finite-width sector strip. Doom stores 151's drawseg from inside that
+    # strip instead of leaking three brown tier pixels from the outside face.
+    for wall_index in (149, 151):
+        assert not geometric_intersections[0, 127, wall_index]
+        assert projected_intersections[0, 127, wall_index]
+        assert projected_left_edges[0, 127, wall_index]
+    assert engine._native_opposing_portal_pairs[149, 151]
+    assert rgb[0, 77:80, 127].tolist() == [
+        [0, 0, 35],
+        [0, 0, 0],
+        [0, 0, 0],
+    ]
+
+
 def test_native_pit_boundary_separates_wallscan_owner_from_portal_path(
     pinned_deathmatch_scenario,
 ) -> None:
