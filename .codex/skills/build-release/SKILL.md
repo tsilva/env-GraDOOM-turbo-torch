@@ -9,11 +9,12 @@ Use the repository-owned release path and preserve the distinction between a
 local candidate and an external publication. A local candidate is reversible;
 pushing a release tag or publishing to PyPI is not.
 
-GraDOOM currently has no checked-in release script or GitHub release workflow.
-Build and audit local candidates with this skill, but stop publication requests
-at that missing gate. Do not compensate with a hand-created tag, GitHub Release,
-PyPI token, or manual upload. If repository-owned trusted-publishing automation
-is added later, inspect it and update this skill before publishing.
+The repository publication path is `.github/workflows/release.yml`. A pushed
+`v<version>` tag runs the locked source checks, builds and audits one universal
+wheel and one source distribution, publishes them with PyPI trusted publishing,
+and creates a GitHub Release. A `workflow_dispatch` run validates the same
+source and artifacts but never publishes. Do not manually upload, substitute
+artifacts, or replay only part of the workflow.
 
 Use normal PEP 440 project versions from `pyproject.toml`. Keep that version
 identical to `src/gradoom/__init__.py` and the root `gradoom` entry in `uv.lock`.
@@ -83,11 +84,17 @@ Require all of the following before any tag or publication action:
 - a checked-in trusted-publishing workflow whose tag, artifact, audit, PyPI,
   and GitHub Release contract can be verified from repository source.
 
-The last requirement is currently absent. Stop and report that
-`.github/workflows/release.yml` (or an equivalent repository-owned workflow)
-does not exist. Do not create or switch branches, synthesize release notes,
-tag, push, or publish unless the user separately asks to add the missing release
-infrastructure.
+Create an annotated tag only after every requirement passes, then atomically
+push the current branch and tag:
+
+```bash
+git tag -a v<version> -m "Release v<version>"
+git push --atomic origin HEAD v<version>
+```
+
+Do not create or switch branches, synthesize release notes, or move an existing
+release tag. If the workflow is absent or no longer matches this contract, stop
+before tagging and repair the repository-owned release path first.
 
 Never print, commit, or pass PyPI credentials on a command line. Trusted
 publishing is the only acceptable normal PyPI publication path.
