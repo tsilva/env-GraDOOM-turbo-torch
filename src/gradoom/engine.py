@@ -131,6 +131,7 @@ _NATIVE_SPRITE_MIN_DEPTH_FIXED = 2048 * 4
 # sampled through an integer column ray. Larger gaps identify another BSP
 # branch rather than the half-open endpoint owner of the selected seg.
 _NATIVE_SHARED_ENDPOINT_DEPTH_TOLERANCE = 1.0 / 16.0
+_NATIVE_PROJECTED_OWNER_MAX_WALL_LENGTH = 32.0
 _FIST_RANGE = 64.0
 _CHAINSAW_RANGE = 65.0
 _CHAINSAW_SPREAD_RADIANS = 2.8125 * math.pi / 180.0
@@ -10220,6 +10221,22 @@ class TorchDeathmatchEngine:
             projected_left_edges & torch.isfinite(distances),
             dim=2,
         )
+        # Wide endpoint correction is local to Doom's short boundary-chain
+        # fragments. Extending it across long linedefs can jump to an unrelated
+        # projected span that happens to share the same map vertex.
+        projected_wall_is_short = (
+            self.map.portal_wall_lengths[None, None, :]
+            <= _NATIVE_PROJECTED_OWNER_MAX_WALL_LENGTH
+        )
+        pending_wide_projected_boundary = torch.zeros_like(
+            current_sector,
+            dtype=torch.bool,
+        )
+        pending_wide_projected_endpoint = torch.zeros(
+            (*current_sector.shape, 2),
+            device=self.device,
+            dtype=all_wall_starts.dtype,
+        )
         for _ in range(32):
             current = current_sector.clamp_min(0)
             incident = (all_sectors[None, None, :, 0] == current[:, :, None]) | (
@@ -10288,6 +10305,13 @@ class TorchDeathmatchEngine:
                 | torch.all(
                     all_wall_ends == selected_endpoint[:, :, None, :],
                     dim=3,
+                )
+            )
+            continues_wide_projected_boundary = (
+                pending_wide_projected_boundary
+                & torch.all(
+                    selected_endpoint == pending_wide_projected_endpoint,
+                    dim=2,
                 )
             )
             selected_is_projected = projected_intersections.gather(
@@ -10442,14 +10466,25 @@ class TorchDeathmatchEngine:
                 wall_screen_right.gather(1, wall_index)
                 - wall_screen_left.gather(1, wall_index)
             )
+            selected_owner_is_short = (
+                self.map.portal_wall_lengths[wall_index]
+                <= _NATIVE_PROJECTED_OWNER_MAX_WALL_LENGTH
+            )
             near_projected_owner = (
                 incident
                 & (all_sectors[None, None, :, 1] >= 0)
                 & projected_intersections
                 & projected_left_edges
+                & (
+                    (selected_owner_span[:, :, None] <= 2)
+                    | (
+                        shares_selected_endpoint
+                        & selected_owner_is_short[:, :, None]
+                        & projected_wall_is_short
+                    )
+                )
                 & ~selected_owner_is_projected[:, :, None]
                 & selected_owner_excluded_right_edge[:, :, None]
-                & (selected_owner_span[:, :, None] <= 2)
                 & (distances > previous_distance[:, :, None] + 1e-3)
                 & (
                     torch.abs(distances - distance[:, :, None])
@@ -10467,6 +10502,10 @@ class TorchDeathmatchEngine:
             replace_with_near_projected_owner = torch.isfinite(
                 near_projected_distance
             )
+            wide_projected_owner = (
+                replace_with_near_projected_owner
+                & (selected_owner_span > 2)
+            )
             distance = torch.where(
                 replace_with_near_projected_owner,
                 near_projected_distance,
@@ -10478,20 +10517,25 @@ class TorchDeathmatchEngine:
                 wall_index,
             )
             valid = torch.isfinite(distance)
-            # A one- or two-column mathematical ray hit can lie exactly on
-            # the excluded right edge of its BSP seg. It remains the portal
-            # traversal path, but Doom does not create a drawseg for that
-            # column unless a projected neighbor owns it.
-            tiny_excluded_raster = (
+            # A mathematical ray hit can lie exactly on the excluded right
+            # edge of its BSP seg. It remains the portal traversal path, but
+            # Doom's half-open [sx1, sx2) span creates no drawseg column there.
+            # Keep this no-owner correction narrow: wider boundaries use the
+            # explicit projected-owner and shared-continuation handling below.
+            excluded_right_edge_traversal_only = (
                 ~selected_owner_is_projected
                 & selected_owner_excluded_right_edge
-                & (selected_owner_span <= 2)
                 & ~replace_with_near_projected_owner
+                & (selected_owner_span <= 2)
                 & ~boundary_has_projected_owner
             )
-            raster_valid = valid & ~tiny_excluded_raster
-            # The projected neighbor owns wallscan, but a geometric hit on the
-            # excluded seg still determines the subsector path behind it.
+            raster_valid = (
+                valid
+                & ~excluded_right_edge_traversal_only
+                & ~continues_wide_projected_boundary
+            )
+            # The projected neighbor owns wallscan, while the mathematical ray
+            # still determines the subsector path behind that drawseg.
             geometric_intersection = torch.where(
                 replace_with_near_projected_owner,
                 near_owner_path_is_geometric,
@@ -11560,6 +11604,15 @@ class TorchDeathmatchEngine:
                     ),
                 ),
                 prior_distance,
+            )
+            pending_wide_projected_endpoint = torch.where(
+                wide_projected_owner[:, :, None],
+                selected_endpoint,
+                pending_wide_projected_endpoint,
+            )
+            pending_wide_projected_boundary = wide_projected_owner | (
+                pending_wide_projected_boundary
+                & continues_wide_projected_boundary
             )
             next_sector = torch.where(
                 near_owner_keeps_portal_path,

@@ -1214,6 +1214,116 @@ def test_native_pit_boundary_separates_wallscan_owner_from_portal_path(
     assert rgb[0, 125, 0].tolist() == [67, 0, 0]
 
 
+def test_native_wide_projected_owner_preserves_shared_boundary_traversal(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([789]))
+    engine.x.fill_(569.3474273681641)
+    engine.y.fill_(515.9971313476562)
+    engine.z.fill_(-64)
+    engine.view_z.fill_(-23)
+    engine.angle.fill_(math.radians(175.1440430095289))
+    engine.episode_time.fill_(61)
+    engine.item_available.zero_()
+    engine.enemy_alive.zero_()
+
+    wall_projection_geometry = engine._native_wall_projection_geometry()
+    (
+        _wall_distance,
+        _wall_along,
+        geometric_intersections,
+        projected_intersections,
+        projected_left_edges,
+        _wall_visibility,
+    ) = engine._native_portal_intersections(wall_projection_geometry)
+    rgb = engine.render_native_frame(include_hud=False)
+
+    # The rays cross walls 175 and 180 exactly on their excluded screen-right
+    # edges. Projected-left neighbors 89 and 139 own those raster columns,
+    # while the geometric segs retain the subsector traversal paths behind them.
+    for column, ray_wall, projected_owner in (
+        (36, 175, 89),
+        (44, 180, 139),
+    ):
+        assert geometric_intersections[0, column, ray_wall]
+        assert not projected_intersections[0, column, ray_wall]
+        assert not geometric_intersections[0, column, projected_owner]
+        assert projected_intersections[0, column, projected_owner]
+        assert projected_left_edges[0, column, projected_owner]
+
+    # Wall 181 is the next ray hit at the same map vertex, and its [8, 36)
+    # raster span excludes column 36. It must update the traversed sector
+    # without hiding line 200's two-row BFALL1 tier or the BRICK12 above it.
+    assert geometric_intersections[0, 36, 181]
+    assert not projected_intersections[0, 36, 181]
+    assert rgb[0, 70:78, 36].tolist() == [
+        [111, 87, 67],
+        [71, 51, 35],
+        [123, 99, 79],
+        [123, 99, 79],
+        [91, 0, 0],
+        [103, 0, 0],
+        [79, 0, 0],
+        [91, 0, 0],
+    ]
+    assert rgb[0, 71:78, 44].tolist() == [
+        [91, 0, 0],
+        [79, 0, 0],
+        [79, 0, 0],
+        [79, 0, 0],
+        [79, 0, 0],
+        [79, 0, 0],
+        [79, 0, 0],
+    ]
+
+
+def test_native_wide_projected_owner_keeps_far_wall_sector_path(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([456]))
+    engine.x.fill_(877.9294128417969)
+    engine.y.fill_(540.6578674316406)
+    engine.z.zero_()
+    engine.view_z.fill_(41)
+    engine.angle.fill_(math.radians(165.67382816357394))
+    engine.episode_time.fill_(81)
+    engine.item_available.zero_()
+    engine.enemy_alive.zero_()
+
+    wall_projection_geometry = engine._native_wall_projection_geometry()
+    (
+        _wall_distance,
+        _wall_along,
+        geometric_intersections,
+        projected_intersections,
+        projected_left_edges,
+        _wall_visibility,
+    ) = engine._native_portal_intersections(wall_projection_geometry)
+    rgb = engine.render_native_frame(include_hud=False)
+
+    # Wall 89 owns column 72's drawseg, but the ray crosses excluded wall 175
+    # and then wall 181 at their shared endpoint. Following wall 89 as the
+    # sector path instead would leave sky at row 41 instead of the far BRICK12.
+    assert geometric_intersections[0, 72, 175]
+    assert not projected_intersections[0, 72, 175]
+    assert projected_intersections[0, 72, 89]
+    assert projected_left_edges[0, 72, 89]
+    assert geometric_intersections[0, 72, 181]
+    assert not projected_intersections[0, 72, 181]
+    assert rgb[0, 41, 72].tolist() == [123, 99, 79]
+    assert rgb[0, 122, 72].tolist() == [79, 0, 0]
+
+
 def test_native_walls_reject_collapsed_screen_edge_span(
     pinned_deathmatch_scenario,
 ) -> None:

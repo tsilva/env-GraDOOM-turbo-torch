@@ -168,6 +168,8 @@ def _run_case(
                     )
                     intersection = actual_item_mask & reference_item_mask
                     union = actual_item_mask | reference_item_mask
+                    non_item_mask = ~union
+                    scene_non_item_mask = non_item_mask[: engine.native_view_height]
                     intersection_pixels = torch.sum(intersection)
                     union_pixels = torch.sum(union)
                     record.update(
@@ -187,10 +189,25 @@ def _run_case(
                                 torch.sum(reference_item_mask & ~actual_item_mask)
                             ),
                             "item_reference_pixels": int(torch.sum(reference_item_mask)),
+                            "mae_non_items": float(
+                                absolute_error[non_item_mask].mean()
+                            ),
+                            "mae_scene_non_items": float(
+                                absolute_error[: engine.native_view_height][
+                                    scene_non_item_mask
+                                ].mean()
+                            ),
                         }
                     )
                 records.append(record)
-                ranked.append((record["mae"], record, reference, actual))
+                ranked.append(
+                    (
+                        record.get("mae_non_items", record["mae"]),
+                        record,
+                        reference,
+                        actual,
+                    )
+                )
             if step == last_step:
                 break
             action_index = _action_index(program, step)
@@ -306,6 +323,17 @@ def main() -> int:
         "top": [record for _mae, record, _reference, _actual in top],
     }
     if args.compare_item_occlusion:
+        non_item_errors = np.asarray(
+            [record["mae_non_items"] for record in records],
+            dtype=np.float64,
+        )
+        result.update(
+            {
+                "mean_mae_non_items": float(non_item_errors.mean()),
+                "median_mae_non_items": float(np.median(non_item_errors)),
+                "ranking_metric": "mae_non_items",
+            }
+        )
         result["item_occlusion"] = {
             "max_actual_only_pixels": max(
                 record["item_actual_only_pixels"] for record in records
