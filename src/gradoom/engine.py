@@ -10665,30 +10665,52 @@ class TorchDeathmatchEngine:
             same_selected_owner_sector_pair = (
                 self._native_same_portal_sector_pairs[wall_index]
             )
+            candidate_wall_ids = torch.arange(
+                distances.shape[2],
+                device=self.device,
+                dtype=torch.int64,
+            )[None, None, :]
+            candidate_endpoint_slot = (wall_along > 0.5).to(torch.int64)
+            candidate_has_sector_bridge = (
+                self._native_projected_sector_bridge_mask[
+                    candidate_endpoint_slot,
+                    candidate_wall_ids,
+                    near_owner_path_index[:, :, None],
+                ]
+            )
+            topological_projected_owner = (
+                projected_left_edges
+                & selected_owner_excluded_right_edge[:, :, None]
+                & (selected_owner_span[:, :, None] <= 2)
+                & candidate_has_sector_bridge
+            )
             near_projected_owner = (
                 incident
                 & (all_sectors[None, None, :, 1] >= 0)
                 & projected_intersections
                 & (
-                    same_selected_owner_sector_pair
-                    | (
-                        projected_left_edges
-                        & selected_owner_excluded_right_edge[:, :, None]
-                        & (
-                            (selected_owner_span[:, :, None] <= 2)
-                            | (
-                                shares_selected_endpoint
-                                & selected_owner_is_short[:, :, None]
+                    (
+                        same_selected_owner_sector_pair
+                        | (
+                            projected_left_edges
+                            & selected_owner_excluded_right_edge[:, :, None]
+                            & (
+                                (selected_owner_span[:, :, None] <= 2)
+                                | (
+                                    shares_selected_endpoint
+                                    & selected_owner_is_short[:, :, None]
+                                )
                             )
                         )
                     )
+                    & (
+                        torch.abs(distances - distance[:, :, None])
+                        <= endpoint_distance_tolerance
+                    )
+                    | topological_projected_owner
                 )
                 & ~selected_owner_is_projected[:, :, None]
                 & (distances > previous_distance[:, :, None] + 1e-3)
-                & (
-                    torch.abs(distances - distance[:, :, None])
-                    <= endpoint_distance_tolerance
-                )
             )
             near_projected_distance, near_projected_index = torch.min(
                 torch.where(

@@ -1675,6 +1675,52 @@ def test_native_walls_reject_collapsed_screen_edge_span(
     assert rgb[0, 113, 0].tolist() == [71, 51, 35]
 
 
+def test_native_projected_owner_uses_topological_bridge_beyond_ray_tolerance(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([123]))
+    engine.x.fill_(877.4517669677734)
+    engine.y.fill_(198.21546936035156)
+    engine.z.zero_()
+    engine.view_z.fill_(41)
+    engine.angle.fill_(math.radians(102.16735842222519))
+    engine.episode_time.fill_(41)
+    engine.item_available.zero_()
+    engine.enemy_alive.zero_()
+
+    wall_projection_geometry = engine._native_wall_projection_geometry()
+    (
+        _wall_distance,
+        _wall_along,
+        geometric_intersections,
+        projected_intersections,
+        projected_left_edges,
+        _wall_visibility,
+    ) = engine._native_portal_intersections(wall_projection_geometry)
+    rgb = engine.render_native_frame(include_hud=False)
+
+    # The mathematical ray meets excluded wall 98 at column 91, but Doom's
+    # half-open rasterization assigns the column to projected wall 205. Their
+    # sampled depths exceed the endpoint tolerance even though bridge wall 0
+    # proves the 10 -> 9 -> 0 sector chain at that shared endpoint.
+    assert geometric_intersections[0, 91, 98]
+    assert not projected_intersections[0, 91, 98]
+    assert not geometric_intersections[0, 91, 205]
+    assert projected_intersections[0, 91, 205]
+    assert projected_left_edges[0, 91, 205]
+    assert engine._native_projected_sector_bridge_mask[1, 205, 98]
+    assert engine._native_projected_sector_bridge_indices[1, 205, 98] == 0
+    assert rgb[0, 2, 91].tolist() == [0, 0, 35]
+    assert rgb[0, 4, 91].tolist() == [0, 0, 35]
+    assert rgb[0, 5, 91].tolist() == [0, 0, 0]
+    assert rgb[0, 121, 91].tolist() == [83, 63, 47]
+
+
 def test_native_partially_clipped_solid_owns_left_frustum_column(
     pinned_deathmatch_scenario,
 ) -> None:
