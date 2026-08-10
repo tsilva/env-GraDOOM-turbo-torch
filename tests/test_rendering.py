@@ -1138,6 +1138,82 @@ def test_native_projected_owner_resolves_short_opposite_endpoint_hit(
     ]
 
 
+def test_native_pit_boundary_separates_wallscan_owner_from_portal_path(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([456]))
+    engine.x.fill_(752.9335632324219)
+    engine.y.fill_(49.700897216796875)
+    engine.z.zero_()
+    engine.view_z.fill_(41)
+    engine.angle.fill_(math.radians(62.314453139508714))
+    engine.episode_time.fill_(81)
+    engine.item_available.zero_()
+    engine.enemy_alive.zero_()
+
+    (
+        wall_distance,
+        _wall_along,
+        geometric_intersections,
+        projected_intersections,
+        projected_left_edges,
+        _wall_visibility,
+    ) = engine._native_portal_intersections(
+        engine._native_wall_projection_geometry()
+    )
+    horizontal_offset_fixed, _vertical_step = engine._native_wall_texture_mapping()
+    frame, surface_depth, scene_surface_depth = engine._native_render_flats(
+        engine._current_sector(),
+        engine.view_z,
+    )
+    frame, _scene_depth, _sprite_clip_depth, _sprite_clip_wall = (
+        engine._native_render_portal_walls(
+            frame,
+            engine.view_z,
+            surface_depth,
+            scene_surface_depth,
+        )
+    )
+    rgb = engine.map.playpal[frame.to(torch.int64)]
+
+    # Column 7 crosses tiny portal 86 outside its half-open projected span.
+    # Projected portal 131 owns wallscan, while portal 86 still determines the
+    # sector path behind it; coupling those choices creates a vertical seam.
+    assert geometric_intersections[0, 7, 86]
+    assert not projected_intersections[0, 7, 86]
+    assert not geometric_intersections[0, 7, 131]
+    assert projected_intersections[0, 7, 131]
+    assert projected_left_edges[0, 7, 131]
+    assert rgb[0, 124, 7].tolist() == [67, 0, 0]
+    assert rgb[0, 125, 7].tolist() == [79, 0, 0]
+
+    # Column 12 crosses wall 98 on its excluded right edge, but no projected
+    # left edge owns that boundary column. It remains a traversal event only;
+    # emitting a drawseg leaks BFALL1 over the visible floor.
+    assert geometric_intersections[0, 12, 98]
+    assert not projected_intersections[0, 12, 98]
+    assert not torch.any(
+        projected_left_edges[0, 12] & torch.isfinite(wall_distance[0, 12])
+    )
+    assert rgb[0, 124, 12].tolist() == [83, 63, 47]
+
+    # PrepWallRoundFix intentionally preserves leading texture-coordinate
+    # spill when a clipped drawseg begins at screen x == 0. Wall 192 reverses
+    # this value to -17440 before applying its sidedef offset; clamping it
+    # selects the adjacent BFALL1 column and produces [79, 0, 0] instead.
+    wall_repeat_fixed = torch.round(
+        engine.map.portal_wall_lengths[192] * (1 << 16)
+    ).to(torch.int64)
+    assert horizontal_offset_fixed[0, 0, 192] - wall_repeat_fixed == 17440
+    assert rgb[0, 124, 0].tolist() == [67, 0, 0]
+    assert rgb[0, 125, 0].tolist() == [67, 0, 0]
+
+
 def test_native_walls_reject_collapsed_screen_edge_span(
     pinned_deathmatch_scenario,
 ) -> None:

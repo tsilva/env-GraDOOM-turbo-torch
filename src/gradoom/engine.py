@@ -9166,14 +9166,9 @@ class TorchDeathmatchEngine:
             fraction * horizontal_repeat_fixed[None, None, :].to(torch.float64)
             + 0.5
         ).to(torch.int64)
-        # PrepWallRoundFix repairs numerical spill at the projected endpoints
-        # before wallscan applies the sidedef offset. Clamping is equivalent
-        # for the monotonic mapping of the certified static walls.
-        horizontal_offset_fixed = horizontal_offset_fixed.clamp_min(0)
-        horizontal_offset_fixed = torch.minimum(
-            horizontal_offset_fixed,
-            horizontal_repeat_fixed[None, None, :] - 1,
-        )
+        # Keep endpoint spill until the selected screen span and viewing side
+        # are known. PrepWallRoundFix deliberately leaves a negative leading
+        # column untouched when a clipped drawseg begins at screen x == 0.
 
         inverse_vertical_aspect = torch.tensor(
             self.native_screen_width * 200.0,
@@ -10221,6 +10216,10 @@ class TorchDeathmatchEngine:
             endpoint_owner_distance,
             distances,
         )
+        boundary_has_projected_owner = torch.any(
+            projected_left_edges & torch.isfinite(distances),
+            dim=2,
+        )
         for _ in range(32):
             current = current_sector.clamp_min(0)
             incident = (all_sectors[None, None, :, 0] == current[:, :, None]) | (
@@ -10421,16 +10420,103 @@ class TorchDeathmatchEngine:
                 selected_endpoint_owner,
                 wall_index,
             )
-            valid = torch.isfinite(distance)
-            # The projected neighbor owns wallscan, but a geometric hit on the
-            # excluded seg still determines the subsector path behind it.
-            geometric_intersection = torch.where(
+            near_owner_path_index = wall_index
+            near_owner_path_distance = distance
+            near_owner_path_is_geometric = torch.where(
                 replace_with_endpoint_owner,
                 endpoint_owner_path_is_geometric,
                 geometric_intersections.gather(
                     2,
                     wall_index[:, :, None],
                 ).squeeze(2),
+            )
+            selected_owner_is_projected = projected_intersections.gather(
+                2,
+                wall_index[:, :, None],
+            ).squeeze(2)
+            selected_owner_excluded_right_edge = (
+                wall_screen_right.gather(1, wall_index)
+                == self._native_pixel_x[0, 0].to(torch.int64)[None, :]
+            )
+            selected_owner_span = (
+                wall_screen_right.gather(1, wall_index)
+                - wall_screen_left.gather(1, wall_index)
+            )
+            near_projected_owner = (
+                incident
+                & (all_sectors[None, None, :, 1] >= 0)
+                & projected_intersections
+                & projected_left_edges
+                & ~selected_owner_is_projected[:, :, None]
+                & selected_owner_excluded_right_edge[:, :, None]
+                & (selected_owner_span[:, :, None] <= 2)
+                & (distances > previous_distance[:, :, None] + 1e-3)
+                & (
+                    torch.abs(distances - distance[:, :, None])
+                    <= endpoint_distance_tolerance
+                )
+            )
+            near_projected_distance, near_projected_index = torch.min(
+                torch.where(
+                    near_projected_owner,
+                    distances,
+                    torch.full_like(distances, torch.inf),
+                ),
+                dim=2,
+            )
+            replace_with_near_projected_owner = torch.isfinite(
+                near_projected_distance
+            )
+            distance = torch.where(
+                replace_with_near_projected_owner,
+                near_projected_distance,
+                distance,
+            )
+            wall_index = torch.where(
+                replace_with_near_projected_owner,
+                near_projected_index,
+                wall_index,
+            )
+            valid = torch.isfinite(distance)
+            # A one- or two-column mathematical ray hit can lie exactly on
+            # the excluded right edge of its BSP seg. It remains the portal
+            # traversal path, but Doom does not create a drawseg for that
+            # column unless a projected neighbor owns it.
+            tiny_excluded_raster = (
+                ~selected_owner_is_projected
+                & selected_owner_excluded_right_edge
+                & (selected_owner_span <= 2)
+                & ~replace_with_near_projected_owner
+                & ~boundary_has_projected_owner
+            )
+            raster_valid = valid & ~tiny_excluded_raster
+            # The projected neighbor owns wallscan, but a geometric hit on the
+            # excluded seg still determines the subsector path behind it.
+            geometric_intersection = torch.where(
+                replace_with_near_projected_owner,
+                near_owner_path_is_geometric,
+                torch.where(
+                    replace_with_endpoint_owner,
+                    endpoint_owner_path_is_geometric,
+                    geometric_intersections.gather(
+                        2,
+                        wall_index[:, :, None],
+                    ).squeeze(2),
+                ),
+            )
+            near_owner_path_sectors = all_sectors[near_owner_path_index]
+            near_owner_path_from_front = (
+                current_sector == near_owner_path_sectors[..., 0]
+            )
+            near_owner_path_other = torch.where(
+                near_owner_path_from_front,
+                near_owner_path_sectors[..., 1],
+                near_owner_path_sectors[..., 0],
+            )
+            near_owner_keeps_portal_path = (
+                replace_with_near_projected_owner
+                & near_owner_path_is_geometric
+                & (near_owner_path_other >= 0)
             )
             sectors = self.map.portal_wall_sectors[wall_index]
             front = sectors[..., 0]
@@ -10839,12 +10925,12 @@ class TorchDeathmatchEngine:
             ceiling_plane_bottom = torch.minimum(clipped_top, floor_clip)
             floor_plane_top = torch.maximum(clipped_bottom, ceiling_clip)
             ceiling_plane_span = (
-                (valid & mark_ceiling)[:, None, :]
+                (raster_valid & mark_ceiling)[:, None, :]
                 & (pixel_y >= ceiling_clip[:, None, :])
                 & (pixel_y < ceiling_plane_bottom[:, None, :])
             )
             floor_plane_span = (
-                (valid & mark_floor)[:, None, :]
+                (raster_valid & mark_floor)[:, None, :]
                 & (pixel_y >= floor_plane_top[:, None, :])
                 & (pixel_y < floor_clip[:, None, :])
             )
@@ -10856,22 +10942,26 @@ class TorchDeathmatchEngine:
             )
             plane_is_floor |= unowned_plane & floor_plane_span
             one_span = (
-                (one_sided & valid)[:, None, :]
+                (one_sided & raster_valid)[:, None, :]
                 & (pixel_y >= clipped_top[:, None, :])
                 & (pixel_y < clipped_bottom[:, None, :])
             )
             lower_span = (
-                (~one_sided & valid & (view_floor < other_floor))[:, None, :]
+                (~one_sided & raster_valid & (view_floor < other_floor))[:, None, :]
                 & (pixel_y >= clipped_lower_top[:, None, :])
                 & (pixel_y < clipped_bottom[:, None, :])
             )
             upper_span = (
-                (~one_sided & valid & (view_ceiling > other_ceiling))[:, None, :]
+                (
+                    ~one_sided
+                    & raster_valid
+                    & (view_ceiling > other_ceiling)
+                )[:, None, :]
                 & (pixel_y >= clipped_top[:, None, :])
                 & (pixel_y < clipped_upper_bottom[:, None, :])
             )
             middle_span = (
-                (~one_sided & valid & (middle_texture_id >= 0))[:, None, :]
+                (~one_sided & raster_valid & (middle_texture_id >= 0))[:, None, :]
                 & (pixel_y >= clipped_middle_top[:, None, :])
                 & (pixel_y < clipped_middle_bottom[:, None, :])
             )
@@ -10951,20 +11041,20 @@ class TorchDeathmatchEngine:
             tier_columns = torch.stack(
                 (
                     one_sided
-                    & valid
+                    & raster_valid
                     & (side_textures[..., 0] >= 0)
                     & (clipped_top < clipped_bottom),
                     ~one_sided
-                    & valid
+                    & raster_valid
                     & (middle_texture_id >= 0)
                     & (clipped_middle_top < clipped_middle_bottom),
                     ~one_sided
-                    & valid
+                    & raster_valid
                     & (view_floor < other_floor)
                     & (side_textures[..., 1] >= 0)
                     & (clipped_lower_top < clipped_bottom),
                     ~one_sided
-                    & valid
+                    & raster_valid
                     & (view_ceiling > other_ceiling)
                     & (side_textures[..., 2] >= 0)
                     & (clipped_top < clipped_upper_bottom),
@@ -11012,9 +11102,16 @@ class TorchDeathmatchEngine:
                 horizontal_offset_fixed,
                 horizontal_repeat_fixed - horizontal_offset_fixed,
             )
-            horizontal_offset_fixed = torch.minimum(
-                horizontal_offset_fixed.clamp_min(0),
+            selected_screen_left = wall_screen_left.gather(1, wall_index)
+            horizontal_offset_fixed = torch.where(
+                (selected_screen_left > 0) & (horizontal_offset_fixed < 0),
+                torch.zeros_like(horizontal_offset_fixed),
+                horizontal_offset_fixed,
+            )
+            horizontal_offset_fixed = torch.where(
+                horizontal_offset_fixed >= horizontal_repeat_fixed,
                 horizontal_repeat_fixed - 1,
+                horizontal_offset_fixed,
             )
             texture_offset_x_fixed = torch.round(
                 texture_offset[..., 0] * _FIXED_UNIT
@@ -11131,7 +11228,7 @@ class TorchDeathmatchEngine:
                 clipped_top,
             )
             ceiling_clip = torch.where(
-                valid & ~one_sided & (draws_upper | mark_ceiling),
+                raster_valid & ~one_sided & (draws_upper | mark_ceiling),
                 ceiling_update,
                 ceiling_clip,
             )
@@ -11145,7 +11242,7 @@ class TorchDeathmatchEngine:
                 clipped_bottom,
             )
             floor_clip = torch.where(
-                valid & ~one_sided & (draws_lower | mark_floor),
+                raster_valid & ~one_sided & (draws_lower | mark_floor),
                 floor_update,
                 floor_clip,
             )
@@ -11176,7 +11273,7 @@ class TorchDeathmatchEngine:
                 top_silhouette[:, None, :]
                 & (pixel_y < ceiling_clip[:, None, :])
             )
-            sprite_clip_span &= valid[:, None, :]
+            sprite_clip_span &= raster_valid[:, None, :]
             nearer_sprite_silhouette = sprite_clip_span & (
                 distance[:, None, :] < sprite_clip_depth
             )
@@ -11445,39 +11542,48 @@ class TorchDeathmatchEngine:
             previous_distance = torch.where(
                 valid,
                 torch.where(
-                    projected_solid_keeps_portal_path,
-                    projected_solid_path_distance,
+                    near_owner_keeps_portal_path,
+                    near_owner_path_distance,
                     torch.where(
-                        endpoint_enters_shared & (other_shared_distance < distance),
-                        prior_distance,
+                        projected_solid_keeps_portal_path,
+                        projected_solid_path_distance,
                         torch.where(
-                            endpoint_uses_geometric_path,
-                            geometric_portal_distance,
-                            distance,
+                            endpoint_enters_shared
+                            & (other_shared_distance < distance),
+                            prior_distance,
+                            torch.where(
+                                endpoint_uses_geometric_path,
+                                geometric_portal_distance,
+                                distance,
+                            ),
                         ),
                     ),
                 ),
                 prior_distance,
             )
             next_sector = torch.where(
-                projected_solid_keeps_portal_path,
-                projected_solid_path_other,
+                near_owner_keeps_portal_path,
+                near_owner_path_other,
                 torch.where(
-                    endpoint_uses_geometric_path,
-                    geometric_portal_other,
+                    projected_solid_keeps_portal_path,
+                    projected_solid_path_other,
                     torch.where(
-                        valid
-                        & ~one_sided
-                        & (
-                            geometric_intersection
-                            | endpoint_enters_other
-                            | endpoint_enters_shared
-                        ),
-                        other_sector,
+                        endpoint_uses_geometric_path,
+                        geometric_portal_other,
                         torch.where(
-                            endpoint_only_portal,
-                            current_sector,
-                            torch.full_like(current_sector, -1),
+                            valid
+                            & ~one_sided
+                            & (
+                                geometric_intersection
+                                | endpoint_enters_other
+                                | endpoint_enters_shared
+                            ),
+                            other_sector,
+                            torch.where(
+                                endpoint_only_portal,
+                                current_sector,
+                                torch.full_like(current_sector, -1),
+                            ),
                         ),
                     ),
                 ),
@@ -11638,9 +11744,16 @@ class TorchDeathmatchEngine:
             masked_horizontal_offset,
             masked_horizontal_repeat - masked_horizontal_offset,
         )
-        masked_horizontal_offset = torch.minimum(
-            masked_horizontal_offset.clamp_min(0),
+        masked_screen_left = wall_screen_left.gather(1, masked_wall_index)
+        masked_horizontal_offset = torch.where(
+            (masked_screen_left > 0) & (masked_horizontal_offset < 0),
+            torch.zeros_like(masked_horizontal_offset),
+            masked_horizontal_offset,
+        )
+        masked_horizontal_offset = torch.where(
+            masked_horizontal_offset >= masked_horizontal_repeat,
             masked_horizontal_repeat - 1,
+            masked_horizontal_offset,
         )
         masked_offset_x = torch.round(
             masked_texture_offset[..., 0] * _FIXED_UNIT
