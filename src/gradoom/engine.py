@@ -132,9 +132,6 @@ _NATIVE_SPRITE_MIN_DEPTH_FIXED = 2048 * 4
 # branch rather than the half-open endpoint owner of the selected seg.
 _NATIVE_SHARED_ENDPOINT_DEPTH_TOLERANCE = 1.0 / 16.0
 _NATIVE_PROJECTED_OWNER_MAX_WALL_LENGTH = 32.0
-# Independent wall and plane projections can straddle the same integer raster
-# edge by less than one map unit. Doom's drawseg owns that coincident tier row.
-_NATIVE_COINCIDENT_SURFACE_DEPTH_TOLERANCE = 1.0
 _FIST_RANGE = 64.0
 _CHAINSAW_RANGE = 65.0
 _CHAINSAW_SPREAD_RADIANS = 2.8125 * math.pi / 180.0
@@ -11189,33 +11186,16 @@ class TorchDeathmatchEngine:
                     ),
                 ),
             )
-            in_front_of_surface = (
-                distance[:, None, :]
-                <= surface_depth + _NATIVE_COINCIDENT_SURFACE_DEPTH_TOLERANCE
-            )
-            tier_top_edge = (
-                (one_span & (pixel_y == clipped_top[:, None, :]))
-                | (
-                    middle_span
-                    & (pixel_y == clipped_middle_top[:, None, :])
-                )
-                | (lower_span & (pixel_y == clipped_lower_top[:, None, :]))
-                | (upper_span & (pixel_y == clipped_top[:, None, :]))
-            )
-            # Doom draws a solid one-sided wall before marking either adjacent
-            # visplane, so its already-clipped wallscan span owns every row. Our
-            # flat prepass samples through pixel centers and is only an
-            # approximation at sloped screen-space boundaries; consulting it
-            # there can punch holes through the final solid-wall rows. Two-sided
-            # tiers still need its depth guard, apart from their exact top edge.
+            # Doom's BSP clips every wall tier against the accumulated integer
+            # ceiling/floor silhouettes; it does not z-test two-sided tiers
+            # against a separately sampled flat. The flat prepass is only an
+            # approximation near height transitions, so using its ray depth here
+            # can suppress an entire lower tier and leave floor texels showing
+            # through the pit wall. Raster ownership and the saved clips are the
+            # authoritative visibility test for all wall tiers.
             span = (
                 (one_span | middle_span | lower_span | upper_span)
                 & (texture_id >= 0)
-                & (
-                    in_front_of_surface
-                    | one_span
-                    | tier_top_edge
-                )
                 & ~filled
             )
             # wallscan batches aligned groups of four columns. Its shared

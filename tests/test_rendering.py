@@ -561,6 +561,45 @@ def test_native_two_sided_wall_top_edges_own_flat_boundary(
     assert rgb[0, 47, 202].tolist() == [115, 19, 19]
 
 
+def test_native_two_sided_wall_tiers_own_full_clipped_span(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([123]))
+    engine.x.fill_(496.6570129394531)
+    engine.y.fill_(318.4211883544922)
+    engine.z.zero_()
+    engine.view_z.fill_(41)
+    engine.angle.fill_(math.radians(102.16735842222519))
+    engine.episode_time.fill_(61)
+
+    wall_distance, *_rest = engine._native_portal_intersections()
+    flat_frame, surface_depth, scene_surface_depth = engine._native_render_flats(
+        engine._current_sector(),
+        engine.view_z,
+    )
+    frame, *_depths = engine._native_render_portal_walls(
+        flat_frame.clone(),
+        engine.view_z,
+        surface_depth,
+        scene_surface_depth,
+    )
+    flat_rgb = engine.map.playpal[flat_frame.to(torch.int64)]
+    rgb = engine.map.playpal[frame.to(torch.int64)]
+
+    # Doom clips this lower BLOOD1 wall tier with its accumulated floor and
+    # ceiling silhouettes, then wallscan owns every row in [157, 174). The
+    # independent flat ray is slightly nearer at row 170, but it is not a
+    # wall-tier z-buffer and must not leave its adjacent floor texel visible.
+    assert wall_distance[0, 123, 78] > surface_depth[0, 170, 123]
+    assert flat_rgb[0, 170, 123].tolist() == [91, 0, 0]
+    assert rgb[0, 170, 123].tolist() == [103, 11, 11]
+
+
 def test_native_wall_planes_clip_before_fixed_projection(
     pinned_deathmatch_scenario,
 ) -> None:
