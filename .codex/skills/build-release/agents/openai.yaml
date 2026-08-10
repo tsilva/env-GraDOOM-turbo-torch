@@ -1,0 +1,4 @@
+interface:
+  display_name: "Build Release"
+  short_description: "Build and audit GraDOOM releases"
+  default_prompt: "Use $build-release to build and validate a GraDOOM release candidate."
