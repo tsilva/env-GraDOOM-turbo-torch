@@ -619,6 +619,58 @@ def test_native_masked_posts_and_projected_owner_match_top_screen_boundary(
     assert rgb[0, 184, 23].tolist() == [127, 0, 0]
 
 
+def test_native_projected_portal_chain_owns_excluded_analytic_edge(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([123]))
+    engine.x.fill_(825.3996887207031)
+    engine.y.fill_(440.40032958984375)
+    engine.z.zero_()
+    engine.view_z.fill_(41)
+    engine.angle.fill_(math.radians(102.16735842222519))
+    engine.episode_time.fill_(21)
+
+    (
+        _wall_distance,
+        _wall_along,
+        geometric_intersections,
+        projected_intersections,
+        projected_left_edges,
+        _wall_visibility,
+    ) = engine._native_portal_intersections()
+    flat_frame, surface_depth, scene_surface_depth = engine._native_render_flats(
+        engine._current_sector(),
+        engine.view_z,
+    )
+    frame, *_depths = engine._native_render_portal_walls(
+        flat_frame.clone(),
+        engine.view_z,
+        surface_depth,
+        scene_surface_depth,
+    )
+    flat_rgb = engine.map.playpal[flat_frame.to(torch.int64)]
+    rgb = engine.map.playpal[frame.to(torch.int64)]
+
+    # The tiny sector-10/9 portal and the sector-9/11 waterfall drawseg both
+    # own x=6 through projected left edges. The analytic ray reaches wall 130
+    # beyond its excluded right edge, but that wall must not start BFALL1 two
+    # rows early; the projected continuation begins at the reference row 142.
+    assert projected_intersections[0, 6, 86]
+    assert projected_left_edges[0, 6, 86]
+    assert projected_intersections[0, 6, 194]
+    assert projected_left_edges[0, 6, 194]
+    assert geometric_intersections[0, 6, 130]
+    assert not projected_intersections[0, 6, 130]
+    assert rgb[0, 140, 6].tolist() == flat_rgb[0, 140, 6].tolist() == [87, 67, 51]
+    assert rgb[0, 141, 6].tolist() == flat_rgb[0, 141, 6].tolist() == [91, 71, 43]
+    assert rgb[0, 142, 6].tolist() == [71, 0, 0]
+
+
 def test_native_two_sided_wall_tiers_own_full_clipped_span(
     pinned_deathmatch_scenario,
 ) -> None:

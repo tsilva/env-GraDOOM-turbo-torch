@@ -407,6 +407,54 @@ def _build_projected_portal_bridge_lookup(
     return bridge_indices, bridge_mask
 
 
+def _build_projected_sector_bridge_lookup(
+    scenario: CompiledScenario,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Index projected sector triangles by pending wall, endpoint, and path."""
+    walls = scenario.wall_segments
+    sectors = scenario.wall_sectors
+    wall_count = len(walls)
+    bridge_indices = np.zeros((2, wall_count, wall_count), dtype=np.int64)
+    bridge_mask = np.zeros((2, wall_count, wall_count), dtype=np.bool_)
+    endpoint_groups: dict[tuple[float, float], list[int]] = {}
+    for wall_index, wall in enumerate(walls):
+        for endpoint in (wall[:2], wall[2:]):
+            key = (float(endpoint[0]), float(endpoint[1]))
+            endpoint_groups.setdefault(key, []).append(wall_index)
+
+    for pending_index, pending_wall in enumerate(walls):
+        pending_pair = {int(value) for value in sectors[pending_index]}
+        if -1 in pending_pair or len(pending_pair) != 2:
+            continue
+        for endpoint_slot, endpoint in enumerate(
+            (pending_wall[:2], pending_wall[2:])
+        ):
+            key = (float(endpoint[0]), float(endpoint[1]))
+            endpoint_walls = endpoint_groups[key]
+            for path_index in range(wall_count):
+                if path_index == pending_index:
+                    continue
+                path_pair = {int(value) for value in sectors[path_index]}
+                shared_sector = pending_pair & path_pair
+                if -1 in path_pair or len(path_pair) != 2 or len(shared_sector) != 1:
+                    continue
+                bridge_pair = (pending_pair | path_pair) - shared_sector
+                candidates = [
+                    wall_index
+                    for wall_index in endpoint_walls
+                    if wall_index not in (pending_index, path_index)
+                    and {int(value) for value in sectors[wall_index]} == bridge_pair
+                ]
+                # Preserve runtime BSP ordering when a generic WAD has more
+                # than one projected drawseg for the same sector triangle.
+                if len(candidates) == 1:
+                    bridge_indices[endpoint_slot, pending_index, path_index] = (
+                        candidates[0]
+                    )
+                    bridge_mask[endpoint_slot, pending_index, path_index] = True
+    return bridge_indices, bridge_mask
+
+
 _FINE_SINE_FIXED = _build_fine_sine_fixed()
 _FINE_TANGENT_FIXED = _build_fine_tangent_fixed()
 _TANGENT_TO_ANGLE = _build_tangent_to_angle()
@@ -1451,6 +1499,19 @@ class TorchDeathmatchEngine:
         )
         self._native_projected_portal_bridge_mask = torch.as_tensor(
             portal_bridge_mask,
+            device=device,
+            dtype=torch.bool,
+        )
+        sector_bridge_indices, sector_bridge_mask = (
+            _build_projected_sector_bridge_lookup(scenario)
+        )
+        self._native_projected_sector_bridge_indices = torch.as_tensor(
+            sector_bridge_indices,
+            device=device,
+            dtype=torch.int64,
+        )
+        self._native_projected_sector_bridge_mask = torch.as_tensor(
+            sector_bridge_mask,
             device=device,
             dtype=torch.bool,
         )
@@ -10572,6 +10633,15 @@ class TorchDeathmatchEngine:
                     wall_index[:, :, None],
                 ).squeeze(2),
             )
+            near_owner_path_sectors = all_sectors[near_owner_path_index]
+            near_owner_path_from_front = (
+                current_sector == near_owner_path_sectors[..., 0]
+            )
+            near_owner_path_other = torch.where(
+                near_owner_path_from_front,
+                near_owner_path_sectors[..., 1],
+                near_owner_path_sectors[..., 0],
+            )
             selected_owner_is_projected = projected_intersections.gather(
                 2,
                 wall_index[:, :, None],
@@ -10627,6 +10697,125 @@ class TorchDeathmatchEngine:
                     torch.full_like(distances, torch.inf),
                 ),
                 dim=2,
+            )
+            # A one-column projected portal can be followed by a projected
+            # drawseg joining its far sector to the analytic path's far
+            # sector. The three walls form a sector triangle even when the
+            # path wall does not share their map vertex. Let that bridge own
+            # wallscan while the analytic path continues to drive traversal.
+            pending_endpoint_sectors = all_sectors[
+                pending_endpoint_projected_wall
+            ]
+            pending_endpoint_from_current = (
+                current_sector == pending_endpoint_sectors[..., 0]
+            )
+            pending_endpoint_incident = pending_endpoint_from_current | (
+                current_sector == pending_endpoint_sectors[..., 1]
+            )
+            pending_endpoint_other = torch.where(
+                pending_endpoint_from_current,
+                pending_endpoint_sectors[..., 1],
+                pending_endpoint_sectors[..., 0],
+            )
+            pending_endpoint_wall = self.map.portal_walls[
+                pending_endpoint_projected_wall
+            ]
+            pending_endpoint_slot = torch.all(
+                pending_endpoint_projected_endpoint
+                == pending_endpoint_wall[..., 2:],
+                dim=2,
+            ).to(torch.int64)
+            projected_sector_bridge_index = (
+                self._native_projected_sector_bridge_indices[
+                    pending_endpoint_slot,
+                    pending_endpoint_projected_wall,
+                    near_owner_path_index,
+                ]
+            )
+            projected_sector_bridge_exists = (
+                self._native_projected_sector_bridge_mask[
+                    pending_endpoint_slot,
+                    pending_endpoint_projected_wall,
+                    near_owner_path_index,
+                ]
+            )
+            projected_sector_bridge_sectors = all_sectors[
+                projected_sector_bridge_index
+            ]
+            projected_sector_bridge_matches = (
+                (
+                    (projected_sector_bridge_sectors[..., 0]
+                    == pending_endpoint_other)
+                    & (projected_sector_bridge_sectors[..., 1]
+                    == near_owner_path_other)
+                )
+                | (
+                    (projected_sector_bridge_sectors[..., 1]
+                    == pending_endpoint_other)
+                    & (projected_sector_bridge_sectors[..., 0]
+                    == near_owner_path_other)
+                )
+            )
+            projected_sector_bridge_distance = distances.gather(
+                2,
+                projected_sector_bridge_index[:, :, None],
+            ).squeeze(2)
+            projected_sector_bridge = (
+                pending_endpoint_projected_boundary
+                & pending_endpoint_incident
+                & (pending_endpoint_other >= 0)
+                & (near_owner_path_other >= 0)
+                & (
+                    wall_screen_right.gather(
+                        1,
+                        pending_endpoint_projected_wall,
+                    )
+                    - wall_screen_left.gather(
+                        1,
+                        pending_endpoint_projected_wall,
+                    )
+                    <= 1
+                )
+                & near_owner_path_is_geometric
+                & ~selected_owner_is_projected
+                & selected_owner_excluded_right_edge
+                & projected_sector_bridge_exists
+                & projected_sector_bridge_matches
+                & projected_intersections.gather(
+                    2,
+                    projected_sector_bridge_index[:, :, None],
+                ).squeeze(2)
+                & projected_left_edges.gather(
+                    2,
+                    projected_sector_bridge_index[:, :, None],
+                ).squeeze(2)
+                & (
+                    projected_sector_bridge_distance
+                    > previous_distance
+                    - endpoint_distance_tolerance.gather(
+                        2,
+                        pending_endpoint_projected_wall[:, :, None],
+                    ).squeeze(2)
+                )
+                & (projected_sector_bridge_distance < near_owner_path_distance)
+            )
+            projected_sector_bridge_distance = torch.where(
+                projected_sector_bridge,
+                projected_sector_bridge_distance,
+                torch.full_like(projected_sector_bridge_distance, torch.inf),
+            )
+            use_projected_sector_bridge = (
+                projected_sector_bridge_distance < near_projected_distance
+            )
+            near_projected_distance = torch.where(
+                use_projected_sector_bridge,
+                projected_sector_bridge_distance,
+                near_projected_distance,
+            )
+            near_projected_index = torch.where(
+                use_projected_sector_bridge,
+                projected_sector_bridge_index,
+                near_projected_index,
             )
             replace_with_near_projected_owner = torch.isfinite(
                 near_projected_distance
@@ -10703,15 +10892,6 @@ class TorchDeathmatchEngine:
                     ).squeeze(2),
                 ),
             )
-            near_owner_path_sectors = all_sectors[near_owner_path_index]
-            near_owner_path_from_front = (
-                current_sector == near_owner_path_sectors[..., 0]
-            )
-            near_owner_path_other = torch.where(
-                near_owner_path_from_front,
-                near_owner_path_sectors[..., 1],
-                near_owner_path_sectors[..., 0],
-            )
             near_owner_keeps_portal_path = (
                 replace_with_near_projected_owner
                 & near_owner_path_is_geometric
@@ -10727,9 +10907,13 @@ class TorchDeathmatchEngine:
             # mathematical traversal on its original side, but use the far
             # drawseg's reference-facing sector for tiers, planes, and light.
             render_current = torch.where(
-                completes_projected_opposing_boundary,
-                other_sector,
-                current,
+                use_projected_sector_bridge,
+                pending_endpoint_other,
+                torch.where(
+                    completes_projected_opposing_boundary,
+                    other_sector,
+                    current,
+                ),
             )
             render_from_front = render_current == front
             render_other = torch.where(render_from_front, back, front)
