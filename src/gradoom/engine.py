@@ -132,6 +132,9 @@ _NATIVE_SPRITE_MIN_DEPTH_FIXED = 2048 * 4
 # branch rather than the half-open endpoint owner of the selected seg.
 _NATIVE_SHARED_ENDPOINT_DEPTH_TOLERANCE = 1.0 / 16.0
 _NATIVE_PROJECTED_OWNER_MAX_WALL_LENGTH = 32.0
+# Independent wall and plane projections can straddle the same integer raster
+# edge by less than one map unit. Doom's drawseg owns that coincident tier row.
+_NATIVE_COINCIDENT_SURFACE_DEPTH_TOLERANCE = 1.0
 _FIST_RANGE = 64.0
 _CHAINSAW_RANGE = 65.0
 _CHAINSAW_SPREAD_RADIANS = 2.8125 * math.pi / 180.0
@@ -1432,6 +1435,7 @@ class TorchDeathmatchEngine:
                 & (portal_sectors[:, None, 1] == portal_sectors[None, :, 0])
             )
         )
+        self._native_same_portal_sector_pairs = same_portal_sector_pair
         self._native_opposing_portal_pairs = (
             same_portal_sector_pair
             & ~shares_portal_endpoint
@@ -10296,6 +10300,21 @@ class TorchDeathmatchEngine:
             device=self.device,
             dtype=all_wall_starts.dtype,
         )
+        pending_endpoint_projected_boundary = torch.zeros_like(
+            current_sector,
+            dtype=torch.bool,
+        )
+        pending_endpoint_projected_endpoint = torch.zeros(
+            (*current_sector.shape, 2),
+            device=self.device,
+            dtype=all_wall_starts.dtype,
+        )
+        pending_endpoint_projected_wall = torch.zeros_like(current_sector)
+        pending_endpoint_bridge_boundary = torch.zeros_like(
+            current_sector,
+            dtype=torch.bool,
+        )
+        pending_endpoint_bridge_index = torch.zeros_like(current_sector)
         pending_portal_bridge = torch.zeros_like(current_sector, dtype=torch.bool)
         pending_portal_bridge_index = torch.zeros_like(current_sector)
         pending_portal_bridge_sector = torch.full_like(current_sector, -1)
@@ -10376,6 +10395,40 @@ class TorchDeathmatchEngine:
                     selected_endpoint == pending_wide_projected_endpoint,
                     dim=2,
                 )
+            )
+            continues_endpoint_projected_boundary = (
+                pending_endpoint_projected_boundary
+                & torch.all(
+                    selected_endpoint == pending_endpoint_projected_endpoint,
+                    dim=2,
+                )
+            )
+            selected_endpoint_slot = (selected_along > 0.5).to(torch.int64)
+            endpoint_forward_bridge_index = (
+                self._native_projected_portal_bridge_indices[
+                    selected_endpoint_slot,
+                    wall_index,
+                    pending_endpoint_projected_wall,
+                ]
+            )
+            pending_endpoint_has_forward_bridge = (
+                continues_endpoint_projected_boundary
+                & self._native_projected_portal_bridge_mask[
+                    selected_endpoint_slot,
+                    wall_index,
+                    pending_endpoint_projected_wall,
+                ]
+                & (
+                    distances.gather(
+                        2,
+                        endpoint_forward_bridge_index[:, :, None],
+                    ).squeeze(2)
+                    > distance + 1e-3
+                )
+            )
+            completes_pending_endpoint_bridge = (
+                pending_endpoint_bridge_boundary
+                & (wall_index == pending_endpoint_bridge_index)
             )
             selected_is_projected = projected_intersections.gather(
                 2,
@@ -10533,6 +10586,13 @@ class TorchDeathmatchEngine:
                 self.map.portal_wall_lengths[wall_index]
                 <= _NATIVE_PROJECTED_OWNER_MAX_WALL_LENGTH
             )
+            # Disconnected BSP fragments can bound the same two sectors. If
+            # their infinite-line depths meet at one raster column, the
+            # projected [sx1, sx2) owner supplies wallscan even without a
+            # shared map vertex.
+            same_selected_owner_sector_pair = (
+                self._native_same_portal_sector_pairs[wall_index]
+            )
             near_projected_owner = (
                 incident
                 & (all_sectors[None, None, :, 1] >= 0)
@@ -10545,6 +10605,7 @@ class TorchDeathmatchEngine:
                         & selected_owner_is_short[:, :, None]
                         & projected_wall_is_short
                     )
+                    | same_selected_owner_sector_pair
                 )
                 & ~selected_owner_is_projected[:, :, None]
                 & selected_owner_excluded_right_edge[:, :, None]
@@ -10596,6 +10657,15 @@ class TorchDeathmatchEngine:
                 valid
                 & ~excluded_right_edge_traversal_only
                 & ~continues_wide_projected_boundary
+                & ~(
+                    (
+                        pending_endpoint_has_forward_bridge
+                        | completes_pending_endpoint_bridge
+                    )
+                    & ~selected_is_projected
+                    & selected_excluded_right_edge
+                    & ~replace_with_near_projected_owner
+                )
             )
             # The projected neighbor owns wallscan, while the mathematical ray
             # still determines the subsector path behind that drawseg.
@@ -11085,7 +11155,10 @@ class TorchDeathmatchEngine:
                     ),
                 ),
             )
-            in_front_of_surface = distance[:, None, :] <= surface_depth + 1e-3
+            in_front_of_surface = (
+                distance[:, None, :]
+                <= surface_depth + _NATIVE_COINCIDENT_SURFACE_DEPTH_TOLERANCE
+            )
             tier_top_edge = (
                 (one_span & (pixel_y == clipped_top[:, None, :]))
                 | (
@@ -11744,6 +11817,36 @@ class TorchDeathmatchEngine:
                 pending_wide_projected_boundary
                 & continues_wide_projected_boundary
             )
+            # A projected-only portal can be followed by an excluded geometric
+            # path and then its forward three-sector bridge. The path still
+            # drives subsector traversal, but its right edge emits no drawseg.
+            endpoint_portal_along = wall_along.gather(
+                2,
+                wall_index[:, :, None],
+            ).squeeze(2)
+            endpoint_portal_wall = self.map.portal_walls[wall_index]
+            endpoint_portal_endpoint = torch.where(
+                (endpoint_portal_along <= 0.5)[:, :, None],
+                endpoint_portal_wall[..., :2],
+                endpoint_portal_wall[..., 2:],
+            )
+            pending_endpoint_projected_endpoint = torch.where(
+                endpoint_only_portal[:, :, None],
+                endpoint_portal_endpoint,
+                pending_endpoint_projected_endpoint,
+            )
+            pending_endpoint_projected_wall = torch.where(
+                endpoint_only_portal,
+                wall_index,
+                pending_endpoint_projected_wall,
+            )
+            pending_endpoint_projected_boundary = endpoint_only_portal
+            pending_endpoint_bridge_index = torch.where(
+                pending_endpoint_has_forward_bridge,
+                endpoint_forward_bridge_index,
+                pending_endpoint_bridge_index,
+            )
+            pending_endpoint_bridge_boundary = pending_endpoint_has_forward_bridge
             next_sector = torch.where(
                 near_owner_keeps_portal_path,
                 near_owner_path_other,

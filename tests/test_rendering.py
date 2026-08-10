@@ -1137,6 +1137,50 @@ def test_native_projected_owner_resolves_short_opposite_endpoint_hit(
         [67, 0, 0],
     ]
 
+    # Column 117 first stores projected-only portal 86, then traverses
+    # geometric walls 192 and 194 at their excluded right edges. Those later
+    # segments still select the far visplanes, but emitting their lower tiers
+    # overwrites the reference BFALL1/floor boundary.
+    assert not geometric_intersections[0, 117, 86]
+    assert projected_intersections[0, 117, 86]
+    assert projected_left_edges[0, 117, 86]
+    for traversal_wall in (192, 194):
+        assert geometric_intersections[0, 117, traversal_wall]
+        assert not projected_intersections[0, 117, traversal_wall]
+    assert rgb[0, 128:131, 117].tolist() == [
+        [67, 0, 0],
+        [71, 0, 0],
+        [127, 27, 27],
+    ]
+
+    # Disconnected fragments 174 and 3 join the same sector pair within one
+    # projected column. Fragment 3's left edge owns wallscan even though the
+    # mathematical ray reaches fragment 174 first.
+    assert geometric_intersections[0, 131, 174]
+    assert not projected_intersections[0, 131, 174]
+    assert not geometric_intersections[0, 131, 3]
+    assert projected_intersections[0, 131, 3]
+    assert projected_left_edges[0, 131, 3]
+    assert rgb[0, 145:156, 131].tolist() == [
+        [71, 0, 0],
+        [91, 0, 0],
+        [115, 0, 0],
+        [103, 0, 0],
+        [71, 0, 0],
+        [79, 0, 0],
+        [71, 0, 0],
+        [71, 0, 0],
+        [67, 0, 0],
+        [67, 0, 0],
+        [67, 0, 0],
+    ]
+
+    # Wall and plane projection differ by less than one map unit on these two
+    # integer tier-edge rows. Doom's drawseg owns both rather than leaking the
+    # independently sampled floor through them.
+    assert rgb[0, 145, 235].tolist() == [79, 0, 0]
+    assert rgb[0, 144, 254].tolist() == [79, 0, 0]
+
 
 def test_native_pit_boundary_separates_wallscan_owner_from_portal_path(
     pinned_deathmatch_scenario,
