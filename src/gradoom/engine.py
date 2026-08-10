@@ -1637,6 +1637,20 @@ class TorchDeathmatchEngine:
         self.item_available = torch.ones(
             (n, len(self.map.item_types)), device=device, dtype=torch.bool
         )
+        # AActor::LevelSpawned randomizes the first state's remaining tics for
+        # every unsynchronized map actor.  Keep the visual-only offsets lane-
+        # local and device-resident without coupling them to gameplay RNG.
+        self.item_animation_initial_tics = torch.ones(
+            (n, len(self.map.item_types)), device=device, dtype=torch.int32
+        )
+        animated_items = (
+            (self.map.item_types == 2014)
+            | (self.map.item_types == 2015)
+            | (self.map.item_types == 2018)
+            | (self.map.item_types == 2019)
+        )
+        self._animated_item_slots = torch.nonzero(animated_items).flatten()
+        self._animated_item_hash_slots = self._animated_item_slots[None, :] + 1
         self.frames = torch.zeros(
             (n, frame_stack, self.observation_height, self.observation_width),
             device=device,
@@ -2104,6 +2118,23 @@ class TorchDeathmatchEngine:
         self.hud_ready_ammo.masked_fill_(mask, 50)
         self.hud_ammo_counts[mask] = self.ammo[mask][:, (1, 2, 4, 5)]
         self.item_available[mask] = True
+        item_random = safe_seeds[:, None] ^ (
+            self._animated_item_hash_slots * _HASH_GOLDEN_RATIO_SIGNED
+        )
+        item_random ^= item_random >> 16
+        item_random = torch.bitwise_and(item_random * 0x7FEB352D, _UINT32_MASK)
+        item_random ^= item_random >> 15
+        item_random = torch.bitwise_and(item_random * 0x846CA68B, _UINT32_MASK)
+        item_random = torch.bitwise_and(item_random ^ (item_random >> 16), _UINT32_MASK)
+        randomized_item_tics = (torch.remainder(item_random, 6) + 1).to(torch.int32)
+        current_item_tics = self.item_animation_initial_tics[
+            :, self._animated_item_slots
+        ]
+        self.item_animation_initial_tics[:, self._animated_item_slots] = torch.where(
+            mask[:, None],
+            randomized_item_tics,
+            current_item_tics,
+        )
         frame = self.render_frame()
         self.frames[mask] = frame[mask, None].expand(-1, self.frame_stack, -1, -1)
         self._update_signal_buffer()
@@ -12002,6 +12033,71 @@ class TorchDeathmatchEngine:
             ).values.to(torch.uint8)
         return self._raw_sprite_post_tops
 
+    def _native_item_sprite_ids(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Resolve map-item animation frames and their full-bright states."""
+
+        map_item_sprite = self.map.item_raw_visual_types[None, :].expand(
+            self.num_envs, -1
+        )
+        item_types = self.map.item_types[None, :]
+        item_animation = self.map.raw_item_animation_sprite_ids
+        # LevelSpawned shortens only the first A frame from six tics to a
+        # uniformly selected 1..6. Actor ticking has already consumed the
+        # episode-time tic visible in the rendered frame.
+        item_animation_elapsed = self.episode_time[:, None] + (
+            6 - self.item_animation_initial_tics
+        )
+        bonus_phase = torch.remainder(item_animation_elapsed // 6, 6)
+        health_bonus_frames = torch.stack(
+            (
+                map_item_sprite,
+                item_animation[0].expand_as(map_item_sprite),
+                item_animation[1].expand_as(map_item_sprite),
+                item_animation[2].expand_as(map_item_sprite),
+                item_animation[1].expand_as(map_item_sprite),
+                item_animation[0].expand_as(map_item_sprite),
+            ),
+            dim=2,
+        )
+        armor_bonus_frames = torch.stack(
+            (
+                map_item_sprite,
+                item_animation[3].expand_as(map_item_sprite),
+                item_animation[4].expand_as(map_item_sprite),
+                item_animation[5].expand_as(map_item_sprite),
+                item_animation[4].expand_as(map_item_sprite),
+                item_animation[3].expand_as(map_item_sprite),
+            ),
+            dim=2,
+        )
+        item_row = torch.arange(self.num_envs, device=self.device)[:, None]
+        item_column = torch.arange(len(self.map.item_types), device=self.device)[None, :]
+        map_item_sprite = torch.where(
+            item_types == 2014,
+            health_bonus_frames[item_row, item_column, bonus_phase],
+            map_item_sprite,
+        )
+        map_item_sprite = torch.where(
+            item_types == 2015,
+            armor_bonus_frames[item_row, item_column, bonus_phase],
+            map_item_sprite,
+        )
+        green_armor_phase = torch.remainder(item_animation_elapsed, 13)
+        blue_armor_phase = torch.remainder(item_animation_elapsed, 12)
+        green_armor_bright = (item_types == 2018) & (green_armor_phase >= 6)
+        blue_armor_bright = (item_types == 2019) & (blue_armor_phase >= 6)
+        map_item_sprite = torch.where(
+            green_armor_bright,
+            item_animation[6],
+            map_item_sprite,
+        )
+        map_item_sprite = torch.where(
+            blue_armor_bright,
+            item_animation[7],
+            map_item_sprite,
+        )
+        return map_item_sprite, green_armor_bright | blue_armor_bright
+
     def _native_render_sprites(
         self,
         frame: torch.Tensor,
@@ -12318,59 +12414,7 @@ class TorchDeathmatchEngine:
         map_item_x = self.map.item_spawns[None, :, 0].expand(self.num_envs, -1)
         map_item_y = self.map.item_spawns[None, :, 1].expand(self.num_envs, -1)
         map_item_z = self._item_z[None, :].expand(self.num_envs, -1)
-        map_item_sprite = self.map.item_raw_visual_types[None, :].expand(self.num_envs, -1)
-        item_types = self.map.item_types[None, :]
-        item_animation = self.map.raw_item_animation_sprite_ids
-        bonus_phase = torch.remainder((self.episode_time - 1) // 6, 6)[:, None]
-        health_bonus_frames = torch.stack(
-            (
-                map_item_sprite,
-                item_animation[0].expand_as(map_item_sprite),
-                item_animation[1].expand_as(map_item_sprite),
-                item_animation[2].expand_as(map_item_sprite),
-                item_animation[1].expand_as(map_item_sprite),
-                item_animation[0].expand_as(map_item_sprite),
-            ),
-            dim=2,
-        )
-        armor_bonus_frames = torch.stack(
-            (
-                map_item_sprite,
-                item_animation[3].expand_as(map_item_sprite),
-                item_animation[4].expand_as(map_item_sprite),
-                item_animation[5].expand_as(map_item_sprite),
-                item_animation[4].expand_as(map_item_sprite),
-                item_animation[3].expand_as(map_item_sprite),
-            ),
-            dim=2,
-        )
-        item_row = torch.arange(self.num_envs, device=self.device)[:, None]
-        item_column = torch.arange(len(self.map.item_types), device=self.device)[None, :]
-        map_item_sprite = torch.where(
-            item_types == 2014,
-            health_bonus_frames[item_row, item_column, bonus_phase],
-            map_item_sprite,
-        )
-        map_item_sprite = torch.where(
-            item_types == 2015,
-            armor_bonus_frames[item_row, item_column, bonus_phase],
-            map_item_sprite,
-        )
-        green_armor_phase = torch.remainder(self.episode_time - 1, 13)[:, None]
-        blue_armor_phase = torch.remainder(self.episode_time - 1, 12)[:, None]
-        green_armor_bright = (item_types == 2018) & (green_armor_phase >= 6)
-        blue_armor_bright = (item_types == 2019) & (blue_armor_phase >= 6)
-        map_item_sprite = torch.where(
-            green_armor_bright,
-            item_animation[6],
-            map_item_sprite,
-        )
-        map_item_sprite = torch.where(
-            blue_armor_bright,
-            item_animation[7],
-            map_item_sprite,
-        )
-        map_item_fullbright = green_armor_bright | blue_armor_bright
+        map_item_sprite, map_item_fullbright = self._native_item_sprite_ids()
         item_slots = torch.nonzero(torch.any(self.item_available, dim=0)).flatten()
         if item_slots.numel():
             visible_item_sprite = map_item_sprite[:, item_slots]

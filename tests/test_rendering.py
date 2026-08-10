@@ -1746,6 +1746,50 @@ def test_enemy_fullbright_matches_actor_attack_states() -> None:
     ]
 
 
+@pytest.mark.skipif(not SCENARIO.is_file() or not DOOM2.is_file(), reason="operator WADs absent")
+def test_native_item_animations_use_independent_level_spawn_tics(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        2,
+        device=torch.device("cpu"),
+    )
+    seeds = torch.tensor([123, 456])
+    engine.reset(torch.ones(2, dtype=torch.bool), seeds)
+    first_tics = engine.item_animation_initial_tics.clone()
+    animated = torch.isin(
+        engine.map.item_types,
+        torch.tensor([2014, 2015, 2018, 2019]),
+    )
+
+    assert torch.all((first_tics[:, animated] >= 1) & (first_tics[:, animated] <= 6))
+    assert all(torch.unique(first_tics[lane, animated]).numel() > 1 for lane in range(2))
+    assert not torch.equal(first_tics[0, animated], first_tics[1, animated])
+
+    engine.reset(torch.ones(2, dtype=torch.bool), seeds)
+    assert torch.equal(engine.item_animation_initial_tics, first_tics)
+    engine.reset(torch.tensor([True, False]), torch.tensor([789, 999]))
+    assert not torch.equal(engine.item_animation_initial_tics[0, animated], first_tics[0, animated])
+    assert torch.equal(engine.item_animation_initial_tics[1], first_tics[1])
+
+    green_armor = torch.nonzero(engine.map.item_types == 2018).flatten()[0]
+    armor_bonus = torch.nonzero(engine.map.item_types == 2015).flatten()[0]
+    engine.item_animation_initial_tics[0, green_armor] = 2
+    engine.item_animation_initial_tics[0, armor_bonus] = 4
+    engine.episode_time[0] = 41
+
+    sprites, fullbright = engine._native_item_sprite_ids()
+
+    # ViZDoom seed 123 reaches ARM1B0 with seven tics and BON2B0 with five
+    # tics at this exact episode time. The initial remaining-tic values above
+    # are the corresponding LevelSpawned trace.
+    assert sprites[0, green_armor] == engine.map.raw_item_animation_sprite_ids[6]
+    assert fullbright[0, green_armor]
+    assert sprites[0, armor_bonus] == engine.map.raw_item_animation_sprite_ids[3]
+    assert not fullbright[0, armor_bonus]
+
+
 def test_chaingunner_refire_gap_uses_nonbright_f_frame(
     pinned_deathmatch_scenario,
 ) -> None:
