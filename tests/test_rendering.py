@@ -418,6 +418,46 @@ def test_native_walls_use_reference_fine_angle_rays(
     assert rgb[0, 135, 10].tolist() == [79, 0, 0]
 
 
+def test_native_bsp_fragments_interpolate_wallscan_light_independently(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([456]))
+    engine.x.fill_(718.8914337158203)
+    engine.y.fill_(16.022705078125)
+    engine.z.zero_()
+    engine.view_z.fill_(41)
+    engine.angle.fill_(math.radians(165.67382816357394))
+    engine.episode_time.fill_(41)
+
+    *_intersections, parent_visibility = engine._native_portal_intersections()
+    fragment_geometry = engine._native_projection_geometry_for_fixed_walls(
+        engine.map.portal_projection_fragments_fixed
+    )
+    fragment_x, fragment_y = engine._native_wall_view_coordinates(
+        engine.map.portal_projection_fragments_fixed
+    )
+    fragment_visibility = engine._native_wall_visibility_from_view_coordinates(
+        fragment_x,
+        fragment_y,
+    )
+    frame = engine.render_native_frame(include_hud=False)
+
+    # The node builder splits wall 60 from [576,0]→[544,0] at x=558. Its
+    # visible second fragment has an independent FWallCoords span [101,103)
+    # and rw_light=552115 at column 101. Interpolating from the parent linedef
+    # yields 565287 and selects the next brighter COMPBLUE colormap.
+    assert fragment_geometry[0][0, 60, 1].item() == 101
+    assert fragment_geometry[1][0, 60, 1].item() == 103
+    assert parent_visibility[0, 101, 60, 0].item() == 565287
+    assert fragment_visibility[0, 101, 60, 1, 0].item() == 552115
+    assert frame[0, 1, 101].tolist() == [0, 0, 83]
+
+
 def test_native_portal_clips_bound_solid_wall_against_planes(
     pinned_deathmatch_scenario,
 ) -> None:

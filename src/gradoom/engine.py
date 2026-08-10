@@ -1315,6 +1315,14 @@ class TorchDeathmatchEngine:
         self.render_screen_flashes = render_screen_flashes
         self.debug_checks = device.type == "cpu" if debug_checks is None else debug_checks
         self.map = DeviceScenario.from_host(scenario, device)
+        self._native_split_projection_wall_indices = torch.nonzero(
+            torch.sum(
+                self.map.portal_projection_fragment_mask.to(torch.int64),
+                dim=1,
+            )
+            > 1,
+            as_tuple=False,
+        ).flatten()
         portal_walls = self.map.portal_walls
         portal_starts = portal_walls[:, :2]
         portal_ends = portal_walls[:, 2:]
@@ -9596,54 +9604,14 @@ class TorchDeathmatchEngine:
         )
         return frame, surface_depth, scene_surface_depth
 
-    def _native_portal_intersections(
+    def _native_wall_view_coordinates(
         self,
-        wall_projection_geometry: (
-            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None
-        ) = None,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-    ]:
-        direction = self._native_wall_ray_directions()
-        origin = torch.stack((self.x, self.y), dim=-1)[:, None, None, :]
-        start = self.map.portal_walls[None, None, :, :2]
-        segment = self.map.portal_walls[None, None, :, 2:] - start
-        ray = direction[:, :, None, :]
-        offset = start - origin
-        denominator = ray[..., 0] * segment[..., 1] - ray[..., 1] * segment[..., 0]
-        safe = torch.where(
-            denominator.abs() < 1e-6,
-            torch.ones_like(denominator),
-            denominator,
-        )
-        distance = (offset[..., 0] * segment[..., 1] - offset[..., 1] * segment[..., 0]) / safe
-        along = (offset[..., 0] * ray[..., 1] - offset[..., 1] * ray[..., 0]) / safe
-        geometric_valid = (
-            (denominator.abs() >= 1e-6)
-            & (distance > 0)
-            & (along >= 0)
-            & (along <= 1)
-        )
+        walls_fixed: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Transform fixed-point linedefs or BSP fragments into view space."""
 
-        # FWallCoords projects segment endpoints to integer screen bounds and
-        # renders the resulting [sx1, sx2) range. A pure ray/segment test owns
-        # the last subpixel column on the opposite side of shared vertices.
-        by_wall = geometric_valid.permute(0, 2, 1)
-        has_columns = torch.any(by_wall, dim=2)
-        first_column = torch.argmax(by_wall.to(torch.int64), dim=2)
-        last_column = self.native_screen_width - 1 - torch.argmax(
-            torch.flip(by_wall, dims=(2,)).to(torch.int64),
-            dim=2,
-        )
-        screen_left = first_column
-        screen_right = last_column + 1
-
-        walls_fixed = torch.round(self.map.portal_walls * _FIXED_UNIT).to(torch.int64)
+        wall_shape = walls_fixed.shape[:-1]
+        flat_walls = walls_fixed.reshape(-1, 4)
         visible_x_fixed = self._x_fixed.to(torch.float32) / _FIXED_UNIT
         visible_y_fixed = self._y_fixed.to(torch.float32) / _FIXED_UNIT
         view_x_fixed = torch.where(
@@ -9656,8 +9624,8 @@ class TorchDeathmatchEngine:
             torch.round(self.y * _FIXED_UNIT).to(torch.int64),
             self._y_fixed,
         )
-        relative_x = walls_fixed[None, :, 0::2] - view_x_fixed[:, None, None]
-        relative_y = walls_fixed[None, :, 1::2] - view_y_fixed[:, None, None]
+        relative_x = flat_walls[None, :, 0::2] - view_x_fixed[:, None, None]
+        relative_y = flat_walls[None, :, 1::2] - view_y_fixed[:, None, None]
         fine_angle = self._native_view_angle_bam() >> _ANGLE_TO_FINE_SHIFT
         view_sine = self._fine_sine_fixed[fine_angle][:, None, None]
         view_cosine = self._fine_sine_fixed[
@@ -9669,8 +9637,20 @@ class TorchDeathmatchEngine:
         transformed_y = (
             relative_x * view_cosine + relative_y * view_sine
         ) >> 20
+        return (
+            transformed_x.reshape(self.num_envs, *wall_shape, 2),
+            transformed_y.reshape(self.num_envs, *wall_shape, 2),
+        )
+
+    def _native_wall_visibility_from_view_coordinates(
+        self,
+        transformed_x: torch.Tensor,
+        transformed_y: torch.Tensor,
+    ) -> torch.Tensor:
+        """Interpolate wallscan visibility over an arbitrary wall batch."""
 
         center_fixed = (self.native_screen_width // 2) * _FIXED_UNIT
+        wall_shape = transformed_x.shape[1:-1]
 
         def interpolate_wall_visibility(
             ordered_x: torch.Tensor,
@@ -9746,20 +9726,79 @@ class TorchDeathmatchEngine:
                 light_right - light_left,
                 (wall_screen_right - wall_screen_left).clamp_min(1),
             )
-            return light_left[:, None, :] + (
-                self._native_pixel_x[0, 0].to(torch.int64)[None, :, None]
-                - wall_screen_left[:, None, :]
-            ) * light_step[:, None, :]
+            pixel_shape = (1, self.native_screen_width) + (1,) * len(wall_shape)
+            pixel_x = self._native_pixel_x[0, 0].to(torch.int64).reshape(pixel_shape)
+            return light_left[:, None] + (
+                pixel_x - wall_screen_left[:, None]
+            ) * light_step[:, None]
 
-        wall_visibility = torch.stack(
+        return torch.stack(
             (
                 interpolate_wall_visibility(transformed_x, transformed_y),
                 interpolate_wall_visibility(
-                    torch.flip(transformed_x, dims=(2,)),
-                    torch.flip(transformed_y, dims=(2,)),
+                    torch.flip(transformed_x, dims=(-1,)),
+                    torch.flip(transformed_y, dims=(-1,)),
                 ),
             ),
-            dim=3,
+            dim=-1,
+        )
+
+    def _native_portal_intersections(
+        self,
+        wall_projection_geometry: (
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None
+        ) = None,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        direction = self._native_wall_ray_directions()
+        origin = torch.stack((self.x, self.y), dim=-1)[:, None, None, :]
+        start = self.map.portal_walls[None, None, :, :2]
+        segment = self.map.portal_walls[None, None, :, 2:] - start
+        ray = direction[:, :, None, :]
+        offset = start - origin
+        denominator = ray[..., 0] * segment[..., 1] - ray[..., 1] * segment[..., 0]
+        safe = torch.where(
+            denominator.abs() < 1e-6,
+            torch.ones_like(denominator),
+            denominator,
+        )
+        distance = (offset[..., 0] * segment[..., 1] - offset[..., 1] * segment[..., 0]) / safe
+        along = (offset[..., 0] * ray[..., 1] - offset[..., 1] * ray[..., 0]) / safe
+        geometric_valid = (
+            (denominator.abs() >= 1e-6)
+            & (distance > 0)
+            & (along >= 0)
+            & (along <= 1)
+        )
+
+        # FWallCoords projects segment endpoints to integer screen bounds and
+        # renders the resulting [sx1, sx2) range. A pure ray/segment test owns
+        # the last subpixel column on the opposite side of shared vertices.
+        by_wall = geometric_valid.permute(0, 2, 1)
+        has_columns = torch.any(by_wall, dim=2)
+        first_column = torch.argmax(by_wall.to(torch.int64), dim=2)
+        last_column = self.native_screen_width - 1 - torch.argmax(
+            torch.flip(by_wall, dims=(2,)).to(torch.int64),
+            dim=2,
+        )
+        screen_left = first_column
+        screen_right = last_column + 1
+
+        walls_fixed = torch.round(self.map.portal_walls * _FIXED_UNIT).to(torch.int64)
+        transformed_x, transformed_y = self._native_wall_view_coordinates(
+            walls_fixed
+        )
+
+        center_fixed = (self.native_screen_width // 2) * _FIXED_UNIT
+        wall_visibility = self._native_wall_visibility_from_view_coordinates(
+            transformed_x,
+            transformed_y,
         )
 
         safe_transformed_y = torch.where(
@@ -9905,6 +9944,65 @@ class TorchDeathmatchEngine:
             projected_left_edges,
             wall_visibility,
         ) = self._native_portal_intersections(wall_projection_geometry)
+        split_wall_indices = self._native_split_projection_wall_indices
+        split_fragments_fixed = self.map.portal_projection_fragments_fixed[
+            split_wall_indices
+        ]
+        fragment_x, fragment_y = self._native_wall_view_coordinates(
+            split_fragments_fixed
+        )
+        fragment_visibility = self._native_wall_visibility_from_view_coordinates(
+            fragment_x,
+            fragment_y,
+        )
+        pixel_x_by_fragment = self._native_pixel_x[0, 0].to(torch.int64).reshape(
+            1,
+            self.native_screen_width,
+            1,
+            1,
+        )
+        fragment_owns_column = (
+            self.map.portal_projection_fragment_mask[
+                None,
+                None,
+                split_wall_indices,
+                :,
+            ]
+            & (
+                fragment_screen_right[:, split_wall_indices]
+                > fragment_screen_left[:, split_wall_indices]
+            )[:, None, :, :]
+            & (
+                pixel_x_by_fragment
+                >= fragment_screen_left[:, split_wall_indices, :][:, None, :, :]
+            )
+            & (
+                pixel_x_by_fragment
+                < fragment_screen_right[:, split_wall_indices, :][:, None, :, :]
+            )
+        )
+        has_projection_fragment = torch.any(fragment_owns_column, dim=3)
+        projection_fragment_slot = torch.argmax(
+            fragment_owns_column.to(torch.int64),
+            dim=3,
+        )
+        selected_fragment_visibility = fragment_visibility.gather(
+            3,
+            projection_fragment_slot[..., None, None].expand(-1, -1, -1, 1, 2),
+        ).squeeze(3)
+        # Runtime BSP splits produce independent FWallCoords and therefore
+        # independent rw_light/rw_lightstep interpolation. The parent linedef
+        # still owns collision and texture mapping, but not wallscan lighting.
+        split_wall_visibility = torch.where(
+            has_projection_fragment[..., None],
+            selected_fragment_visibility,
+            wall_visibility[:, :, split_wall_indices],
+        )
+        wall_visibility = wall_visibility.index_copy(
+            2,
+            split_wall_indices,
+            split_wall_visibility,
+        )
         wall_horizontal_offsets, wall_vertical_steps = self._native_wall_texture_mapping()
         filled = torch.zeros_like(frame, dtype=torch.bool)
         plane_sector = torch.full_like(frame, -1, dtype=torch.int64)
