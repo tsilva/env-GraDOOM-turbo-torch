@@ -361,6 +361,52 @@ def _build_rocket_wall_grid(
     )
 
 
+def _build_projected_portal_bridge_lookup(
+    scenario: CompiledScenario,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Index three-sector boundary chains by path wall, endpoint, and owner."""
+    walls = scenario.wall_segments
+    sectors = scenario.wall_sectors
+    wall_count = len(walls)
+    bridge_indices = np.zeros((2, wall_count, wall_count), dtype=np.int64)
+    bridge_mask = np.zeros((2, wall_count, wall_count), dtype=np.bool_)
+    endpoint_groups: dict[tuple[float, float], list[int]] = {}
+    for wall_index, wall in enumerate(walls):
+        for endpoint in (wall[:2], wall[2:]):
+            key = (float(endpoint[0]), float(endpoint[1]))
+            endpoint_groups.setdefault(key, []).append(wall_index)
+
+    for path_index, path_wall in enumerate(walls):
+        path_pair = {int(value) for value in sectors[path_index]}
+        if -1 in path_pair or len(path_pair) != 2:
+            continue
+        for endpoint_slot, endpoint in enumerate((path_wall[:2], path_wall[2:])):
+            key = (float(endpoint[0]), float(endpoint[1]))
+            endpoint_walls = endpoint_groups[key]
+            for owner_index in endpoint_walls:
+                if owner_index == path_index:
+                    continue
+                owner_pair = {int(value) for value in sectors[owner_index]}
+                shared_sector = path_pair & owner_pair
+                if -1 in owner_pair or len(owner_pair) != 2 or len(shared_sector) != 1:
+                    continue
+                bridge_pair = (path_pair | owner_pair) - shared_sector
+                candidates = [
+                    wall_index
+                    for wall_index in endpoint_walls
+                    if wall_index not in (path_index, owner_index)
+                    and {int(value) for value in sectors[wall_index]} == bridge_pair
+                ]
+                # Ambiguous parallel bridges require runtime BSP ordering; do
+                # not guess when a generic WAD supplies more than one.
+                if len(candidates) == 1:
+                    bridge_indices[endpoint_slot, path_index, owner_index] = (
+                        candidates[0]
+                    )
+                    bridge_mask[endpoint_slot, path_index, owner_index] = True
+    return bridge_indices, bridge_mask
+
+
 _FINE_SINE_FIXED = _build_fine_sine_fixed()
 _FINE_TANGENT_FIXED = _build_fine_tangent_fixed()
 _TANGENT_TO_ANGLE = _build_tangent_to_angle()
@@ -1391,6 +1437,19 @@ class TorchDeathmatchEngine:
             & ~shares_portal_endpoint
             & (portal_direction_dot < 0)
             & (torch.abs(portal_direction_cross) < 1e-6)
+        )
+        portal_bridge_indices, portal_bridge_mask = (
+            _build_projected_portal_bridge_lookup(scenario)
+        )
+        self._native_projected_portal_bridge_indices = torch.as_tensor(
+            portal_bridge_indices,
+            device=device,
+            dtype=torch.int64,
+        )
+        self._native_projected_portal_bridge_mask = torch.as_tensor(
+            portal_bridge_mask,
+            device=device,
+            dtype=torch.bool,
         )
         (
             self._rocket_wall_grid_minimum_x,
@@ -10237,6 +10296,10 @@ class TorchDeathmatchEngine:
             device=self.device,
             dtype=all_wall_starts.dtype,
         )
+        pending_portal_bridge = torch.zeros_like(current_sector, dtype=torch.bool)
+        pending_portal_bridge_index = torch.zeros_like(current_sector)
+        pending_portal_bridge_sector = torch.full_like(current_sector, -1)
+        pending_portal_bridge_exit_distance = torch.zeros_like(previous_distance)
         for _ in range(32):
             current = current_sector.clamp_min(0)
             incident = (all_sectors[None, None, :, 0] == current[:, :, None]) | (
@@ -11583,6 +11646,60 @@ class TorchDeathmatchEngine:
                 & torch.isfinite(geometric_portal_distance)
                 & (geometric_portal_other >= 0)
             )
+            geometric_portal_along = wall_along.gather(
+                2,
+                geometric_portal_index[:, :, None],
+            ).squeeze(2)
+            portal_bridge_endpoint_slot = (
+                geometric_portal_along > 0.5
+            ).to(torch.int64)
+            projected_portal_bridge_index = (
+                self._native_projected_portal_bridge_indices[
+                    portal_bridge_endpoint_slot,
+                    geometric_portal_index,
+                    wall_index,
+                ]
+            )
+            projected_portal_bridge_exists = (
+                self._native_projected_portal_bridge_mask[
+                    portal_bridge_endpoint_slot,
+                    geometric_portal_index,
+                    wall_index,
+                ]
+            )
+            projected_portal_bridge_distance = distances.gather(
+                2,
+                projected_portal_bridge_index[:, :, None],
+            ).squeeze(2)
+            geometric_portal_tolerance = endpoint_distance_tolerance.gather(
+                2,
+                geometric_portal_index[:, :, None],
+            ).squeeze(2)
+            endpoint_portal_bridge = (
+                endpoint_uses_geometric_path
+                & projected_portal_bridge_exists
+                & projected_intersections.gather(
+                    2,
+                    projected_portal_bridge_index[:, :, None],
+                ).squeeze(2)
+                & projected_left_edges.gather(
+                    2,
+                    projected_portal_bridge_index[:, :, None],
+                ).squeeze(2)
+                & (projected_portal_bridge_distance > prior_distance + 1e-3)
+                & (
+                    torch.abs(
+                        projected_portal_bridge_distance
+                        - geometric_portal_distance
+                    )
+                    <= geometric_portal_tolerance
+                )
+            )
+            completes_pending_portal_bridge = (
+                valid
+                & pending_portal_bridge
+                & (wall_index == pending_portal_bridge_index)
+            )
             previous_distance = torch.where(
                 valid,
                 torch.where(
@@ -11604,6 +11721,19 @@ class TorchDeathmatchEngine:
                     ),
                 ),
                 prior_distance,
+            )
+            previous_distance = torch.where(
+                valid & endpoint_portal_bridge,
+                prior_distance,
+                previous_distance,
+            )
+            previous_distance = torch.where(
+                valid & completes_pending_portal_bridge,
+                torch.maximum(
+                    distance,
+                    pending_portal_bridge_exit_distance,
+                ),
+                previous_distance,
             )
             pending_wide_projected_endpoint = torch.where(
                 wide_projected_owner[:, :, None],
@@ -11641,6 +11771,36 @@ class TorchDeathmatchEngine:
                     ),
                 ),
             )
+            next_sector = torch.where(
+                endpoint_portal_bridge,
+                other_sector,
+                next_sector,
+            )
+            next_sector = torch.where(
+                completes_pending_portal_bridge,
+                pending_portal_bridge_sector,
+                next_sector,
+            )
+            # At a three-sector vertex Doom stores the projected owner, the
+            # portal joining its far sector to the ray path, and finally the
+            # excluded geometric seg. Rewind for one layer so the middle tier
+            # renders, then advance past the excluded path without crossing it.
+            pending_portal_bridge_index = torch.where(
+                endpoint_portal_bridge,
+                projected_portal_bridge_index,
+                pending_portal_bridge_index,
+            )
+            pending_portal_bridge_sector = torch.where(
+                endpoint_portal_bridge,
+                geometric_portal_other,
+                pending_portal_bridge_sector,
+            )
+            pending_portal_bridge_exit_distance = torch.where(
+                endpoint_portal_bridge,
+                geometric_portal_distance,
+                pending_portal_bridge_exit_distance,
+            )
+            pending_portal_bridge = endpoint_portal_bridge
             current_sector = next_sector
         exact_plane = (plane_sector >= 0) & ~filled
         safe_plane_sector = plane_sector.clamp_min(0)

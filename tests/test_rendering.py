@@ -1324,6 +1324,55 @@ def test_native_wide_projected_owner_keeps_far_wall_sector_path(
     assert rgb[0, 122, 72].tolist() == [79, 0, 0]
 
 
+def test_native_projected_portal_bridge_draws_intermediate_sector_tier(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([789]))
+    engine.x.fill_(569.3474273681641)
+    engine.y.fill_(515.9971313476562)
+    engine.z.fill_(-64)
+    engine.view_z.fill_(-27)
+    engine.angle.fill_(math.radians(34.51904297678709))
+    engine.episode_time.fill_(21)
+    engine.item_available.zero_()
+    engine.enemy_alive.zero_()
+
+    wall_projection_geometry = engine._native_wall_projection_geometry()
+    (
+        _wall_distance,
+        _wall_along,
+        geometric_intersections,
+        projected_intersections,
+        projected_left_edges,
+        _wall_visibility,
+    ) = engine._native_portal_intersections(wall_projection_geometry)
+    rgb = engine.render_native_frame(include_hud=False)
+
+    # The ray crosses excluded wall 192 from sector 10 to 11, while wall 86
+    # owns column 29 from sector 10 to 9. Doom stores projected bridge 194
+    # between them, completing the -8 -> -4 -> 0 BFALL1 boundary chain.
+    assert geometric_intersections[0, 29, 192]
+    assert not projected_intersections[0, 29, 192]
+    for projected_wall in (86, 194):
+        assert not geometric_intersections[0, 29, projected_wall]
+        assert projected_intersections[0, 29, projected_wall]
+        assert projected_left_edges[0, 29, projected_wall]
+    assert engine._native_projected_portal_bridge_mask[0, 192, 86]
+    assert engine._native_projected_portal_bridge_indices[0, 192, 86] == 194
+    assert rgb[0, 24:29, 29].tolist() == [
+        [79, 0, 0],
+        [79, 0, 0],
+        [79, 0, 0],
+        [103, 0, 0],
+        [103, 0, 0],
+    ]
+
+
 def test_native_walls_reject_collapsed_screen_edge_span(
     pinned_deathmatch_scenario,
 ) -> None:
