@@ -1060,6 +1060,84 @@ def test_native_projected_endpoint_owner_preserves_geometric_portal_path(
     assert rgb[0, 140, 21].tolist() == [71, 0, 0]
 
 
+def test_native_projected_owner_resolves_short_opposite_endpoint_hit(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([789]))
+    engine.x.fill_(262.9338836669922)
+    engine.y.fill_(576.4520568847656)
+    engine.z.zero_()
+    engine.view_z.fill_(41)
+    engine.angle.fill_(math.radians(348.81591804996503))
+    engine.episode_time.fill_(61)
+
+    (
+        wall_distance,
+        _wall_along,
+        geometric_intersections,
+        projected_intersections,
+        projected_left_edges,
+        _wall_visibility,
+    ) = engine._native_portal_intersections()
+    frame, surface_depth, scene_surface_depth = engine._native_render_flats(
+        engine._current_sector(),
+        engine.view_z,
+    )
+    frame, _scene_depth, _sprite_clip_depth, _sprite_clip_wall = (
+        engine._native_render_portal_walls(
+            frame,
+            engine.view_z,
+            surface_depth,
+            scene_surface_depth,
+        )
+    )
+    direct_frame = frame
+    assert engine._native_direct_endpoint_neighbors is not None
+    engine._native_direct_endpoint_neighbors = None
+    generic_frame, generic_surface_depth, generic_scene_surface_depth = (
+        engine._native_render_flats(
+            engine._current_sector(),
+            engine.view_z,
+        )
+    )
+    generic_frame, *_generic_depths = engine._native_render_portal_walls(
+        generic_frame,
+        engine.view_z,
+        generic_surface_depth,
+        generic_scene_surface_depth,
+    )
+    assert torch.equal(direct_frame, generic_frame)
+    rgb = engine.map.playpal[frame.to(torch.int64)]
+
+    # The column ray geometrically crosses tiny portal 68 near its end, but
+    # FWallCoords excludes column 124 from that seg's half-open span. Portal
+    # 191 owns the column through its other shared endpoint and must provide
+    # the BFALL1 wallscan while portal 68 retains the subsector path.
+    assert geometric_intersections[0, 124, 68]
+    assert not projected_intersections[0, 124, 68]
+    assert not geometric_intersections[0, 124, 191]
+    assert projected_intersections[0, 124, 191]
+    assert projected_left_edges[0, 124, 191]
+    owner_depth_delta = wall_distance[0, 124, 191] - wall_distance[0, 124, 68]
+    assert 0 < owner_depth_delta <= max(wall_distance[0, 124, 68] / 128, 4)
+    assert rgb[0, 134:143, 124].tolist() == [
+        [91, 0, 0],
+        [103, 0, 0],
+        [115, 0, 0],
+        [71, 0, 0],
+        [79, 0, 0],
+        [71, 0, 0],
+        [71, 0, 0],
+        [71, 0, 0],
+        [67, 0, 0],
+    ]
+
+
 def test_native_walls_reject_collapsed_screen_edge_span(
     pinned_deathmatch_scenario,
 ) -> None:

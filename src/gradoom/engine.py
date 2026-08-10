@@ -1323,6 +1323,39 @@ class TorchDeathmatchEngine:
             > 1,
             as_tuple=False,
         ).flatten()
+        endpoint_neighbor_starts = self.map.portal_endpoint_neighbor_starts
+        endpoint_neighbor_ends = self.map.portal_endpoint_neighbor_ends
+        start_neighbor_counts = torch.sum(
+            endpoint_neighbor_starts.to(torch.int64),
+            dim=1,
+        )
+        end_neighbor_counts = torch.sum(
+            endpoint_neighbor_ends.to(torch.int64),
+            dim=1,
+        )
+        if bool(
+            torch.all(start_neighbor_counts <= 1)
+            & torch.all(end_neighbor_counts <= 1)
+        ):
+            endpoint_neighbors = self.map.portal_endpoint_neighbors
+            start_slots = torch.argmax(
+                endpoint_neighbor_starts.to(torch.int64),
+                dim=1,
+            )
+            end_slots = torch.argmax(
+                endpoint_neighbor_ends.to(torch.int64),
+                dim=1,
+            )
+            self._native_direct_endpoint_neighbors = (
+                endpoint_neighbors.gather(1, start_slots[:, None]).squeeze(1),
+                endpoint_neighbors.gather(1, end_slots[:, None]).squeeze(1),
+                start_slots,
+                end_slots,
+                start_neighbor_counts > 0,
+                end_neighbor_counts > 0,
+            )
+        else:
+            self._native_direct_endpoint_neighbors = None
         portal_walls = self.map.portal_walls
         portal_starts = portal_walls[:, :2]
         portal_ends = portal_walls[:, 2:]
@@ -10030,41 +10063,149 @@ class TorchDeathmatchEngine:
         all_sectors = self.map.portal_wall_sectors
         all_wall_starts = self.map.portal_walls[None, None, :, :2]
         all_wall_ends = self.map.portal_walls[None, None, :, 2:]
-        endpoint_neighbors = self.map.portal_endpoint_neighbors
-        neighbor_distances = distances[:, :, endpoint_neighbors]
-        neighbor_projected = projected_intersections[:, :, endpoint_neighbors]
-        neighbor_left_edges = projected_left_edges[:, :, endpoint_neighbors]
-        selected_endpoint_neighbors = torch.where(
-            (wall_along <= 0.5)[:, :, :, None],
-            self.map.portal_endpoint_neighbor_starts[None, None, :, :],
-            self.map.portal_endpoint_neighbor_ends[None, None, :, :],
+        # If a two-sided seg projects to at most one column, its linear ray
+        # hit can lie closer to the opposite map endpoint even though that
+        # endpoint's neighboring seg owns the half-open raster span. Resolve
+        # both endpoints for only these subpixel portals; wider segs retain
+        # the ray-selected endpoint and avoid unrelated boundary jumps.
+        subpixel_two_sided = (
+            (wall_screen_right - wall_screen_left <= 1)
+            & (self.map.portal_wall_sectors[None, :, 1] >= 0)
         )
-        endpoint_owner_distance, endpoint_owner_slot = torch.min(
-            torch.where(
-                neighbor_projected
-                & neighbor_left_edges
-                & selected_endpoint_neighbors,
-                neighbor_distances,
-                torch.full_like(neighbor_distances, torch.inf),
-            ),
-            dim=3,
+        endpoint_distance_tolerance = torch.maximum(
+            distances.abs() / 128.0,
+            torch.full_like(distances, 4.0),
         )
-        endpoint_owner_index = torch.gather(
-            endpoint_neighbors[None, None, :, :].expand(
-                self.num_envs,
-                self.native_screen_width,
-                -1,
-                -1,
-            ),
-            3,
-            endpoint_owner_slot[:, :, :, None],
-        ).squeeze(3)
+        if self._native_direct_endpoint_neighbors is not None:
+            (
+                start_neighbor_index,
+                end_neighbor_index,
+                start_neighbor_slot,
+                end_neighbor_slot,
+                has_start_neighbor,
+                has_end_neighbor,
+            ) = self._native_direct_endpoint_neighbors
+            ray_uses_start = wall_along <= 0.5
+            ray_neighbor_index = torch.where(
+                ray_uses_start,
+                start_neighbor_index[None, None, :],
+                end_neighbor_index[None, None, :],
+            )
+            ray_neighbor_slot = torch.where(
+                ray_uses_start,
+                start_neighbor_slot[None, None, :],
+                end_neighbor_slot[None, None, :],
+            )
+            ray_neighbor_exists = torch.where(
+                ray_uses_start,
+                has_start_neighbor[None, None, :],
+                has_end_neighbor[None, None, :],
+            )
+            ray_neighbor_distance = distances.gather(2, ray_neighbor_index)
+            ray_neighbor_owns_column = (
+                ray_neighbor_exists
+                & projected_intersections.gather(2, ray_neighbor_index)
+                & projected_left_edges.gather(2, ray_neighbor_index)
+            )
+            opposite_neighbor_index = torch.where(
+                ray_uses_start,
+                end_neighbor_index[None, None, :],
+                start_neighbor_index[None, None, :],
+            )
+            opposite_neighbor_slot = torch.where(
+                ray_uses_start,
+                end_neighbor_slot[None, None, :],
+                start_neighbor_slot[None, None, :],
+            )
+            opposite_neighbor_exists = torch.where(
+                ray_uses_start,
+                has_end_neighbor[None, None, :],
+                has_start_neighbor[None, None, :],
+            )
+            opposite_neighbor_distance = distances.gather(
+                2,
+                opposite_neighbor_index,
+            )
+            opposite_neighbor_owns_column = (
+                subpixel_two_sided[:, None, :]
+                & opposite_neighbor_exists
+                & projected_intersections.gather(2, opposite_neighbor_index)
+                & projected_left_edges.gather(2, opposite_neighbor_index)
+                & (
+                    torch.abs(opposite_neighbor_distance - distances)
+                    <= endpoint_distance_tolerance
+                )
+            )
+            use_opposite_neighbor = opposite_neighbor_owns_column & (
+                ~ray_neighbor_owns_column
+                | (opposite_neighbor_distance < ray_neighbor_distance)
+                | (
+                    (opposite_neighbor_distance == ray_neighbor_distance)
+                    & (opposite_neighbor_slot < ray_neighbor_slot)
+                )
+            )
+            endpoint_owner_index = torch.where(
+                use_opposite_neighbor,
+                opposite_neighbor_index,
+                ray_neighbor_index,
+            )
+            endpoint_owner_distance = torch.where(
+                use_opposite_neighbor,
+                opposite_neighbor_distance,
+                ray_neighbor_distance,
+            )
+            endpoint_owner_is_valid = (
+                ray_neighbor_owns_column | opposite_neighbor_owns_column
+            )
+        else:
+            endpoint_neighbors = self.map.portal_endpoint_neighbors
+            neighbor_distances = distances[:, :, endpoint_neighbors]
+            neighbor_projected = projected_intersections[:, :, endpoint_neighbors]
+            neighbor_left_edges = projected_left_edges[:, :, endpoint_neighbors]
+            ray_endpoint_neighbors = torch.where(
+                (wall_along <= 0.5)[:, :, :, None],
+                self.map.portal_endpoint_neighbor_starts[None, None, :, :],
+                self.map.portal_endpoint_neighbor_ends[None, None, :, :],
+            )
+            all_endpoint_neighbors = (
+                self.map.portal_endpoint_neighbor_starts[None, None, :, :]
+                | self.map.portal_endpoint_neighbor_ends[None, None, :, :]
+            )
+            selected_endpoint_neighbors = ray_endpoint_neighbors | (
+                subpixel_two_sided[:, None, :, None]
+                & all_endpoint_neighbors
+                & (
+                    torch.abs(neighbor_distances - distances[:, :, :, None])
+                    <= endpoint_distance_tolerance[:, :, :, None]
+                )
+            )
+            endpoint_owner_distance, endpoint_owner_slot = torch.min(
+                torch.where(
+                    neighbor_projected
+                    & neighbor_left_edges
+                    & selected_endpoint_neighbors,
+                    neighbor_distances,
+                    torch.full_like(neighbor_distances, torch.inf),
+                ),
+                dim=3,
+            )
+            endpoint_owner_index = torch.gather(
+                endpoint_neighbors[None, None, :, :].expand(
+                    self.num_envs,
+                    self.native_screen_width,
+                    -1,
+                    -1,
+                ),
+                3,
+                endpoint_owner_slot[:, :, :, None],
+            ).squeeze(3)
+            endpoint_owner_is_valid = torch.isfinite(endpoint_owner_distance)
         # Infinite-line ray depths diverge at angled shared vertices even when
         # FWallCoords assigns the integer column unambiguously. Projected span
         # ownership therefore cannot be bounded by an arbitrary depth delta.
         has_endpoint_owner = (
             ~projected_intersections
-            & torch.isfinite(endpoint_owner_distance)
+            & endpoint_owner_is_valid
         )
         endpoint_owner_index = torch.where(
             has_endpoint_owner,
