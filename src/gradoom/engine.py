@@ -499,6 +499,9 @@ DEVICE_SIGNAL_NAMES = (
     "episode_return",
     "player_dead",
     "pending_reset",
+    "deathcount",
+    "hitcount",
+    "damagecount",
 )
 
 
@@ -1397,6 +1400,8 @@ class TorchDeathmatchEngine:
         frame_skip: int = 2,
         frame_stack: int = 4,
         episode_timeout: int = 4200,
+        doom_skill: int = 3,
+        wall_contact_damage_scale: float = 1.0,
         mask_hud: bool = True,
         render_screen_flashes: bool = False,
         debug_checks: bool | None = None,
@@ -1406,6 +1411,16 @@ class TorchDeathmatchEngine:
         self.frame_skip = frame_skip
         self.frame_stack = frame_stack
         self.episode_timeout = episode_timeout
+        if doom_skill not in (1, 3):
+            raise ValueError("TorchDeathmatchEngine supports Doom skill 1 or 3")
+        self.doom_skill = doom_skill
+        if (
+            not math.isfinite(wall_contact_damage_scale)
+            or wall_contact_damage_scale < 0.0
+            or wall_contact_damage_scale > 1.0
+        ):
+            raise ValueError("wall_contact_damage_scale must be finite and in [0, 1]")
+        self.wall_contact_damage_scale = float(wall_contact_damage_scale)
         self.mask_hud = mask_hud
         self.render_screen_flashes = render_screen_flashes
         self.debug_checks = device.type == "cpu" if debug_checks is None else debug_checks
@@ -1540,6 +1555,7 @@ class TorchDeathmatchEngine:
         self.hitscan_decal_rng_state = torch.ones(n, device=device, dtype=torch.int64)
         self.episode_time = torch.zeros(n, device=device, dtype=torch.int32)
         self.episode_return = torch.zeros(n, device=device)
+        self.infighting_reward = torch.zeros(n, device=device)
         self.pending_reset = torch.ones(n, device=device, dtype=torch.bool)
         self.player_dead = torch.zeros(n, device=device, dtype=torch.bool)
         self.x = torch.zeros(n, device=device)
@@ -1576,6 +1592,9 @@ class TorchDeathmatchEngine:
         self.armor = torch.zeros(n, device=device)
         self.armor_save_fraction = torch.zeros(n, device=device)
         self.killcount = torch.zeros(n, device=device, dtype=torch.int32)
+        self.player_deathcount = torch.zeros(n, device=device, dtype=torch.int32)
+        self.player_hitcount = torch.zeros(n, device=device, dtype=torch.int32)
+        self.player_damagecount = torch.zeros(n, device=device)
         self.selected_weapon = torch.full((n,), 2, device=device, dtype=torch.int64)
         self.selected_weapon_variant = torch.zeros(n, device=device, dtype=torch.bool)
         self.weapons = torch.zeros((n, 6), device=device)
@@ -1583,6 +1602,7 @@ class TorchDeathmatchEngine:
         self.shotgun_owned = torch.zeros(n, device=device, dtype=torch.bool)
         self.super_shotgun_owned = torch.zeros(n, device=device, dtype=torch.bool)
         self.ammo = torch.zeros((n, 6), device=device)
+        self._hud_ammo_indices = torch.tensor((1, 2, 4, 5), device=device)
         # SBARINFO caches the ready weapon's ammo during Draw and consumes that
         # cache on the next status-bar Tick.  The large current-ammo number is
         # therefore one rendered observation behind inventory/game variables.
@@ -1676,6 +1696,8 @@ class TorchDeathmatchEngine:
         self.enemy_move_direction = torch.zeros(
             (n, self.enemy_slots), device=device, dtype=torch.int64
         )
+        direction_angles = torch.arange(8, device=device, dtype=torch.float32) * (math.pi / 4)
+        self._enemy_direction_angles = self._wrap_angle(direction_angles)
         self.enemy_move_count = torch.zeros(
             (n, self.enemy_slots), device=device, dtype=torch.int32
         )
@@ -1962,7 +1984,7 @@ class TorchDeathmatchEngine:
         if mask is not None:
             updated = torch.where(mask, updated, value)
         self.rng_state.copy_(updated)
-        return self.rng_state
+        return updated
 
     def _random_unit(self, mask: torch.Tensor | None = None) -> torch.Tensor:
         return self._random_u32(mask).to(torch.float32) * (1.0 / 4294967296.0)
@@ -1975,8 +1997,9 @@ class TorchDeathmatchEngine:
         updated = torch.bitwise_xor(updated, updated >> 17)
         updated = torch.bitwise_xor(updated, torch.bitwise_and(updated << 5, _UINT32_MASK))
         updated = torch.bitwise_and(updated, _UINT32_MASK)
-        self.hitscan_puff_rng_state.copy_(torch.where(mask, updated, value))
-        return self.hitscan_puff_rng_state
+        updated = torch.where(mask, updated, value)
+        self.hitscan_puff_rng_state.copy_(updated)
+        return updated
 
     def _hitscan_decal_random_u32(self, mask: torch.Tensor) -> torch.Tensor:
         """Advance the visual-only BulletChip stream independently of gameplay RNG."""
@@ -1986,8 +2009,9 @@ class TorchDeathmatchEngine:
         updated = torch.bitwise_xor(updated, updated >> 17)
         updated = torch.bitwise_xor(updated, torch.bitwise_and(updated << 5, _UINT32_MASK))
         updated = torch.bitwise_and(updated, _UINT32_MASK)
-        self.hitscan_decal_rng_state.copy_(torch.where(mask, updated, value))
-        return self.hitscan_decal_rng_state
+        updated = torch.where(mask, updated, value)
+        self.hitscan_decal_rng_state.copy_(updated)
+        return updated
 
     @staticmethod
     def _public_or_retained_fixed(
@@ -2011,9 +2035,10 @@ class TorchDeathmatchEngine:
         updated = torch.bitwise_xor(updated, updated >> 17)
         updated = torch.bitwise_xor(updated, torch.bitwise_and(updated << 5, _UINT32_MASK))
         updated = torch.bitwise_and(updated, _UINT32_MASK)
-        self.enemy_chase_rng_state.copy_(torch.where(mask, updated, value))
+        updated = torch.where(mask, updated, value)
+        self.enemy_chase_rng_state.copy_(updated)
         slot = torch.arange(self.enemy_slots, device=self.device, dtype=torch.int64)[None, :]
-        mixed = self.enemy_chase_rng_state[:, None] ^ (slot * _HASH_GOLDEN_RATIO_SIGNED)
+        mixed = updated[:, None] ^ (slot * _HASH_GOLDEN_RATIO_SIGNED)
         mixed ^= mixed >> 16
         return torch.bitwise_and(mixed, 255)
 
@@ -2225,6 +2250,7 @@ class TorchDeathmatchEngine:
             self.armor,
             self.armor_save_fraction,
             self.episode_return,
+            self.infighting_reward,
         ):
             tensor.masked_fill_(mask, 0)
         self._momentum_x_fixed.masked_fill_(mask, 0)
@@ -2232,6 +2258,9 @@ class TorchDeathmatchEngine:
         self._player_bob_fixed.masked_fill_(mask, 0)
         self.health.masked_fill_(mask, 100)
         self.killcount.masked_fill_(mask, 0)
+        self.player_deathcount.masked_fill_(mask, 0)
+        self.player_hitcount.masked_fill_(mask, 0)
+        self.player_damagecount.masked_fill_(mask, 0)
         self.episode_time.masked_fill_(mask, 1)
         self.selected_weapon.masked_fill_(mask, 2)
         self.selected_weapon_variant.masked_fill_(mask, False)
@@ -2271,18 +2300,24 @@ class TorchDeathmatchEngine:
         self.reaction_time.masked_fill_(mask, _PLAYER_TELEPORT_LOCK_TICS)
         self.player_dead.masked_fill_(mask, False)
         self.pending_reset.masked_fill_(mask, False)
-        self.weapons[mask] = 0
-        self.weapons[mask, 0] = 1
-        self.weapons[mask, 1] = 1
+        self.weapons.masked_fill_(mask[:, None], 0)
+        self.weapons[:, 0].masked_fill_(mask, 1)
+        self.weapons[:, 1].masked_fill_(mask, 1)
         self.chainsaw_owned.masked_fill_(mask, False)
         self.shotgun_owned.masked_fill_(mask, False)
         self.super_shotgun_owned.masked_fill_(mask, False)
-        self.ammo[mask] = 0
-        self.ammo[mask, 1] = 50
-        self.ammo[mask, 3] = 50
+        self.ammo.masked_fill_(mask[:, None], 0)
+        self.ammo[:, 1].masked_fill_(mask, 50)
+        self.ammo[:, 3].masked_fill_(mask, 50)
         self.hud_ready_ammo.masked_fill_(mask, 50)
-        self.hud_ammo_counts[mask] = self.ammo[mask][:, (1, 2, 4, 5)]
-        self.item_available[mask] = True
+        self.hud_ammo_counts.copy_(
+            torch.where(
+                mask[:, None],
+                self.ammo.index_select(1, self._hud_ammo_indices),
+                self.hud_ammo_counts,
+            )
+        )
+        self.item_available.masked_fill_(mask[:, None], True)
         item_random = safe_seeds[:, None] ^ (
             self._animated_item_hash_slots * _HASH_GOLDEN_RATIO_SIGNED
         )
@@ -2301,91 +2336,115 @@ class TorchDeathmatchEngine:
             current_item_tics,
         )
         frame = self.render_frame()
-        self.frames[mask] = frame[mask, None].expand(-1, self.frame_stack, -1, -1)
+        self.frames.copy_(
+            torch.where(
+                mask[:, None, None, None],
+                frame[:, None].expand(-1, self.frame_stack, -1, -1),
+                self.frames,
+            )
+        )
         self._update_signal_buffer()
         return self.frames
 
     def _reset_enemies(self, mask: torch.Tensor) -> None:
-        self.enemy_x[mask] = 0
-        self.enemy_y[mask] = 0
-        self.enemy_z[mask] = 0
-        self.enemy_angle[mask] = 0
-        self._enemy_x_fixed[mask] = 0
-        self._enemy_y_fixed[mask] = 0
-        self._enemy_z_fixed[mask] = 0
-        self._enemy_floor_z_fixed[mask] = 0
-        self._enemy_ceiling_z_fixed[mask] = 0
-        self._enemy_opening_initialized[mask] = False
-        self._enemy_momentum_x_fixed[mask] = 0
-        self._enemy_momentum_y_fixed[mask] = 0
-        self._enemy_velocity_z_fixed[mask] = 0
-        self.enemy_type[mask] = -1
-        self.enemy_health[mask] = 0
-        self.enemy_alive[mask] = False
-        self.enemy_cooldown[mask] = 0
-        self.enemy_attack_phase[mask] = 0
-        self.enemy_just_attacked[mask] = False
-        self.enemy_just_hit[mask] = False
-        self.enemy_reaction_time[mask] = 0
-        self.enemy_target_slot[mask] = -1
-        self.enemy_target_threshold[mask] = 0
-        self.enemy_heard_player[mask] = False
-        self.enemy_move_direction[mask] = 0
-        self.enemy_move_count[mask] = 0
-        self.enemy_move_cooldown[mask] = 0
-        self.enemy_animation_tics[mask] = 0
-        self.enemy_pain_tics[mask] = 0
-        self.enemy_death_type[mask] = -1
-        self.enemy_death_extreme[mask] = False
-        self.enemy_death_tics[mask] = 0
-        self.enemy_death_elapsed[mask] = 0
-        self.teleport_fog_x[mask] = 0
-        self.teleport_fog_y[mask] = 0
-        self.teleport_fog_z[mask] = 0
-        self.teleport_fog_tics[mask] = 0
-        self.drop_type[mask] = -1
-        self.drop_delay[mask] = 0
-        self.drop_spawned[mask] = False
-        self.drop_x[mask] = 0
-        self.drop_y[mask] = 0
-        self.drop_z[mask] = 0
-        self._drop_x_fixed[mask] = 0
-        self._drop_y_fixed[mask] = 0
-        self._drop_z_fixed[mask] = 0
-        self._drop_velocity_x_fixed[mask] = 0
-        self._drop_velocity_y_fixed[mask] = 0
-        self._drop_velocity_z_fixed[mask] = 0
-        self.projectile_x[mask] = 0
-        self.projectile_y[mask] = 0
-        self.projectile_z[mask] = 0
-        self.projectile_velocity_x[mask] = 0
-        self.projectile_velocity_y[mask] = 0
-        self.projectile_velocity_z[mask] = 0
-        self.projectile_type[mask] = -1
-        self.projectile_age[mask] = 0
-        self.projectile_alive[mask] = False
-        self.projectile_impact_type[mask] = -1
-        self.projectile_impact_tics[mask] = 0
-        self.hitscan_puff_x[mask] = 0
-        self.hitscan_puff_y[mask] = 0
-        self.hitscan_puff_z[mask] = 0
-        self.hitscan_puff_tics[mask] = 0
-        self.hitscan_decal_wall[mask] = 0
-        self.hitscan_decal_along[mask] = 0
-        self.hitscan_decal_z[mask] = 0
-        self.hitscan_decal_style[mask] = 0
-        self.hitscan_decal_serial[mask] = -1
-        self.hitscan_decal_count[mask] = 0
-        self.enemy_projectile_x[mask] = 0
-        self.enemy_projectile_y[mask] = 0
-        self.enemy_projectile_z[mask] = 0
-        self.enemy_projectile_velocity_x[mask] = 0
-        self.enemy_projectile_velocity_y[mask] = 0
-        self.enemy_projectile_velocity_z[mask] = 0
-        self.enemy_projectile_age[mask] = 0
-        self.enemy_projectile_alive[mask] = False
-        self.enemy_projectile_source_slot[mask] = -1
-        self.enemy_projectile_impact_tics[mask] = 0
+        for tensor in (
+            self.enemy_x,
+            self.enemy_y,
+            self.enemy_z,
+            self.enemy_angle,
+            self._enemy_x_fixed,
+            self._enemy_y_fixed,
+            self._enemy_z_fixed,
+            self._enemy_floor_z_fixed,
+            self._enemy_ceiling_z_fixed,
+            self._enemy_momentum_x_fixed,
+            self._enemy_momentum_y_fixed,
+            self._enemy_velocity_z_fixed,
+            self.enemy_health,
+            self.enemy_cooldown,
+            self.enemy_attack_phase,
+            self.enemy_reaction_time,
+            self.enemy_target_threshold,
+            self.enemy_move_direction,
+            self.enemy_move_count,
+            self.enemy_move_cooldown,
+            self.enemy_animation_tics,
+            self.enemy_pain_tics,
+            self.enemy_death_tics,
+            self.enemy_death_elapsed,
+            self.teleport_fog_x,
+            self.teleport_fog_y,
+            self.teleport_fog_z,
+            self.teleport_fog_tics,
+            self.drop_delay,
+            self.drop_x,
+            self.drop_y,
+            self.drop_z,
+            self._drop_x_fixed,
+            self._drop_y_fixed,
+            self._drop_z_fixed,
+            self._drop_velocity_x_fixed,
+            self._drop_velocity_y_fixed,
+            self._drop_velocity_z_fixed,
+            self.projectile_x,
+            self.projectile_y,
+            self.projectile_z,
+            self.projectile_velocity_x,
+            self.projectile_velocity_y,
+            self.projectile_velocity_z,
+            self.projectile_age,
+            self.projectile_impact_tics,
+            self.hitscan_puff_x,
+            self.hitscan_puff_y,
+            self.hitscan_puff_z,
+            self.hitscan_puff_tics,
+            self.hitscan_decal_wall,
+            self.hitscan_decal_along,
+            self.hitscan_decal_z,
+            self.hitscan_decal_style,
+            self.hitscan_decal_count,
+            self.enemy_projectile_x,
+            self.enemy_projectile_y,
+            self.enemy_projectile_z,
+            self.enemy_projectile_velocity_x,
+            self.enemy_projectile_velocity_y,
+            self.enemy_projectile_velocity_z,
+            self.enemy_projectile_age,
+            self.enemy_projectile_impact_tics,
+        ):
+            tensor.masked_fill_(
+                mask.reshape((self.num_envs,) + (1,) * (tensor.ndim - 1)),
+                0,
+            )
+        for tensor in (
+            self._enemy_opening_initialized,
+            self.enemy_alive,
+            self.enemy_just_attacked,
+            self.enemy_just_hit,
+            self.enemy_heard_player,
+            self.enemy_death_extreme,
+            self.drop_spawned,
+            self.projectile_alive,
+            self.enemy_projectile_alive,
+        ):
+            tensor.masked_fill_(
+                mask.reshape((self.num_envs,) + (1,) * (tensor.ndim - 1)),
+                False,
+            )
+        for tensor in (
+            self.enemy_type,
+            self.enemy_target_slot,
+            self.enemy_death_type,
+            self.drop_type,
+            self.projectile_type,
+            self.projectile_impact_type,
+            self.hitscan_decal_serial,
+            self.enemy_projectile_source_slot,
+        ):
+            tensor.masked_fill_(
+                mask.reshape((self.num_envs,) + (1,) * (tensor.ndim - 1)),
+                -1,
+            )
         self.next_spawn_check.masked_fill_(mask, 1 + _ENEMY_SPAWN_DELAY)
 
     def _points_collide(
@@ -2397,7 +2456,11 @@ class TorchDeathmatchEngine:
         walls = self.map.blocking_walls
         if not len(walls):
             return torch.zeros_like(x, dtype=torch.bool)
-        collision_radius = torch.as_tensor(radius, device=self.device, dtype=x.dtype)
+        collision_radius = (
+            radius.to(device=self.device, dtype=x.dtype)
+            if isinstance(radius, torch.Tensor)
+            else torch.full((), radius, device=self.device, dtype=x.dtype)
+        )
         left = x[..., None] - collision_radius[..., None]
         right = x[..., None] + collision_radius[..., None]
         bottom = y[..., None] - collision_radius[..., None]
@@ -2448,10 +2511,12 @@ class TorchDeathmatchEngine:
         if not len(walls):
             return floor, ceiling, dropoff
 
-        actor_radius = torch.broadcast_to(
-            torch.as_tensor(radius, device=self.device, dtype=x.dtype),
-            x.shape,
+        radius_tensor = (
+            radius.to(device=self.device, dtype=x.dtype)
+            if isinstance(radius, torch.Tensor)
+            else torch.full((), radius, device=self.device, dtype=x.dtype)
         )
+        actor_radius = torch.broadcast_to(radius_tensor, x.shape)
         left = x[..., None] - actor_radius[..., None]
         right = x[..., None] + actor_radius[..., None]
         bottom = y[..., None] - actor_radius[..., None]
@@ -2555,21 +2620,28 @@ class TorchDeathmatchEngine:
         unit_y = torch.stack([self._random_unit(mask) for _ in range(candidate_count)], dim=1)
         candidate_x = low_x + unit_x * (high_x - low_x)
         candidate_y = low_y + unit_y * (high_y - low_y)
-        radius = torch.as_tensor(actor_radius, device=self.device, dtype=candidate_x.dtype)
+        radius = (
+            actor_radius.to(device=self.device, dtype=candidate_x.dtype)
+            if isinstance(actor_radius, torch.Tensor)
+            else torch.full((), actor_radius, device=self.device, dtype=candidate_x.dtype)
+        )
         valid = ~self._points_collide(candidate_x, candidate_y, radius)
         candidate_z: torch.Tensor | None = None
         candidate_height: torch.Tensor | None = None
         if actor_z is not None:
-            candidate_z = torch.broadcast_to(
-                torch.as_tensor(actor_z, device=self.device, dtype=candidate_x.dtype),
-                (self.num_envs,),
-            )[:, None]
+            actor_z_tensor = (
+                actor_z.to(device=self.device, dtype=candidate_x.dtype)
+                if isinstance(actor_z, torch.Tensor)
+                else torch.full((), actor_z, device=self.device, dtype=candidate_x.dtype)
+            )
+            candidate_z = torch.broadcast_to(actor_z_tensor, (self.num_envs,))[:, None]
+            actor_height_tensor = (
+                actor_height.to(device=self.device, dtype=candidate_x.dtype)
+                if isinstance(actor_height, torch.Tensor)
+                else torch.full((), actor_height, device=self.device, dtype=candidate_x.dtype)
+            )
             candidate_height = torch.broadcast_to(
-                torch.as_tensor(
-                    actor_height,
-                    device=self.device,
-                    dtype=candidate_x.dtype,
-                ),
+                actor_height_tensor,
                 (self.num_envs,),
             )[:, None]
             floor, ceiling = self._actor_opening_at(candidate_x, candidate_y, radius)
@@ -3740,8 +3812,27 @@ class TorchDeathmatchEngine:
         thrust_x_fixed: torch.Tensor | None = None,
         thrust_y_fixed: torch.Tensor | None = None,
         armor_absorb_request: torch.Tensor | None = None,
+        damage_scale: torch.Tensor | None = None,
     ) -> None:
         incoming = torch.floor(incoming)
+        if self.doom_skill == 1:
+            # Doom's baby skill applies a 0.5 fixed-point factor to player
+            # damage greater than one before thrust and armor absorption.
+            incoming = torch.where(incoming > 1, torch.floor(incoming * 0.5), incoming)
+            if thrust_x_fixed is not None:
+                thrust_x_fixed = torch.div(thrust_x_fixed, 2, rounding_mode="trunc")
+            if thrust_y_fixed is not None:
+                thrust_y_fixed = torch.div(thrust_y_fixed, 2, rounding_mode="trunc")
+            if armor_absorb_request is not None:
+                armor_absorb_request = torch.floor(armor_absorb_request * 0.5)
+        if damage_scale is not None:
+            incoming = torch.floor(incoming * damage_scale)
+            if thrust_x_fixed is not None:
+                thrust_x_fixed = torch.trunc(thrust_x_fixed * damage_scale).to(torch.int64)
+            if thrust_y_fixed is not None:
+                thrust_y_fixed = torch.trunc(thrust_y_fixed * damage_scale).to(torch.int64)
+            if armor_absorb_request is not None:
+                armor_absorb_request = torch.floor(armor_absorb_request * damage_scale)
         if attacker_x is not None and attacker_y is not None:
             # P_DamageMobj applies thrust before armor absorption. DoomPlayer's
             # mass and Doom's default monster kickback are both 100, reducing
@@ -3802,6 +3893,20 @@ class TorchDeathmatchEngine:
                 torch.full_like(self.mugshot_pain_tics, _MUGSHOT_STATE_TICS),
                 self.mugshot_pain_tics,
             )
+        )
+
+    def _wall_contact_enemy_damage_scale(self) -> torch.Tensor | None:
+        if self.wall_contact_damage_scale == 1.0:
+            return None
+        contact = self._points_collide(
+            self.x,
+            self.y,
+            _PLAYER_RADIUS + 1.0,
+        )
+        return torch.where(
+            contact,
+            torch.full_like(self.health, self.wall_contact_damage_scale),
+            torch.ones_like(self.health),
         )
 
     def _move_player(self, buttons: torch.Tensor) -> None:
@@ -4403,10 +4508,10 @@ class TorchDeathmatchEngine:
         cosine_fixed = self._fine_sine_fixed[
             (fine_angle + _FINE_ANGLES // 4) & (_FINE_ANGLES - 1)
         ]
-        kickback_tensor = torch.as_tensor(
-            kickback,
-            device=self.device,
-            dtype=damage.dtype,
+        kickback_tensor = (
+            kickback.to(device=self.device, dtype=damage.dtype)
+            if isinstance(kickback, torch.Tensor)
+            else torch.full((), kickback, device=self.device, dtype=damage.dtype)
         )
         thrust_fixed = torch.round(
             damage
@@ -4499,6 +4604,9 @@ class TorchDeathmatchEngine:
         monster_damage_by_source: torch.Tensor | None = None,
     ) -> torch.Tensor:
         applied = torch.where(self.enemy_alive, damage, torch.zeros_like(damage))
+        if credit_player:
+            self.player_hitcount.add_(torch.sum(applied > 0, dim=1, dtype=torch.int32))
+            self.player_damagecount.add_(torch.sum(applied, dim=1))
         if monster_damage_by_source is not None:
             self._retarget_enemies_from_monster_damage(
                 monster_damage_by_source,
@@ -4579,17 +4687,20 @@ class TorchDeathmatchEngine:
             torch.where(killed, death_duration.to(torch.int32), self.enemy_death_tics)
         )
         self.enemy_death_elapsed.masked_fill_(killed, 0)
-        if credit_player:
-            reward = torch.sum(
-                torch.where(
-                    killed,
-                    self._enemy_kill_reward[killed_type],
-                    torch.zeros_like(applied),
-                ),
-                dim=1,
-            )
-        else:
-            reward = torch.zeros(self.num_envs, device=self.device)
+        # In a single-player Doom game, P_KillMobj credits every countable
+        # monster death to player 0, including infighting kills. ViZDoom's
+        # KILLCOUNT and native reward therefore advance even when the player
+        # never damaged the monster.
+        reward = torch.sum(
+            torch.where(
+                killed,
+                self._enemy_kill_reward[killed_type],
+                torch.zeros_like(applied),
+            ),
+            dim=1,
+        )
+        if not credit_player:
+            self.infighting_reward.add_(reward)
         self.enemy_alive &= ~killed
         self.enemy_pain_tics.masked_fill_(killed, 0)
         self.enemy_cooldown.masked_fill_(killed, 0)
@@ -4623,8 +4734,7 @@ class TorchDeathmatchEngine:
         self.enemy_type.copy_(
             torch.where(killed, torch.full_like(self.enemy_type, -1), self.enemy_type)
         )
-        if credit_player:
-            self.killcount.add_(torch.sum(killed.to(torch.int32), dim=1))
+        self.killcount.add_(torch.sum(killed.to(torch.int32), dim=1))
         return reward
 
     def _spawn_player_projectile(
@@ -7090,6 +7200,7 @@ class TorchDeathmatchEngine:
             thrust_x_fixed=torch.sum(thrust_x_by_projectile, dim=1),
             thrust_y_fixed=torch.sum(thrust_y_by_projectile, dim=1),
             armor_absorb_request=armor_absorb_request,
+            damage_scale=self._wall_contact_enemy_damage_scale(),
         )
         target_enemy_type = solid_enemy_type.gather(1, nearest_enemy)
         live_enemy_impact = enemy_impact & self.enemy_alive.gather(
@@ -7767,6 +7878,7 @@ class TorchDeathmatchEngine:
             thrust_y_fixed=torch.sum(melee_thrust_y, dim=1)
             + torch.sum(hitscan_thrust_y, dim=(1, 2)),
             armor_absorb_request=armor_absorb_request,
+            damage_scale=self._wall_contact_enemy_damage_scale(),
         )
         monster_thrust_x, monster_thrust_y = self._enemy_damage_thrust_components(
             monster_damage_by_source,
@@ -7889,24 +8001,29 @@ class TorchDeathmatchEngine:
         self.enemy_reaction_time.copy_(next_reaction_time)
         attack_ready = move_ready & (next_cooldown <= 0) & ~self.enemy_just_attacked
         turning = move_ready & (self.enemy_move_direction < 8)
-        quantized_angle = torch.floor(
+        quantized_direction = torch.floor(
             torch.remainder(self.enemy_angle, 2 * math.pi) / (math.pi / 4)
-        ) * (math.pi / 4)
-        movement_direction_angle = self.enemy_move_direction.to(torch.float32) * (
-            math.pi / 4
-        )
-        turn_delta = self._wrap_angle(quantized_angle - movement_direction_angle)
-        turned_angle = torch.where(
+        ).to(torch.int64)
+        movement_direction = self.enemy_move_direction.clamp(0, 7)
+        turn_delta = torch.remainder(
+            quantized_direction - movement_direction + 4,
+            8,
+        ) - 4
+        turned_direction = torch.where(
             turn_delta > 0,
-            quantized_angle - math.pi / 4,
+            quantized_direction - 1,
             torch.where(
                 turn_delta < 0,
-                quantized_angle + math.pi / 4,
-                quantized_angle,
+                quantized_direction + 1,
+                quantized_direction,
             ),
         )
         self.enemy_angle.copy_(
-            torch.where(turning, self._wrap_angle(turned_angle), self.enemy_angle)
+            torch.where(
+                turning,
+                self._enemy_direction_angles[torch.remainder(turned_direction, 8)],
+                self.enemy_angle,
+            )
         )
         melee_type = (enemy_type == 2) | (enemy_type == 4) | (enemy_type == 5)
         melee_attack = attack_ready & melee_type & melee_target
@@ -8128,6 +8245,7 @@ class TorchDeathmatchEngine:
         )
         types = self.map.item_types[None, :]
         consumed = torch.zeros_like(touched)
+        ammo_factor = 2.0 if self.doom_skill == 1 else 1.0
 
         standard_health = touched & ((types == 2011) | (types == 2012))
         health_gain = torch.where(
@@ -8192,12 +8310,13 @@ class TorchDeathmatchEngine:
             (2046, 4, 5.0, 50.0),
             (17, 5, 100.0, 300.0),
         ):
+            adjusted_amount = amount * ammo_factor
             ammo_touch = touched & (types == type_id)
             successful = self._successful_fixed_gain_pickups(
-                ammo_touch, self.ammo[:, slot], amount, cap
+                ammo_touch, self.ammo[:, slot], adjusted_amount, cap
             )
             count = torch.sum(successful, dim=1).to(torch.float32)
-            self._add_ammo(slot, count * amount, cap)
+            self._add_ammo(slot, count * adjusted_amount, cap)
             consumed |= successful
 
         for type_id, code, ammo_amount, ammo_cap in (
@@ -8211,7 +8330,7 @@ class TorchDeathmatchEngine:
             consumed |= self._pickup_weapon(
                 touched & (types == type_id),
                 code=code,
-                ammo_amount=ammo_amount,
+                ammo_amount=ammo_amount * ammo_factor,
                 ammo_cap=ammo_cap,
             )
         self.item_available &= ~consumed
@@ -8521,13 +8640,14 @@ class TorchDeathmatchEngine:
             torch.where(hud_ammo_slot < 0, torch.zeros_like(hud_ammo), hud_ammo)
         )
         reward = torch.zeros(self.num_envs, device=self.device)
+        self.infighting_reward.zero_()
         for _ in range(self.frame_skip):
             # The four inventory counters read the ammo visible at the start
             # of each game tic. With frame skipping, a pickup on an earlier
             # internal tic must reach the final HUD, while a pickup on the
             # last internal tic remains one rendered frame behind. The large
             # ready-ammo widget has its own Draw/Tick cache above.
-            self.hud_ammo_counts.copy_(self.ammo[:, (1, 2, 4, 5)])
+            self.hud_ammo_counts.copy_(self.ammo.index_select(1, self._hud_ammo_indices))
             self.player_dead |= self.health <= 0
             active = ~self.player_dead & (self.episode_time < self.episode_timeout)
             previous_mugshot_override = (self.mugshot_pain_tics > 0) | (
@@ -8645,13 +8765,15 @@ class TorchDeathmatchEngine:
             self._collect_items()
             self.episode_time.add_(active.to(torch.int32))
             self._spawn_tick(active & ~self.player_dead)
+        reward.add_(self.infighting_reward)
         self.episode_return.add_(reward)
         self.player_dead.copy_(self.health <= 0)
+        self.player_deathcount.copy_(self.player_dead.to(torch.int32))
         terminated = self.player_dead.clone()
         truncated = (self.episode_time >= self.episode_timeout) & ~terminated
         self.pending_reset.copy_(terminated | truncated)
         frame = self.render_frame()
-        self.frames = torch.roll(self.frames, shifts=-1, dims=1)
+        self.frames.copy_(torch.roll(self.frames, shifts=-1, dims=1))
         self.frames[:, -1].copy_(frame)
         self._update_signal_buffer()
         return self.frames, reward, terminated, truncated
@@ -14155,7 +14277,7 @@ class TorchDeathmatchEngine:
         weapon_index = (self.selected_weapon - 1)[:, None]
         selected_ammo = self.ammo.gather(1, weapon_index).squeeze(1)
         self.signal_buffer[:, 0].copy_(self.killcount)
-        self.signal_buffer[:, 1].copy_(self.health)
+        self.signal_buffer[:, 1].copy_(self.health).clamp_min_(0)
         self.signal_buffer[:, 2].copy_(self.armor)
         self.signal_buffer[:, 3].copy_(self.selected_weapon)
         self.signal_buffer[:, 4].copy_(selected_ammo)
@@ -14165,6 +14287,9 @@ class TorchDeathmatchEngine:
         self.signal_buffer[:, 18].copy_(self.episode_return)
         self.signal_buffer[:, 19].copy_(self.player_dead)
         self.signal_buffer[:, 20].copy_(self.pending_reset)
+        self.signal_buffer[:, 21].copy_(self.player_deathcount)
+        self.signal_buffer[:, 22].copy_(self.player_hitcount)
+        self.signal_buffer[:, 23].copy_(self.player_damagecount)
 
     def signals(self) -> dict[str, torch.Tensor]:
         return {

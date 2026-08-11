@@ -29,6 +29,69 @@ def _finish_pending_attack(engine: TorchDeathmatchEngine) -> torch.Tensor:
     return reward
 
 
+def test_skill_one_halves_player_damage_above_one(square_scenario) -> None:
+    engine = TorchDeathmatchEngine(
+        square_scenario,
+        2,
+        device=torch.device("cpu"),
+        doom_skill=1,
+    )
+    engine.reset(torch.ones(2, dtype=torch.bool), torch.tensor([123, 456]))
+
+    engine._apply_player_damage(torch.tensor([5.0, 1.0]))
+
+    assert engine.health.tolist() == [98.0, 99.0]
+
+
+def test_wall_contact_damage_scale_only_applies_at_blocking_geometry(
+    square_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        square_scenario,
+        2,
+        device=torch.device("cpu"),
+        wall_contact_damage_scale=0.5,
+    )
+    engine.reset(torch.ones(2, dtype=torch.bool), torch.tensor([123, 456]))
+    engine.x[:] = torch.tensor([240.0, 0.0])
+    engine.y.zero_()
+
+    scale = engine._wall_contact_enemy_damage_scale()
+    assert scale is not None
+    assert scale.tolist() == [0.5, 1.0]
+    engine._apply_player_damage(torch.full((2,), 10.0), damage_scale=scale)
+
+    assert engine.health.tolist() == [95.0, 90.0]
+
+
+def test_player_combat_counters_match_vizdoom_game_variables(square_scenario) -> None:
+    engine = _engine(square_scenario)
+    engine.enemy_alive[:, 0] = True
+    engine.enemy_type[:, 0] = 0
+    engine.enemy_health[:, 0] = 10.0
+    damage = torch.zeros_like(engine.enemy_health)
+    damage[:, 0] = 5.0
+
+    player_reward = engine._apply_enemy_damage(damage)
+    infighting_reward = engine._apply_enemy_damage(damage, credit_player=False)
+
+    assert engine.player_hitcount.tolist() == [1, 1]
+    assert engine.player_damagecount.tolist() == [5.0, 5.0]
+    assert torch.equal(player_reward, torch.zeros(2))
+    assert torch.equal(infighting_reward, torch.ones(2))
+    assert engine.killcount.tolist() == [1, 1]
+
+    engine.health[0] = -1
+    engine.step(torch.zeros((2, 20), dtype=torch.bool))
+    assert engine.player_deathcount.tolist() == [1, 0]
+    assert engine.signal_buffer[0, 1].item() == 0
+
+    engine.reset(torch.tensor([True, False]), torch.tensor([789, 0]))
+    assert engine.player_deathcount.tolist() == [0, 0]
+    assert engine.player_hitcount.tolist() == [0, 1]
+    assert engine.player_damagecount.tolist() == [0.0, 5.0]
+
+
 def test_certified_enemy_actor_radii_match_reference(square_scenario) -> None:
     engine = _engine(square_scenario)
 
@@ -385,7 +448,7 @@ def test_enemy_projectile_hits_voodoo_doll_without_moving_player(
     assert torch.equal(engine.momentum_y, torch.zeros(2))
 
 
-def test_enemy_projectile_hits_monsters_without_player_kill_credit(
+def test_enemy_projectile_kill_counts_for_single_player_vizdoom(
     square_scenario,
 ) -> None:
     engine = _engine(square_scenario)
@@ -420,10 +483,11 @@ def test_enemy_projectile_hits_monsters_without_player_kill_credit(
     assert engine.enemy_alive[:, 1].tolist() == [False, True]
     assert engine.enemy_death_type[:, 1].tolist() == [0, -1]
     assert engine.drop_type[:, 1].tolist() == [2007, -1]
-    # Hell Knight species absorb their own Baron balls without damage, and
-    # an infighting kill never belongs to the controlled player's counters.
+    # Hell Knight species absorb their own Baron balls without damage. Doom's
+    # single-player P_KillMobj path credits every other monster death to player 0.
     assert engine.enemy_health[:, 0].tolist() == [500.0, 500.0]
-    assert engine.killcount.tolist() == [0, 0]
+    assert engine.killcount.tolist() == [1, 0]
+    assert engine.infighting_reward.tolist() == [1.0, 0.0]
 
 
 def test_pooled_enemy_projectile_uses_recorded_owner_for_collision_and_retaliation(

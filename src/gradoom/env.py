@@ -24,6 +24,9 @@ from .scenario import CompiledScenario, compile_deathmatch_scenario
 
 _DEFAULT_SIGNALS = (
     "killcount",
+    "deathcount",
+    "hitcount",
+    "damagecount",
     "health",
     "armor",
     "selected_weapon",
@@ -42,6 +45,50 @@ _DEFAULT_SIGNALS = (
     "ammo6",
 )
 _DERIVED_SIGNALS = ("episode_time", "episode_return", "player_dead", "pending_reset")
+_COMPILED_ENGINE_PHASES = (
+    "_select_weapons",
+    "_move_player",
+    "_vertical_player_tick",
+    "_player_attack",
+    "_hitscan_puff_tick",
+    "_projectile_tick",
+    "_enemy_projectile_tick",
+    "_collect_items",
+    "_spawn_tick",
+    "render_frame",
+    "_move_enemy_thrust",
+    "_sight_blocked",
+    "_enemy_chaingun_refire_decision",
+    "_spawn_enemy_projectiles",
+    "_enemy_hitscan_damage",
+    "_enemy_damage_roll",
+    "_player_damage_thrust_components",
+    "_apply_player_damage",
+    "_enemy_damage_thrust_components",
+    "_apply_enemy_damage",
+    "_enemy_chase_move",
+    "_enemy_missile_decision",
+)
+_LIMITED_FUSION_PHASES = frozenset(
+    {
+        "_enemy_projectile_tick",
+        "_collect_items",
+        "_spawn_tick",
+        "_move_enemy_thrust",
+        "_sight_blocked",
+        "_enemy_chaingun_refire_decision",
+        "_spawn_enemy_projectiles",
+        "_enemy_hitscan_damage",
+        "_enemy_damage_roll",
+        "_player_damage_thrust_components",
+        "_apply_player_damage",
+        "_enemy_damage_thrust_components",
+        "_apply_enemy_damage",
+        "_enemy_chase_move",
+        "_enemy_missile_decision",
+    }
+)
+_LIMITED_FUSION_OPTIONS = {"max_fusion_size": 8}
 
 
 def _positive_int(value: Any, name: str) -> int:
@@ -218,6 +265,7 @@ class GraDoomVecEnv(VectorEnv):
         state_catalog: Sequence[Any] | None = None,
         doom_map: str | None = None,
         doom_skill: int | None = None,
+        wall_contact_damage_scale: float = 1.0,
         game_args: str | None = None,
         game_variables: Sequence[str] | None = None,
         enemy_variants: Mapping[str, Sequence[str]] | Sequence[str] | None = None,
@@ -248,8 +296,17 @@ class GraDoomVecEnv(VectorEnv):
             value is not None for value in (doom_map, game_args, enemy_variants, surface_variants)
         ):
             raise ValueError("custom maps, game args, and variants are not yet supported")
-        if doom_skill not in (None, 3):
-            raise ValueError("deathmatch-p1-v1 requires Doom skill 3")
+        if doom_skill not in (None, 1, 3):
+            raise ValueError("deathmatch-p1-v1 supports Doom skill 1 or 3")
+        resolved_doom_skill = 3 if doom_skill is None else doom_skill
+        self.doom_skill = resolved_doom_skill
+        if (
+            not math.isfinite(wall_contact_damage_scale)
+            or wall_contact_damage_scale < 0.0
+            or wall_contact_damage_scale > 1.0
+        ):
+            raise ValueError("wall_contact_damage_scale must be finite and in [0, 1]")
+        self.wall_contact_damage_scale = float(wall_contact_damage_scale)
         if use_fire_reset or noop_reset_max or sticky_action_prob:
             raise ValueError(
                 "fire reset, no-op reset, and sticky actions are not in deathmatch-p1-v1"
@@ -368,6 +425,8 @@ class GraDoomVecEnv(VectorEnv):
             frame_skip=self.frame_skip,
             frame_stack=self.frame_stack,
             episode_timeout=episode_timeout,
+            doom_skill=resolved_doom_skill,
+            wall_contact_damage_scale=self.wall_contact_damage_scale,
             mask_hud=obs_crop is not None,
             render_screen_flashes=render_screen_flashes,
         )
@@ -397,17 +456,48 @@ class GraDoomVecEnv(VectorEnv):
         )
         self._safe_obs_index = 0
         self.compile_engine = bool(compile_engine)
-        self.engine_backend = "torch-compiled" if self.compile_engine else "torch-eager"
-        self._step_engine = (
+        self.engine_backend = (
+            "torch-compiled-cudagraph" if self.compile_engine else "torch-eager"
+        )
+        if self.compile_engine:
+            for phase_name in _COMPILED_ENGINE_PHASES:
+                compile_options: dict[str, Any] = {
+                    "backend": "inductor",
+                    "fullgraph": True,
+                    "dynamic": False,
+                }
+                if phase_name in _LIMITED_FUSION_PHASES:
+                    compile_options["options"] = _LIMITED_FUSION_OPTIONS
+                setattr(
+                    self._engine,
+                    phase_name,
+                    torch.compile(getattr(self._engine, phase_name), **compile_options),
+                )
+        self._step_engine = self._engine.step
+        self._reset_engine = (
             torch.compile(
-                self._engine.step,
+                self._engine.reset,
                 backend="inductor",
                 fullgraph=True,
                 dynamic=False,
+                options=_LIMITED_FUSION_OPTIONS,
             )
             if self.compile_engine
-            else self._engine.step
+            else self._engine.reset
         )
+        self._latest_reset_seeds = torch.zeros(
+            self.num_envs,
+            device=self.device,
+            dtype=torch.int64,
+        )
+        self._cuda_graph: torch.cuda.CUDAGraph | None = None
+        self._cuda_graph_actions = torch.empty(
+            self.num_envs,
+            device=self.device,
+            dtype=torch.int64,
+        )
+        self._cuda_graph_reset_seeds = torch.empty_like(self._cuda_graph_actions)
+        self._cuda_graph_transition: DeviceAutoResetTransition | None = None
 
         self.buttons = DEATHMATCH_BUTTONS
         if isinstance(use_restricted_actions, str):
@@ -753,21 +843,22 @@ class GraDoomVecEnv(VectorEnv):
             shape=(self.num_envs,),
             dtypes=(torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8),
         ).to(torch.int64)
-        observations = self._engine.reset(
+        observations = self._reset_engine(
             device_mask,
             device_seeds,
+        )
+        self._latest_reset_seeds.copy_(
+            torch.where(device_mask, device_seeds, self._latest_reset_seeds)
         )
         self._initialized |= device_mask
         self._reset_info_histories(device_mask)
         return self._device_observations(observations), self._engine.signal_buffer
 
-    def step_and_reset_device(
+    def _step_and_reset_device_impl(
         self,
         actions: torch.Tensor,
         reset_seeds: torch.Tensor,
     ) -> DeviceAutoResetTransition:
-        """Step and reset terminal lanes without synchronizing or leaving the device."""
-
         transition = self.step_device(actions)
         final_observations = transition.observations.clone()
         final_signals = transition.signals.clone()
@@ -785,6 +876,71 @@ class GraDoomVecEnv(VectorEnv):
             final_signals=final_signals,
             final_info_histories=final_info_histories,
         )
+
+    def _capture_step_and_reset_graph(
+        self,
+        actions: torch.Tensor,
+        reset_seeds: torch.Tensor,
+    ) -> None:
+        """Warm compiled phases, restore the lanes, and capture one fixed-shape transaction."""
+
+        initial_seeds = self._latest_reset_seeds.clone()
+        all_lanes = torch.ones(self.num_envs, device=self.device, dtype=torch.bool)
+        self._cuda_graph_actions.copy_(actions)
+        self._cuda_graph_reset_seeds.copy_(reset_seeds)
+
+        self._step_and_reset_device_impl(
+            self._cuda_graph_actions,
+            self._cuda_graph_reset_seeds,
+        )
+        torch.cuda.synchronize(self.device)
+        self.reset_device(all_lanes, initial_seeds)
+        torch.cuda.synchronize(self.device)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            transition = self._step_and_reset_device_impl(
+                self._cuda_graph_actions,
+                self._cuda_graph_reset_seeds,
+            )
+        torch.cuda.synchronize(self.device)
+
+        # Capture executes the transaction once. Restore the exact initial lane
+        # states so the caller's first replay remains its first environment step.
+        self.reset_device(all_lanes, initial_seeds)
+        torch.cuda.synchronize(self.device)
+        self._cuda_graph = graph
+        self._cuda_graph_transition = transition
+
+    def step_and_reset_device(
+        self,
+        actions: torch.Tensor,
+        reset_seeds: torch.Tensor,
+    ) -> DeviceAutoResetTransition:
+        """Step and reset terminal lanes without synchronizing or leaving the device."""
+
+        if not self.compile_engine:
+            return self._step_and_reset_device_impl(actions, reset_seeds)
+        device_actions = self._require_device_tensor(
+            actions,
+            "actions",
+            shape=(self.num_envs,),
+            dtypes=(torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8),
+        ).to(torch.int64)
+        device_reset_seeds = self._require_device_tensor(
+            reset_seeds,
+            "reset_seeds",
+            shape=(self.num_envs,),
+            dtypes=(torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8),
+        ).to(torch.int64)
+        if self._cuda_graph is None:
+            self._capture_step_and_reset_graph(device_actions, device_reset_seeds)
+        self._cuda_graph_actions.copy_(device_actions)
+        self._cuda_graph_reset_seeds.copy_(device_reset_seeds)
+        self._cuda_graph.replay()
+        if self._cuda_graph_transition is None:  # pragma: no cover - defensive invariant
+            raise RuntimeError("CUDA graph capture did not produce a transition")
+        return self._cuda_graph_transition
 
     def device_signals(self) -> torch.Tensor:
         return self._engine.signal_buffer

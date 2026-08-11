@@ -252,8 +252,15 @@ def test_reward_clip_keeps_episode_return_signal_aligned(square_scenario) -> Non
 def test_profile_rejects_silently_ignored_options(square_scenario) -> None:
     with pytest.raises(ValueError, match=r"area.*only"):
         _env(square_scenario, obs_resize_algorithm="nearest")
-    with pytest.raises(ValueError, match="skill 3"):
-        _env(square_scenario, doom_skill=1)
+    skill_one = _env(square_scenario, doom_skill=1)
+    skill_one.close()
+    with pytest.raises(ValueError, match="skill 1 or 3"):
+        _env(square_scenario, doom_skill=2)
+    wall_scaled = _env(square_scenario, wall_contact_damage_scale=0.5)
+    assert wall_scaled.wall_contact_damage_scale == 0.5
+    wall_scaled.close()
+    with pytest.raises(ValueError, match="wall_contact_damage_scale"):
+        _env(square_scenario, wall_contact_damage_scale=1.01)
     with pytest.raises(ValueError, match="unsupported vizdoom_config"):
         _env(square_scenario, vizdoom_config={"render_hud": True})
     with pytest.raises(ValueError, match="only VizdoomDeathmatch-v1"):
