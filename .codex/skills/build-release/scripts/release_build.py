@@ -22,7 +22,15 @@ REPO_ROOT = Path(__file__).resolve().parents[4]
 PACKAGE_NAME = "gradoom"
 IMPORT_NAME = "gradoom"
 VERSION_PATTERN = re.compile(
-    r"^[0-9]+(?:\.[0-9]+){2}(?:(?:a|b|rc)[0-9]+|\.post[0-9]+|\.dev[0-9]+)?$"
+    r"^(?P<major>[0-9]+)\.(?P<minor>[0-9]+)\.(?P<patch>[0-9]+)"
+    r"(?:(?P<pre>a|b|rc)(?P<pre_number>[0-9]+)"
+    r"|\.post(?P<post_number>[0-9]+)"
+    r"|\.dev(?P<dev_number>[0-9]+))?$"
+)
+VERSION_FILES = (
+    REPO_ROOT / "pyproject.toml",
+    REPO_ROOT / "src" / IMPORT_NAME / "__init__.py",
+    REPO_ROOT / "uv.lock",
 )
 
 
@@ -73,6 +81,21 @@ def validate_version(version: str) -> None:
         raise SystemExit(f"unsupported PEP 440 release version: {version!r}")
 
 
+def next_version(version: str) -> str:
+    match = VERSION_PATTERN.fullmatch(version)
+    if match is None:
+        raise SystemExit(f"unsupported PEP 440 release version: {version!r}")
+    base = ".".join(match.group(name) for name in ("major", "minor", "patch"))
+    if pre := match.group("pre"):
+        return f"{base}{pre}{int(match.group('pre_number')) + 1}"
+    if dev := match.group("dev_number"):
+        return f"{base}.dev{int(dev) + 1}"
+    return (
+        f"{match.group('major')}.{match.group('minor')}."
+        f"{int(match.group('patch')) + 1}"
+    )
+
+
 def check_version(args: argparse.Namespace) -> None:
     project_name, project_version = project_metadata()
     expected = args.version or project_version
@@ -115,11 +138,127 @@ def fetch_pypi() -> dict[str, object]:
     return data
 
 
-def check_pypi(args: argparse.Namespace) -> None:
-    validate_version(args.version)
+def pypi_releases() -> dict[str, object]:
     releases = fetch_pypi().get("releases", {})
     if not isinstance(releases, dict):
         raise SystemExit("unexpected PyPI releases payload")
+    return releases
+
+
+def tagged_versions() -> set[str]:
+    result = subprocess.run(
+        ["git", "tag", "--list", "v*"],
+        cwd=REPO_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return {
+        tag.removeprefix("v")
+        for tag in result.stdout.splitlines()
+        if tag.startswith("v")
+    }
+
+
+def select_release_version(
+    current: str,
+    releases: dict[str, object],
+    tags: set[str],
+) -> str:
+    validate_version(current)
+    candidate = current
+    while releases.get(candidate) or candidate in tags:
+        candidate = next_version(candidate)
+    return candidate
+
+
+def replace_project_version(path: Path, current: str, target: str) -> None:
+    text = path.read_text(encoding="utf-8")
+    pattern = re.compile(
+        rf'(?ms)(^\[project\]\n.*?^version\s*=\s*"){re.escape(current)}(")'
+    )
+    updated, count = pattern.subn(rf"\g<1>{target}\g<2>", text, count=1)
+    if count != 1:
+        raise SystemExit(f"could not update [project] version in {path}")
+    path.write_text(updated, encoding="utf-8")
+
+
+def replace_init_version(path: Path, current: str, target: str) -> None:
+    text = path.read_text(encoding="utf-8")
+    pattern = re.compile(
+        rf'(?m)^(?P<prefix>__version__\s*=\s*["\']){re.escape(current)}(?P<suffix>["\'])$'
+    )
+    updated, count = pattern.subn(
+        rf"\g<prefix>{target}\g<suffix>",
+        text,
+        count=1,
+    )
+    if count != 1:
+        raise SystemExit(f"could not update __version__ in {path}")
+    path.write_text(updated, encoding="utf-8")
+
+
+def replace_lock_version(path: Path, current: str, target: str) -> None:
+    text = path.read_text(encoding="utf-8")
+    pattern = re.compile(
+        rf'(?m)(^\[\[package\]\]\nname = "{PACKAGE_NAME}"\nversion = ")'
+        rf'{re.escape(current)}(")'
+    )
+    updated, count = pattern.subn(rf"\g<1>{target}\g<2>", text, count=1)
+    if count != 1:
+        raise SystemExit(f"could not update {PACKAGE_NAME!r} version in {path}")
+    path.write_text(updated, encoding="utf-8")
+
+
+def write_version(target: str) -> None:
+    validate_version(target)
+    _, current = project_metadata()
+    check_version(argparse.Namespace(version=current))
+    snapshots = {path: path.read_bytes() for path in VERSION_FILES}
+    try:
+        replace_project_version(VERSION_FILES[0], current, target)
+        replace_init_version(VERSION_FILES[1], current, target)
+        replace_lock_version(VERSION_FILES[2], current, target)
+        check_version(argparse.Namespace(version=target))
+    except BaseException:
+        for path, contents in snapshots.items():
+            path.write_bytes(contents)
+        raise
+
+
+def prepare_version(args: argparse.Namespace) -> None:
+    _, current = project_metadata()
+    check_version(argparse.Namespace(version=current))
+    releases = pypi_releases()
+    tags = tagged_versions()
+    if args.to:
+        validate_version(args.to)
+        target = args.to
+        if releases.get(target):
+            raise SystemExit(f"{PACKAGE_NAME}=={target} already exists on PyPI")
+        if target in tags:
+            raise SystemExit(f"release tag already exists: v{target}")
+    else:
+        target = select_release_version(current, releases, tags)
+    if args.write and target != current:
+        write_version(target)
+    print(
+        json.dumps(
+            {
+                "package": PACKAGE_NAME,
+                "current_version": current,
+                "selected_version": target,
+                "bumped": target != current,
+                "written": bool(args.write and target != current),
+            },
+            indent=2,
+        )
+    )
+
+
+def check_pypi(args: argparse.Namespace) -> None:
+    validate_version(args.version)
+    releases = pypi_releases()
     if releases.get(args.version):
         raise SystemExit(f"{PACKAGE_NAME}=={args.version} already exists on PyPI")
     print(f"{PACKAGE_NAME}=={args.version} is unused on PyPI")
@@ -283,6 +422,11 @@ def main() -> None:
     version = commands.add_parser("check-version")
     version.add_argument("--version")
     version.set_defaults(func=check_version)
+
+    prepare = commands.add_parser("prepare-version")
+    prepare.add_argument("--to")
+    prepare.add_argument("--write", action="store_true")
+    prepare.set_defaults(func=prepare_version)
 
     pypi = commands.add_parser("check-pypi")
     pypi.add_argument("--version", required=True)

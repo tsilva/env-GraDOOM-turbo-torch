@@ -1,6 +1,6 @@
 ---
 name: build-release
-description: Build, audit, publish, monitor, or verify a GraDOOM Python release. Use when the user asks to build release artifacts, cut/tag/publish a release, requests a specific GraDOOM version, invokes $build-release, diagnoses release packaging, or asks whether a version is live on PyPI.
+description: Automatically version, build, audit, publish, monitor, or verify a GraDOOM Python release. Use when the user asks to build release artifacts, cut/tag/publish a release, requests a specific GraDOOM version, invokes $build-release, diagnoses release packaging, or asks whether a version is live on PyPI.
 ---
 
 # Build Release
@@ -18,14 +18,17 @@ artifacts, or replay only part of the workflow.
 
 Use normal PEP 440 project versions from `pyproject.toml`. Keep that version
 identical to `src/gradoom/__init__.py` and the root `gradoom` entry in `uv.lock`.
-Do not infer or write a version bump: require the user to choose it when the
-checked-in version is not the intended release.
+Treat an untagged, unused checked-in version as pending. Otherwise select the
+next unused, untagged version automatically: increment the numeric suffix for
+`aN`, `bN`, `rcN`, or `.devN` versions, and increment the patch component for a
+final or `.postN` version. GraDOOM has no upstream-derived `.postN` release
+scheme. Honor an exact user-selected version instead of auto-selection.
 
 ## Build a local candidate
 
 1. Read `AGENTS.md` and use `$specs-author` as required there.
 
-2. Confirm the worktree state and version without mutating either:
+2. Confirm the worktree state and synchronized metadata without mutating either:
 
 ```bash
 git status --short --branch
@@ -35,7 +38,22 @@ python3 .codex/skills/build-release/scripts/release_build.py check-version
 Dirty files do not prevent an explicitly requested local candidate, but report
 that it is not eligible for publication and preserve every existing change.
 
-3. Run the locked source gates:
+3. Select the release version. On a clean worktree, write an automatic bump when
+the checked-in version is already tagged or published:
+
+```bash
+python3 .codex/skills/build-release/scripts/release_build.py \
+  prepare-version --write
+```
+
+For an exact version explicitly requested by the user, add `--to <version>`.
+The helper checks local tags and PyPI, skips occupied versions, and transactionally
+updates `pyproject.toml`, `src/gradoom/__init__.py`, and the root `gradoom`
+entry in `uv.lock`. If the worktree was dirty, run without `--write`; proceed
+only when the reported pending version requires no bump. Never layer an
+automatic version edit onto existing user changes.
+
+4. Run the locked source gates after version preparation:
 
 ```bash
 uv sync --frozen --group dev
@@ -45,7 +63,7 @@ uv sync --frozen --group dev
 
 Do not build a candidate when a source gate fails.
 
-4. Confirm that the exact version is unused on PyPI:
+5. Confirm that the selected exact version is still unused on PyPI:
 
 ```bash
 python3 .codex/skills/build-release/scripts/release_build.py \
@@ -55,7 +73,7 @@ python3 .codex/skills/build-release/scripts/release_build.py \
 For packaging diagnosis of an already-published version, skip only this check
 and say why. Never overwrite or republish an existing PyPI version.
 
-5. Build into a fresh version-scoped directory:
+6. Build into a fresh version-scoped directory:
 
 ```bash
 .venv/bin/python .codex/skills/build-release/scripts/release_build.py build \
@@ -68,9 +86,10 @@ wheel in an isolated working directory using the locked environment, and prints
 SHA-256 digests. It refuses to reuse an output directory so stale artifacts
 cannot enter the candidate.
 
-6. Report the two artifact paths, their SHA-256 digests, the exact version, and
-every completed gate. Preserve failed artifacts and exact error output for
-diagnosis.
+7. Report the two artifact paths, their SHA-256 digests, the selected version,
+whether metadata was bumped, and every completed gate. Preserve failed
+artifacts and exact error output for diagnosis. A candidate with an uncommitted
+automatic bump is not eligible for publication.
 
 ## Publish or cut a release
 
@@ -78,14 +97,19 @@ Require all of the following before any tag or publication action:
 
 - a clean worktree on the current branch;
 - the branch synchronized with its configured upstream;
-- an explicitly selected version matching all three metadata locations;
+- an automatically selected or explicitly requested version matching all three
+  metadata locations;
 - an unused version on PyPI;
 - a passing local candidate build from the exact commit; and
 - a checked-in trusted-publishing workflow whose tag, artifact, audit, PyPI,
   and GitHub Release contract can be verified from repository source.
 
-Create an annotated tag only after every requirement passes, then atomically
-push the current branch and tag:
+Start clean, run `prepare-version --write`, and complete the source and candidate
+gates. If version preparation changed metadata, commit exactly
+`pyproject.toml`, `src/gradoom/__init__.py`, and `uv.lock` as
+`Release v<version>`. Verify the committed tree is identical to the source used
+for the passing candidate. Create an annotated tag only after every requirement
+passes, then atomically push the current branch and tag:
 
 ```bash
 git tag -a v<version> -m "Release v<version>"
