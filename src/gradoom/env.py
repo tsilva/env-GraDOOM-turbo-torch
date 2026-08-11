@@ -325,6 +325,7 @@ class GraDoomVecEnv(VectorEnv):
         self._device_state_indices = torch.zeros(
             self.num_envs, device=self.device, dtype=torch.int32
         )
+        self._resident_device = self._device_state_indices.device
         self._initialized = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
         self._seed_values: list[int | None] = [None] * self.num_envs
         self._reset_rngs = [np.random.default_rng(lane) for lane in range(self.num_envs)]
@@ -587,8 +588,8 @@ class GraDoomVecEnv(VectorEnv):
     ) -> torch.Tensor:
         if not isinstance(value, torch.Tensor):
             raise TypeError(f"{name} must be a Torch tensor")
-        if value.device != self.device:
-            raise TypeError(f"{name} must be on device {self.device}")
+        if value.device != self._resident_device:
+            raise TypeError(f"{name} must be on device {self._resident_device}")
         if value.shape != shape:
             raise ValueError(f"{name} must have shape {shape}")
         if value.dtype not in dtypes:

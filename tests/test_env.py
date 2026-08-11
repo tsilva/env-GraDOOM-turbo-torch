@@ -8,10 +8,11 @@ from gradoom.actions import DEATHMATCH_ACTION_TABLE_SHA256
 
 
 def _env(square_scenario, **kwargs) -> GraDoomVecEnv:
+    device = kwargs.pop("device", "cpu")
     return GraDoomVecEnv(
         compiled_scenario=square_scenario,
         num_envs=2,
-        device="cpu",
+        device=device,
         **kwargs,
     )
 
@@ -37,6 +38,29 @@ def test_device_api_is_deterministic_and_resident(square_scenario) -> None:
     finally:
         first.close()
         second.close()
+
+
+def test_device_api_validates_concrete_resident_device(square_scenario) -> None:
+    env = _env(square_scenario, device="cpu:0")
+    resident_device = torch.empty((), device="cpu:0").device
+    try:
+        assert env.device == torch.device("cpu:0")
+        observations, signals = env.reset_device(
+            torch.ones(2, device="cpu:0", dtype=torch.bool),
+            torch.tensor([123, 456], device="cpu:0"),
+        )
+        transition = env.step_and_reset_device(
+            torch.tensor([2, 13], device="cpu:0"),
+            torch.tensor([789, 1011], device="cpu:0"),
+        )
+
+        assert observations.device == resident_device
+        assert signals.device == resident_device
+        assert transition.observations.device == resident_device
+        assert transition.rewards.device == resident_device
+        assert transition.signals.device == resident_device
+    finally:
+        env.close()
 
 
 def test_vizdoom_screen_flash_option_is_static_and_validated(square_scenario) -> None:
