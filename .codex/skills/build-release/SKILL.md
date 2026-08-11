@@ -1,6 +1,6 @@
 ---
 name: build-release
-description: Automatically version, build, audit, publish, monitor, or verify a GraDOOM Python release. Use when the user asks to build release artifacts, cut/tag/publish a release, requests a specific GraDOOM version, invokes $build-release, diagnoses release packaging, or asks whether a version is live on PyPI.
+description: Automatically version, build, audit, publish, monitor, and verify a GraDOOM Python release through PyPI availability. Use when the user asks to build release artifacts, cut/tag/publish a release, requests a specific GraDOOM version, invokes $build-release, diagnoses release packaging, or asks whether a version is live on PyPI.
 ---
 
 # Build Release
@@ -8,6 +8,13 @@ description: Automatically version, build, audit, publish, monitor, or verify a 
 Use the repository-owned release path and preserve the distinction between a
 local candidate and an external publication. A local candidate is reversible;
 pushing a release tag or publishing to PyPI is not.
+
+Treat an unqualified `$build-release` invocation as authorization to complete
+the publication flow. Do not stop after building a local candidate: commit the
+release metadata, tag and atomically push the release, monitor the exact
+workflow, and verify the exact version on PyPI and GitHub. Use the local-only
+candidate flow only when the user explicitly asks for a candidate, dry run,
+validation-only run, or no publication.
 
 The repository publication path is `.github/workflows/release.yml`. A pushed
 `v<version>` tag runs the locked source checks, builds and audits one universal
@@ -24,7 +31,7 @@ next unused, untagged version automatically: increment the numeric suffix for
 final or `.postN` version. GraDOOM has no upstream-derived `.postN` release
 scheme. Honor an exact user-selected version instead of auto-selection.
 
-## Build a local candidate
+## Build an explicitly requested local candidate
 
 1. Read `AGENTS.md` and use `$specs-author` as required there.
 
@@ -153,5 +160,7 @@ https://pypi.org/project/gradoom/<version>/
 For a local candidate, lead with the artifact directory and report both files,
 digests, version, and gates. For a published release, lead with the exact PyPI
 version URL and report the tag, workflow URL and conclusion, GitHub Release URL,
-and every distribution filename. On failure, report the exact failed command or
-gate and the next safe recovery action.
+and every distribution filename. Never report an unqualified release invocation
+as complete until PyPI returns files for the exact version and the GitHub
+Release exists. On failure, report the exact failed command or gate and the next
+safe recovery action.

@@ -1,4 +1,4 @@
 interface:
   display_name: "Build Release"
-  short_description: "Version, build, and audit GraDOOM releases"
-  default_prompt: "Use $build-release to select the next GraDOOM version and build a validated release candidate."
+  short_description: "Publish and verify GraDOOM releases on PyPI"
+  default_prompt: "Use $build-release to publish the next GraDOOM version and verify it on PyPI."
