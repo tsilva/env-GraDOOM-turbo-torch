@@ -10354,11 +10354,11 @@ class TorchDeathmatchEngine:
             projected_left_edges & torch.isfinite(distances),
             dim=2,
         )
-        pending_wide_projected_boundary = torch.zeros_like(
+        pending_projected_owner_boundary = torch.zeros_like(
             current_sector,
             dtype=torch.bool,
         )
-        pending_wide_projected_endpoint = torch.zeros(
+        pending_projected_owner_endpoint = torch.zeros(
             (*current_sector.shape, 2),
             device=self.device,
             dtype=all_wall_starts.dtype,
@@ -10452,10 +10452,10 @@ class TorchDeathmatchEngine:
                     dim=3,
                 )
             )
-            continues_wide_projected_boundary = (
-                pending_wide_projected_boundary
+            continues_projected_owner_boundary = (
+                pending_projected_owner_boundary
                 & torch.all(
-                    selected_endpoint == pending_wide_projected_endpoint,
+                    selected_endpoint == pending_projected_owner_endpoint,
                     dim=2,
                 )
             )
@@ -10842,10 +10842,10 @@ class TorchDeathmatchEngine:
             replace_with_near_projected_owner = torch.isfinite(
                 near_projected_distance
             )
-            wide_projected_owner = (
-                replace_with_near_projected_owner
-                & (selected_owner_span > 2)
-            )
+            # The replacement drawseg owns this endpoint regardless of the
+            # analytic path wall's projected width. Any immediate continuation
+            # at the same vertex remains traversal-only.
+            starts_projected_owner_boundary = replace_with_near_projected_owner
             distance = torch.where(
                 replace_with_near_projected_owner,
                 near_projected_distance,
@@ -10889,7 +10889,7 @@ class TorchDeathmatchEngine:
             raster_valid = (
                 valid
                 & ~excluded_right_edge_traversal_only
-                & ~continues_wide_projected_boundary
+                & ~continues_projected_owner_boundary
                 & ~(
                     (
                         pending_endpoint_has_forward_bridge
@@ -12025,14 +12025,14 @@ class TorchDeathmatchEngine:
                 ),
                 previous_distance,
             )
-            pending_wide_projected_endpoint = torch.where(
-                wide_projected_owner[:, :, None],
+            pending_projected_owner_endpoint = torch.where(
+                starts_projected_owner_boundary[:, :, None],
                 selected_endpoint,
-                pending_wide_projected_endpoint,
+                pending_projected_owner_endpoint,
             )
-            pending_wide_projected_boundary = wide_projected_owner | (
-                pending_wide_projected_boundary
-                & continues_wide_projected_boundary
+            pending_projected_owner_boundary = starts_projected_owner_boundary | (
+                pending_projected_owner_boundary
+                & continues_projected_owner_boundary
             )
             # A projected-only portal can be followed by an excluded geometric
             # path and then its forward three-sector bridge. The path still

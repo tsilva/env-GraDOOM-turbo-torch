@@ -1580,6 +1580,53 @@ def test_native_wide_projected_owner_keeps_far_wall_sector_path(
     assert rgb[0, 122, 72].tolist() == [79, 0, 0]
 
 
+def test_native_excluded_wide_portal_does_not_clip_next_drawseg(
+    pinned_deathmatch_scenario,
+) -> None:
+    engine = TorchDeathmatchEngine(
+        pinned_deathmatch_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([456]))
+    engine.x.fill_(838.550537109375)
+    engine.y.fill_(385.9864501953125)
+    engine.z.zero_()
+    engine.view_z.fill_(41)
+    angle_degrees = 165.67382816357394
+    angle_bam = round(angle_degrees / 360.0 * (1 << 32))
+    engine._angle_bam.fill_(angle_bam)
+    engine.angle.fill_(angle_bam * (2.0 * math.pi / float(1 << 32)))
+    engine.episode_time.fill_(61)
+    engine.item_available.zero_()
+    engine.enemy_alive.zero_()
+
+    (
+        _wall_distance,
+        _wall_along,
+        geometric_intersections,
+        projected_intersections,
+        _projected_left_edges,
+        _wall_visibility,
+    ) = engine._native_portal_intersections(
+        engine._native_wall_projection_geometry()
+    )
+    rgb = engine.render_native_frame(include_hud=False)
+
+    # The ray traverses portal 181 exactly at its excluded screen-right edge.
+    # It therefore advances from sector 0 into sector 1 without storing a
+    # drawseg or tightening floorclip. Portal 200 then retains both reference
+    # BFALL1 rows instead of exposing the sector-0 floor at rows 123 and 124.
+    assert geometric_intersections[0, 135, 181]
+    assert not projected_intersections[0, 135, 181]
+    assert projected_intersections[0, 135, 200]
+    assert rgb[0, 123:126, 135].tolist() == [
+        [79, 0, 0],
+        [67, 0, 0],
+        [67, 0, 0],
+    ]
+
+
 def test_native_projected_portal_bridge_draws_intermediate_sector_tier(
     pinned_deathmatch_scenario,
 ) -> None:
