@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -32,6 +33,76 @@ def test_checkpoint_evaluation_defaults_to_exact_stochastic_100() -> None:
     assert args.evaluation_num_envs == 16
     assert args.evaluation_seed == train.REFERENCE_RECIPE.seed
     assert args.evaluation_stochastic is True
+    assert args.wandb is False
+    assert args.wandb_project == "VizdoomDeathmatch-v1"
+    assert args.wandb_mode == "online"
+
+
+def test_wandb_uses_gradlab_project_metrics_and_gradoom_provider_tag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeRun:
+        def __init__(self) -> None:
+            self.defined: list[tuple[tuple[object, ...], dict[str, object]]] = []
+            self.logged: list[dict[str, int | float]] = []
+
+        def define_metric(self, *args: object, **kwargs: object) -> None:
+            self.defined.append((args, kwargs))
+
+        def log(self, payload: dict[str, int | float]) -> None:
+            self.logged.append(payload)
+
+    run = FakeRun()
+    init_calls: list[dict[str, object]] = []
+
+    def init(**kwargs: object) -> FakeRun:
+        init_calls.append(kwargs)
+        return run
+
+    monkeypatch.setitem(sys.modules, "wandb", SimpleNamespace(init=init))
+    args = _args(
+        "--wandb",
+        "--wandb-mode",
+        "disabled",
+        "--wandb-tags",
+        "experiment:throughput,env_provider:gradoom",
+    )
+    audit = train._audit_config(args)
+
+    actual_run = train._init_wandb(args, audit)
+    emitter = train.JsonEmitter(None)
+    emitter.attach_wandb(actual_run)
+    emitter.emit(
+        {
+            "type": "rollout",
+            "train/global_step": 4096,
+            train.GRADLAB_RETURN_METRIC: 12.5,
+            train.GRADLAB_KILLS_METRIC: 4.25,
+        }
+    )
+
+    assert init_calls[0]["project"] == "VizdoomDeathmatch-v1"
+    assert init_calls[0]["job_type"] == "train"
+    assert init_calls[0]["tags"] == [
+        "goal_id:VizdoomDeathmatch-v1",
+        "recipe_id:ppo",
+        "env_id:VizdoomDeathmatch-v1",
+        "env_provider:gradoom",
+        "experiment:throughput",
+    ]
+    assert audit["tracking"]["wandb_metrics"] == [
+        train.GRADLAB_RETURN_METRIC,
+        train.GRADLAB_KILLS_METRIC,
+    ]
+    assert run.logged == [
+        {
+            "global_step": 4096,
+            train.GRADLAB_RETURN_METRIC: 12.5,
+            train.GRADLAB_KILLS_METRIC: 4.25,
+        }
+    ]
+    assert ((train.GRADLAB_RETURN_METRIC,), {"step_metric": "global_step"}) in run.defined
+    assert ((train.GRADLAB_KILLS_METRIC,), {"step_metric": "global_step"}) in run.defined
 
 
 def test_partial_final_ppo_minibatch_is_supported() -> None:

@@ -15,6 +15,7 @@ dependencies = [
   "gymnasium>=1.2,<2",
   "numpy>=1.26,<3",
   "torch>=2.12,<2.13",
+  "wandb>=0.18,<0.23",
 ]
 
 [dependency-groups]

@@ -60,6 +60,8 @@ uv run python play.py --scenario /path/to/deathmatch.wad \
 uv run python tools/cuda_correctness_smoke.py --compile-engine   # check CUDA residency
 python train.py --iwad /path/to/doom2.wad \
   --scenario /path/to/deathmatch.wad                    # standalone 256x16 PPO
+python train.py --iwad /path/to/doom2.wad \
+  --scenario /path/to/deathmatch.wad --wandb            # log to GradLab's W&B project
 python train.py --initialize-from /path/to/policy.pt \
   --iwad /path/to/doom2.wad --scenario /path/to/deathmatch.wad  # weights-only start
 python tools/convert_gradlab_checkpoint.py \

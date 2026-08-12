@@ -42,6 +42,10 @@ REFERENCE_NAME = "GradLab VizdoomDeathmatch-v1/ppo"
 REFERENCE_CAPTURED_AT = "2026-08-11"
 ROLLING_EPISODES = 100
 REFERENCE_KILLS_TARGET = 31.78
+GRADLAB_WANDB_PROJECT = "VizdoomDeathmatch-v1"
+GRADLAB_RETURN_METRIC = "train/episode/return/shaped/origin/target/rolling/mean"
+GRADLAB_KILLS_METRIC = "train/progress/kills/origin/target/rolling/mean"
+GRADOOM_WANDB_TAG = "env_provider:gradoom"
 UINT32_MASK = (1 << 32) - 1
 SEED_TABLE_INITIAL_EPISODES = 64
 NATIVE_MONSTER_KILL_REWARDS = (1.0, 3.0, 3.0, 4.0, 3.0, 10.0)
@@ -362,6 +366,36 @@ def _parser() -> argparse.ArgumentParser:
         help="Optionally append every emitted JSON record to this file.",
     )
     parser.add_argument(
+        "--wandb",
+        action="store_true",
+        help="Log GradLab-compatible training metrics to Weights & Biases.",
+    )
+    parser.add_argument(
+        "--wandb-project",
+        default=GRADLAB_WANDB_PROJECT,
+        help=(
+            "W&B project (default: VizdoomDeathmatch-v1, matching GradLab's "
+            "environment-project convention)."
+        ),
+    )
+    parser.add_argument("--wandb-entity", default=None)
+    parser.add_argument("--wandb-group", default=None)
+    parser.add_argument(
+        "--wandb-tags",
+        default="",
+        help=(
+            "Comma-separated additional W&B tags. The env_provider:gradoom tag "
+            "is always included."
+        ),
+    )
+    parser.add_argument(
+        "--wandb-mode",
+        choices=("online", "offline", "disabled"),
+        default="online",
+    )
+    parser.add_argument("--run-name", default=None)
+    parser.add_argument("--run-description", default="")
+    parser.add_argument(
         "--checkpoint",
         type=Path,
         help="Optionally save the final standalone policy and optimizer checkpoint.",
@@ -563,7 +597,12 @@ def _audit_config(args: argparse.Namespace) -> dict[str, Any]:
         "contract": "standalone-gradoom-deathmatch-ppo-v2",
         "operation": "evaluate" if args.evaluate_checkpoint is not None else "train",
         "standalone": True,
-        "runtime_dependencies": ["gradoom", "torch", "numpy"],
+        "runtime_dependencies": [
+            "gradoom",
+            "torch",
+            "numpy",
+            *(["wandb"] if bool(args.wandb) else []),
+        ],
         "reference": REFERENCE_NAME,
         "reference_captured_at": REFERENCE_CAPTURED_AT,
         "recipe_sha256": hashlib.sha256(canonical.encode("ascii")).hexdigest(),
@@ -651,12 +690,25 @@ def _audit_config(args: argparse.Namespace) -> dict[str, Any]:
             "action_count": REFERENCE_RECIPE.action_count,
             "action_table": [list(action) for action in RESTRICTED_ACTIONS],
         },
+        "tracking": {
+            "wandb_enabled": bool(args.wandb),
+            "wandb_project": str(args.wandb_project),
+            "wandb_entity": args.wandb_entity,
+            "wandb_group": args.wandb_group,
+            "wandb_mode": str(args.wandb_mode),
+            "wandb_provider_tag": GRADOOM_WANDB_TAG,
+            "wandb_metrics": [GRADLAB_RETURN_METRIC, GRADLAB_KILLS_METRIC],
+        },
     }
 
 
 class JsonEmitter:
     def __init__(self, path: Path | None) -> None:
         self.path = None if path is None else path.expanduser().resolve()
+        self.wandb_run: Any | None = None
+
+    def attach_wandb(self, run: Any) -> None:
+        self.wandb_run = run
 
     def emit(self, payload: Mapping[str, Any]) -> None:
         line = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
@@ -665,6 +717,55 @@ class JsonEmitter:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with self.path.open("a", encoding="utf-8") as stream:
                 stream.write(line + "\n")
+        if self.wandb_run is not None and payload.get("type") == "rollout":
+            wandb_payload: dict[str, int | float] = {
+                "global_step": int(payload["train/global_step"]),
+            }
+            for metric in (GRADLAB_RETURN_METRIC, GRADLAB_KILLS_METRIC):
+                value = payload.get(metric)
+                if value is not None:
+                    wandb_payload[metric] = float(value)
+            self.wandb_run.log(wandb_payload)
+
+
+def _wandb_tags(additional: str) -> list[str]:
+    requested = [tag.strip() for tag in additional.split(",") if tag.strip()]
+    standard = [
+        "goal_id:VizdoomDeathmatch-v1",
+        "recipe_id:ppo",
+        "env_id:VizdoomDeathmatch-v1",
+        GRADOOM_WANDB_TAG,
+    ]
+    return list(dict.fromkeys([*standard, *requested]))
+
+
+def _init_wandb(args: argparse.Namespace, audit: Mapping[str, Any]) -> Any | None:
+    if not bool(args.wandb):
+        return None
+    try:
+        import wandb
+    except ImportError as error:  # pragma: no cover - packaging invariant
+        raise RuntimeError("--wandb requires the project's wandb dependency") from error
+
+    init_kwargs: dict[str, Any] = {
+        "project": str(args.wandb_project),
+        "entity": args.wandb_entity,
+        "group": args.wandb_group,
+        "name": args.run_name,
+        "notes": args.run_description or None,
+        "tags": _wandb_tags(str(args.wandb_tags)),
+        "config": dict(audit),
+        "mode": str(args.wandb_mode),
+        "job_type": "train",
+        "save_code": True,
+    }
+    if args.metrics_jsonl is not None:
+        init_kwargs["dir"] = str(args.metrics_jsonl.expanduser().resolve().parent)
+    run = wandb.init(**init_kwargs)
+    run.define_metric("global_step")
+    run.define_metric(GRADLAB_RETURN_METRIC, step_metric="global_step")
+    run.define_metric(GRADLAB_KILLS_METRIC, step_metric="global_step")
+    return run
 
 
 class CombatContextEncoder:
@@ -2532,7 +2633,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     _runtime_paths(args)
     if args.evaluate_checkpoint is not None:
         return _evaluate(args, emitter, audit, process_started=process_started)
-    return _train(args, emitter, audit, process_started=process_started)
+    wandb_run = _init_wandb(args, audit)
+    if wandb_run is not None:
+        emitter.attach_wandb(wandb_run)
+    exit_code = 1
+    try:
+        exit_code = _train(args, emitter, audit, process_started=process_started)
+        return exit_code
+    finally:
+        if wandb_run is not None:
+            wandb_run.finish(exit_code=exit_code)
 
 
 if __name__ == "__main__":
