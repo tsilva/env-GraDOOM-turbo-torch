@@ -45,6 +45,25 @@ REFERENCE_KILLS_TARGET = 31.78
 GRADLAB_WANDB_PROJECT = "VizdoomDeathmatch-v1"
 GRADLAB_RETURN_METRIC = "train/episode/return/shaped/origin/target/rolling/mean"
 GRADLAB_KILLS_METRIC = "train/progress/kills/origin/target/rolling/mean"
+GRADLAB_PPO_DIAGNOSTIC_METRICS = (
+    "train/algorithm/ppo/policy/dominant/action/rate",
+    "train/algorithm/ppo/policy/entropy",
+    "train/algorithm/ppo/rollout/advantage/mean",
+    "train/algorithm/ppo/rollout/advantage/std",
+    "train/algorithm/ppo/rollout/value/prediction/mean",
+    "train/algorithm/ppo/rollout/value/prediction/std",
+    "train/algorithm/ppo/update/approx_kl",
+    "train/algorithm/ppo/update/clip_fraction",
+    "train/algorithm/ppo/update/learning_rate",
+    "train/algorithm/ppo/update/policy_gradient_loss",
+    "train/algorithm/ppo/update/value_loss",
+    "train/algorithm/ppo/value/explained_variance",
+)
+GRADLAB_WANDB_METRICS = (
+    GRADLAB_RETURN_METRIC,
+    GRADLAB_KILLS_METRIC,
+    *GRADLAB_PPO_DIAGNOSTIC_METRICS,
+)
 GRADOOM_WANDB_TAG = "env_provider:gradoom"
 UINT32_MASK = (1 << 32) - 1
 SEED_TABLE_INITIAL_EPISODES = 64
@@ -697,7 +716,7 @@ def _audit_config(args: argparse.Namespace) -> dict[str, Any]:
             "wandb_group": args.wandb_group,
             "wandb_mode": str(args.wandb_mode),
             "wandb_provider_tag": GRADOOM_WANDB_TAG,
-            "wandb_metrics": [GRADLAB_RETURN_METRIC, GRADLAB_KILLS_METRIC],
+            "wandb_metrics": list(GRADLAB_WANDB_METRICS),
         },
     }
 
@@ -721,7 +740,7 @@ class JsonEmitter:
             wandb_payload: dict[str, int | float] = {
                 "global_step": int(payload["train/global_step"]),
             }
-            for metric in (GRADLAB_RETURN_METRIC, GRADLAB_KILLS_METRIC):
+            for metric in GRADLAB_WANDB_METRICS:
                 value = payload.get(metric)
                 if value is not None:
                     wandb_payload[metric] = float(value)
@@ -763,8 +782,8 @@ def _init_wandb(args: argparse.Namespace, audit: Mapping[str, Any]) -> Any | Non
         init_kwargs["dir"] = str(args.metrics_jsonl.expanduser().resolve().parent)
     run = wandb.init(**init_kwargs)
     run.define_metric("global_step")
-    run.define_metric(GRADLAB_RETURN_METRIC, step_metric="global_step")
-    run.define_metric(GRADLAB_KILLS_METRIC, step_metric="global_step")
+    for metric in GRADLAB_WANDB_METRICS:
+        run.define_metric(metric, step_metric="global_step")
     return run
 
 

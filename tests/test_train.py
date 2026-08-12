@@ -72,14 +72,17 @@ def test_wandb_uses_gradlab_project_metrics_and_gradoom_provider_tag(
     actual_run = train._init_wandb(args, audit)
     emitter = train.JsonEmitter(None)
     emitter.attach_wandb(actual_run)
-    emitter.emit(
-        {
-            "type": "rollout",
-            "train/global_step": 4096,
-            train.GRADLAB_RETURN_METRIC: 12.5,
-            train.GRADLAB_KILLS_METRIC: 4.25,
-        }
-    )
+    rollout = {
+        "type": "rollout",
+        "train/global_step": 4096,
+        train.GRADLAB_RETURN_METRIC: 12.5,
+        train.GRADLAB_KILLS_METRIC: 4.25,
+        **{
+            metric: float(index)
+            for index, metric in enumerate(train.GRADLAB_PPO_DIAGNOSTIC_METRICS)
+        },
+    }
+    emitter.emit(rollout)
 
     assert init_calls[0]["project"] == "VizdoomDeathmatch-v1"
     assert init_calls[0]["job_type"] == "train"
@@ -90,19 +93,20 @@ def test_wandb_uses_gradlab_project_metrics_and_gradoom_provider_tag(
         "env_provider:gradoom",
         "experiment:throughput",
     ]
-    assert audit["tracking"]["wandb_metrics"] == [
-        train.GRADLAB_RETURN_METRIC,
-        train.GRADLAB_KILLS_METRIC,
-    ]
+    assert audit["tracking"]["wandb_metrics"] == list(train.GRADLAB_WANDB_METRICS)
     assert run.logged == [
         {
             "global_step": 4096,
             train.GRADLAB_RETURN_METRIC: 12.5,
             train.GRADLAB_KILLS_METRIC: 4.25,
+            **{
+                metric: float(index)
+                for index, metric in enumerate(train.GRADLAB_PPO_DIAGNOSTIC_METRICS)
+            },
         }
     ]
-    assert ((train.GRADLAB_RETURN_METRIC,), {"step_metric": "global_step"}) in run.defined
-    assert ((train.GRADLAB_KILLS_METRIC,), {"step_metric": "global_step"}) in run.defined
+    for metric in train.GRADLAB_WANDB_METRICS:
+        assert ((metric,), {"step_metric": "global_step"}) in run.defined
 
 
 def test_partial_final_ppo_minibatch_is_supported() -> None:
