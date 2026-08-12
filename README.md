@@ -58,6 +58,16 @@ uv run python -m gradoom.inspect_scenario \
 uv run python play.py --scenario /path/to/deathmatch.wad \
   --iwad /path/to/doom2.wad                              # play with keyboard controls
 uv run python tools/cuda_correctness_smoke.py --compile-engine   # check CUDA residency
+python train.py --iwad /path/to/doom2.wad \
+  --scenario /path/to/deathmatch.wad                    # standalone 256x16 PPO
+python train.py --initialize-from /path/to/policy.pt \
+  --iwad /path/to/doom2.wad --scenario /path/to/deathmatch.wad  # weights-only start
+python tools/convert_gradlab_checkpoint.py \
+  --source /path/to/published/model.zip \
+  --output /path/to/standalone-policy.pt                # no GradLab/SB3 imports
+python tools/evaluate_vizdoom_checkpoint.py \
+  --checkpoint /path/to/policy.pt --iwad /path/to/doom2.wad \
+  --scenario-config /path/to/deathmatch.cfg                      # zero-shot transfer gate
 ```
 
 ## Notes
@@ -69,6 +79,7 @@ uv run python tools/cuda_correctness_smoke.py --compile-engine   # check CUDA re
 - Pass asset paths directly or set `GRADOOM_IWAD` and `GRADOOM_DEATHMATCH_WAD`. WADs and other game data are not distributed with this repository.
 - Torch tensors are the only reset/step transition transport. The Turbo control and rendering surfaces still use NumPy where required for read-only state indices and RGB arrays.
 - Operator-run benchmarks require a controlled quiet window and matched reference evidence; see [deathmatch parity](./docs/deathmatch-parity.md).
+- The current internal RTX 4090 training optimization recipe and its three-seed evidence are recorded in [training optimization](./docs/training-optimization.md). These results are experimental and do not supersede the parity-certification requirement.
 - See [third-party notices](./THIRD_PARTY_NOTICES.md) for source and game-data policy.
 
 ## Architecture

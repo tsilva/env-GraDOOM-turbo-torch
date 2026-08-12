@@ -1,0 +1,344 @@
+"""Evaluate a standalone GraDOOM checkpoint unchanged in reference ViZDoom.
+
+This optional transfer gate depends on ``vizdoom-turbo``. The root trainer does
+not import it and remains independent of ViZDoom, GradLab, and Stable-Baselines3.
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import json
+import random
+import statistics
+import sys
+import time
+from collections.abc import Mapping, Sequence
+from pathlib import Path
+from types import ModuleType
+from typing import Any
+
+import numpy as np
+import torch
+
+UINT32_MASK = (1 << 32) - 1
+DEFAULT_EPISODES = 100
+DEFAULT_NUM_ENVS = 16
+REFERENCE_KILLS_TARGET = 31.78
+REFERENCE_RENDER_HUD = True
+
+
+def _load_standalone_train() -> ModuleType:
+    path = Path(__file__).parents[1] / "train.py"
+    spec = importlib.util.spec_from_file_location("gradoom_standalone_train", path)
+    if spec is None or spec.loader is None:  # pragma: no cover - import invariant
+        raise RuntimeError(f"cannot load standalone trainer: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _provider_seed(run_seed: int, lane: int, episode_index: int) -> int:
+    """Reproduce GradLab BatchRuntime's provider seed for one lane episode."""
+
+    if episode_index == 0:
+        return int(run_seed) + int(lane)
+    sequence = np.random.SeedSequence([int(run_seed), int(lane), int(episode_index)])
+    return int(sequence.generate_state(1, dtype=np.uint32)[0])
+
+
+def _game_seed(provider_seed: int) -> int:
+    """Reproduce vizdoom-turbo's provider-seed to game-seed conversion."""
+
+    generator = np.random.default_rng(int(provider_seed))
+    return int(generator.integers(0, UINT32_MASK + 1, dtype=np.uint32))
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Evaluate an unchanged standalone checkpoint in reference ViZDoom.",
+    )
+    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--iwad", type=Path, required=True)
+    parser.add_argument("--scenario-config", type=Path, required=True)
+    parser.add_argument("--episodes", type=int, default=DEFAULT_EPISODES)
+    parser.add_argument("--num-envs", type=int, default=DEFAULT_NUM_ENVS)
+    parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument("--metrics-jsonl", type=Path)
+    parser.add_argument(
+        "--compile-policy",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    return parser
+
+
+def _validate_args(args: argparse.Namespace, train: ModuleType) -> None:
+    for name in ("episodes", "num_envs"):
+        if int(getattr(args, name)) <= 0:
+            raise ValueError(f"{name.replace('_', '-')} must be positive")
+    if int(args.num_envs) > int(args.episodes):
+        raise ValueError("num-envs cannot exceed episodes")
+    if not 0 <= int(args.seed) <= UINT32_MASK:
+        raise ValueError(f"seed must be in [0, {UINT32_MASK}]")
+    args.checkpoint = train._checkpoint_destination(args.checkpoint)
+    args.iwad = args.iwad.expanduser().resolve()
+    args.scenario_config = args.scenario_config.expanduser().resolve()
+    for label in ("checkpoint", "iwad", "scenario_config"):
+        path = getattr(args, label)
+        if not path.is_file():
+            raise FileNotFoundError(f"{label.replace('_', '-')} does not exist: {path}")
+
+
+def _info_values(
+    infos: Mapping[str, Any],
+    names: Sequence[str],
+    num_envs: int,
+) -> np.ndarray:
+    values = np.stack([np.asarray(infos[name]) for name in names], axis=1)
+    if values.shape != (num_envs, len(names)):
+        raise RuntimeError(f"expected info values {(num_envs, len(names))}, got {values.shape}")
+    return values.astype(np.float32, copy=False)
+
+
+def _summary(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    kills = [float(record["kills"]) for record in records]
+    if not kills:
+        raise ValueError("zero-shot evaluation requires completed episodes")
+    mean_kills = statistics.fmean(kills)
+    return {
+        "evaluation/episode/count": len(records),
+        "evaluation/kills/mean": mean_kills,
+        "evaluation/kills/median": statistics.median(kills),
+        "evaluation/kills/std": statistics.pstdev(kills),
+        "evaluation/kills/min": min(kills),
+        "evaluation/kills/max": max(kills),
+        "evaluation/episode/length/mean": statistics.fmean(
+            float(record["length"]) for record in records
+        ),
+        "evaluation/target/kills/mean": REFERENCE_KILLS_TARGET,
+        "evaluation/target/passed": mean_kills >= REFERENCE_KILLS_TARGET,
+    }
+
+
+def _evaluate(args: argparse.Namespace, train: ModuleType) -> dict[str, Any]:
+    try:
+        from vizdoom_turbo import VizdoomTurboVecEnv
+    except ImportError as exc:
+        raise RuntimeError(
+            "zero-shot evaluation requires vizdoom-turbo in the selected Python runtime"
+        ) from exc
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for standalone checkpoint policy inference")
+
+    random.seed(int(args.seed))
+    np.random.seed(int(args.seed))
+    torch.manual_seed(int(args.seed))
+    torch.cuda.manual_seed_all(int(args.seed))
+    device = torch.device("cuda")
+    num_envs = int(args.num_envs)
+    quotas = train._episode_quotas(int(args.episodes), num_envs)
+    scenario_wad = args.scenario_config.with_name("deathmatch.wad")
+    if not scenario_wad.is_file():
+        raise FileNotFoundError(f"scenario WAD does not exist beside config: {scenario_wad}")
+
+    env = VizdoomTurboVecEnv(
+        str(args.scenario_config),
+        use_restricted_actions=train.RESTRICTED_ACTIONS,
+        rom_path=str(args.iwad),
+        num_envs=num_envs,
+        num_threads=num_envs,
+        obs_resize=(84, 84),
+        obs_crop=(0, 32, 0, 0),
+        obs_crop_mode="mask",
+        obs_crop_fill=0,
+        obs_grayscale=True,
+        obs_layout="chw",
+        obs_copy="safe_view",
+        obs_resize_algorithm="area",
+        frame_skip=train.REFERENCE_RECIPE.frame_skip,
+        frame_stack=train.FRAME_STACK,
+        maxpool_last_two=False,
+        noop_reset_max=0,
+        sticky_action_prob=0.0,
+        reward_clip=False,
+        info="data",
+        info_filter={"mode": "all", "keys": list(train.INFO_SIGNALS)},
+        doom_skill=train.REFERENCE_RECIPE.doom_skill,
+        game_variables=train.GAME_VARIABLES,
+        treat_episode_timeout_as_truncation=True,
+        vizdoom_config={
+            "episode_timeout": train.REFERENCE_RECIPE.episode_timeout,
+            "render_hud": REFERENCE_RENDER_HUD,
+        },
+    )
+    started = time.perf_counter()
+    try:
+        if tuple(env.action_table or ()) != train.RESTRICTED_ACTIONS:
+            raise RuntimeError("reference action table differs from checkpoint contract")
+        loaded = torch.load(args.checkpoint, map_location=device, weights_only=False)
+        if not isinstance(loaded, Mapping) or loaded.get("format") != "standalone-gradoom-ppo-v1":
+            raise ValueError(f"unsupported standalone checkpoint: {args.checkpoint}")
+        policy = train.NatureActorCritic().to(device)
+        policy.load_state_dict(loaded["policy_state_dict"])
+        policy.eval()
+        calls = train.PolicyCalls(policy, compile_policy=bool(args.compile_policy))
+        precision = train.Precision("fp32", device)
+        context_encoder = train.CombatContextEncoder(train.MODEL_HISTORY_SIGNALS, device)
+
+        episode_indices = np.zeros(num_envs, dtype=np.int64)
+        provider_seeds = [_provider_seed(int(args.seed), lane, 0) for lane in range(num_envs)]
+        observations, infos = env.reset(seed=provider_seeds)
+        initial_values = _info_values(infos, train.MODEL_HISTORY_SIGNALS, num_envs)
+        histories = (
+            torch.as_tensor(initial_values, device=device)[..., None]
+            .expand(
+                -1,
+                -1,
+                train.FRAME_STACK,
+            )
+            .clone()
+        )
+        episode_returns = np.zeros(num_envs, dtype=np.float64)
+        episode_lengths = np.zeros(num_envs, dtype=np.int64)
+        records_by_grid: dict[tuple[int, int], dict[str, Any]] = {}
+        watchdog = train.REFERENCE_RECIPE.episode_timeout // train.REFERENCE_RECIPE.frame_skip + 1
+        maximum_decisions = watchdog * max(quotas)
+
+        for decision in range(maximum_decisions):
+            observation_device = torch.as_tensor(observations, device=device)
+            context = context_encoder.encode(histories)
+            with torch.no_grad(), precision.autocast():
+                actions, _values, _log_probs = calls.act(observation_device, context)
+            next_observations, rewards, terminated, truncated, step_infos = env.step(
+                actions.cpu().numpy()
+            )
+            done = np.asarray(terminated) | np.asarray(truncated)
+            episode_returns += np.asarray(rewards, dtype=np.float64)
+            episode_lengths += 1
+            step_values = _info_values(step_infos, train.MODEL_HISTORY_SIGNALS, num_envs)
+            histories = torch.roll(histories, shifts=-1, dims=2)
+            histories[:, :, -1].copy_(torch.as_tensor(step_values, device=device))
+
+            for lane in np.flatnonzero(done).tolist():
+                lane_episode = int(episode_indices[lane])
+                if lane_episode < quotas[lane]:
+                    provider_seed = _provider_seed(int(args.seed), lane, lane_episode)
+                    records_by_grid[(lane, lane_episode)] = {
+                        "lane": lane,
+                        "lane_episode": lane_episode,
+                        "provider_seed": provider_seed,
+                        "game_seed": _game_seed(provider_seed),
+                        "kills": float(np.asarray(step_infos["killcount"])[lane]),
+                        "return": float(episode_returns[lane]),
+                        "length": int(episode_lengths[lane]),
+                        "terminated": bool(np.asarray(terminated)[lane]),
+                        "truncated": bool(np.asarray(truncated)[lane]),
+                        "completion_decision": decision + 1,
+                    }
+                episode_indices[lane] += 1
+
+            if len(records_by_grid) == int(args.episodes):
+                observations = next_observations
+                break
+            if np.any(done):
+                reset_seeds: list[int | None] = [None] * num_envs
+                for lane in np.flatnonzero(done).tolist():
+                    reset_seeds[lane] = _provider_seed(
+                        int(args.seed),
+                        lane,
+                        int(episode_indices[lane]),
+                    )
+                reset_observations, reset_infos = env.reset(
+                    seed=reset_seeds,
+                    options={
+                        "reset_mask": done.astype(np.bool_, copy=False),
+                        "state_indices": np.zeros(num_envs, dtype=np.int32),
+                    },
+                )
+                reset_values = _info_values(
+                    reset_infos,
+                    train.MODEL_HISTORY_SIGNALS,
+                    num_envs,
+                )
+                reset_history = torch.as_tensor(reset_values, device=device)[..., None].expand(
+                    -1,
+                    -1,
+                    train.FRAME_STACK,
+                )
+                done_device = torch.as_tensor(done, device=device)
+                histories.copy_(torch.where(done_device[:, None, None], reset_history, histories))
+                episode_returns[done] = 0.0
+                episode_lengths[done] = 0
+                observations = reset_observations
+            else:
+                observations = next_observations
+        else:
+            missing = [
+                (lane, episode)
+                for lane, quota in enumerate(quotas)
+                for episode in range(quota)
+                if (lane, episode) not in records_by_grid
+            ]
+            raise RuntimeError(f"zero-shot evaluation watchdog expired: {missing}")
+
+        expected_grid = [
+            (lane, episode) for lane, quota in enumerate(quotas) for episode in range(quota)
+        ]
+        records = [
+            {"index": index, **records_by_grid[key]} for index, key in enumerate(expected_grid)
+        ]
+        torch.cuda.synchronize(device)
+        return {
+            "type": "evaluation",
+            "status": "completed",
+            "protocol": "standalone-zero-shot-vizdoom-turbo-v2-fixed-seed-grid",
+            "action_sampling": "stochastic",
+            "checkpoint": str(args.checkpoint),
+            "checkpoint_sha256": train._file_sha256(args.checkpoint),
+            "checkpoint_step": int(loaded.get("step", 0)),
+            "checkpoint_config": loaded.get("config"),
+            "episodes": records,
+            "episode_quotas": list(quotas),
+            "evaluation_seed": int(args.seed),
+            "evaluation_num_envs": num_envs,
+            "evaluation_seconds": time.perf_counter() - started,
+            "iwad_sha256": train._file_sha256(args.iwad),
+            "scenario_config_sha256": train._file_sha256(args.scenario_config),
+            "scenario_sha256": train._file_sha256(scenario_wad),
+            "doom_skill": train.REFERENCE_RECIPE.doom_skill,
+            "environment_contract": {
+                "frame_skip": train.REFERENCE_RECIPE.frame_skip,
+                "frame_stack": train.FRAME_STACK,
+                "obs_crop": [0, 32, 0, 0],
+                "obs_crop_mode": "mask",
+                "obs_resize": [84, 84],
+                "obs_resize_algorithm": "area",
+                "render_hud": REFERENCE_RENDER_HUD,
+            },
+            "device": torch.cuda.get_device_name(device),
+            "torch": torch.__version__,
+            **_summary(records),
+        }
+    finally:
+        env.close()
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    train = _load_standalone_train()
+    args = _parser().parse_args(argv)
+    _validate_args(args, train)
+    result = _evaluate(args, train)
+    line = json.dumps(result, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    print(line, flush=True)
+    if args.metrics_jsonl is not None:
+        destination = args.metrics_jsonl.expanduser().resolve()
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with destination.open("a", encoding="utf-8") as stream:
+            stream.write(line + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

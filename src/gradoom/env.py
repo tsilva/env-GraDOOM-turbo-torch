@@ -46,49 +46,38 @@ _DEFAULT_SIGNALS = (
 )
 _DERIVED_SIGNALS = ("episode_time", "episode_return", "player_dead", "pending_reset")
 _COMPILED_ENGINE_PHASES = (
+    "_begin_decision",
+    "_game_tic_bookkeeping",
     "_select_weapons",
     "_move_player",
     "_vertical_player_tick",
     "_player_attack",
     "_hitscan_puff_tick",
+    "_post_player_attack_bookkeeping",
     "_projectile_tick",
+    "_enemy_tick",
     "_enemy_projectile_tick",
     "_collect_items",
-    "_spawn_tick",
+    "_finish_transition",
     "render_frame",
-    "_move_enemy_thrust",
-    "_sight_blocked",
-    "_enemy_chaingun_refire_decision",
-    "_spawn_enemy_projectiles",
-    "_enemy_hitscan_damage",
-    "_enemy_damage_roll",
-    "_player_damage_thrust_components",
-    "_apply_player_damage",
-    "_enemy_damage_thrust_components",
-    "_apply_enemy_damage",
-    "_enemy_chase_move",
-    "_enemy_missile_decision",
+    "_finish_observation",
 )
 _LIMITED_FUSION_PHASES = frozenset(
     {
+        "render_frame",
+        "_enemy_tick",
         "_enemy_projectile_tick",
         "_collect_items",
-        "_spawn_tick",
-        "_move_enemy_thrust",
-        "_sight_blocked",
-        "_enemy_chaingun_refire_decision",
-        "_spawn_enemy_projectiles",
-        "_enemy_hitscan_damage",
-        "_enemy_damage_roll",
-        "_player_damage_thrust_components",
-        "_apply_player_damage",
-        "_enemy_damage_thrust_components",
-        "_apply_enemy_damage",
-        "_enemy_chase_move",
-        "_enemy_missile_decision",
+        "_begin_decision",
+        "_game_tic_bookkeeping",
+        "_post_player_attack_bookkeeping",
+        "_finish_transition",
+        "_finish_observation",
     }
 )
 _LIMITED_FUSION_OPTIONS = {"max_fusion_size": 8}
+_RENDER_FUSION_OPTIONS = {"max_fusion_size": 32}
+_ENEMY_FUSION_OPTIONS = {"max_fusion_size": 8}
 
 
 def _positive_int(value: Any, name: str) -> int:
@@ -456,9 +445,7 @@ class GraDoomVecEnv(VectorEnv):
         )
         self._safe_obs_index = 0
         self.compile_engine = bool(compile_engine)
-        self.engine_backend = (
-            "torch-compiled-cudagraph" if self.compile_engine else "torch-eager"
-        )
+        self.engine_backend = "torch-compiled-cudagraph" if self.compile_engine else "torch-eager"
         if self.compile_engine:
             for phase_name in _COMPILED_ENGINE_PHASES:
                 compile_options: dict[str, Any] = {
@@ -466,7 +453,11 @@ class GraDoomVecEnv(VectorEnv):
                     "fullgraph": True,
                     "dynamic": False,
                 }
-                if phase_name in _LIMITED_FUSION_PHASES:
+                if phase_name == "render_frame":
+                    compile_options["options"] = _RENDER_FUSION_OPTIONS
+                elif phase_name == "_enemy_tick":
+                    compile_options["options"] = _ENEMY_FUSION_OPTIONS
+                elif phase_name in _LIMITED_FUSION_PHASES:
                     compile_options["options"] = _LIMITED_FUSION_OPTIONS
                 setattr(
                     self._engine,
@@ -548,9 +539,7 @@ class GraDoomVecEnv(VectorEnv):
                 f"{sorted(history_not_selected)}"
             )
         if self.device_info_history_names and self._info_mode != "all":
-            raise ValueError(
-                "info_frame_stack_keys must be available on reset and every step"
-            )
+            raise ValueError("info_frame_stack_keys must be available on reset and every step")
         signal_schema = (
             {
                 name: MappingProxyType(
@@ -619,9 +608,7 @@ class GraDoomVecEnv(VectorEnv):
             keys = value.get("keys")
             if isinstance(keys, (str, bytes, bytearray)):
                 raise TypeError("info_filter keys must be a sequence of signal names")
-            selected = (
-                signal_names if keys is None else tuple(str(key).casefold() for key in keys)
-            )
+            selected = signal_names if keys is None else tuple(str(key).casefold() for key in keys)
         else:
             mode = str(value)
             selected = signal_names
@@ -899,9 +886,28 @@ class GraDoomVecEnv(VectorEnv):
 
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            transition = self._step_and_reset_device_impl(
-                self._cuda_graph_actions,
+            stepped = self.step_device(self._cuda_graph_actions)
+            final_observations = stepped.observations.clone()
+            final_signals = stepped.signals.clone()
+            final_info_histories = stepped.info_histories.clone()
+            done = stepped.terminated | stepped.truncated
+            reset_requested = torch.any(done)
+            graph.begin_capture_to_if_node(reset_requested)
+            observations, signals = self.reset_device(
+                done,
                 self._cuda_graph_reset_seeds,
+            )
+            graph.end_capture_to_conditional_node()
+            transition = DeviceAutoResetTransition(
+                observations=observations,
+                rewards=stepped.rewards,
+                terminated=stepped.terminated,
+                truncated=stepped.truncated,
+                signals=signals,
+                info_histories=self._info_history,
+                final_observations=final_observations,
+                final_signals=final_signals,
+                final_info_histories=final_info_histories,
             )
         torch.cuda.synchronize(self.device)
 

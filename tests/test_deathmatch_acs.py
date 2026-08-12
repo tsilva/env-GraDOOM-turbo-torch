@@ -43,6 +43,26 @@ def test_skill_one_halves_player_damage_above_one(square_scenario) -> None:
     assert engine.health.tolist() == [98.0, 99.0]
 
 
+def test_skill_one_adjusts_simultaneous_damage_per_event(square_scenario) -> None:
+    engine = TorchDeathmatchEngine(
+        square_scenario,
+        2,
+        device=torch.device("cpu"),
+        doom_skill=1,
+    )
+    engine.reset(torch.ones(2, dtype=torch.bool), torch.tensor([123, 456]))
+    events = torch.tensor(((3.0, 3.0), (1.0, 5.0)))
+
+    adjusted = engine._skill_adjust_player_damage(events)
+    engine._apply_player_damage(
+        adjusted.sum(dim=1),
+        skill_adjusted=True,
+    )
+
+    assert adjusted.tolist() == [[1.0, 1.0], [1.0, 2.0]]
+    assert engine.health.tolist() == [98.0, 97.0]
+
+
 def test_wall_contact_damage_scale_only_applies_at_blocking_geometry(
     square_scenario,
 ) -> None:

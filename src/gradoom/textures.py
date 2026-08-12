@@ -175,6 +175,8 @@ def decode_patch(payload: bytes, name: str = "<patch>") -> IndexedTexture:
 def grayscale_palette(playpal: np.ndarray) -> np.ndarray:
     if playpal.shape != (256, 3):
         raise ValueError("PLAYPAL must contain exactly 256 RGB colors")
+    # ViZDoom's GRAY8 buffer uses these coefficients and truncates the result
+    # when assigning it to an unsigned byte.
     values = (
         playpal[:, 0].astype(np.float32) * 0.21
         + playpal[:, 1].astype(np.float32) * 0.72

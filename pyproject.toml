@@ -14,7 +14,7 @@ authors = [{name = "Tiago Silva"}]
 dependencies = [
   "gymnasium>=1.2,<2",
   "numpy>=1.26,<3",
-  "torch>=2.7,<3",
+  "torch>=2.12,<2.13",
 ]
 
 [dependency-groups]

@@ -36,11 +36,15 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from gradoom._triton_kernels import frozen_nature_conv1
+
 REFERENCE_NAME = "GradLab VizdoomDeathmatch-v1/ppo"
 REFERENCE_CAPTURED_AT = "2026-08-11"
 ROLLING_EPISODES = 100
+REFERENCE_KILLS_TARGET = 31.78
 UINT32_MASK = (1 << 32) - 1
 SEED_TABLE_INITIAL_EPISODES = 64
+NATIVE_MONSTER_KILL_REWARDS = (1.0, 3.0, 3.0, 4.0, 3.0, 10.0)
 
 GAME_VARIABLES = (
     "killcount",
@@ -104,7 +108,11 @@ MODEL_HISTORY_SIGNALS = (
 )
 FRAME_STACK = 4
 CONTEXT_FEATURES_PER_FRAME = 21
-CONTEXT_FEATURES = FRAME_STACK * CONTEXT_FEATURES_PER_FRAME
+# Preserve a short temporal trace for the standalone learner. The 4-frame
+# context learned measurably faster than current-state-only context in the
+# faithful native-reward gates, and every value is policy-facing at transfer.
+MODEL_CONTEXT_FRAMES = FRAME_STACK
+CONTEXT_FEATURES = MODEL_CONTEXT_FRAMES * CONTEXT_FEATURES_PER_FRAME
 
 
 @dataclass(frozen=True)
@@ -136,6 +144,37 @@ class Recipe:
 
 
 REFERENCE_RECIPE = Recipe()
+
+
+@dataclass(frozen=True)
+class PolicyArchitecture:
+    """Static NatureCNN widths used by an audited training run."""
+
+    convolution_channels: tuple[int, int, int]
+    observation_features: int
+    fusion_features: int
+
+
+POLICY_ARCHITECTURES = {
+    "nature": PolicyArchitecture((32, 64, 64), 512, 256),
+    # Preserve the successful policy/value trunk while reducing only the
+    # convolutional work.  The earlier half/quarter profiles also narrowed the
+    # learned observation embedding and fusion trunk, so they could not
+    # distinguish visual-encoder capacity from decision-trunk capacity.
+    "nature-pyramid": PolicyArchitecture((16, 32, 64), 512, 256),
+    "nature-waist": PolicyArchitecture((32, 32, 64), 512, 256),
+    "nature-flat": PolicyArchitecture((32, 32, 32), 512, 256),
+    "nature-thin": PolicyArchitecture((16, 32, 32), 512, 256),
+    "nature-half": PolicyArchitecture((16, 32, 32), 128, 128),
+    "nature-quarter": PolicyArchitecture((8, 16, 16), 128, 128),
+}
+
+# Keep the immutable GradLab recipe above as evidence, while using the measured
+# RTX 4090 sweet spot for new standalone runs.  Both shapes contain 4,096
+# transitions; 256x16 was faster and learned at least as well in the short
+# acceptance gates as the historical 128x32 shape.
+DEFAULT_NUM_ENVS = 256
+DEFAULT_N_STEPS = 16
 
 
 @dataclass(frozen=True)
@@ -189,11 +228,17 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--timesteps", type=int, default=REFERENCE_RECIPE.timesteps)
     parser.add_argument("--seed", type=int, default=REFERENCE_RECIPE.seed)
-    parser.add_argument("--num-envs", type=int, default=REFERENCE_RECIPE.num_envs)
-    parser.add_argument("--n-steps", type=int, default=REFERENCE_RECIPE.n_steps)
+    parser.add_argument("--num-envs", type=int, default=DEFAULT_NUM_ENVS)
+    parser.add_argument("--n-steps", type=int, default=DEFAULT_N_STEPS)
     parser.add_argument("--batch-size", type=int, default=REFERENCE_RECIPE.batch_size)
     parser.add_argument("--n-epochs", type=int, default=REFERENCE_RECIPE.n_epochs)
     parser.add_argument("--learning-rate", type=float, default=REFERENCE_RECIPE.learning_rate)
+    parser.add_argument(
+        "--ent-coef",
+        type=float,
+        default=REFERENCE_RECIPE.ent_coef,
+        help=("PPO entropy coefficient (default: 0.01, matching the registered reference recipe)."),
+    )
     parser.add_argument(
         "--wall-contact-damage-scale",
         type=float,
@@ -205,15 +250,85 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--reward-shape",
-        choices=("native-v1", "sample-factory-v0"),
+        choices=(
+            "native-v1",
+            "native-death-v1",
+            "killcount-v1",
+            "sample-factory-v0",
+        ),
         default="native-v1",
-        help="Use native kills or the registered GradLab Sample Factory shaping contract.",
+        help=(
+            "Use scenario-native rewards, native rewards plus an explicit death cost, "
+            "uniform kill-count deltas, or the registered GradLab Sample Factory "
+            "shaping contract."
+        ),
+    )
+    parser.add_argument(
+        "--death-penalty",
+        type=float,
+        default=2.0,
+        help="Terminal cost used only by native-death-v1 (default: 2.0).",
+    )
+    parser.add_argument(
+        "--privileged-imitation-coef",
+        type=float,
+        default=0.0,
+        help=(
+            "Training-only cross-entropy coefficient for GraDOOM's visible-enemy "
+            "combat teacher (default: 0, disabled). The saved policy remains "
+            "pixels/context-only."
+        ),
     )
     parser.add_argument(
         "--precision",
         choices=("fp32", "amp-fp16", "amp-bf16"),
         default=REFERENCE_RECIPE.precision,
         help="FP32 matches the registered reference recipe.",
+    )
+    parser.add_argument(
+        "--float32-matmul-precision",
+        choices=("highest", "high", "medium"),
+        default="high",
+        help=(
+            "PyTorch float32 matrix-multiply mode (default: high, enabling audited "
+            "TF32 acceleration on RTX 4090 while retaining float32 storage)."
+        ),
+    )
+    parser.add_argument(
+        "--policy-architecture",
+        choices=tuple(POLICY_ARCHITECTURES),
+        default="nature",
+        help=(
+            "Audited NatureCNN width profile. 'nature' preserves checkpoint compatibility; "
+            "the half- and quarter-width profiles trade capacity for training throughput."
+        ),
+    )
+    parser.add_argument(
+        "--policy-memory-format",
+        choices=("contiguous", "channels-last"),
+        default="channels-last",
+        help=(
+            "CUDA convolution memory format (default: channels-last, including the "
+            "policy-input conversion in the compiled graph)."
+        ),
+    )
+    parser.add_argument(
+        "--freeze-observation-encoder",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Freeze the visual encoder and cache its rollout features during PPO updates. "
+            "Intended for a resumed late training stage after the encoder has learned."
+        ),
+    )
+    parser.add_argument(
+        "--frozen-encoder-custom-conv",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Use the fused uint8 first-convolution kernel while the observation "
+            "encoder is frozen (default: enabled)."
+        ),
     )
     parser.add_argument(
         "--compile-policy",
@@ -263,6 +378,49 @@ def _parser() -> argparse.ArgumentParser:
         help="Resume policy, optimizer, counters, and RNG state from a trusted checkpoint.",
     )
     parser.add_argument(
+        "--initialize-from",
+        type=Path,
+        help=(
+            "Initialize policy weights from a trusted standalone checkpoint while "
+            "starting fresh optimizer, episode, and timestep state."
+        ),
+    )
+    parser.add_argument(
+        "--evaluate-checkpoint",
+        type=Path,
+        help=(
+            "Evaluate a trusted standalone checkpoint without learning and emit an exact "
+            "episode-level result."
+        ),
+    )
+    parser.add_argument(
+        "--evaluation-episodes",
+        type=int,
+        default=ROLLING_EPISODES,
+        help=f"Number of completed checkpoint-evaluation episodes (default: {ROLLING_EPISODES}).",
+    )
+    parser.add_argument(
+        "--evaluation-num-envs",
+        type=int,
+        default=16,
+        help=(
+            "Parallel evaluation lanes; episodes are balanced across lane seed streams "
+            "(default: 16, matching GradLab and zero-shot ViZDoom evaluation)."
+        ),
+    )
+    parser.add_argument(
+        "--evaluation-seed",
+        type=int,
+        default=REFERENCE_RECIPE.seed,
+        help="Independent GradLab-compatible evaluation seed (default: 123).",
+    )
+    parser.add_argument(
+        "--evaluation-stochastic",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Sample policy actions during evaluation, matching GradLab (default: enabled).",
+    )
+    parser.add_argument(
         "--config-only",
         action="store_true",
         help="Print the effective contract and exit before CUDA/environment setup.",
@@ -281,12 +439,30 @@ def _checkpoint_destination(path: Path) -> Path:
 
 
 def _validate_args(args: argparse.Namespace) -> None:
-    for name in ("timesteps", "num_envs", "n_steps", "batch_size", "n_epochs"):
+    for name in (
+        "timesteps",
+        "num_envs",
+        "n_steps",
+        "batch_size",
+        "n_epochs",
+        "evaluation_episodes",
+        "evaluation_num_envs",
+    ):
         _validate_positive(int(getattr(args, name)), name.replace("_", "-"))
     if not 0 <= int(args.seed) <= UINT32_MASK:
         raise ValueError(f"seed must be in [0, {UINT32_MASK}]")
+    if not 0 <= int(args.evaluation_seed) <= UINT32_MASK:
+        raise ValueError(f"evaluation-seed must be in [0, {UINT32_MASK}]")
+    if int(args.evaluation_num_envs) > int(args.evaluation_episodes):
+        raise ValueError("evaluation-num-envs cannot exceed evaluation-episodes")
     if not math.isfinite(args.learning_rate) or args.learning_rate <= 0.0:
         raise ValueError("learning-rate must be finite and positive")
+    if not math.isfinite(args.ent_coef) or args.ent_coef < 0.0:
+        raise ValueError("ent-coef must be finite and non-negative")
+    if not math.isfinite(args.death_penalty) or args.death_penalty < 0.0:
+        raise ValueError("death-penalty must be finite and non-negative")
+    if not math.isfinite(args.privileged_imitation_coef) or args.privileged_imitation_coef < 0.0:
+        raise ValueError("privileged-imitation-coef must be finite and non-negative")
     if (
         not math.isfinite(args.wall_contact_damage_scale)
         or args.wall_contact_damage_scale < 0.0
@@ -300,8 +476,6 @@ def _validate_args(args: argparse.Namespace) -> None:
     rollout_transitions = int(args.num_envs) * int(args.n_steps)
     if int(args.batch_size) > rollout_transitions:
         raise ValueError("batch-size cannot exceed num-envs * n-steps")
-    if rollout_transitions % int(args.batch_size) != 0:
-        raise ValueError("num-envs * n-steps must be divisible by batch-size")
     if args.checkpoint is not None:
         destination = _checkpoint_destination(args.checkpoint)
         if destination.exists():
@@ -312,6 +486,26 @@ def _validate_args(args: argparse.Namespace) -> None:
         args.resume = _checkpoint_destination(args.resume)
         if not args.resume.is_file():
             raise FileNotFoundError(f"resume checkpoint does not exist: {args.resume}")
+    if args.initialize_from is not None:
+        args.initialize_from = _checkpoint_destination(args.initialize_from)
+        if not args.initialize_from.is_file():
+            raise FileNotFoundError(
+                f"initialization checkpoint does not exist: {args.initialize_from}"
+            )
+        if args.resume is not None:
+            raise ValueError("initialize-from cannot be combined with resume")
+    if args.evaluate_checkpoint is not None:
+        args.evaluate_checkpoint = _checkpoint_destination(args.evaluate_checkpoint)
+        if not args.evaluate_checkpoint.is_file():
+            raise FileNotFoundError(
+                f"evaluation checkpoint does not exist: {args.evaluate_checkpoint}"
+            )
+        if args.resume is not None:
+            raise ValueError("evaluate-checkpoint cannot be combined with resume")
+        if args.initialize_from is not None:
+            raise ValueError("evaluate-checkpoint cannot be combined with initialize-from")
+        if args.checkpoint is not None:
+            raise ValueError("evaluate-checkpoint cannot be combined with checkpoint")
 
 
 def _runtime_paths(args: argparse.Namespace) -> None:
@@ -332,6 +526,10 @@ def _execution_timesteps(args: argparse.Namespace) -> int:
 
 
 def _audit_config(args: argparse.Namespace) -> dict[str, Any]:
+    initialization_checkpoint = None if args.initialize_from is None else str(args.initialize_from)
+    initialization_sha256 = (
+        None if args.initialize_from is None else _file_sha256(args.initialize_from)
+    )
     effective = {
         **asdict(REFERENCE_RECIPE),
         "timesteps": int(args.timesteps),
@@ -341,48 +539,100 @@ def _audit_config(args: argparse.Namespace) -> dict[str, Any]:
         "batch_size": int(args.batch_size),
         "n_epochs": int(args.n_epochs),
         "learning_rate": float(args.learning_rate),
+        "ent_coef": float(args.ent_coef),
+        "death_penalty": float(args.death_penalty),
+        "privileged_imitation_coef": float(args.privileged_imitation_coef),
         "wall_contact_damage_scale": float(args.wall_contact_damage_scale),
         "reward_shape": str(args.reward_shape),
         "precision": str(args.precision),
+        "float32_matmul_precision": str(args.float32_matmul_precision),
+        "policy_architecture": str(args.policy_architecture),
+        "policy_memory_format": str(args.policy_memory_format),
+        "freeze_observation_encoder": bool(args.freeze_observation_encoder),
+        "frozen_encoder_custom_conv": bool(args.frozen_encoder_custom_conv),
         "compile_policy": bool(args.compile_policy),
         "compile_engine": bool(args.compile_engine),
         "fused_optimizer": bool(args.fused_optimizer),
         "torch_permutation": bool(args.torch_permutation),
+        "initialize_from": initialization_checkpoint,
+        "initialize_from_sha256": initialization_sha256,
     }
     canonical = json.dumps(effective, sort_keys=True, separators=(",", ":"))
     return {
         "type": "config",
         "contract": "standalone-gradoom-deathmatch-ppo-v2",
+        "operation": "evaluate" if args.evaluate_checkpoint is not None else "train",
         "standalone": True,
         "runtime_dependencies": ["gradoom", "torch", "numpy"],
         "reference": REFERENCE_NAME,
         "reference_captured_at": REFERENCE_CAPTURED_AT,
         "recipe_sha256": hashlib.sha256(canonical.encode("ascii")).hexdigest(),
         "reward_shape": str(args.reward_shape),
-        "reward_config": (
-            asdict(SAMPLE_FACTORY_REWARD)
-            if args.reward_shape == "sample-factory-v0"
-            else {"kill_reward": 1.0}
-        ),
+        "reward_config": {
+            "native-v1": {
+                "source": "scenario-native",
+                "monster_kill_rewards": list(NATIVE_MONSTER_KILL_REWARDS),
+            },
+            "native-death-v1": {
+                "source": "scenario-native",
+                "monster_kill_rewards": list(NATIVE_MONSTER_KILL_REWARDS),
+                "terminal_death_penalty": float(args.death_penalty),
+            },
+            "killcount-v1": {"killcount_delta_reward": 1.0},
+            "sample-factory-v0": asdict(SAMPLE_FACTORY_REWARD),
+        }[str(args.reward_shape)],
         "return_comparability": (
-            "exact sample-factory-v0 shaped return and kills"
-            if args.reward_shape == "sample-factory-v0"
-            else "native return and kills"
+            {
+                "native-v1": "scenario-native return and kills",
+                "native-death-v1": "native-plus-death-cost return and kills",
+                "killcount-v1": "uniform kill-count return and kills",
+                "sample-factory-v0": "exact sample-factory-v0 shaped return and kills",
+            }[str(args.reward_shape)]
         ),
         "requested_timesteps": int(args.timesteps),
         "execution_timesteps": _execution_timesteps(args),
         "rollout_transitions": int(args.num_envs) * int(args.n_steps),
+        "initialization": {
+            "checkpoint": initialization_checkpoint,
+            "checkpoint_sha256": initialization_sha256,
+            "mode": "policy-weights-only" if initialization_checkpoint is not None else "random",
+        },
+        "evaluation": {
+            "checkpoint": (
+                None if args.evaluate_checkpoint is None else str(args.evaluate_checkpoint)
+            ),
+            "episodes": int(args.evaluation_episodes),
+            "num_envs": int(args.evaluation_num_envs),
+            "seed": int(args.evaluation_seed),
+            "stochastic_actions": bool(args.evaluation_stochastic),
+            "kills_target": REFERENCE_KILLS_TARGET,
+        },
         "effective_recipe": effective,
         "policy_model": {
+            "architecture": str(args.policy_architecture),
+            "memory_format": str(args.policy_memory_format),
             "observation_encoder": "nature_cnn",
-            "observation_features": REFERENCE_RECIPE.cnn_features,
-            "context_history_frames": FRAME_STACK,
+            "convolution_channels": list(
+                POLICY_ARCHITECTURES[str(args.policy_architecture)].convolution_channels
+            ),
+            "observation_features": POLICY_ARCHITECTURES[
+                str(args.policy_architecture)
+            ].observation_features,
+            "context_history_frames": MODEL_CONTEXT_FRAMES,
             "context_features": CONTEXT_FEATURES,
-            "fusion_features": REFERENCE_RECIPE.fusion_features,
+            "fusion_features": POLICY_ARCHITECTURES[str(args.policy_architecture)].fusion_features,
             "fusion_activation": "tanh",
             "shared_actor_critic_features": True,
             "normalize_images": True,
             "orthogonal_init": True,
+            "observation_encoder_trainable": not bool(args.freeze_observation_encoder),
+            "frozen_encoder_custom_conv": bool(
+                args.freeze_observation_encoder and args.frozen_encoder_custom_conv
+            ),
+            "ppo_update_input": (
+                "cached_observation_features" if bool(args.freeze_observation_encoder) else "pixels"
+            ),
+            "training_only_privileged_imitation": (float(args.privileged_imitation_coef) > 0.0),
         },
         "environment": {
             "provider": "gradoom",
@@ -418,7 +668,7 @@ class JsonEmitter:
 
 
 class CombatContextEncoder:
-    """Encode GradLab's four-frame Deathmatch combat context on device."""
+    """Encode the standalone policy's short combat history on device."""
 
     def __init__(self, history_names: Sequence[str], device: torch.device) -> None:
         indices = {name: index for index, name in enumerate(history_names)}
@@ -449,19 +699,20 @@ class CombatContextEncoder:
     def encode(self, histories: torch.Tensor) -> torch.Tensor:
         if histories.ndim != 3 or histories.shape[2] != FRAME_STACK:
             raise ValueError(f"context histories must have shape (N, signals, {FRAME_STACK})")
-        armor = (histories[:, self.armor] * 0.005).clamp_(0.0, 1.0)
-        health = (histories[:, self.health] * 0.01).clamp_(0.0, 2.0)
-        selected_raw = histories[:, self.selected_weapon]
+        current = histories[:, :, -MODEL_CONTEXT_FRAMES:]
+        armor = (current[:, self.armor] * 0.005).clamp_(0.0, 1.0)
+        health = (current[:, self.health] * 0.01).clamp_(0.0, 2.0)
+        selected_raw = current[:, self.selected_weapon]
         selected_indices = torch.argmax(
             (selected_raw[..., None] == self.categories).to(torch.int64),
             dim=-1,
         )
         selected_one_hot = F.one_hot(selected_indices, num_classes=6).to(torch.float32)
-        selected_ammo = (histories[:, self.selected_weapon_ammo] / 300.0).clamp_(0.0, 1.0)
-        ammo = (histories.index_select(1, self.ammo).transpose(1, 2) * self.ammo_scale).clamp_(
+        selected_ammo = (current[:, self.selected_weapon_ammo] / 300.0).clamp_(0.0, 1.0)
+        ammo = (current.index_select(1, self.ammo).transpose(1, 2) * self.ammo_scale).clamp_(
             0.0, 1.0
         )
-        weapons = histories.index_select(1, self.weapons).transpose(1, 2).clamp_(0.0, 1.0)
+        weapons = current.index_select(1, self.weapons).transpose(1, 2).clamp_(0.0, 1.0)
         per_frame = torch.cat(
             (
                 armor[..., None],
@@ -474,6 +725,64 @@ class CombatContextEncoder:
             dim=2,
         )
         return per_frame.flatten(1)
+
+
+class PrivilegedCombatTeacher:
+    """Label visible combat states without changing the deployed policy inputs."""
+
+    def __init__(self, env: Any, device: torch.device) -> None:
+        self.engine = env._engine
+        self.rows = torch.arange(env.num_envs, dtype=torch.int64, device=device)
+        self.turn_threshold = math.radians(7.0)
+
+    def actions(self) -> tuple[torch.Tensor, torch.Tensor]:
+        engine = self.engine
+        delta_x = engine.enemy_x - engine.x[:, None]
+        delta_y = engine.enemy_y - engine.y[:, None]
+        distance_squared = delta_x.square() + delta_y.square()
+        blocked = engine._sight_blocked(
+            engine.x[:, None],
+            engine.y[:, None],
+            engine.z[:, None] + 36.0,
+            engine.enemy_x,
+            engine.enemy_y,
+            engine.enemy_z,
+            engine._effective_enemy_height(),
+        )
+        visible = engine.enemy_alive & ~blocked
+        valid = torch.any(visible, dim=1)
+        target_scores = torch.where(
+            visible,
+            distance_squared,
+            torch.full_like(distance_squared, torch.inf),
+        )
+        target = torch.argmin(target_scores, dim=1)
+        target_delta = (
+            torch.atan2(
+                delta_y[self.rows, target],
+                delta_x[self.rows, target],
+            )
+            - engine.angle
+        )
+        target_delta = torch.atan2(torch.sin(target_delta), torch.cos(target_delta))
+        target_distance = torch.sqrt(distance_squared[self.rows, target])
+
+        turn_left = target_delta > self.turn_threshold
+        turn_right = target_delta < -self.turn_threshold
+        strafe_left = torch.full_like(target, 11)
+        strafe_right = torch.full_like(target, 12)
+        strafe = torch.where(
+            torch.bitwise_and(engine.episode_time // 32, 1) == 0,
+            strafe_left,
+            strafe_right,
+        )
+        aligned = torch.where(target_distance < 192.0, torch.full_like(target, 10), strafe)
+        actions = torch.where(
+            turn_left,
+            torch.full_like(target, 13),
+            torch.where(turn_right, torch.full_like(target, 14), aligned),
+        )
+        return torch.where(valid, actions, torch.full_like(actions, 8)), valid
 
 
 class SampleFactoryDeathmatchReward:
@@ -561,9 +870,7 @@ class SampleFactoryDeathmatchReward:
         )
         process = self._process
         self.process = (
-            torch.compile(process, dynamic=False, fullgraph=True)
-            if compile_reward
-            else process
+            torch.compile(process, dynamic=False, fullgraph=True) if compile_reward else process
         )
 
     @staticmethod
@@ -657,40 +964,83 @@ class SampleFactoryDeathmatchReward:
         self.held_weapon.copy_(
             torch.where(done, torch.zeros_like(selected_weapon), selected_weapon)
         )
-        self.held_steps.copy_(
-            torch.where(done, torch.zeros_like(next_held_steps), next_held_steps)
+        self.held_steps.copy_(torch.where(done, torch.zeros_like(next_held_steps), next_held_steps))
+        return reward
+
+
+class KillcountReward:
+    """GPU-resident uniform reward for each KILLCOUNT increment."""
+
+    def __init__(
+        self,
+        signal_names: Sequence[str],
+        num_envs: int,
+        device: torch.device,
+        *,
+        compile_reward: bool,
+    ) -> None:
+        try:
+            self.kill_index = tuple(signal_names).index("killcount")
+        except ValueError as exc:
+            raise ValueError("killcount-v1 signals are missing: ['killcount']") from exc
+        self.previous_kills = torch.zeros(num_envs, dtype=torch.float32, device=device)
+        process = self._process
+        self.process = (
+            torch.compile(process, dynamic=False, fullgraph=True) if compile_reward else process
         )
+
+    def _process(
+        self,
+        final_signals: torch.Tensor,
+        terminated: torch.Tensor,
+        truncated: torch.Tensor,
+    ) -> torch.Tensor:
+        current_kills = final_signals[:, self.kill_index]
+        reward = torch.clamp_min(current_kills - self.previous_kills, 0.0).to(torch.float32)
+        done = terminated | truncated
+        self.previous_kills.copy_(torch.where(done, torch.zeros_like(current_kills), current_kills))
         return reward
 
 
 class NatureActorCritic(nn.Module):
-    """GradLab/SB3-compatible shared NatureCNN actor-critic architecture."""
+    """Shared NatureCNN actor-critic with a fixed, audited width profile."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        architecture: str = "nature",
+        memory_format: str = "contiguous",
+    ) -> None:
         super().__init__()
+        if memory_format not in ("contiguous", "channels-last"):
+            raise ValueError(f"unsupported policy memory format: {memory_format}")
+        self.channels_last = memory_format == "channels-last"
+        self.use_frozen_encoder_custom_conv = False
+        profile = POLICY_ARCHITECTURES[architecture]
+        self.observation_feature_count = profile.observation_features
+        first_channels, second_channels, third_channels = profile.convolution_channels
         self.observation_encoder = nn.Sequential(
-            nn.Conv2d(4, 32, kernel_size=8, stride=4),
+            nn.Conv2d(4, first_channels, kernel_size=8, stride=4),
             nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=4, stride=2),
+            nn.Conv2d(first_channels, second_channels, kernel_size=4, stride=2),
             nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1),
+            nn.Conv2d(second_channels, third_channels, kernel_size=3, stride=1),
             nn.ReLU(),
             nn.Flatten(),
-            nn.Linear(64 * 7 * 7, REFERENCE_RECIPE.cnn_features),
+            nn.Linear(third_channels * 7 * 7, profile.observation_features),
             nn.ReLU(),
         )
         self.fusion = nn.Sequential(
             nn.Linear(
-                REFERENCE_RECIPE.cnn_features + CONTEXT_FEATURES,
-                REFERENCE_RECIPE.fusion_features,
+                profile.observation_features + CONTEXT_FEATURES,
+                profile.fusion_features,
             ),
             nn.Tanh(),
         )
         self.action_head = nn.Linear(
-            REFERENCE_RECIPE.fusion_features,
+            profile.fusion_features,
             REFERENCE_RECIPE.action_count,
         )
-        self.value_head = nn.Linear(REFERENCE_RECIPE.fusion_features, 1)
+        self.value_head = nn.Linear(profile.fusion_features, 1)
         self._orthogonal_initialize()
 
     @staticmethod
@@ -707,50 +1057,132 @@ class NatureActorCritic(nn.Module):
         self._initialize_module(self.action_head, 0.01)
         self._initialize_module(self.value_head, 1.0)
 
+    def encode_observations(self, observations: torch.Tensor) -> torch.Tensor:
+        if self.use_frozen_encoder_custom_conv:
+            first_convolution = self.observation_encoder[0]
+            if not isinstance(first_convolution, nn.Conv2d):  # pragma: no cover - invariant
+                raise RuntimeError("NatureCNN first encoder layer is not a convolution")
+            if first_convolution.bias is None:  # pragma: no cover - invariant
+                raise RuntimeError("NatureCNN first convolution requires a bias")
+            encoded = frozen_nature_conv1(
+                observations,
+                first_convolution.weight,
+                first_convolution.bias,
+            )
+            encoded = F.relu(self.observation_encoder[2](encoded))
+            encoded = F.relu(self.observation_encoder[4](encoded))
+            encoded = torch.flatten(encoded, start_dim=1)
+            return F.relu(self.observation_encoder[7](encoded))
+        normalized = observations.float() / 255.0
+        if self.channels_last:
+            normalized = normalized.contiguous(memory_format=torch.channels_last)
+        return self.observation_encoder(normalized)
+
+    def features_from_encoded(
+        self,
+        encoded_observations: torch.Tensor,
+        context: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.fusion(torch.cat((encoded_observations, context), dim=1))
+
     def features(self, observations: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
-        encoded = self.observation_encoder(observations.float() / 255.0)
-        return self.fusion(torch.cat((encoded, context), dim=1))
+        return self.features_from_encoded(self.encode_observations(observations), context)
+
+    def _act_from_features(
+        self,
+        features: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        distribution = torch.distributions.Categorical(logits=self.action_head(features))
+        actions = distribution.sample()
+        values = self.value_head(features).flatten()
+        return actions, values, distribution.log_prob(actions)
 
     def act(
         self,
         observations: torch.Tensor,
         context: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        features = self.features(observations, context)
-        distribution = torch.distributions.Categorical(logits=self.action_head(features))
-        actions = distribution.sample()
+        return self._act_from_features(self.features(observations, context))
+
+    def act_and_encode(
+        self,
+        observations: torch.Tensor,
+        context: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        encoded_observations = self.encode_observations(observations)
+        actions, values, log_probs = self._act_from_features(
+            self.features_from_encoded(encoded_observations, context)
+        )
+        return actions, values, log_probs, encoded_observations
+
+    def evaluate_encoded_actions(
+        self,
+        encoded_observations: torch.Tensor,
+        context: torch.Tensor,
+        actions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        features = self.features_from_encoded(encoded_observations, context)
+        logits = self.action_head(features)
+        distribution = torch.distributions.Categorical(logits=logits)
         values = self.value_head(features).flatten()
-        return actions, values, distribution.log_prob(actions)
+        return values, distribution.log_prob(actions), distribution.entropy(), logits
 
     def evaluate_actions(
         self,
         observations: torch.Tensor,
         context: torch.Tensor,
         actions: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        features = self.features(observations, context)
-        distribution = torch.distributions.Categorical(logits=self.action_head(features))
-        values = self.value_head(features).flatten()
-        return values, distribution.log_prob(actions), distribution.entropy()
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.evaluate_encoded_actions(
+            self.encode_observations(observations),
+            context,
+            actions,
+        )
 
     def value(self, observations: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
         return self.value_head(self.features(observations, context)).flatten()
+
+    def deterministic_action(
+        self,
+        observations: torch.Tensor,
+        context: torch.Tensor,
+    ) -> torch.Tensor:
+        features = self.features(observations, context)
+        return torch.argmax(self.action_head(features), dim=1)
 
 
 class PolicyCalls:
     def __init__(self, policy: NatureActorCritic, *, compile_policy: bool) -> None:
         if compile_policy:
             self.act = torch.compile(policy.act, dynamic=False, fullgraph=False)
+            self.act_and_encode = torch.compile(
+                policy.act_and_encode,
+                dynamic=False,
+                fullgraph=False,
+            )
             self.evaluate_actions = torch.compile(
                 policy.evaluate_actions,
                 dynamic=False,
                 fullgraph=False,
             )
+            self.evaluate_encoded_actions = torch.compile(
+                policy.evaluate_encoded_actions,
+                dynamic=False,
+                fullgraph=False,
+            )
             self.value = torch.compile(policy.value, dynamic=True, fullgraph=False)
+            self.deterministic_action = torch.compile(
+                policy.deterministic_action,
+                dynamic=False,
+                fullgraph=False,
+            )
         else:
             self.act = policy.act
+            self.act_and_encode = policy.act_and_encode
             self.evaluate_actions = policy.evaluate_actions
+            self.evaluate_encoded_actions = policy.evaluate_encoded_actions
             self.value = policy.value
+            self.deterministic_action = policy.deterministic_action
 
 
 class Precision:
@@ -778,15 +1210,38 @@ class Precision:
 
 
 class RolloutBuffer:
-    def __init__(self, n_steps: int, n_envs: int, device: torch.device) -> None:
+    def __init__(
+        self,
+        n_steps: int,
+        n_envs: int,
+        device: torch.device,
+        *,
+        observation_feature_count: int | None = None,
+    ) -> None:
         batch = (n_steps, n_envs)
         observations = (n_steps, n_envs, 4, 84, 84)
         contexts = (n_steps, n_envs, CONTEXT_FEATURES)
-        self.observations = torch.empty(observations, dtype=torch.uint8, device=device)
+        histories = (n_steps, n_envs, len(MODEL_HISTORY_SIGNALS), FRAME_STACK)
+        self.observations = (
+            torch.empty(observations, dtype=torch.uint8, device=device)
+            if observation_feature_count is None
+            else None
+        )
+        self.observation_features = (
+            None
+            if observation_feature_count is None
+            else torch.empty(
+                (n_steps, n_envs, int(observation_feature_count)),
+                dtype=torch.float32,
+                device=device,
+            )
+        )
         self.context = torch.empty(contexts, dtype=torch.float32, device=device)
         self.final_observations = torch.empty(observations, dtype=torch.uint8, device=device)
-        self.final_context = torch.empty(contexts, dtype=torch.float32, device=device)
+        self.final_histories = torch.empty(histories, dtype=torch.float32, device=device)
         self.actions = torch.empty(batch, dtype=torch.int64, device=device)
+        self.teacher_actions = torch.empty(batch, dtype=torch.int64, device=device)
+        self.teacher_valid = torch.empty(batch, dtype=torch.bool, device=device)
         self.rewards = torch.empty(batch, dtype=torch.float32, device=device)
         self.episode_starts = torch.empty(batch, dtype=torch.bool, device=device)
         self.values = torch.empty(batch, dtype=torch.float32, device=device)
@@ -824,34 +1279,50 @@ class RolloutBuffer:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.position >= self.n_steps:
             raise RuntimeError("rollout buffer overflow")
-        self.observations[self.position].copy_(observations)
+        if self.observations is not None:
+            self.observations[self.position].copy_(observations)
+            staged_observations = self.observations[self.position]
+        else:
+            staged_observations = observations
         self.context[self.position].copy_(context)
         self.episode_starts[self.position].copy_(episode_starts)
-        return self.observations[self.position], self.context[self.position]
+        return staged_observations, self.context[self.position]
 
     def add(
         self,
         *,
         actions: torch.Tensor,
+        teacher_actions: torch.Tensor,
+        teacher_valid: torch.Tensor,
         rewards: torch.Tensor,
         values: torch.Tensor,
         log_probs: torch.Tensor,
+        observation_features: torch.Tensor | None,
         terminated: torch.Tensor,
         truncated: torch.Tensor,
         final_observations: torch.Tensor,
-        final_context: torch.Tensor,
+        final_histories: torch.Tensor,
         episode_returns: torch.Tensor,
         episode_lengths: torch.Tensor,
         final_kills: torch.Tensor,
     ) -> None:
         step = self.position
         self.actions[step].copy_(actions)
+        self.teacher_actions[step].copy_(teacher_actions)
+        self.teacher_valid[step].copy_(teacher_valid)
         self.rewards[step].copy_(rewards)
         self.values[step].copy_(values.float())
         self.log_probs[step].copy_(log_probs.float())
+        if self.observation_features is None:
+            if observation_features is not None:
+                raise ValueError("rollout buffer was not configured for observation features")
+        elif observation_features is None:
+            raise ValueError("cached observation features are required by this rollout buffer")
+        else:
+            self.observation_features[step].copy_(observation_features.float())
         self.truncated[step].copy_(truncated)
         self.final_observations[step].copy_(final_observations)
-        self.final_context[step].copy_(final_context)
+        self.final_histories[step].copy_(final_histories)
         torch.logical_or(terminated, truncated, out=self.completed[step])
         self.completed_returns[step].copy_(episode_returns)
         self.completed_kills[step].copy_(final_kills)
@@ -905,6 +1376,7 @@ def _bootstrap_time_limits(
     buffer: RolloutBuffer,
     *,
     calls: PolicyCalls,
+    context_encoder: CombatContextEncoder,
     precision: Precision,
     gamma: float,
 ) -> None:
@@ -912,9 +1384,10 @@ def _bootstrap_time_limits(
     indices = torch.nonzero(flat_truncated, as_tuple=False).flatten()
     safe_indices = torch.cat((indices, torch.zeros(1, dtype=torch.int64, device=indices.device)))
     flat_observations = buffer.final_observations.flatten(0, 1)
-    flat_context = buffer.final_context.flatten(0, 1)
+    flat_histories = buffer.final_histories.flatten(0, 1)
     selected_observations = flat_observations.index_select(0, safe_indices)
-    selected_context = flat_context.index_select(0, safe_indices)
+    selected_histories = flat_histories.index_select(0, safe_indices)
+    selected_context = context_encoder.encode(selected_histories)
     with torch.no_grad(), precision.autocast():
         selected_values = calls.value(selected_observations, selected_context).float()
     bootstrap = torch.zeros_like(flat_truncated, dtype=torch.float32)
@@ -937,14 +1410,28 @@ def _ppo_update(
 ) -> dict[str, float]:
     policy.train()
     env_major = not bool(args.torch_permutation)
-    observations = _flatten(buffer.observations, env_major=env_major)
+    observations = (
+        None if buffer.observations is None else _flatten(buffer.observations, env_major=env_major)
+    )
+    observation_features = (
+        None
+        if buffer.observation_features is None
+        else _flatten(buffer.observation_features, env_major=env_major)
+    )
     context = _flatten(buffer.context, env_major=env_major)
     actions = _flatten(buffer.actions, env_major=env_major)
+    imitation_enabled = float(args.privileged_imitation_coef) > 0.0
+    teacher_actions = (
+        _flatten(buffer.teacher_actions, env_major=env_major) if imitation_enabled else None
+    )
+    teacher_valid = (
+        _flatten(buffer.teacher_valid, env_major=env_major) if imitation_enabled else None
+    )
     old_values = _flatten(buffer.values, env_major=env_major)
     old_log_probs = _flatten(buffer.log_probs, env_major=env_major)
     advantages = _flatten(buffer.advantages, env_major=env_major)
     returns = _flatten(buffer.returns, env_major=env_major)
-    metric_sums = torch.zeros(4, dtype=torch.float32, device=buffer.rewards.device)
+    metric_sums = torch.zeros(6, dtype=torch.float32, device=buffer.rewards.device)
     metric_count = 0
     last_epoch_kl_sum = torch.zeros((), dtype=torch.float32, device=buffer.rewards.device)
     last_epoch_kl_count = 0
@@ -962,7 +1449,6 @@ def _ppo_update(
             )
         for start in range(0, buffer.size, int(args.batch_size)):
             batch = indices[start : start + int(args.batch_size)]
-            batch_observations = observations.index_select(0, batch)
             batch_context = context.index_select(0, batch)
             batch_actions = actions.index_select(0, batch)
             batch_old_log_probs = old_log_probs.index_select(0, batch)
@@ -974,11 +1460,20 @@ def _ppo_update(
                 )
 
             with precision.autocast():
-                values, log_probs, entropy = calls.evaluate_actions(
-                    batch_observations,
-                    batch_context,
-                    batch_actions,
-                )
+                if observation_features is None:
+                    if observations is None:  # pragma: no cover - constructor invariant
+                        raise RuntimeError("rollout has neither pixels nor encoded observations")
+                    values, log_probs, entropy, logits = calls.evaluate_actions(
+                        observations.index_select(0, batch),
+                        batch_context,
+                        batch_actions,
+                    )
+                else:
+                    values, log_probs, entropy, logits = calls.evaluate_encoded_actions(
+                        observation_features.index_select(0, batch),
+                        batch_context,
+                        batch_actions,
+                    )
                 ratio = torch.exp(log_probs - batch_old_log_probs)
                 policy_loss = -torch.min(
                     batch_advantages * ratio,
@@ -991,10 +1486,35 @@ def _ppo_update(
                 ).mean()
                 value_loss = F.mse_loss(batch_returns, values)
                 entropy_loss = -entropy.mean()
+                if imitation_enabled:
+                    if teacher_actions is None or teacher_valid is None:  # pragma: no cover
+                        raise RuntimeError("imitation tensors were not prepared")
+                    batch_teacher_actions = teacher_actions.index_select(0, batch)
+                    batch_teacher_valid = teacher_valid.index_select(0, batch)
+                    imitation_per_sample = F.cross_entropy(
+                        logits,
+                        batch_teacher_actions,
+                        reduction="none",
+                    )
+                    imitation_weight = batch_teacher_valid.to(imitation_per_sample.dtype)
+                    imitation_count = imitation_weight.sum().clamp_min(1.0)
+                    imitation_loss = (imitation_per_sample * imitation_weight).sum() / (
+                        imitation_count
+                    )
+                    imitation_accuracy = (
+                        (torch.argmax(logits, dim=1) == batch_teacher_actions).to(
+                            imitation_per_sample.dtype
+                        )
+                        * batch_teacher_valid.to(imitation_per_sample.dtype)
+                    ).sum() / batch_teacher_valid.sum().clamp_min(1)
+                else:
+                    imitation_loss = logits.sum() * 0.0
+                    imitation_accuracy = logits.new_zeros(())
                 loss = (
                     policy_loss
-                    + REFERENCE_RECIPE.ent_coef * entropy_loss
+                    + float(args.ent_coef) * entropy_loss
                     + REFERENCE_RECIPE.vf_coef * value_loss
+                    + float(args.privileged_imitation_coef) * imitation_loss
                 )
 
             with torch.no_grad():
@@ -1010,6 +1530,8 @@ def _ppo_update(
                             value_loss.detach().float(),
                             entropy.detach().mean().float(),
                             clip_fraction,
+                            imitation_loss.detach().float(),
+                            imitation_accuracy.detach().float(),
                         )
                     )
                 )
@@ -1056,7 +1578,10 @@ def _ppo_update(
         "train/algorithm/ppo/update/value_loss": float(tensors[2]),
         "train/algorithm/ppo/update/policy_gradient_loss": float(tensors[3]),
         "train/algorithm/ppo/policy/entropy": float(tensors[4]),
-        "train/algorithm/ppo/update/learning_rate": float(args.learning_rate),
+        "train/algorithm/ppo/update/learning_rate": _optimizer_learning_rate(optimizer),
+        "train/algorithm/imitation/loss": float(means[4].detach().cpu()),
+        "train/algorithm/imitation/accuracy": float(means[5].detach().cpu()),
+        "train/algorithm/imitation/valid_rate": float(buffer.teacher_valid.float().mean().cpu()),
     }
     if math.isfinite(tensors[5]):
         metrics["train/algorithm/ppo/value/explained_variance"] = float(tensors[5])
@@ -1108,7 +1633,34 @@ def _make_optimizer(
     )
 
 
-def _make_env(args: argparse.Namespace, device: torch.device):
+def _load_optimizer_state(
+    optimizer: torch.optim.Optimizer,
+    state_dict: Mapping[str, Any],
+    *,
+    learning_rate: float,
+) -> None:
+    """Restore optimizer moments while honoring the resumed run's explicit LR."""
+
+    optimizer.load_state_dict(state_dict)
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = float(learning_rate)
+
+
+def _optimizer_learning_rate(optimizer: torch.optim.Optimizer) -> float:
+    learning_rates = {float(group["lr"]) for group in optimizer.param_groups}
+    if len(learning_rates) != 1:
+        raise RuntimeError(
+            f"optimizer parameter groups disagree on learning rate: {learning_rates}"
+        )
+    return learning_rates.pop()
+
+
+def _make_env(
+    args: argparse.Namespace,
+    device: torch.device,
+    *,
+    num_envs: int | None = None,
+):
     from gradoom import GraDoomVecEnv
 
     return GraDoomVecEnv(
@@ -1116,7 +1668,7 @@ def _make_env(args: argparse.Namespace, device: torch.device):
         scenario=None if args.scenario is None else str(args.scenario),
         use_restricted_actions=RESTRICTED_ACTIONS,
         rom_path=str(args.iwad),
-        num_envs=int(args.num_envs),
+        num_envs=int(args.num_envs) if num_envs is None else int(num_envs),
         num_threads=1,
         device=device,
         info="data",
@@ -1198,6 +1750,33 @@ def _rolling_mean(values: Sequence[float]) -> float | None:
     return None if not values else statistics.fmean(values)
 
 
+def _episode_quotas(episodes: int, num_envs: int) -> tuple[int, ...]:
+    """Balance an exact episode count over stable lane seed streams."""
+
+    quotient, remainder = divmod(int(episodes), int(num_envs))
+    return tuple(quotient + int(lane < remainder) for lane in range(int(num_envs)))
+
+
+def _restore_episode_indices(
+    destination: torch.Tensor,
+    saved: torch.Tensor | None,
+    *,
+    fallback_index: int,
+) -> int:
+    """Restore stable lane streams while permitting an explicit env-count change."""
+    if saved is None:
+        destination.fill_(int(fallback_index))
+        return 0
+    if saved.ndim != 1:
+        raise ValueError("checkpoint episode_index must be one-dimensional")
+    destination.zero_()
+    preserved = min(destination.numel(), saved.numel())
+    destination[:preserved].copy_(
+        saved[:preserved].to(device=destination.device, dtype=torch.int64)
+    )
+    return preserved
+
+
 def _save_checkpoint(
     path: Path,
     *,
@@ -1228,6 +1807,242 @@ def _save_checkpoint(
 def _periodic_checkpoint_path(path: Path, step: int) -> Path:
     destination = _checkpoint_destination(path)
     return destination.with_name(f"{destination.stem}.step-{int(step)}{destination.suffix}")
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _evaluation_aggregate(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    if not records:
+        raise ValueError("evaluation requires at least one completed episode")
+    kills = [float(record["kills"]) for record in records]
+    returns = [float(record["return"]) for record in records]
+    lengths = [float(record["length"]) for record in records]
+    mean_kills = statistics.fmean(kills)
+    return {
+        "evaluation/episode/count": len(records),
+        "evaluation/kills/mean": mean_kills,
+        "evaluation/kills/median": statistics.median(kills),
+        "evaluation/kills/std": statistics.pstdev(kills),
+        "evaluation/kills/min": min(kills),
+        "evaluation/kills/max": max(kills),
+        "evaluation/return/native/mean": statistics.fmean(returns),
+        "evaluation/episode/length/mean": statistics.fmean(lengths),
+        "evaluation/target/kills/mean": REFERENCE_KILLS_TARGET,
+        "evaluation/target/passed": mean_kills >= REFERENCE_KILLS_TARGET,
+    }
+
+
+def _evaluate(
+    args: argparse.Namespace,
+    emitter: JsonEmitter,
+    audit: Mapping[str, Any],
+    *,
+    process_started: float,
+) -> int:
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for GraDOOM checkpoint evaluation")
+    if args.evaluate_checkpoint is None:  # pragma: no cover - caller invariant
+        raise ValueError("evaluate-checkpoint is required")
+    random.seed(int(args.evaluation_seed))
+    np.random.seed(int(args.evaluation_seed))
+    torch.manual_seed(int(args.evaluation_seed))
+    torch.cuda.manual_seed_all(int(args.evaluation_seed))
+    device = torch.device("cuda")
+    evaluation_envs = int(args.evaluation_num_envs)
+    env = _make_env(args, device, num_envs=evaluation_envs)
+    try:
+        loaded = torch.load(args.evaluate_checkpoint, map_location=device, weights_only=False)
+        if not isinstance(loaded, Mapping) or loaded.get("format") != "standalone-gradoom-ppo-v1":
+            raise ValueError(f"unsupported evaluation checkpoint: {args.evaluate_checkpoint}")
+        policy = NatureActorCritic(
+            str(args.policy_architecture),
+            str(args.policy_memory_format),
+        ).to(
+            device=device,
+            memory_format=(
+                torch.channels_last
+                if str(args.policy_memory_format) == "channels-last"
+                else torch.contiguous_format
+            ),
+        )
+        policy.load_state_dict(loaded["policy_state_dict"])
+        policy.use_frozen_encoder_custom_conv = bool(
+            args.freeze_observation_encoder and args.frozen_encoder_custom_conv
+        )
+        policy.eval()
+        calls = PolicyCalls(policy, compile_policy=bool(args.compile_policy))
+        precision = Precision(str(args.precision), device)
+        context_encoder = CombatContextEncoder(env.device_info_history_names, device)
+        episode_index = torch.zeros(evaluation_envs, dtype=torch.int64, device=device)
+        episode_seeds = GradLabEpisodeSeeds(
+            int(args.evaluation_seed),
+            evaluation_envs,
+            device,
+        )
+        current_seeds = episode_seeds.lookup(episode_index)
+        observations, _signals = env.reset_device(
+            torch.ones(evaluation_envs, dtype=torch.bool, device=device),
+            current_seeds,
+        )
+        context = context_encoder.encode(env.device_info_histories())
+        episode_returns = torch.zeros(evaluation_envs, dtype=torch.float32, device=device)
+        episode_lengths = torch.zeros(evaluation_envs, dtype=torch.int32, device=device)
+        kill_index = {name: index for index, name in enumerate(env.device_signal_names)}[
+            "killcount"
+        ]
+        episode_quotas = _episode_quotas(int(args.evaluation_episodes), evaluation_envs)
+        decisions_per_episode = math.ceil(
+            REFERENCE_RECIPE.episode_timeout / REFERENCE_RECIPE.frame_skip
+        )
+        maximum_decisions = max(episode_quotas) * (decisions_per_episode + 1)
+        quota_tensor = torch.tensor(episode_quotas, dtype=torch.int64, device=device)
+        episode_seeds.ensure(maximum_decisions + 1)
+        completed = torch.empty(
+            (maximum_decisions, evaluation_envs),
+            dtype=torch.bool,
+            device=device,
+        )
+        completed_kills = torch.empty(
+            (maximum_decisions, evaluation_envs),
+            dtype=torch.float32,
+            device=device,
+        )
+        completed_returns = torch.empty_like(completed_kills)
+        completed_lengths = torch.empty(
+            (maximum_decisions, evaluation_envs),
+            dtype=torch.int32,
+            device=device,
+        )
+        completed_seeds = torch.empty(
+            (maximum_decisions, evaluation_envs),
+            dtype=torch.int64,
+            device=device,
+        )
+        completed_episode_indices = torch.empty_like(completed_seeds)
+        completed_terminated = torch.empty_like(completed)
+        completed_truncated = torch.empty_like(completed)
+        evaluation_started = time.perf_counter()
+        emitter.emit(
+            {
+                "type": "event",
+                "event": "evaluation_started",
+                "checkpoint": str(args.evaluate_checkpoint),
+                "checkpoint_step": int(loaded.get("step", 0)),
+                "episodes": int(args.evaluation_episodes),
+                "num_envs": evaluation_envs,
+                "episode_quotas": list(episode_quotas),
+                "seed_grid": "gradlab-vizdoom-turbo-v1 lanes x episode-index",
+                "deterministic_actions": not bool(args.evaluation_stochastic),
+            }
+        )
+        executed_decisions = maximum_decisions
+        for decision in range(maximum_decisions):
+            with torch.no_grad(), precision.autocast():
+                if args.evaluation_stochastic:
+                    actions, _values, _log_probs = calls.act(observations, context)
+                else:
+                    actions = calls.deterministic_action(observations, context)
+            next_episode_index = episode_index + 1
+            next_seeds = episode_seeds.lookup(next_episode_index)
+            transition = env.step_and_reset_device(actions, next_seeds)
+            episode_returns.add_(transition.rewards)
+            episode_lengths.add_(1)
+            done = transition.terminated | transition.truncated
+            completed[decision].copy_(done)
+            completed_kills[decision].copy_(transition.final_signals[:, kill_index])
+            completed_returns[decision].copy_(episode_returns)
+            completed_lengths[decision].copy_(episode_lengths)
+            completed_seeds[decision].copy_(current_seeds)
+            completed_episode_indices[decision].copy_(episode_index)
+            completed_terminated[decision].copy_(transition.terminated)
+            completed_truncated[decision].copy_(transition.truncated)
+            episode_returns.masked_fill_(done, 0.0)
+            episode_lengths.masked_fill_(done, 0)
+            episode_index.add_(done.to(torch.int64))
+            current_seeds.copy_(torch.where(done, next_seeds, current_seeds))
+            observations = transition.observations
+            context = context_encoder.encode(transition.info_histories)
+            if decision % int(args.n_steps) == int(args.n_steps) - 1 and bool(
+                torch.all(episode_index >= quota_tensor)
+            ):
+                executed_decisions = decision + 1
+                break
+
+        torch.cuda.synchronize(device)
+        evaluation_seconds = time.perf_counter() - evaluation_started
+        completed_cpu = completed[:executed_decisions].cpu().numpy()
+        kills_cpu = completed_kills[:executed_decisions].cpu().numpy()
+        returns_cpu = completed_returns[:executed_decisions].cpu().numpy()
+        lengths_cpu = completed_lengths[:executed_decisions].cpu().numpy()
+        seeds_cpu = completed_seeds[:executed_decisions].cpu().numpy()
+        episode_indices_cpu = completed_episode_indices[:executed_decisions].cpu().numpy()
+        terminated_cpu = completed_terminated[:executed_decisions].cpu().numpy()
+        truncated_cpu = completed_truncated[:executed_decisions].cpu().numpy()
+        records_by_seed_grid: dict[tuple[int, int], dict[str, Any]] = {}
+        for completion_decision in range(executed_decisions):
+            for lane in np.flatnonzero(completed_cpu[completion_decision]).tolist():
+                lane_episode = int(episode_indices_cpu[completion_decision, lane])
+                if lane_episode >= episode_quotas[lane]:
+                    continue
+                key = (int(lane), lane_episode)
+                if key in records_by_seed_grid:
+                    raise RuntimeError(f"duplicate evaluation seed-grid completion: {key}")
+                records_by_seed_grid[key] = {
+                    "lane": int(lane),
+                    "lane_episode": lane_episode,
+                    "game_seed": int(seeds_cpu[completion_decision, lane]),
+                    "kills": float(kills_cpu[completion_decision, lane]),
+                    "return": float(returns_cpu[completion_decision, lane]),
+                    "length": int(lengths_cpu[completion_decision, lane]),
+                    "terminated": bool(terminated_cpu[completion_decision, lane]),
+                    "truncated": bool(truncated_cpu[completion_decision, lane]),
+                    "completion_decision": completion_decision + 1,
+                }
+        expected_grid = [
+            (lane, lane_episode)
+            for lane in range(evaluation_envs)
+            for lane_episode in range(episode_quotas[lane])
+        ]
+        missing_grid = [key for key in expected_grid if key not in records_by_seed_grid]
+        if missing_grid:
+            raise RuntimeError(f"evaluation did not complete fixed seed grid: {missing_grid}")
+        records = []
+        for index, key in enumerate(expected_grid):
+            records.append({"index": index, **records_by_seed_grid[key]})
+        emitter.emit(
+            {
+                "type": "evaluation",
+                "status": "completed",
+                "protocol": "standalone-gradoom-deathmatch-checkpoint-eval-v3-balanced-seed-grid",
+                "checkpoint": str(args.evaluate_checkpoint),
+                "checkpoint_sha256": _file_sha256(args.evaluate_checkpoint),
+                "checkpoint_step": int(loaded.get("step", 0)),
+                "checkpoint_config": loaded.get("config"),
+                "evaluation_config": audit["evaluation"],
+                "deterministic_actions": not bool(args.evaluation_stochastic),
+                "episode_quotas": list(episode_quotas),
+                "evaluation_seconds": evaluation_seconds,
+                "process_elapsed_seconds": time.perf_counter() - process_started,
+                "environment_steps": executed_decisions * evaluation_envs,
+                "environment_backend": env.engine_backend,
+                "iwad_sha256": env.iwad_sha256,
+                "scenario_sha256": env.scenario_sha256,
+                "device": torch.cuda.get_device_name(device),
+                "torch": torch.__version__,
+                "cuda": torch.version.cuda,
+                **_evaluation_aggregate(records),
+                "episodes": records,
+            }
+        )
+        return 0
+    finally:
+        env.close()
 
 
 def _train(
@@ -1276,13 +2091,46 @@ def _train(
                 f"{tuple(observations.shape)} on {observations.device}"
             )
 
-        policy = NatureActorCritic().to(device)
+        policy = NatureActorCritic(
+            str(args.policy_architecture),
+            str(args.policy_memory_format),
+        ).to(
+            device=device,
+            memory_format=(
+                torch.channels_last
+                if str(args.policy_memory_format) == "channels-last"
+                else torch.contiguous_format
+            ),
+        )
+        if bool(args.freeze_observation_encoder):
+            policy.observation_encoder.requires_grad_(False)
+        policy.use_frozen_encoder_custom_conv = bool(
+            args.freeze_observation_encoder and args.frozen_encoder_custom_conv
+        )
         optimizer = _make_optimizer(
             policy,
             learning_rate=float(args.learning_rate),
             fused=bool(args.fused_optimizer),
         )
         resume_payload: Mapping[str, Any] | None = None
+        if args.initialize_from is not None:
+            loaded = torch.load(args.initialize_from, map_location=device, weights_only=False)
+            if (
+                not isinstance(loaded, Mapping)
+                or loaded.get("format") != "standalone-gradoom-ppo-v1"
+            ):
+                raise ValueError(f"unsupported initialization checkpoint: {args.initialize_from}")
+            policy.load_state_dict(loaded["policy_state_dict"])
+            emitter.emit(
+                {
+                    "type": "event",
+                    "event": "policy_initialized",
+                    "checkpoint": str(args.initialize_from),
+                    "checkpoint_sha256": _file_sha256(args.initialize_from),
+                    "source_step": int(loaded.get("step", 0)),
+                    "mode": "policy-weights-only",
+                }
+            )
         if args.resume is not None:
             loaded = torch.load(args.resume, map_location=device, weights_only=False)
             if (
@@ -1291,27 +2139,51 @@ def _train(
             ):
                 raise ValueError(f"unsupported resume checkpoint: {args.resume}")
             policy.load_state_dict(loaded["policy_state_dict"])
-            optimizer.load_state_dict(loaded["optimizer_state_dict"])
+            _load_optimizer_state(
+                optimizer,
+                loaded["optimizer_state_dict"],
+                learning_rate=float(args.learning_rate),
+            )
             resume_payload = loaded
         calls = PolicyCalls(policy, compile_policy=bool(args.compile_policy))
         precision = Precision(str(args.precision), device)
-        buffer = RolloutBuffer(int(args.n_steps), int(args.num_envs), device)
+        buffer = RolloutBuffer(
+            int(args.n_steps),
+            int(args.num_envs),
+            device,
+            observation_feature_count=(
+                policy.observation_feature_count if bool(args.freeze_observation_encoder) else None
+            ),
+        )
         episode_starts = torch.ones(int(args.num_envs), dtype=torch.bool, device=device)
         dones = torch.zeros(int(args.num_envs), dtype=torch.bool, device=device)
         episode_returns = torch.zeros(int(args.num_envs), dtype=torch.float32, device=device)
         episode_lengths = torch.zeros(int(args.num_envs), dtype=torch.int32, device=device)
         signal_indices = {name: index for index, name in enumerate(env.device_signal_names)}
         kill_index = signal_indices["killcount"]
-        reward_shaper = (
-            SampleFactoryDeathmatchReward(
+        reward_shaper = {
+            "native-v1": None,
+            "native-death-v1": None,
+            "killcount-v1": KillcountReward(
                 env.device_signal_names,
                 int(args.num_envs),
                 device,
                 compile_reward=bool(args.compile_engine),
-            )
-            if args.reward_shape == "sample-factory-v0"
+            ),
+            "sample-factory-v0": SampleFactoryDeathmatchReward(
+                env.device_signal_names,
+                int(args.num_envs),
+                device,
+                compile_reward=bool(args.compile_engine),
+            ),
+        }[str(args.reward_shape)]
+        combat_teacher = (
+            PrivilegedCombatTeacher(env, device)
+            if float(args.privileged_imitation_coef) > 0.0
             else None
         )
+        disabled_teacher_actions = torch.zeros(int(args.num_envs), dtype=torch.int64, device=device)
+        disabled_teacher_valid = torch.zeros(int(args.num_envs), dtype=torch.bool, device=device)
         saved_training_state = (
             resume_payload.get("training_state", {}) if resume_payload is not None else {}
         )
@@ -1346,10 +2218,28 @@ def _train(
         resume_step = global_step
         if resume_payload is not None:
             saved_episode_index = saved_training_state.get("episode_index")
-            if isinstance(saved_episode_index, torch.Tensor):
-                episode_index.copy_(saved_episode_index.to(device=device, dtype=torch.int64))
-            else:
-                episode_index.fill_(global_step // int(args.num_envs))
+            saved_episode_index_tensor = (
+                saved_episode_index if isinstance(saved_episode_index, torch.Tensor) else None
+            )
+            preserved_lanes = _restore_episode_indices(
+                episode_index,
+                saved_episode_index_tensor,
+                fallback_index=global_step // int(args.num_envs),
+            )
+            if (
+                saved_episode_index_tensor is not None
+                and saved_episode_index_tensor.numel() != episode_index.numel()
+            ):
+                emitter.emit(
+                    {
+                        "type": "event",
+                        "event": "resume_lanes_migrated",
+                        "source_num_envs": saved_episode_index_tensor.numel(),
+                        "target_num_envs": episode_index.numel(),
+                        "preserved_lanes": preserved_lanes,
+                        "new_lanes_start_at_episode": 0,
+                    }
+                )
             episode_seeds.ensure(int(episode_index.max().item()))
             observations, _signals = env.reset_device(
                 reset_mask,
@@ -1411,42 +2301,60 @@ def _train(
             torch.cuda.synchronize(device)
             rollout_started = time.perf_counter()
             for _step in range(int(args.n_steps)):
+                if combat_teacher is None:
+                    teacher_actions = disabled_teacher_actions
+                    teacher_valid = disabled_teacher_valid
+                else:
+                    with torch.no_grad():
+                        teacher_actions, teacher_valid = combat_teacher.actions()
                 staged_observations, staged_context = buffer.stage(
                     observations,
                     context,
                     episode_starts,
                 )
                 with torch.no_grad(), precision.autocast():
-                    actions, values, log_probs = calls.act(
-                        staged_observations,
-                        staged_context,
-                    )
+                    if bool(args.freeze_observation_encoder):
+                        actions, values, log_probs, observation_features = calls.act_and_encode(
+                            staged_observations,
+                            staged_context,
+                        )
+                    else:
+                        actions, values, log_probs = calls.act(
+                            staged_observations,
+                            staged_context,
+                        )
+                        observation_features = None
                 next_episode_index = episode_index + 1
                 transition = env.step_and_reset_device(
                     actions,
                     episode_seeds.lookup(next_episode_index),
                 )
-                policy_rewards = (
-                    transition.rewards
-                    if reward_shaper is None
-                    else reward_shaper.process(
+                if str(args.reward_shape) == "native-death-v1":
+                    policy_rewards = transition.rewards - (
+                        float(args.death_penalty) * transition.terminated.to(torch.float32)
+                    )
+                elif reward_shaper is None:
+                    policy_rewards = transition.rewards
+                else:
+                    policy_rewards = reward_shaper.process(
                         transition.final_signals,
                         transition.terminated,
                         transition.truncated,
                     )
-                )
                 episode_returns.add_(policy_rewards)
                 episode_lengths.add_(1)
-                final_context = context_encoder.encode(transition.final_info_histories)
                 buffer.add(
                     actions=actions,
+                    teacher_actions=teacher_actions,
+                    teacher_valid=teacher_valid,
                     rewards=policy_rewards,
                     values=values,
                     log_probs=log_probs,
+                    observation_features=observation_features,
                     terminated=transition.terminated,
                     truncated=transition.truncated,
                     final_observations=transition.final_observations,
-                    final_context=final_context,
+                    final_histories=transition.final_info_histories,
                     episode_returns=episode_returns,
                     episode_lengths=episode_lengths,
                     final_kills=transition.final_signals[:, kill_index],
@@ -1475,6 +2383,7 @@ def _train(
             _bootstrap_time_limits(
                 buffer,
                 calls=calls,
+                context_encoder=context_encoder,
                 precision=precision,
                 gamma=REFERENCE_RECIPE.gamma,
             )
@@ -1614,12 +2523,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     process_started = time.perf_counter()
     args = _parser().parse_args(argv)
     _validate_args(args)
+    torch.set_float32_matmul_precision(str(args.float32_matmul_precision))
     audit = _audit_config(args)
     emitter = JsonEmitter(args.metrics_jsonl)
     emitter.emit(audit)
     if args.config_only:
         return 0
     _runtime_paths(args)
+    if args.evaluate_checkpoint is not None:
+        return _evaluate(args, emitter, audit, process_started=process_started)
     return _train(args, emitter, audit, process_started=process_started)
 
 
