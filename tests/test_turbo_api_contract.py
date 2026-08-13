@@ -20,9 +20,15 @@ from gradoom import GraDoomVecEnv, scenario_buttons
 
 def _env(square_scenario, **kwargs) -> GraDoomVecEnv:
     return GraDoomVecEnv(
+        game="VizdoomDeathmatch-v1",
         compiled_scenario=square_scenario,
         num_envs=2,
         device="cpu",
+        transport=kwargs.pop("transport", "torch"),
+        render_mode=kwargs.pop("render_mode", "rgb_array"),
+        obs_crop=kwargs.pop("obs_crop", (0, 32, 0, 0)),
+        obs_crop_mode=kwargs.pop("obs_crop_mode", "mask"),
+        frame_skip=kwargs.pop("frame_skip", 2),
         **kwargs,
     )
 
@@ -96,9 +102,9 @@ def test_generic_gymnasium_factory_preserves_torch_transport(square_scenario):
         env.close()
 
 
-def test_public_surface_matches_turbo_vector_api_v1(square_scenario) -> None:
+def test_public_surface_matches_turbo_vector_api_v2(square_scenario) -> None:
     parameters = inspect.signature(GraDoomVecEnv).parameters
-    shared_parameters = {
+    common_parameters = (
         "game",
         "state",
         "scenario",
@@ -112,6 +118,7 @@ def test_public_surface_matches_turbo_vector_api_v1(square_scenario) -> None:
         "num_envs",
         "num_threads",
         "rom_path",
+        "transport",
         "obs_copy",
         "obs_resize",
         "obs_crop",
@@ -130,59 +137,131 @@ def test_public_surface_matches_turbo_vector_api_v1(square_scenario) -> None:
         "info_filter",
         "info_frame_stack_keys",
         "state_catalog",
+    )
+    provider_extensions = {
+        "device",
         "doom_map",
         "doom_skill",
+        "wall_contact_damage_scale",
         "game_args",
         "game_variables",
         "enemy_variants",
         "surface_variants",
         "treat_episode_timeout_as_truncation",
         "vizdoom_config",
+        "compiled_scenario",
+        "require_pinned_scenario",
+        "compile_engine",
     }
-    assert shared_parameters <= set(parameters)
-    assert parameters["transport"].default == "torch"
+    assert tuple(parameters)[: len(common_parameters)] == common_parameters
+    assert tuple(
+        parameter.default for parameter in tuple(parameters.values())[: len(common_parameters)]
+    ) == (
+        inspect.Parameter.empty,
+        None,
+        None,
+        None,
+        "default",
+        False,
+        1,
+        "stable",
+        "image",
+        None,
+        1,
+        None,
+        None,
+        "default",
+        "safe_view",
+        (84, 84),
+        None,
+        "remove",
+        0,
+        True,
+        "area",
+        "chw",
+        4,
+        4,
+        False,
+        0,
+        False,
+        0.0,
+        False,
+        "all",
+        None,
+        None,
+    )
+    assert set(parameters) - set(common_parameters) == provider_extensions
+    assert all(
+        parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        for parameter in tuple(parameters.values())[10:]
+    )
+    assert parameters["game"].default is inspect.Parameter.empty
+    assert parameters["transport"].default == "default"
+    assert parameters["render_mode"].default is None
+    assert parameters["frame_skip"].default == 4
     assert issubclass(GraDoomVecEnv, gym.vector.VectorEnv)
     assert GraDoomVecEnv.metadata["autoreset_mode"] is AutoresetMode.DISABLED
-    assert GraDoomVecEnv.metadata["turbo_api_version"] == 1
+    assert GraDoomVecEnv.metadata["turbo_api_version"] == 2
+    assert GraDoomVecEnv.metadata["transition_transport"] == "torch"
 
     env = _env(square_scenario)
     try:
-        expected_capabilities = {
+        expected_capabilities = (
             "supported_action_modes",
             "supported_observation_layouts",
+            "supported_observation_color_modes",
             "supported_resize_algorithms",
+            "supported_crop_modes",
             "supported_observation_copy_modes",
-            "supports_maxpool_last_two",
-            "supports_sticky_action_prob",
-            "supports_reward_clipping",
-            "supports_noop_reset",
-            "supports_state_catalog",
-            "supports_live_snapshots",
-            "supports_per_lane_rgb",
+            "supported_transition_transports",
+            "supports_async_step",
+            "supports_branching",
+            "supports_device_api",
+            "supports_emulator_ram",
             "supports_enemy_variants",
-            "supports_surface_variants",
+            "supports_fire_reset",
             "supports_info_frame_stack",
-        }
+            "supports_live_snapshots",
+            "supports_maxpool_last_two",
+            "supports_noop_reset",
+            "supports_per_lane_rgb",
+            "supports_reward_clipping",
+            "supports_snapshot_codec",
+            "supports_state_catalog",
+            "supports_sticky_action_prob",
+            "supports_surface_variants",
+        )
         assert isinstance(env.capabilities, type(MappingProxyType({})))
-        assert set(env.capabilities) == expected_capabilities
+        assert tuple(env.capabilities) == expected_capabilities
         assert env.capabilities["supported_action_modes"] == ("custom_discrete",)
         assert env.capabilities["supported_resize_algorithms"] == ("area",)
-        assert env.num_threads == env.num_envs
+        assert env.num_threads is None
         assert env.state_catalog == ("default",)
         assert env.info_frame_stack_keys == ()
         assert env.supports_live_snapshots is False
         assert env.live_snapshots_deterministic is False
         assert isinstance(env.signal_schema, type(MappingProxyType({})))
         assert all(
-            isinstance(spec, type(MappingProxyType({})))
-            for spec in env.signal_schema.values()
+            isinstance(spec, type(MappingProxyType({}))) for spec in env.signal_schema.values()
+        )
+        observations, infos = env.reset(seed=19)
+        transition = env.step(torch.zeros(env.num_envs, dtype=torch.int64))
+        for name, spec in env.signal_schema.items():
+            assert isinstance(spec["dtype"], str)
+            assert isinstance(spec["shape"], tuple)
+            if spec["available_on_reset"]:
+                assert getattr(torch, spec["dtype"]) == infos[name].dtype
+                assert tuple(infos[name].shape[1:]) == spec["shape"]
+        assert all(
+            isinstance(value, torch.Tensor)
+            for value in (observations, *transition[:4], *infos.values(), *transition[4].values())
         )
 
         active = env.active_state_indices()
         assert active is env.active_state_indices()
         assert active.shape == (env.num_envs,)
-        assert active.dtype == np.dtype(np.int32)
-        assert not active.flags.writeable
+        assert active.dtype == torch.int32
+        assert active.device == env.device
     finally:
         env.close()
 
@@ -198,12 +277,8 @@ def test_torch_is_the_only_transition_transport(square_scenario) -> None:
 
         observations, infos = env.reset(seed=7)
         assert isinstance(observations, torch.Tensor)
-        assert all(
-            isinstance(value, torch.Tensor)
-            for key, value in infos.items()
-            if key != "start_source"
-        )
-        assert isinstance(infos["start_source"], np.ndarray)
+        assert all(isinstance(value, torch.Tensor) for value in infos.values())
+        assert infos["start_source"].dtype == torch.int8
 
         with pytest.raises(TypeError, match="Torch tensor"):
             env.step(np.zeros(2, dtype=np.int64))
@@ -212,6 +287,51 @@ def test_torch_is_the_only_transition_transport(square_scenario) -> None:
         assert all(isinstance(value, torch.Tensor) for value in transition[4].values())
     finally:
         env.close()
+
+    with pytest.raises(ValueError, match="num_threads is unsupported"):
+        _env(square_scenario, num_threads=1)
+
+
+def test_v2_defaults_action_resolution_rendering_catalog_and_async(square_scenario) -> None:
+    env = GraDoomVecEnv(
+        game="VizdoomDeathmatch-v1",
+        compiled_scenario=square_scenario,
+        num_envs=2,
+        device="cpu",
+    )
+    try:
+        assert env.transport == "torch"
+        assert env.action_preset == "deathmatch-p1-v1"
+        assert env.render_mode is None
+        assert env.render() is None
+        assert env.get_images() == [None, None]
+        assert env.capabilities["supports_per_lane_rgb"] is False
+        observations, infos = env.reset(seed=17)
+        assert observations.shape == (2, 4, 84, 84)
+        assert infos["state_index"].dtype == torch.int32
+        assert infos["start_source"].dtype == torch.int8
+        assert infos["noop_reset_count"].dtype == torch.int64
+        env.step_async(torch.zeros(2, dtype=torch.int64))
+        transition = env.step_wait()
+        assert all(isinstance(value, torch.Tensor) for value in transition[:4])
+    finally:
+        env.close()
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        GraDoomVecEnv(
+            game="VizdoomDeathmatch-v1",
+            state="default",
+            state_catalog=("default",),
+            compiled_scenario=square_scenario,
+            device="cpu",
+        )
+    with pytest.raises(ValueError, match="unique"):
+        GraDoomVecEnv(
+            game="VizdoomDeathmatch-v1",
+            state_catalog=("default", "default"),
+            compiled_scenario=square_scenario,
+            device="cpu",
+        )
 
 
 def test_seed_and_manual_lifecycle_match_turbo_semantics(square_scenario) -> None:
@@ -273,7 +393,7 @@ def test_info_filter_schema_and_histories_are_exact(square_scenario) -> None:
     try:
         _observations, infos = history.reset(seed=2)
         assert history.info_frame_stack_keys == ("health",)
-        assert history.signal_schema["health_frame_stack"]["dtype"] == np.dtype(np.float64)
+        assert history.signal_schema["health_frame_stack"]["dtype"] == "float64"
         assert infos["health_frame_stack"].dtype == torch.float64
         assert history.device_info_histories().dtype == torch.float32
     finally:

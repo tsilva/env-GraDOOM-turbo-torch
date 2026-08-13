@@ -183,19 +183,39 @@ def main(argv: list[str] | None = None) -> int:
     env: GraDoomVecEnv | None = None
     try:
         env = GraDoomVecEnv(
+            game="VizdoomDeathmatch-v1",
             scenario=args.scenario,
             rom_path=None if args.iwad is None else str(args.iwad),
             num_envs=1,
             device=args.device,
+            transport="torch",
+            use_restricted_actions=DEATHMATCH_ACTIONS,
+            render_mode="rgb_array",
+            obs_copy="unsafe_view",
+            obs_resize=(84, 84),
+            obs_crop=(0, 32, 0, 0),
+            obs_crop_mode="mask",
+            obs_crop_fill=0,
+            obs_grayscale=True,
+            obs_resize_algorithm="area",
+            obs_layout="chw",
+            frame_skip=2,
+            frame_stack=4,
+            maxpool_last_two=False,
+            noop_reset_max=0,
+            use_fire_reset=False,
+            sticky_action_prob=0.0,
+            reward_clip=False,
             compile_engine=args.compile_engine,
             require_pinned_scenario=not args.allow_unpinned_scenario,
         )
         env.reset(seed=args.seed)
 
-        native_height, native_width, _ = env.capabilities["native_render_shape"]
-        screen = pygame.display.set_mode(
-            (native_width * args.scale, native_height * args.scale)
-        )
+        initial_frame = env.render()
+        if initial_frame is None:  # pragma: no cover - explicit render mode invariant
+            raise RuntimeError("rgb_array rendering did not produce a frame")
+        native_height, native_width, _ = initial_frame.shape
+        screen = pygame.display.set_mode((native_width * args.scale, native_height * args.scale))
         pygame.display.set_caption("GraDOOM")
         step_fps = args.fps or env.metadata["render_fps"] / env.frame_skip
         frame_period = 1.0 / step_fps

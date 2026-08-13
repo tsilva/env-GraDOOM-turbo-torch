@@ -93,9 +93,16 @@ def main() -> int:
         else {"rom_path": str(args.iwad), "scenario": args.scenario}
     )
     env = GraDoomVecEnv(
+        game="VizdoomDeathmatch-v1",
         **env_kwargs,
         num_envs=args.num_envs,
         device=device,
+        transport="torch",
+        render_mode="rgb_array",
+        obs_copy="unsafe_view",
+        obs_crop=(0, 32, 0, 0),
+        obs_crop_mode="mask",
+        frame_skip=2,
         compile_engine=args.compile_engine,
     )
     try:

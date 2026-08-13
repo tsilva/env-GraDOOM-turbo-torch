@@ -200,15 +200,16 @@ class DeviceAutoResetTransition:
 class GraDoomVecEnv(VectorEnv):
     """Device-resident vector deathmatch environment.
 
-    Torch tensors are the only transition transport. NumPy is limited to the
-    Turbo API's host-side state-index and RGB rendering surfaces.
+    Torch tensors are the only transition transport, including reset selectors
+    and state indices. NumPy is limited to diagnostic RGB rendering.
     """
 
     metadata: ClassVar[dict[str, Any]] = {
         "autoreset_mode": AutoresetMode.DISABLED,
         "render_modes": ["rgb_array"],
         "render_fps": 35,
-        "turbo_api_version": 1,
+        "turbo_api_version": 2,
+        "transition_transport": "torch",
         "gradoom_device_api_version": 1,
     }
     supports_live_snapshots = False
@@ -218,31 +219,30 @@ class GraDoomVecEnv(VectorEnv):
 
     def __init__(
         self,
-        game: str | Path | None = "VizdoomDeathmatch-v1",
-        state: Any = "default",
+        game: str | Path,
+        state: Any = None,
         scenario: str | Path | None = None,
         info: Any = None,
-        use_restricted_actions: Any = DEATHMATCH_ACTIONS,
+        use_restricted_actions: Any = "default",
         record: bool = False,
         players: int = 1,
         inttype: Any = "stable",
         obs_type: Any = "image",
-        render_mode: str = "rgb_array",
+        render_mode: str | None = None,
         *,
         num_envs: int = 1,
         num_threads: int | None = None,
         rom_path: str | None = None,
-        device: str | torch.device | None = None,
-        transport: Literal["torch"] = "torch",
-        obs_copy: Literal["copy", "safe_view", "unsafe_view"] = "unsafe_view",
+        transport: Literal["default", "torch"] = "default",
+        obs_copy: Literal["copy", "safe_view", "unsafe_view"] = "safe_view",
         obs_resize: tuple[int, int] | None = (84, 84),
-        obs_crop: tuple[int, int, int, int] | None = (0, 32, 0, 0),
-        obs_crop_mode: Literal["remove", "mask"] = "mask",
+        obs_crop: tuple[int, int, int, int] | None = None,
+        obs_crop_mode: Literal["remove", "mask"] = "remove",
         obs_crop_fill: int = 0,
         obs_grayscale: bool = True,
         obs_resize_algorithm: Literal["nearest", "bilinear", "area"] = "area",
         obs_layout: Literal["hwc", "chw"] = "chw",
-        frame_skip: int = 2,
+        frame_skip: int = 4,
         frame_stack: int = 4,
         maxpool_last_two: bool = False,
         noop_reset_max: int = 0,
@@ -252,6 +252,7 @@ class GraDoomVecEnv(VectorEnv):
         info_filter: str | Mapping[str, Any] = "all",
         info_frame_stack_keys: Sequence[str] | None = None,
         state_catalog: Sequence[Any] | None = None,
+        device: str | torch.device | None = None,
         doom_map: str | None = None,
         doom_skill: int | None = None,
         wall_contact_damage_scale: float = 1.0,
@@ -264,10 +265,11 @@ class GraDoomVecEnv(VectorEnv):
         compiled_scenario: CompiledScenario | None = None,
         require_pinned_scenario: bool = True,
         compile_engine: bool = False,
-        **unsupported: Any,
     ) -> None:
-        if unsupported:
-            raise TypeError(f"unsupported option(s): {', '.join(sorted(unsupported))}")
+        if transport == "default":
+            transport = "torch"
+        if isinstance(use_restricted_actions, str) and use_restricted_actions == "default":
+            use_restricted_actions = DEATHMATCH_ACTIONS
         _validate_deathmatch_request(game, scenario)
         if info not in (None, "data"):
             raise ValueError("info must be None or 'data'")
@@ -277,9 +279,16 @@ class GraDoomVecEnv(VectorEnv):
             raise ValueError("the deathmatch-p1-v1 profile supports players=1")
         if str(obs_type).split(".")[-1].casefold() != "image":
             raise ValueError("GraDoomVecEnv supports image observations only")
-        if render_mode != "rgb_array":
-            raise ValueError("render_mode must be 'rgb_array'")
-        if state not in (None, "default") or state_catalog not in (None, ("default",), ["default"]):
+        if render_mode not in (None, "rgb_array"):
+            raise ValueError("render_mode must be None or 'rgb_array'")
+        if state is not None and state_catalog is not None:
+            raise ValueError("state and state_catalog are mutually exclusive")
+        configured_catalog = ("default",) if state_catalog is None else tuple(state_catalog)
+        if not configured_catalog:
+            raise ValueError("state_catalog must not be empty")
+        if len(set(configured_catalog)) != len(configured_catalog):
+            raise ValueError("state_catalog must contain unique states")
+        if state not in (None, "default") or configured_catalog != ("default",):
             raise ValueError("the first device profile supports only the default initial state")
         if any(
             value is not None for value in (doom_map, game_args, enemy_variants, surface_variants)
@@ -320,14 +329,14 @@ class GraDoomVecEnv(VectorEnv):
             raise ValueError("transport must be 'torch'; NumPy transition transport is unsupported")
         if obs_copy not in {"copy", "safe_view", "unsafe_view"}:
             raise ValueError("obs_copy must be copy, safe_view, or unsafe_view")
-        del inttype
+        inttype_name = getattr(inttype, "name", inttype)
+        if str(inttype_name).split(".")[-1].casefold() != "stable":
+            raise ValueError("inttype must select the Stable integration")
+        if num_threads is not None:
+            raise ValueError("num_threads is unsupported and must be None on the device path")
 
         self.num_envs = _positive_int(num_envs, "num_envs")
-        self.num_threads = (
-            self.num_envs
-            if num_threads is None
-            else min(_positive_int(num_threads, "num_threads"), self.num_envs)
-        )
+        self.num_threads = None
         self.frame_skip = _positive_int(frame_skip, "frame_skip")
         self.frame_stack = frame_stack
         if info_frame_stack_keys is None:
@@ -365,13 +374,12 @@ class GraDoomVecEnv(VectorEnv):
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         if compile_engine and self.device.type != "cuda":
             raise ValueError("compile_engine=True requires a CUDA device")
-        self.state_catalog = ("default",)
-        self._active_state_indices = np.zeros(self.num_envs, dtype=np.int32)
-        self._active_state_indices.setflags(write=False)
+        self.state_catalog = configured_catalog
         self._device_state_indices = torch.zeros(
             self.num_envs, device=self.device, dtype=torch.int32
         )
         self._resident_device = self._device_state_indices.device
+        self._pending_actions: torch.Tensor | None = None
         self._initialized = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
         self._seed_values: list[int | None] = [None] * self.num_envs
         self._reset_rngs = [np.random.default_rng(lane) for lane in range(self.num_envs)]
@@ -544,7 +552,7 @@ class GraDoomVecEnv(VectorEnv):
             {
                 name: MappingProxyType(
                     {
-                        "dtype": np.dtype(np.float64),
+                        "dtype": "float64",
                         "shape": (),
                         "available_on_reset": self._info_mode == "all",
                         "available_on_step": self._info_mode != "none",
@@ -558,7 +566,7 @@ class GraDoomVecEnv(VectorEnv):
         for name in self.device_info_history_names:
             signal_schema[f"{name}_frame_stack"] = MappingProxyType(
                 {
-                    "dtype": np.dtype(np.float64),
+                    "dtype": "float64",
                     "shape": (self.frame_stack,),
                     "available_on_reset": True,
                     "available_on_step": True,
@@ -569,18 +577,27 @@ class GraDoomVecEnv(VectorEnv):
             {
                 "supported_action_modes": ("custom_discrete",),
                 "supported_observation_layouts": ("chw", "hwc"),
+                "supported_observation_color_modes": ("grayscale",),
                 "supported_resize_algorithms": ("area",),
+                "supported_crop_modes": ("remove", "mask"),
                 "supported_observation_copy_modes": ("copy", "safe_view", "unsafe_view"),
-                "supports_maxpool_last_two": False,
-                "supports_sticky_action_prob": False,
-                "supports_reward_clipping": True,
-                "supports_noop_reset": False,
-                "supports_state_catalog": False,
-                "supports_live_snapshots": False,
-                "supports_per_lane_rgb": True,
+                "supported_transition_transports": ("torch",),
+                "supports_async_step": True,
+                "supports_branching": False,
+                "supports_device_api": True,
+                "supports_emulator_ram": False,
                 "supports_enemy_variants": False,
-                "supports_surface_variants": False,
+                "supports_fire_reset": False,
                 "supports_info_frame_stack": True,
+                "supports_live_snapshots": False,
+                "supports_maxpool_last_two": False,
+                "supports_noop_reset": False,
+                "supports_per_lane_rgb": render_mode == "rgb_array",
+                "supports_reward_clipping": True,
+                "supports_snapshot_codec": False,
+                "supports_state_catalog": True,
+                "supports_sticky_action_prob": False,
+                "supports_surface_variants": False,
             }
         )
 
@@ -750,7 +767,7 @@ class GraDoomVecEnv(VectorEnv):
         infos = self._infos(mask)
         infos["state_index"] = self._device_state_indices.clone()
         infos["_state_index"] = mask.clone()
-        infos["start_source"] = np.full(self.num_envs, "environment", dtype=object)
+        infos["start_source"] = torch.zeros(self.num_envs, device=self.device, dtype=torch.int8)
         infos["_start_source"] = mask.clone()
         infos["noop_reset_count"] = torch.zeros(
             self.num_envs, device=self.device, dtype=torch.int64
@@ -782,6 +799,18 @@ class GraDoomVecEnv(VectorEnv):
             transition.truncated,
             self._infos(),
         )
+
+    def step_async(self, actions: torch.Tensor) -> None:
+        if self._pending_actions is not None:
+            raise RuntimeError("an asynchronous step is already pending")
+        self._pending_actions = actions
+
+    def step_wait(self):
+        if self._pending_actions is None:
+            raise RuntimeError("no asynchronous step is pending")
+        actions = self._pending_actions
+        self._pending_actions = None
+        return self.step(actions)
 
     def step_device(self, actions: torch.Tensor) -> DeviceTransition:
         """Advance all lanes and return only device tensors, with no host synchronization."""
@@ -954,10 +983,10 @@ class GraDoomVecEnv(VectorEnv):
     def device_info_histories(self) -> torch.Tensor:
         return self._info_history
 
-    def active_state_indices(self) -> np.ndarray:
-        return self._active_state_indices
+    def active_state_indices(self) -> torch.Tensor:
+        return self._device_state_indices
 
-    def render_lane(self, lane: int) -> np.ndarray:
+    def render_lane(self, lane: int) -> np.ndarray | None:
         if self.closed:
             raise RuntimeError("cannot render a closed environment")
         if isinstance(lane, (bool, np.bool_)):
@@ -965,6 +994,8 @@ class GraDoomVecEnv(VectorEnv):
         lane_index = operator.index(lane)
         if not 0 <= lane_index < self.num_envs:
             raise IndexError(f"lane must be in [0, {self.num_envs - 1}]")
+        if self.render_mode != "rgb_array":
+            return None
         return (
             self._engine.render_native_frame(include_hud=True)[lane_index]
             .detach()
@@ -973,16 +1004,19 @@ class GraDoomVecEnv(VectorEnv):
             .copy()
         )
 
-    def render(self) -> np.ndarray:
+    def render(self) -> np.ndarray | None:
         return self.render_lane(0)
 
-    def get_images(self) -> list[np.ndarray]:
+    def get_images(self) -> list[np.ndarray | None]:
         if self.closed:
             raise RuntimeError("cannot render a closed environment")
+        if self.render_mode != "rgb_array":
+            return [None for _ in range(self.num_envs)]
         frames = self._engine.render_native_frame(include_hud=True).detach().to("cpu").numpy()
         return [frame.copy() for frame in frames]
 
     def close(self) -> None:
+        self._pending_actions = None
         self.closed = True
 
 

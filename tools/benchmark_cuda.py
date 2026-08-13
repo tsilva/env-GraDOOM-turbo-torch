@@ -34,10 +34,17 @@ def main() -> int:
 
     device = torch.device("cuda")
     env = GraDoomVecEnv(
+        game="VizdoomDeathmatch-v1",
         scenario=args.scenario,
         rom_path=str(args.iwad),
         num_envs=args.num_envs,
         device=device,
+        transport="torch",
+        render_mode="rgb_array",
+        obs_copy="unsafe_view",
+        obs_crop=(0, 32, 0, 0),
+        obs_crop_mode="mask",
+        frame_skip=2,
         compile_engine=not args.eager,
     )
     try:

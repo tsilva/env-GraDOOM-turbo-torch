@@ -10,9 +10,15 @@ from gradoom.actions import DEATHMATCH_ACTION_TABLE_SHA256
 def _env(square_scenario, **kwargs) -> GraDoomVecEnv:
     device = kwargs.pop("device", "cpu")
     return GraDoomVecEnv(
+        game="VizdoomDeathmatch-v1",
         compiled_scenario=square_scenario,
         num_envs=2,
         device=device,
+        transport="torch",
+        render_mode=kwargs.pop("render_mode", "rgb_array"),
+        obs_crop=kwargs.pop("obs_crop", (0, 32, 0, 0)),
+        obs_crop_mode=kwargs.pop("obs_crop_mode", "mask"),
+        frame_skip=kwargs.pop("frame_skip", 2),
         **kwargs,
     )
 
@@ -91,7 +97,7 @@ def test_turbo_api_contract_and_torch_transport(square_scenario) -> None:
         assert observations.dtype == torch.uint8
         assert observations.device.type == "cpu"
         assert env.action_table_hash == DEATHMATCH_ACTION_TABLE_SHA256
-        assert env.metadata["turbo_api_version"] == 1
+        assert env.metadata["turbo_api_version"] == 2
         assert env.metadata["gradoom_device_api_version"] == 1
         assert env.engine_backend == "torch-eager"
         assert "engine_backend" not in env.capabilities
