@@ -2,7 +2,7 @@
 
 ## Performance boundary
 
-The certified training path is a device-resident state machine. Host code may configure a run, compile scenario assets, launch work, and consume bounded telemetry; it must not participate in each environment step. Reset/step transitions use Torch tensors exclusively; only control-plane state indices and diagnostic RGB rendering cross through NumPy.
+The certified training path is a device-resident state machine. Host code may configure a run, compile scenario assets, launch work, and consume bounded telemetry; it must not participate in each environment step. Reset/step transitions and state indices use Torch tensors exclusively; only diagnostic RGB rendering crosses through NumPy.
 
 ## Layers
 

@@ -453,8 +453,7 @@ def _parser() -> argparse.ArgumentParser:
         "--wandb-tags",
         default="",
         help=(
-            "Comma-separated additional W&B tags. The env_provider:gradoom tag "
-            "is always included."
+            "Comma-separated additional W&B tags. The env_provider:gradoom tag is always included."
         ),
     )
     parser.add_argument(
@@ -1969,8 +1968,9 @@ def _make_env(
         use_restricted_actions=RESTRICTED_ACTIONS,
         rom_path=str(args.iwad),
         num_envs=int(args.num_envs) if num_envs is None else int(num_envs),
-        num_threads=1,
         device=device,
+        transport="torch",
+        render_mode=None,
         info="data",
         obs_resize=(84, 84),
         obs_crop=(0, 32, 0, 0),
