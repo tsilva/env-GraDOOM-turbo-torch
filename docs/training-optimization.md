@@ -119,3 +119,46 @@ while throughput differs by less than 1%. Native reward therefore remains the
 selected optimization reward. This single native-tuned schedule does not rule
 out a separately tuned learning rate, reward scale, or longer schedule for
 `sample-factory-v0`.
+
+## Experimental greater-than-30-kill curriculum
+
+A 2026-08-13 follow-up reached the internal 30-kill target by using the
+experimental wall-contact damage control. This is not a parity or transfer
+result: `wall_contact_damage_scale=0.25` changes enemy damage while the player
+touches blocking geometry, and the default remains `1.0`.
+
+The selected branch resumed the seed-789 exact-grayscale lineage at step
+25,341,952 and used 256 environments x 16 steps, batch size 512, two epochs,
+learning rate 3.125e-5, entropy coefficient 0.003, and `native-v1`. It reached a
+peak 100-episode rolling mean of **37.02 kills** at step 31,236,096 and ended at
+31.09 kills at step 34,000,896. The 8.66M-transition branch took 194.5 seconds
+of measured training time and sustained 51,445 transitions/s. The W&B run is
+`jppzf0hs` in `tsilva/VizdoomDeathmatch-v1`.
+
+The selected step-32,681,984 checkpoint scored 30.85 mean kills, 31.5 median,
+and 62 maximum on the fixed 100-episode seed-123 evaluation, with 1,382.83 mean
+episode length. The same checkpoint under default damage scored only 21.06 mean
+kills and 995.95 mean episode length. A subsequent 0.5-damage curriculum stage
+ended at 21.42 rolling kills and was rejected. The greater-than-30 result must
+therefore remain labeled as an experimental mechanics result.
+
+The high-throughput preservation check resumed the selected checkpoint with
+4,096 environments x 16 steps, a single 65,536-transition minibatch and epoch,
+a frozen visual encoder, the fused uint8 first-convolution kernel, and learning
+rate 1e-9. It sustained **147,349 transitions/s**, or **10.98x** the audited
+13,418.4-transition/s baseline. Fixed evaluation after this stage reproduced
+the selected checkpoint's 30.85 mean, 31.5 median, and 62 maximum kills exactly.
+The W&B run is `gt1jwls0`. As with the earlier mature-policy benchmark, this
+proves throughput and behavior preservation, not a 10x reduction in
+end-to-end time-to-quality.
+
+Parity remains the blocking issue for a certified result. The converted
+GradLab reference policy scored 35.11 mean kills over 100 episodes in ViZDoom
+but only 3.59 in the current GraDOOM environment on the corresponding fixed
+seed grid. An exact reference-recipe GraDOOM reproduction also peaked at only
+7.30 rolling kills by 10.0M steps. These results point to observation or
+simulation incompatibility rather than a PPO-throughput limitation.
+
+The retained evidence is under
+`/home/tsilva/gradoom-runs/20260813-native-wall025-mature-seed789-goal30` and
+`/home/tsilva/gradoom-runs/20260813-wall025-goal30-throughput10x` on Beast-3.
