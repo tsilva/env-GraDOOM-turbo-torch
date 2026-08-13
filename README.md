@@ -21,13 +21,14 @@ uv sync --group dev
 ## Use
 
 ```python
+import gymnasium as gym
 import torch
-
-from gradoom import GraDoomVecEnv
 
 num_envs = 128
 device = torch.device("cuda")
-env = GraDoomVecEnv(
+env = gym.make_vec(
+    "gradoom:GraDOOM-v0",
+    game="VizdoomDeathmatch-v1",
     scenario="/path/to/vizdoom/scenarios/deathmatch.wad",
     rom_path="/path/to/doom2.wad",
     num_envs=num_envs,
@@ -45,6 +46,10 @@ transition = env.step_and_reset_device(actions, lanes + num_envs + 1)
 raw_rgb_with_hud = env.render()  # 320x240 RGB24, no observation preprocessing
 env.close()
 ```
+
+The module-qualified ID imports the package and registers the factory. This ID
+is vector-only, requires an explicit `game`, and returns the native
+Torch-only `GraDoomVecEnv`; the class also remains available for direct use.
 
 `observations`, rewards, episode flags, and signals remain Torch tensors on the selected device.
 

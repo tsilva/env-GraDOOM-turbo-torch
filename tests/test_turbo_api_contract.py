@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 import inspect
+import os
+import subprocess
+import sys
+from pathlib import Path
 from types import MappingProxyType
 
 import gymnasium as gym
 import numpy as np
 import pytest
 import torch
+from gymnasium.envs.registration import EnvSpec
 from gymnasium.vector import AutoresetMode
 
+import gradoom
 from gradoom import GraDoomVecEnv, scenario_buttons
 
 
@@ -19,6 +25,75 @@ def _env(square_scenario, **kwargs) -> GraDoomVecEnv:
         device="cpu",
         **kwargs,
     )
+
+
+def test_generic_gymnasium_registration_is_vector_only_and_idempotent(monkeypatch):
+    spec = gym.spec(gradoom.GYMNASIUM_ENV_ID)
+    assert spec.entry_point is None
+    assert spec.vector_entry_point == "gradoom:_make_gymnasium_vec_env"
+    assert spec.kwargs == {}
+    gradoom._register_gymnasium_env()
+
+    with pytest.raises(gym.error.Error, match="entry_point is not specified"):
+        gym.make(gradoom.GYMNASIUM_ENV_ID, game="VizdoomDeathmatch-v1")
+    with pytest.raises(TypeError, match="game"):
+        gym.make_vec(gradoom.GYMNASIUM_ENV_ID, num_envs=1)
+
+    monkeypatch.setitem(
+        gym.registry,
+        gradoom.GYMNASIUM_ENV_ID,
+        EnvSpec(
+            id=gradoom.GYMNASIUM_ENV_ID,
+            entry_point=None,
+            vector_entry_point="tests:conflicting_factory",
+        ),
+    )
+    with pytest.raises(gym.error.Error, match="conflicting specification"):
+        gradoom._register_gymnasium_env()
+
+
+def test_module_qualified_gymnasium_id_registers_in_a_clean_process():
+    root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, (str(root / "src"), env.get("PYTHONPATH"))))
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            'exec("""import gymnasium as gym\n'
+            "assert 'GraDOOM-v0' not in gym.registry\n"
+            "try:\n"
+            "    gym.make_vec('gradoom:GraDOOM-v0', num_envs=1)\n"
+            "except TypeError as exc:\n"
+            "    assert 'game' in str(exc)\n"
+            "else:\n"
+            "    raise AssertionError('game was not required')\n"
+            "spec = gym.spec('GraDOOM-v0')\n"
+            "assert spec.vector_entry_point == "
+            '\'gradoom:_make_gymnasium_vec_env\'\n""")',
+        ],
+        check=True,
+        cwd=root,
+        env=env,
+    )
+
+
+def test_generic_gymnasium_factory_preserves_torch_transport(square_scenario):
+    env = gym.make_vec(
+        "gradoom:GraDOOM-v0",
+        game="VizdoomDeathmatch-v1",
+        num_envs=2,
+        device="cpu",
+        compiled_scenario=square_scenario,
+    )
+    try:
+        assert isinstance(env, GraDoomVecEnv)
+        observations, _infos = env.reset(seed=7)
+        assert isinstance(observations, torch.Tensor)
+        transition = env.step(torch.zeros(2, dtype=torch.int64))
+        assert all(isinstance(value, torch.Tensor) for value in transition[:4])
+    finally:
+        env.close()
 
 
 def test_public_surface_matches_turbo_vector_api_v1(square_scenario) -> None:
