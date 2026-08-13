@@ -44,6 +44,7 @@ _DEFAULT_SIGNALS = (
     "ammo5",
     "ammo6",
 )
+_SUPPORTED_GAME_VARIABLES = (*_DEFAULT_SIGNALS, "hits_taken", "damage_taken")
 _DERIVED_SIGNALS = ("episode_time", "episode_return", "player_dead", "pending_reset")
 _COMPILED_ENGINE_PHASES = (
     "_begin_decision",
@@ -255,6 +256,7 @@ class GraDoomVecEnv(VectorEnv):
         doom_map: str | None = None,
         doom_skill: int | None = None,
         wall_contact_damage_scale: float = 1.0,
+        observation_renderer: Literal["approximate", "native-fused", "reference"] = "approximate",
         game_args: str | None = None,
         game_variables: Sequence[str] | None = None,
         enemy_variants: Mapping[str, Sequence[str]] | Sequence[str] | None = None,
@@ -296,6 +298,11 @@ class GraDoomVecEnv(VectorEnv):
         ):
             raise ValueError("wall_contact_damage_scale must be finite and in [0, 1]")
         self.wall_contact_damage_scale = float(wall_contact_damage_scale)
+        if observation_renderer not in {"approximate", "native-fused", "reference"}:
+            raise ValueError(
+                "observation_renderer must be 'approximate', 'native-fused', or 'reference'"
+            )
+        self.observation_renderer = observation_renderer
         if use_fire_reset or noop_reset_max or sticky_action_prob:
             raise ValueError(
                 "fire reset, no-op reset, and sticky actions are not in deathmatch-p1-v1"
@@ -419,6 +426,10 @@ class GraDoomVecEnv(VectorEnv):
             mask_hud=obs_crop is not None,
             render_screen_flashes=render_screen_flashes,
         )
+        if self.observation_renderer == "reference":
+            self._engine.render_frame = self._engine.render_reference_frame
+        elif self.observation_renderer == "native-fused":
+            self._engine.render_frame = self._engine.render_fast_native_policy_frame
         signal_indices = {name: index for index, name in enumerate(DEVICE_SIGNAL_NAMES)}
         self._info_history_indices = torch.tensor(
             [signal_indices[name] for name in self.device_info_history_names],
@@ -445,9 +456,27 @@ class GraDoomVecEnv(VectorEnv):
         )
         self._safe_obs_index = 0
         self.compile_engine = bool(compile_engine)
-        self.engine_backend = "torch-compiled-cudagraph" if self.compile_engine else "torch-eager"
+        self._use_transaction_cuda_graph = (
+            self.compile_engine and self.observation_renderer == "approximate"
+        )
+        if self._use_transaction_cuda_graph:
+            self.engine_backend = "torch-compiled-cudagraph"
+        elif self.compile_engine and self.observation_renderer == "native-fused":
+            self.engine_backend = "torch-compiled-phases-native-fused-renderer"
+        elif self.compile_engine:
+            self.engine_backend = "torch-compiled-phases-reference-renderer"
+        else:
+            self.engine_backend = "torch-eager"
         if self.compile_engine:
             for phase_name in _COMPILED_ENGINE_PHASES:
+                # The reference renderer owns an internal CUDA graph and
+                # data-dependent native composition. Keep only that phase
+                # eager while compiling all gameplay dynamics around it.
+                if (
+                    self.observation_renderer in {"native-fused", "reference"}
+                    and phase_name == "render_frame"
+                ):
+                    continue
                 compile_options: dict[str, Any] = {
                     "backend": "inductor",
                     "fullgraph": True,
@@ -473,7 +502,7 @@ class GraDoomVecEnv(VectorEnv):
                 dynamic=False,
                 options=_LIMITED_FUSION_OPTIONS,
             )
-            if self.compile_engine
+            if self._use_transaction_cuda_graph
             else self._engine.reset
         )
         self._latest_reset_seeds = torch.zeros(
@@ -528,7 +557,7 @@ class GraDoomVecEnv(VectorEnv):
         )
         if len(self.game_variable_names) != len(set(self.game_variable_names)):
             raise ValueError("game_variables must not contain duplicates")
-        unknown = set(self.game_variable_names) - set(_DEFAULT_SIGNALS)
+        unknown = set(self.game_variable_names) - set(_SUPPORTED_GAME_VARIABLES)
         if unknown:
             raise ValueError(f"unknown deathmatch game variables: {sorted(unknown)}")
         self._configure_info_filter(info_filter)
@@ -851,6 +880,20 @@ class GraDoomVecEnv(VectorEnv):
         final_signals = transition.signals.clone()
         final_info_histories = transition.info_histories.clone()
         done = transition.terminated | transition.truncated
+        if self.observation_renderer in {"native-fused", "reference"} and not bool(
+            torch.any(done)
+        ):
+            return DeviceAutoResetTransition(
+                observations=transition.observations,
+                rewards=transition.rewards,
+                terminated=transition.terminated,
+                truncated=transition.truncated,
+                signals=transition.signals,
+                info_histories=transition.info_histories,
+                final_observations=final_observations,
+                final_signals=final_signals,
+                final_info_histories=final_info_histories,
+            )
         observations, signals = self.reset_device(done, reset_seeds)
         return DeviceAutoResetTransition(
             observations=observations,
@@ -925,7 +968,7 @@ class GraDoomVecEnv(VectorEnv):
     ) -> DeviceAutoResetTransition:
         """Step and reset terminal lanes without synchronizing or leaving the device."""
 
-        if not self.compile_engine:
+        if not self._use_transaction_cuda_graph:
             return self._step_and_reset_device_impl(actions, reset_seeds)
         device_actions = self._require_device_tensor(
             actions,

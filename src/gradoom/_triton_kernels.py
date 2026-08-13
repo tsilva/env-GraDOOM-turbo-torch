@@ -7,6 +7,555 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
+_FAST_NATIVE_PORTAL_LAYERS = 16
+_FAST_NATIVE_SPRITE_LAYERS = 1
+
+
+@triton.jit
+def _bounded_observation_augment_kernel(
+    observations_ptr,
+    randoms_ptr,
+    output_ptr,
+    observation_stride_n: tl.constexpr,
+    observation_stride_c: tl.constexpr,
+    observation_stride_y: tl.constexpr,
+    observation_stride_x: tl.constexpr,
+    channels: tl.constexpr,
+    height: tl.constexpr,
+    width: tl.constexpr,
+    total_pixels: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Apply one bounded spatial/photometric transform per frame stack."""
+
+    output_offset = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    pixels_per_env = channels * height * width
+    env = output_offset // pixels_per_env
+    within_env = output_offset - env * pixels_per_env
+    channel = within_env // (height * width)
+    within_channel = within_env - channel * height * width
+    output_y = within_channel // width
+    output_x = within_channel - output_y * width
+    output_valid = output_offset < total_pixels
+
+    random_base = env * 4
+    random_x = tl.load(randoms_ptr + random_base, mask=output_valid, other=0.5)
+    random_y = tl.load(randoms_ptr + random_base + 1, mask=output_valid, other=0.5)
+    random_gain = tl.load(randoms_ptr + random_base + 2, mask=output_valid, other=0.5)
+    random_bias = tl.load(randoms_ptr + random_base + 3, mask=output_valid, other=0.5)
+    shift_x = (random_x * 5.0).to(tl.int32) - 2
+    shift_y = (random_y * 5.0).to(tl.int32) - 2
+    gain = 0.9 + random_gain * 0.2
+    bias = -8.0 + random_bias * 16.0
+
+    source_x = output_x - shift_x
+    source_y = output_y - shift_y
+    source_valid = (
+        output_valid
+        & (source_x >= 0)
+        & (source_x < width)
+        & (source_y >= 0)
+        & (source_y < height)
+    )
+    source_offset = (
+        env * observation_stride_n
+        + channel * observation_stride_c
+        + source_y * observation_stride_y
+        + source_x * observation_stride_x
+    )
+    pixel = tl.load(observations_ptr + source_offset, mask=source_valid, other=0.0).to(
+        tl.float32
+    )
+    adjusted = tl.maximum(0.0, tl.minimum(255.0, pixel * gain + bias))
+    adjusted = tl.where(source_valid, tl.floor(adjusted + 0.5), 0.0)
+    tl.store(output_ptr + output_offset, adjusted, mask=output_valid)
+
+
+@torch.library.custom_op("gradoom::bounded_observation_augment", mutates_args=())
+def bounded_observation_augment(
+    observations: torch.Tensor,
+    randoms: torch.Tensor,
+) -> torch.Tensor:
+    """Apply bounded stack-consistent jitter to CUDA uint8 policy observations.
+
+    ``randoms`` has four uniform values per environment. They select integer x/y
+    shifts in ``[-2, 2]``, grayscale gain in ``[0.9, 1.1)``, and bias in
+    ``[-8, 8)``. The same transform is applied to all frames in each stack.
+    """
+
+    if observations.ndim != 4:
+        raise ValueError("observations must have shape (N, C, H, W)")
+    if observations.dtype != torch.uint8:
+        raise TypeError("observations must be uint8")
+    if randoms.shape != (observations.shape[0], 4):
+        raise ValueError("randoms must have shape (N, 4)")
+    if randoms.dtype != torch.float32:
+        raise TypeError("randoms must be float32")
+    if observations.device != randoms.device:
+        raise ValueError("observations and randoms must be on the same device")
+    if observations.device.type != "cuda":
+        raise ValueError("bounded observation augmentation requires CUDA tensors")
+    output = torch.empty_like(observations, memory_format=torch.contiguous_format)
+    total_pixels = observations.numel()
+    block = 256
+    torch.library.wrap_triton(_bounded_observation_augment_kernel)[
+        (triton.cdiv(total_pixels, block),)
+    ](
+        observations,
+        randoms,
+        output,
+        *observations.stride(),
+        observations.shape[1],
+        observations.shape[2],
+        observations.shape[3],
+        total_pixels,
+        block,
+        num_warps=4,
+    )
+    return output
+
+
+@bounded_observation_augment.register_fake
+def _bounded_observation_augment_fake(
+    observations: torch.Tensor,
+    randoms: torch.Tensor,
+) -> torch.Tensor:
+    del randoms
+    return torch.empty_like(observations, memory_format=torch.contiguous_format)
+
+
+@triton.jit
+def _policy_area_grayscale_kernel(
+    indexed_ptr,
+    palette_ptr,
+    output_ptr,
+    source_height: tl.constexpr,
+    OUTPUT_BLOCK: tl.constexpr,
+    SAMPLE_BLOCK: tl.constexpr,
+):
+    """Exact 320x240 -> 84x84 ViZDoom-turbo indexed-area conversion."""
+
+    output_pixels = 84 * 84
+    program = tl.program_id(0)
+    env = program // tl.cdiv(output_pixels, OUTPUT_BLOCK)
+    output_block = program % tl.cdiv(output_pixels, OUTPUT_BLOCK)
+    output_offset = output_block * OUTPUT_BLOCK + tl.arange(0, OUTPUT_BLOCK)
+    output_valid = output_offset < output_pixels
+    output_y = output_offset // 84
+    output_x = output_offset % 84
+
+    sample = tl.arange(0, SAMPLE_BLOCK)
+    sample_y = sample // 5
+    sample_x = sample % 5
+    y_start = output_y[:, None] * 240
+    y_end = (output_y[:, None] + 1) * 240
+    x_start = output_x[:, None] * 320
+    x_end = (output_x[:, None] + 1) * 320
+    source_y = y_start // 84 + sample_y[None, :]
+    source_x = x_start // 84 + sample_x[None, :]
+    y_overlap = tl.minimum(y_end, (source_y + 1) * 84) - tl.maximum(
+        y_start, source_y * 84
+    )
+    x_overlap = tl.minimum(x_end, (source_x + 1) * 84) - tl.maximum(
+        x_start, source_x * 84
+    )
+    sample_valid = (
+        output_valid[:, None]
+        & (source_y >= 0)
+        & (source_y < source_height)
+        & (source_x >= 0)
+        & (source_x < 320)
+        & (y_overlap > 0)
+        & (x_overlap > 0)
+    )
+    weight = (y_overlap * x_overlap) // 48
+    source_offset = env * source_height * 320 + source_y * 320 + source_x
+    palette_index = tl.load(indexed_ptr + source_offset, mask=sample_valid, other=0).to(tl.int32)
+    red = tl.load(palette_ptr + palette_index * 3, mask=sample_valid, other=0).to(tl.int32)
+    green = tl.load(palette_ptr + palette_index * 3 + 1, mask=sample_valid, other=0).to(
+        tl.int32
+    )
+    blue = tl.load(palette_ptr + palette_index * 3 + 2, mask=sample_valid, other=0).to(
+        tl.int32
+    )
+    red_sum = tl.sum(red * weight, axis=1)
+    green_sum = tl.sum(green * weight, axis=1)
+    blue_sum = tl.sum(blue * weight, axis=1)
+    red_pooled = (red_sum + 800) // 1600
+    green_pooled = (green_sum + 800) // 1600
+    blue_pooled = (blue_sum + 800) // 1600
+    grayscale = (red_pooled * 77 + green_pooled * 150 + blue_pooled * 29 + 128) // 256
+    tl.store(
+        output_ptr + env * output_pixels + output_offset,
+        grayscale,
+        mask=output_valid,
+    )
+
+
+@torch.library.custom_op("gradoom::policy_area_grayscale", mutates_args=())
+def policy_area_grayscale(indexed: torch.Tensor, palette: torch.Tensor) -> torch.Tensor:
+    """Apply the pinned ViZDoom-turbo area/grayscale transform on CUDA."""
+
+    if indexed.ndim != 3 or indexed.shape[1:] not in ((208, 320), (240, 320)):
+        raise ValueError("indexed must have shape (N, 208, 320) or (N, 240, 320)")
+    if indexed.dtype != torch.uint8 or palette.dtype != torch.uint8:
+        raise TypeError("indexed and palette must be uint8 tensors")
+    if palette.shape != (256, 3):
+        raise ValueError("palette must have shape (256, 3)")
+    output = torch.empty((indexed.shape[0], 84, 84), device=indexed.device, dtype=torch.uint8)
+    output_block = 32
+    sample_block = 32
+    grid = (indexed.shape[0] * triton.cdiv(84 * 84, output_block),)
+    torch.library.wrap_triton(_policy_area_grayscale_kernel)[grid](
+        indexed,
+        palette,
+        output,
+        indexed.shape[1],
+        output_block,
+        sample_block,
+        num_warps=4,
+    )
+    return output
+
+
+@policy_area_grayscale.register_fake
+def _policy_area_grayscale_fake(
+    indexed: torch.Tensor,
+    palette: torch.Tensor,
+) -> torch.Tensor:
+    del palette
+    return torch.empty((indexed.shape[0], 84, 84), device=indexed.device, dtype=torch.uint8)
+
+
+@triton.jit
+def _render_fast_native_flats_kernel(
+    player_x,
+    player_y,
+    player_angle,
+    view_z,
+    center,
+    ray_offsets,
+    floor_plane_heights,
+    ceiling_plane_heights,
+    sector_lookup,
+    lookup_metadata,
+    sector_heights,
+    sector_floor_texture_ids,
+    sector_ceiling_texture_ids,
+    texture_widths,
+    texture_heights,
+    texture_index_atlas,
+    sector_lights,
+    flash_light,
+    colormap,
+    frame,
+    surface_depth,
+    env_count: tl.constexpr,
+    view_height: tl.constexpr,
+    view_width: tl.constexpr,
+    floor_plane_count: tl.constexpr,
+    ceiling_plane_count: tl.constexpr,
+    lookup_height: tl.constexpr,
+    lookup_width: tl.constexpr,
+    atlas_stride_texture: tl.constexpr,
+    atlas_stride_y: tl.constexpr,
+    atlas_stride_x: tl.constexpr,
+    block: tl.constexpr,
+):
+    """Resolve deathmatch visplanes with a compact world-space sector LUT."""
+
+    offset = tl.program_id(0) * block + tl.arange(0, block)
+    pixels_per_env = view_height * view_width
+    total_pixels = env_count * pixels_per_env
+    valid = offset < total_pixels
+    env = offset // pixels_per_env
+    pixel = offset - env * pixels_per_env
+    pixel_y = pixel // view_width
+    pixel_x = pixel - pixel_y * view_width
+
+    current_x = tl.load(player_x + env, mask=valid, other=0.0)
+    current_y = tl.load(player_y + env, mask=valid, other=0.0)
+    current_angle = tl.load(player_angle + env, mask=valid, other=0.0)
+    current_view_z = tl.load(view_z + env, mask=valid, other=41.0)
+    current_center = tl.load(center + env, mask=valid, other=103.5)
+    ray_offset = tl.load(ray_offsets + pixel_x, mask=valid, other=0.0)
+    ray_angle = current_angle + ray_offset
+    ray_cos = tl.cos(ray_angle)
+    ray_sin = tl.sin(ray_angle)
+    cosine_correction = tl.maximum(tl.cos(ray_offset), 1.0e-4)
+    row_delta = pixel_y.to(tl.float32) - current_center
+    floor_pixel = row_delta > 0.0
+    denominator = tl.maximum(tl.abs(row_delta), 0.5)
+    focal_y = 192.0
+    origin_x = tl.load(lookup_metadata)
+    origin_y = tl.load(lookup_metadata + 1)
+    cell_size = tl.load(lookup_metadata + 2)
+    player_lookup_x = tl.floor((current_x - origin_x) / cell_size).to(tl.int64)
+    player_lookup_y = tl.floor((current_y - origin_y) / cell_size).to(tl.int64)
+    player_in_lookup = (
+        (player_lookup_x >= 0)
+        & (player_lookup_x < lookup_width)
+        & (player_lookup_y >= 0)
+        & (player_lookup_y < lookup_height)
+    )
+    fallback_sector = tl.load(
+        sector_lookup + player_lookup_y * lookup_width + player_lookup_x,
+        mask=valid & player_in_lookup,
+        other=0,
+    ).to(tl.int64)
+    fallback_sector = tl.maximum(fallback_sector, 0)
+
+    best_distance = tl.full((block,), float("inf"), tl.float32)
+    selected_sector = fallback_sector
+
+    for plane_index in tl.static_range(floor_plane_count):
+        plane_z = tl.load(floor_plane_heights + plane_index)
+        plane_height = current_view_z - plane_z
+        perpendicular_depth = plane_height * focal_y / denominator
+        ray_distance = perpendicular_depth / cosine_correction
+        world_x = current_x + ray_cos * ray_distance
+        world_y = current_y + ray_sin * ray_distance
+        lookup_x = tl.floor((world_x - origin_x) / cell_size).to(tl.int64)
+        lookup_y = tl.floor((world_y - origin_y) / cell_size).to(tl.int64)
+        in_lookup = (
+            (lookup_x >= 0)
+            & (lookup_x < lookup_width)
+            & (lookup_y >= 0)
+            & (lookup_y < lookup_height)
+        )
+        sector = tl.load(
+            sector_lookup + lookup_y * lookup_width + lookup_x,
+            mask=valid & in_lookup,
+            other=-1,
+        ).to(tl.int64)
+        safe_sector = tl.maximum(sector, 0)
+        sector_floor = tl.load(sector_heights + safe_sector * 2)
+        candidate = (
+            valid
+            & floor_pixel
+            & in_lookup
+            & (sector >= 0)
+            & (tl.abs(sector_floor - plane_z) < 0.01)
+            & (plane_height > 0.0)
+            & (ray_distance > 0.0)
+            & (ray_distance < best_distance)
+        )
+        best_distance = tl.where(candidate, ray_distance, best_distance)
+        selected_sector = tl.where(candidate, sector, selected_sector)
+
+    for plane_index in tl.static_range(ceiling_plane_count):
+        plane_z = tl.load(ceiling_plane_heights + plane_index)
+        plane_height = plane_z - current_view_z
+        perpendicular_depth = plane_height * focal_y / denominator
+        ray_distance = perpendicular_depth / cosine_correction
+        world_x = current_x + ray_cos * ray_distance
+        world_y = current_y + ray_sin * ray_distance
+        lookup_x = tl.floor((world_x - origin_x) / cell_size).to(tl.int64)
+        lookup_y = tl.floor((world_y - origin_y) / cell_size).to(tl.int64)
+        in_lookup = (
+            (lookup_x >= 0)
+            & (lookup_x < lookup_width)
+            & (lookup_y >= 0)
+            & (lookup_y < lookup_height)
+        )
+        sector = tl.load(
+            sector_lookup + lookup_y * lookup_width + lookup_x,
+            mask=valid & in_lookup,
+            other=-1,
+        ).to(tl.int64)
+        safe_sector = tl.maximum(sector, 0)
+        sector_ceiling = tl.load(sector_heights + safe_sector * 2 + 1)
+        candidate = (
+            valid
+            & ~floor_pixel
+            & in_lookup
+            & (sector >= 0)
+            & (tl.abs(sector_ceiling - plane_z) < 0.01)
+            & (plane_height > 0.0)
+            & (ray_distance > 0.0)
+            & (ray_distance < best_distance)
+        )
+        best_distance = tl.where(candidate, ray_distance, best_distance)
+        selected_sector = tl.where(candidate, sector, selected_sector)
+
+    selected_floor = tl.load(sector_heights + selected_sector * 2)
+    selected_ceiling = tl.load(sector_heights + selected_sector * 2 + 1)
+    selected_plane_height = tl.where(
+        floor_pixel,
+        current_view_z - selected_floor,
+        selected_ceiling - current_view_z,
+    )
+    fallback_distance = (
+        selected_plane_height * focal_y / denominator / cosine_correction
+    )
+    ray_distance = tl.where(best_distance == float("inf"), fallback_distance, best_distance)
+    world_x = current_x + ray_cos * ray_distance
+    world_y = current_y + ray_sin * ray_distance
+    floor_texture = tl.load(sector_floor_texture_ids + selected_sector)
+    ceiling_texture = tl.load(sector_ceiling_texture_ids + selected_sector)
+    texture_id = tl.where(floor_pixel, floor_texture, ceiling_texture).to(tl.int64)
+    texture_width = tl.load(texture_widths + texture_id).to(tl.int64)
+    texture_height = tl.load(texture_heights + texture_id).to(tl.int64)
+    texture_u = tl.floor(world_x).to(tl.int64) % texture_width
+    texture_v = tl.floor(-world_y).to(tl.int64) % texture_height
+    texture_u = tl.where(texture_u < 0, texture_u + texture_width, texture_u)
+    texture_v = tl.where(texture_v < 0, texture_v + texture_height, texture_v)
+    palette_index = tl.load(
+        texture_index_atlas
+        + texture_id * atlas_stride_texture
+        + texture_v * atlas_stride_y
+        + texture_u * atlas_stride_x,
+        mask=valid,
+        other=0,
+    ).to(tl.int64)
+    light = tl.load(sector_lights + selected_sector).to(tl.float32)
+    light += tl.load(flash_light + env, mask=valid, other=0).to(tl.float32) * 16.0
+    base_shade = 61.0 - light / 4.0
+    row_distance = tl.abs(current_center + 0.5 - pixel_y.to(tl.float32))
+    visibility = tl.minimum(
+        24.0,
+        6.6666565 * row_distance / tl.maximum(selected_plane_height, 1.0e-4),
+    )
+    shade = tl.maximum(0, tl.minimum(31, tl.floor(base_shade - visibility))).to(tl.int64)
+    lit_index = tl.load(colormap + shade * 256 + palette_index).to(tl.uint8)
+    tl.store(frame + offset, lit_index, mask=valid)
+    resolved_depth = tl.where(
+        best_distance == float("inf"),
+        float("inf"),
+        best_distance * cosine_correction,
+    )
+    tl.store(surface_depth + offset, resolved_depth, mask=valid)
+
+
+@torch.library.custom_op(
+    "gradoom::render_fast_native_flats",
+    mutates_args=(),
+    device_types="cuda",
+)
+def render_fast_native_flats(
+    player_x: torch.Tensor,
+    player_y: torch.Tensor,
+    player_angle: torch.Tensor,
+    view_z: torch.Tensor,
+    center: torch.Tensor,
+    ray_offsets: torch.Tensor,
+    floor_plane_heights: torch.Tensor,
+    ceiling_plane_heights: torch.Tensor,
+    sector_lookup: torch.Tensor,
+    lookup_metadata: torch.Tensor,
+    sector_heights: torch.Tensor,
+    sector_floor_texture_ids: torch.Tensor,
+    sector_ceiling_texture_ids: torch.Tensor,
+    texture_widths: torch.Tensor,
+    texture_heights: torch.Tensor,
+    texture_index_atlas: torch.Tensor,
+    sector_lights: torch.Tensor,
+    flash_light: torch.Tensor,
+    colormap: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Render a native-resolution indexed visplane approximation in one launch."""
+
+    view_height = 208
+    view_width = ray_offsets.shape[0]
+    frame = torch.empty(
+        (player_x.shape[0], view_height, view_width),
+        device=player_x.device,
+        dtype=torch.uint8,
+    )
+    surface_depth = torch.empty(
+        frame.shape,
+        device=player_x.device,
+        dtype=torch.float32,
+    )
+    block = 1024
+    total_pixels = frame.numel()
+    torch.library.wrap_triton(_render_fast_native_flats_kernel)[
+        (triton.cdiv(total_pixels, block),)
+    ](
+        player_x,
+        player_y,
+        player_angle,
+        view_z,
+        center,
+        ray_offsets,
+        floor_plane_heights,
+        ceiling_plane_heights,
+        sector_lookup,
+        lookup_metadata,
+        sector_heights,
+        sector_floor_texture_ids,
+        sector_ceiling_texture_ids,
+        texture_widths,
+        texture_heights,
+        texture_index_atlas,
+        sector_lights,
+        flash_light,
+        colormap,
+        frame,
+        surface_depth,
+        player_x.shape[0],
+        view_height,
+        view_width,
+        floor_plane_heights.shape[0],
+        ceiling_plane_heights.shape[0],
+        sector_lookup.shape[0],
+        sector_lookup.shape[1],
+        texture_index_atlas.stride(0),
+        texture_index_atlas.stride(1),
+        texture_index_atlas.stride(2),
+        block,
+        num_warps=8,
+    )
+    return frame, surface_depth
+
+
+@render_fast_native_flats.register_fake
+def _render_fast_native_flats_fake(
+    player_x: torch.Tensor,
+    player_y: torch.Tensor,
+    player_angle: torch.Tensor,
+    view_z: torch.Tensor,
+    center: torch.Tensor,
+    ray_offsets: torch.Tensor,
+    floor_plane_heights: torch.Tensor,
+    ceiling_plane_heights: torch.Tensor,
+    sector_lookup: torch.Tensor,
+    lookup_metadata: torch.Tensor,
+    sector_heights: torch.Tensor,
+    sector_floor_texture_ids: torch.Tensor,
+    sector_ceiling_texture_ids: torch.Tensor,
+    texture_widths: torch.Tensor,
+    texture_heights: torch.Tensor,
+    texture_index_atlas: torch.Tensor,
+    sector_lights: torch.Tensor,
+    flash_light: torch.Tensor,
+    colormap: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    del (
+        player_y,
+        player_angle,
+        view_z,
+        center,
+        floor_plane_heights,
+        ceiling_plane_heights,
+        sector_lookup,
+        lookup_metadata,
+        sector_heights,
+        sector_floor_texture_ids,
+        sector_ceiling_texture_ids,
+        texture_widths,
+        texture_heights,
+        texture_index_atlas,
+        sector_lights,
+        flash_light,
+        colormap,
+    )
+    shape = (player_x.shape[0], 208, ray_offsets.shape[0])
+    return (
+        torch.empty(shape, device=player_x.device, dtype=torch.uint8),
+        torch.empty(shape, device=player_x.device, dtype=torch.float32),
+    )
+
 
 @triton.jit
 def _frozen_nature_conv1_kernel(
@@ -265,12 +814,12 @@ def portal_intersections(
     walls: torch.Tensor,
     wall_blocks_sight: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return eight closest wall crossings and closest blocking wall per ray."""
+    """Return the closest wall crossings and closest blocking wall per ray."""
 
     env_count = player_x.shape[0]
     ray_count = ray_offsets.shape[0]
     wall_count = walls.shape[0]
-    layer_count = min(8, wall_count)
+    layer_count = min(_FAST_NATIVE_PORTAL_LAYERS, wall_count)
     distances = torch.empty(
         (env_count, ray_count, layer_count),
         device=player_x.device,
@@ -329,7 +878,7 @@ def masked_portal_intersections(
     env_count = player_x.shape[0]
     ray_count = ray_offsets.shape[0]
     wall_count = walls.shape[0]
-    layer_count = min(8, wall_count)
+    layer_count = min(_FAST_NATIVE_PORTAL_LAYERS, wall_count)
     shape = (env_count, ray_count, layer_count)
     distances = torch.empty(shape, device=player_x.device, dtype=torch.float32)
     wall_indices = torch.empty(shape, device=player_x.device, dtype=torch.int64)
@@ -372,7 +921,11 @@ def _masked_portal_intersections_fake(
     wall_blocks_sight: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     del active, player_y, player_angle, wall_blocks_sight
-    shape = (player_x.shape[0], ray_offsets.shape[0], min(8, walls.shape[0]))
+    shape = (
+        player_x.shape[0],
+        ray_offsets.shape[0],
+        min(_FAST_NATIVE_PORTAL_LAYERS, walls.shape[0]),
+    )
     distances = player_x.new_empty(shape)
     wall_indices = torch.empty(shape, device=player_x.device, dtype=torch.int64)
     along = player_x.new_empty(shape)
@@ -390,7 +943,11 @@ def _portal_intersections_fake(
     wall_blocks_sight: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     del wall_blocks_sight
-    shape = (player_x.shape[0], ray_offsets.shape[0], min(8, walls.shape[0]))
+    shape = (
+        player_x.shape[0],
+        ray_offsets.shape[0],
+        min(_FAST_NATIVE_PORTAL_LAYERS, walls.shape[0]),
+    )
     distances = player_x.new_empty(shape)
     wall_indices = torch.empty(shape, device=player_x.device, dtype=torch.int64)
     along = player_x.new_empty(shape)
@@ -805,6 +1362,7 @@ def _move_drops_fake(
 @triton.jit
 def _render_portal_walls_kernel(
     frame,
+    surface_depth,
     active,
     view_z,
     center,
@@ -821,8 +1379,12 @@ def _render_portal_walls_kernel(
     portal_wall_lengths,
     texture_widths,
     texture_heights,
-    texture_atlas,
+    texture_index_atlas,
+    colormap,
+    policy_grayscale_palette,
     sector_lights,
+    flash_light,
+    projection_focal_y,
     observation_height: tl.constexpr,
     observation_width: tl.constexpr,
     layer_count: tl.constexpr,
@@ -831,6 +1393,9 @@ def _render_portal_walls_kernel(
     atlas_stride_x: tl.constexpr,
     block_height: tl.constexpr,
     use_active_mask: tl.constexpr,
+    output_indexed: tl.constexpr,
+    use_flash_light: tl.constexpr,
+    write_surface_depth: tl.constexpr,
 ):
     ray_index = tl.program_id(0)
     y_block = tl.program_id(1)
@@ -843,7 +1408,13 @@ def _render_portal_walls_kernel(
     frame_index = (
         env_index * observation_height * observation_width + pixel_y * observation_width + column
     )
-    value = tl.load(frame + frame_index, mask=valid_pixel, other=0.0)
+    value = tl.load(frame + frame_index, mask=valid_pixel, other=0.0).to(tl.float32)
+    if write_surface_depth:
+        depth_value = tl.load(
+            surface_depth + frame_index,
+            mask=valid_pixel,
+            other=float("inf"),
+        )
     filled = tl.zeros((block_height,), dtype=tl.int1)
     current_view_z = tl.load(view_z + env_index)
     current_center = tl.load(center + env_index)
@@ -872,12 +1443,24 @@ def _render_portal_walls_kernel(
             upper_low = tl.minimum(front_ceiling, back_ceiling)
             upper_high = tl.maximum(front_ceiling, back_ceiling)
 
-            one_top = current_center - ((front_ceiling - current_view_z) * 67.2 / distance)
-            one_bottom = current_center - ((front_floor - current_view_z) * 67.2 / distance)
-            lower_top = current_center - ((lower_high - current_view_z) * 67.2 / distance)
-            lower_bottom = current_center - ((lower_low - current_view_z) * 67.2 / distance)
-            upper_top = current_center - ((upper_high - current_view_z) * 67.2 / distance)
-            upper_bottom = current_center - ((upper_low - current_view_z) * 67.2 / distance)
+            one_top = current_center - (
+                (front_ceiling - current_view_z) * projection_focal_y / distance
+            )
+            one_bottom = current_center - (
+                (front_floor - current_view_z) * projection_focal_y / distance
+            )
+            lower_top = current_center - (
+                (lower_high - current_view_z) * projection_focal_y / distance
+            )
+            lower_bottom = current_center - (
+                (lower_low - current_view_z) * projection_focal_y / distance
+            )
+            upper_top = current_center - (
+                (upper_high - current_view_z) * projection_focal_y / distance
+            )
+            upper_bottom = current_center - (
+                (upper_low - current_view_z) * projection_focal_y / distance
+            )
 
             wall_base = wall_index * 4
             wall_x1 = tl.load(portal_walls + wall_base)
@@ -885,7 +1468,7 @@ def _render_portal_walls_kernel(
             segment_x = tl.load(portal_walls + wall_base + 2) - wall_x1
             segment_y = tl.load(portal_walls + wall_base + 3) - wall_y1
             camera_cross = segment_x * (current_y - wall_y1) - segment_y * (current_x - wall_x1)
-            side_index = (camera_cross < 0.0).to(tl.int64)
+            side_index = (camera_cross > 0.0).to(tl.int64)
             from_front = side_index == 0
             view_floor = tl.where(from_front, front_floor, back_floor)
             other_floor = tl.where(from_front, back_floor, front_floor)
@@ -895,19 +1478,19 @@ def _render_portal_walls_kernel(
                 one_sided
                 & from_front
                 & (pixel_y.to(tl.float32) >= one_top)
-                & (pixel_y.to(tl.float32) <= one_bottom)
+                & (pixel_y.to(tl.float32) < one_bottom)
             )
             lower_span = (
                 ~one_sided
                 & (view_floor < other_floor)
                 & (pixel_y.to(tl.float32) >= lower_top)
-                & (pixel_y.to(tl.float32) <= lower_bottom)
+                & (pixel_y.to(tl.float32) < lower_bottom)
             )
             upper_span = (
                 ~one_sided
                 & (view_ceiling > other_ceiling)
                 & (pixel_y.to(tl.float32) >= upper_top)
-                & (pixel_y.to(tl.float32) <= upper_bottom)
+                & (pixel_y.to(tl.float32) < upper_bottom)
             )
             texture_base = wall_index * 6 + side_index * 3
             texture_id = tl.where(
@@ -926,34 +1509,71 @@ def _render_portal_walls_kernel(
             offset_base = wall_index * 4 + side_index * 2
             texture_offset_u = tl.load(portal_side_texture_offsets + offset_base)
             texture_offset_v = tl.load(portal_side_texture_offsets + offset_base + 1)
-            texture_u = tl.floor(
-                along * tl.load(portal_wall_lengths + wall_index) + texture_offset_u
-            ).to(tl.int64)
+            wall_length = tl.load(portal_wall_lengths + wall_index)
+            horizontal_offset = tl.where(
+                from_front,
+                along * wall_length,
+                wall_length - along * wall_length,
+            )
+            # PrepWallRoundFix retains the last texel at the reversed endpoint
+            # rather than wrapping the exact wall length back to column zero.
+            horizontal_offset = tl.minimum(horizontal_offset, wall_length - 1.0e-4)
+            texture_u = tl.floor(horizontal_offset + texture_offset_u).to(tl.int64)
             texture_u = texture_u % texture_width
             texture_u = tl.where(texture_u < 0, texture_u + texture_width, texture_u)
-            world_z = current_view_z + ((current_center - pixel_y.to(tl.float32)) * distance / 67.2)
-            texture_v = tl.floor(-world_z + texture_offset_v).to(tl.int64)
+            world_z = current_view_z + (
+                (current_center - pixel_y.to(tl.float32)) * distance / projection_focal_y
+            )
+            texture_origin_z = tl.where(
+                one_span,
+                view_ceiling,
+                tl.where(lower_span, other_floor, other_ceiling),
+            )
+            texture_v = tl.floor(texture_origin_z - world_z + texture_offset_v).to(tl.int64)
             texture_v = texture_v % texture_height
             texture_v = tl.where(texture_v < 0, texture_v + texture_height, texture_v)
-            texture = tl.load(
-                texture_atlas
+            palette_index = tl.load(
+                texture_index_atlas
                 + safe_texture_id * atlas_stride_texture
                 + texture_v * atlas_stride_y
                 + texture_u * atlas_stride_x,
-                mask=valid_pixel,
+                mask=span,
                 other=0,
-            ).to(tl.float32)
+            ).to(tl.int64)
             view_sector = tl.where(from_front, front, back)
-            light = tl.load(sector_lights + view_sector)
-            attenuation = tl.maximum(24.0, tl.minimum(220.0, light))
-            wall_value = tl.maximum(
-                0.0,
-                tl.minimum(255.0, texture * attenuation / 210.0),
+            light = tl.load(sector_lights + view_sector).to(tl.float32)
+            if use_flash_light:
+                light += tl.load(flash_light + env_index).to(tl.float32) * 16.0
+            horizontal_wall = tl.abs(segment_y) < 1.0e-6
+            vertical_wall = tl.abs(segment_x) < 1.0e-6
+            light += tl.where(vertical_wall, 16.0, tl.where(horizontal_wall, -16.0, 0.0))
+            base_shade = 61.0 - light / 4.0
+            visibility = tl.minimum(24.0, 1280.0 / tl.maximum(distance, 1.0))
+            shade = tl.maximum(0, tl.minimum(31, tl.floor(base_shade - visibility))).to(
+                tl.int64
+            )
+            lit_index = tl.load(
+                colormap + shade * 256 + palette_index,
+                mask=span,
+                other=0,
+            ).to(tl.int64)
+            wall_value = tl.where(
+                output_indexed,
+                lit_index.to(tl.float32),
+                tl.load(
+                    policy_grayscale_palette + lit_index,
+                    mask=span,
+                    other=0.0,
+                ).to(tl.float32),
             )
             value = tl.where(span, wall_value, value)
+            if write_surface_depth:
+                depth_value = tl.where(span, distance, depth_value)
             filled = filled | span
 
     tl.store(frame + frame_index, value, mask=valid_pixel)
+    if write_surface_depth:
+        tl.store(surface_depth + frame_index, depth_value, mask=valid_pixel)
 
 
 @torch.library.custom_op(
@@ -978,7 +1598,9 @@ def render_portal_walls_(
     portal_wall_lengths: torch.Tensor,
     texture_widths: torch.Tensor,
     texture_heights: torch.Tensor,
-    texture_atlas: torch.Tensor,
+    texture_index_atlas: torch.Tensor,
+    colormap: torch.Tensor,
+    policy_grayscale_palette: torch.Tensor,
     sector_lights: torch.Tensor,
 ) -> None:
     """Composite all sorted portal-wall layers in one column/pixel launch."""
@@ -992,6 +1614,7 @@ def render_portal_walls_(
         triton.cdiv(observation_height, block_height),
     )
     torch.library.wrap_triton(_render_portal_walls_kernel)[grid](
+        frame,
         frame,
         view_z,
         view_z,
@@ -1009,15 +1632,22 @@ def render_portal_walls_(
         portal_wall_lengths,
         texture_widths,
         texture_heights,
-        texture_atlas,
+        texture_index_atlas,
+        colormap,
+        policy_grayscale_palette,
         sector_lights,
+        view_z,
+        67.2,
         observation_height,
         observation_width,
         layer_count,
-        texture_atlas.stride(0),
-        texture_atlas.stride(1),
-        texture_atlas.stride(2),
+        texture_index_atlas.stride(0),
+        texture_index_atlas.stride(1),
+        texture_index_atlas.stride(2),
         block_height,
+        False,
+        False,
+        False,
         False,
         num_warps=2,
     )
@@ -1046,7 +1676,9 @@ def masked_render_portal_walls_(
     portal_wall_lengths: torch.Tensor,
     texture_widths: torch.Tensor,
     texture_heights: torch.Tensor,
-    texture_atlas: torch.Tensor,
+    texture_index_atlas: torch.Tensor,
+    colormap: torch.Tensor,
+    policy_grayscale_palette: torch.Tensor,
     sector_lights: torch.Tensor,
 ) -> None:
     """Composite portal walls only for active environment lanes."""
@@ -1060,6 +1692,7 @@ def masked_render_portal_walls_(
         triton.cdiv(observation_height, block_height),
     )
     torch.library.wrap_triton(_render_portal_walls_kernel)[grid](
+        frame,
         frame,
         active,
         view_z,
@@ -1077,17 +1710,151 @@ def masked_render_portal_walls_(
         portal_wall_lengths,
         texture_widths,
         texture_heights,
-        texture_atlas,
+        texture_index_atlas,
+        colormap,
+        policy_grayscale_palette,
         sector_lights,
+        view_z,
+        67.2,
         observation_height,
         observation_width,
         layer_count,
-        texture_atlas.stride(0),
-        texture_atlas.stride(1),
-        texture_atlas.stride(2),
+        texture_index_atlas.stride(0),
+        texture_index_atlas.stride(1),
+        texture_index_atlas.stride(2),
         block_height,
         True,
+        False,
+        False,
+        False,
         num_warps=2,
+    )
+
+
+@torch.library.custom_op(
+    "gradoom::render_fast_native_portal_walls_",
+    mutates_args=("frame", "surface_depth"),
+    device_types="cuda",
+)
+def render_fast_native_portal_walls_(
+    frame: torch.Tensor,
+    surface_depth: torch.Tensor,
+    view_z: torch.Tensor,
+    center: torch.Tensor,
+    distances: torch.Tensor,
+    wall_indices: torch.Tensor,
+    wall_along: torch.Tensor,
+    player_x: torch.Tensor,
+    player_y: torch.Tensor,
+    portal_walls: torch.Tensor,
+    portal_wall_sectors: torch.Tensor,
+    sector_heights: torch.Tensor,
+    portal_side_texture_ids: torch.Tensor,
+    portal_side_texture_offsets: torch.Tensor,
+    portal_wall_lengths: torch.Tensor,
+    texture_widths: torch.Tensor,
+    texture_heights: torch.Tensor,
+    texture_index_atlas: torch.Tensor,
+    colormap: torch.Tensor,
+    sector_lights: torch.Tensor,
+    flash_light: torch.Tensor,
+) -> None:
+    """Composite native-resolution indexed walls for the fused policy path."""
+
+    observation_height = frame.shape[1]
+    observation_width = frame.shape[2]
+    layer_count = distances.shape[2]
+    block_height = 256
+    grid = (
+        frame.shape[0] * observation_width,
+        triton.cdiv(observation_height, block_height),
+    )
+    torch.library.wrap_triton(_render_portal_walls_kernel)[grid](
+        frame,
+        surface_depth,
+        view_z,
+        view_z,
+        center,
+        distances,
+        wall_indices,
+        wall_along,
+        player_x,
+        player_y,
+        portal_walls,
+        portal_wall_sectors,
+        sector_heights,
+        portal_side_texture_ids,
+        portal_side_texture_offsets,
+        portal_wall_lengths,
+        texture_widths,
+        texture_heights,
+        texture_index_atlas,
+        colormap,
+        colormap,
+        sector_lights,
+        flash_light,
+        192.0,
+        observation_height,
+        observation_width,
+        layer_count,
+        texture_index_atlas.stride(0),
+        texture_index_atlas.stride(1),
+        texture_index_atlas.stride(2),
+        block_height,
+        False,
+        True,
+        True,
+        True,
+        num_warps=4,
+    )
+
+
+@render_fast_native_portal_walls_.register_fake
+def _render_fast_native_portal_walls_fake(
+    frame: torch.Tensor,
+    surface_depth: torch.Tensor,
+    view_z: torch.Tensor,
+    center: torch.Tensor,
+    distances: torch.Tensor,
+    wall_indices: torch.Tensor,
+    wall_along: torch.Tensor,
+    player_x: torch.Tensor,
+    player_y: torch.Tensor,
+    portal_walls: torch.Tensor,
+    portal_wall_sectors: torch.Tensor,
+    sector_heights: torch.Tensor,
+    portal_side_texture_ids: torch.Tensor,
+    portal_side_texture_offsets: torch.Tensor,
+    portal_wall_lengths: torch.Tensor,
+    texture_widths: torch.Tensor,
+    texture_heights: torch.Tensor,
+    texture_index_atlas: torch.Tensor,
+    colormap: torch.Tensor,
+    sector_lights: torch.Tensor,
+    flash_light: torch.Tensor,
+) -> None:
+    del (
+        frame,
+        surface_depth,
+        view_z,
+        center,
+        distances,
+        wall_indices,
+        wall_along,
+        player_x,
+        player_y,
+        portal_walls,
+        portal_wall_sectors,
+        sector_heights,
+        portal_side_texture_ids,
+        portal_side_texture_offsets,
+        portal_wall_lengths,
+        texture_widths,
+        texture_heights,
+        texture_index_atlas,
+        colormap,
+        sector_lights,
+        flash_light,
     )
 
 
@@ -1110,7 +1877,9 @@ def _masked_render_portal_walls_fake(
     portal_wall_lengths: torch.Tensor,
     texture_widths: torch.Tensor,
     texture_heights: torch.Tensor,
-    texture_atlas: torch.Tensor,
+    texture_index_atlas: torch.Tensor,
+    colormap: torch.Tensor,
+    policy_grayscale_palette: torch.Tensor,
     sector_lights: torch.Tensor,
 ) -> None:
     del (
@@ -1131,7 +1900,9 @@ def _masked_render_portal_walls_fake(
         portal_wall_lengths,
         texture_widths,
         texture_heights,
-        texture_atlas,
+        texture_index_atlas,
+        colormap,
+        policy_grayscale_palette,
         sector_lights,
     )
 
@@ -1154,7 +1925,9 @@ def _render_portal_walls_fake(
     portal_wall_lengths: torch.Tensor,
     texture_widths: torch.Tensor,
     texture_heights: torch.Tensor,
-    texture_atlas: torch.Tensor,
+    texture_index_atlas: torch.Tensor,
+    colormap: torch.Tensor,
+    policy_grayscale_palette: torch.Tensor,
     sector_lights: torch.Tensor,
 ) -> None:
     del (
@@ -1174,7 +1947,9 @@ def _render_portal_walls_fake(
         portal_wall_lengths,
         texture_widths,
         texture_heights,
-        texture_atlas,
+        texture_index_atlas,
+        colormap,
+        policy_grayscale_palette,
         sector_lights,
     )
 
@@ -1231,9 +2006,11 @@ def _render_sprites_kernel(
     )
     scale = 42.0 / distance
     width = tl.load(sprite_widths + safe_type).to(tl.float32)
-    left = (0.5 - relative / 1.5707963267948966) * observation_width - tl.load(
-        sprite_left_offsets + safe_type
-    ) * scale
+    # Match the perspective projection used by the Torch path and Doom's
+    # view transform.  Linear angle-to-column mapping increasingly displaced
+    # combat sprites toward the edges of the 90-degree field of view.
+    screen_center = observation_width * 0.5 - tl.sin(relative) / tl.cos(relative) * 42.0
+    left = screen_center - tl.load(sprite_left_offsets + safe_type) * scale
     right = left + width * scale
     candidate = (
         valid_actor
@@ -1261,7 +2038,11 @@ def _render_sprites_kernel(
         - tl.floor(selected_relative / 6.283185307179586) * 6.283185307179586
         - 3.141592653589793
     )
-    selected_left = (0.5 - selected_relative / 1.5707963267948966) * observation_width - tl.load(
+    selected_screen_center = (
+        observation_width * 0.5
+        - tl.sin(selected_relative) / tl.cos(selected_relative) * 42.0
+    )
+    selected_left = selected_screen_center - tl.load(
         sprite_left_offsets + selected_type
     ) * selected_scale
     selected_top = (
@@ -1405,6 +2186,577 @@ def _render_sprites_fake(
         sprite_atlas,
         sprite_opaque,
     )
+
+
+@triton.jit
+def _project_fast_native_sprites_kernel(
+    actor_x,
+    actor_y,
+    actor_sprite,
+    player_x,
+    player_y,
+    player_angle,
+    sprite_widths,
+    sprite_left_offsets,
+    projected_depth,
+    projected_left,
+    projected_right,
+    total_actors: tl.constexpr,
+    actor_count: tl.constexpr,
+    block: tl.constexpr,
+):
+    """Project every actor once instead of repeating trig for all 320 columns."""
+
+    offset = tl.program_id(0) * block + tl.arange(0, block)
+    valid = offset < total_actors
+    env = offset // actor_count
+    candidate_x = tl.load(actor_x + offset, mask=valid, other=0.0)
+    candidate_y = tl.load(actor_y + offset, mask=valid, other=0.0)
+    dx = candidate_x - tl.load(player_x + env, mask=valid, other=0.0)
+    dy = candidate_y - tl.load(player_y + env, mask=valid, other=0.0)
+    distance = tl.maximum(tl.sqrt(dx * dx + dy * dy), 1.0)
+    relative = libdevice.atan2(dy, dx) - tl.load(
+        player_angle + env,
+        mask=valid,
+        other=0.0,
+    )
+    relative = relative + 3.141592653589793
+    relative = (
+        relative
+        - tl.floor(relative / 6.283185307179586) * 6.283185307179586
+        - 3.141592653589793
+    )
+    depth = distance * tl.cos(relative)
+    safe_depth = tl.maximum(depth, 1.0)
+    sprite = tl.maximum(tl.load(actor_sprite + offset, mask=valid, other=0), 0)
+    scale_x = 160.0 / safe_depth
+    screen_center = 160.0 - tl.sin(relative) / tl.cos(relative) * 160.0
+    left = screen_center - tl.load(sprite_left_offsets + sprite) * scale_x
+    right = left + tl.load(sprite_widths + sprite).to(tl.float32) * scale_x
+    in_view = valid & (depth > 0.125) & (tl.abs(relative) < 0.7853981633974483)
+    tl.store(projected_depth + offset, tl.where(in_view, depth, float("inf")), mask=valid)
+    tl.store(projected_left + offset, left, mask=valid)
+    tl.store(projected_right + offset, right, mask=valid)
+
+
+@triton.jit
+def _render_fast_native_sprites_kernel(
+    frame,
+    blocking_distance,
+    surface_depth,
+    actor_x,
+    actor_y,
+    actor_z,
+    actor_alive,
+    actor_sprite,
+    actor_fullbright,
+    player_x,
+    player_y,
+    player_angle,
+    projected_depth,
+    projected_left,
+    projected_right,
+    view_z,
+    center,
+    sprite_widths,
+    sprite_heights,
+    sprite_left_offsets,
+    sprite_top_offsets,
+    sprite_atlas,
+    sprite_opaque,
+    sector_lookup,
+    lookup_metadata,
+    sector_lights,
+    flash_light,
+    colormap,
+    observation_height: tl.constexpr,
+    observation_width: tl.constexpr,
+    actor_count: tl.constexpr,
+    atlas_stride_type: tl.constexpr,
+    atlas_stride_y: tl.constexpr,
+    atlas_stride_x: tl.constexpr,
+    lookup_height: tl.constexpr,
+    lookup_width: tl.constexpr,
+    block_actors: tl.constexpr,
+    block_height: tl.constexpr,
+    sprite_rank: tl.constexpr,
+):
+    """Composite one depth-ranked native indexed actor per screen column."""
+
+    ray_index = tl.program_id(0)
+    env_index = ray_index // observation_width
+    column = ray_index - env_index * observation_width
+    candidate_slot = tl.arange(0, block_actors)
+    valid_actor = candidate_slot < actor_count
+    candidate_actor = candidate_slot
+    actor_index = env_index * actor_count + candidate_actor
+    depth = tl.load(projected_depth + actor_index, mask=valid_actor, other=float("inf"))
+    left = tl.load(projected_left + actor_index, mask=valid_actor, other=0.0)
+    right = tl.load(projected_right + actor_index, mask=valid_actor, other=0.0)
+    candidate = (
+        valid_actor
+        & tl.load(actor_alive + actor_index, mask=valid_actor, other=0).to(tl.int1)
+        & (column.to(tl.float32) >= left)
+        & (column.to(tl.float32) < right)
+        & (depth < tl.load(blocking_distance + ray_index))
+    )
+    candidate_depth = tl.where(candidate, depth, float("inf"))
+    # The wrapper invokes ranks far-to-near.  Retaining several horizontally
+    # overlapping sprites is necessary because a nearer sprite can be short
+    # or transparent at this row; selecting only one actor for the whole
+    # column incorrectly erased every actor behind it.
+    selected_depth = float("inf")
+    selected_actor = 0
+    for _rank in range(sprite_rank + 1):
+        selected_depth = tl.min(candidate_depth, axis=0)
+        selected_actor = tl.argmin(candidate_depth, axis=0, tie_break_left=True)
+        candidate_depth = tl.where(
+            candidate_slot == selected_actor,
+            float("inf"),
+            candidate_depth,
+        )
+    selected_index = env_index * actor_count + selected_actor
+    selected_sprite = tl.maximum(tl.load(actor_sprite + selected_index), 0)
+    selected_width = tl.load(sprite_widths + selected_sprite).to(tl.int64)
+    selected_height = tl.load(sprite_heights + selected_sprite).to(tl.int64)
+    selected_scale_x = 160.0 / selected_depth
+    selected_scale_y = 192.0 / selected_depth
+    selected_x = tl.load(actor_x + selected_index)
+    selected_y = tl.load(actor_y + selected_index)
+    selected_left = tl.load(projected_left + selected_index)
+    selected_top = (
+        tl.load(center + env_index)
+        + (tl.load(view_z + env_index) - tl.load(actor_z + selected_index))
+        * selected_scale_y
+        - tl.load(sprite_top_offsets + selected_sprite) * selected_scale_y
+    )
+    sprite_u = tl.floor(
+        (column.to(tl.float32) - selected_left) / selected_scale_x
+    ).to(tl.int64)
+    pixel_y = tl.arange(0, block_height)
+    valid_pixel = pixel_y < observation_height
+    sprite_v = tl.floor(
+        (pixel_y.to(tl.float32) - selected_top) / selected_scale_y
+    ).to(tl.int64)
+    inside = (
+        valid_pixel
+        & (selected_depth != float("inf"))
+        & (sprite_u >= 0)
+        & (sprite_u < selected_width)
+        & (sprite_v >= 0)
+        & (sprite_v < selected_height)
+    )
+    safe_u = tl.maximum(0, tl.minimum(sprite_u, selected_width - 1))
+    safe_v = tl.maximum(0, tl.minimum(sprite_v, selected_height - 1))
+    atlas_index = (
+        selected_sprite * atlas_stride_type
+        + safe_v * atlas_stride_y
+        + safe_u * atlas_stride_x
+    )
+    opaque = tl.load(sprite_opaque + atlas_index, mask=inside, other=0).to(tl.int1)
+    palette_index = tl.load(sprite_atlas + atlas_index, mask=inside, other=0).to(tl.int64)
+    origin_x = tl.load(lookup_metadata)
+    origin_y = tl.load(lookup_metadata + 1)
+    cell_size = tl.load(lookup_metadata + 2)
+    lookup_x = tl.floor((selected_x - origin_x) / cell_size).to(tl.int64)
+    lookup_y = tl.floor((selected_y - origin_y) / cell_size).to(tl.int64)
+    in_lookup = (
+        (lookup_x >= 0)
+        & (lookup_x < lookup_width)
+        & (lookup_y >= 0)
+        & (lookup_y < lookup_height)
+    )
+    sector = tl.load(
+        sector_lookup + lookup_y * lookup_width + lookup_x,
+        mask=in_lookup,
+        other=0,
+    ).to(tl.int64)
+    sector = tl.maximum(sector, 0)
+    light = tl.load(sector_lights + sector).to(tl.float32)
+    light += tl.load(flash_light + env_index).to(tl.float32) * 16.0
+    light = tl.where(tl.load(actor_fullbright + selected_index), 255.0, light)
+    base_shade = 61.0 - light / 4.0
+    visibility = tl.minimum(24.0, 1280.0 / tl.maximum(selected_depth, 1.0))
+    shade = tl.maximum(0, tl.minimum(31, tl.floor(base_shade - visibility))).to(tl.int64)
+    lit_index = tl.load(
+        colormap + shade * 256 + palette_index,
+        mask=inside & opaque,
+        other=0,
+    ).to(tl.uint8)
+    frame_index = (
+        env_index * observation_height * observation_width
+        + pixel_y * observation_width
+        + column
+    )
+    visible_against_scene = selected_depth < tl.load(
+        surface_depth + frame_index,
+        mask=valid_pixel,
+        other=float("inf"),
+    )
+    prior = tl.load(frame + frame_index, mask=valid_pixel, other=0)
+    tl.store(
+        frame + frame_index,
+        tl.where(inside & opaque & visible_against_scene, lit_index, prior),
+        mask=valid_pixel,
+    )
+
+
+@torch.library.custom_op(
+    "gradoom::render_fast_native_sprites_",
+    mutates_args=("frame",),
+    device_types="cuda",
+)
+def render_fast_native_sprites_(
+    frame: torch.Tensor,
+    blocking_distance: torch.Tensor,
+    surface_depth: torch.Tensor,
+    actor_x: torch.Tensor,
+    actor_y: torch.Tensor,
+    actor_z: torch.Tensor,
+    actor_alive: torch.Tensor,
+    actor_sprite: torch.Tensor,
+    actor_fullbright: torch.Tensor,
+    player_x: torch.Tensor,
+    player_y: torch.Tensor,
+    player_angle: torch.Tensor,
+    view_z: torch.Tensor,
+    center: torch.Tensor,
+    sprite_widths: torch.Tensor,
+    sprite_heights: torch.Tensor,
+    sprite_left_offsets: torch.Tensor,
+    sprite_top_offsets: torch.Tensor,
+    sprite_atlas: torch.Tensor,
+    sprite_opaque: torch.Tensor,
+    sector_lookup: torch.Tensor,
+    lookup_metadata: torch.Tensor,
+    sector_lights: torch.Tensor,
+    flash_light: torch.Tensor,
+    colormap: torch.Tensor,
+) -> None:
+    """Composite fixed-shape native indexed actors in one kernel launch."""
+
+    observation_height = frame.shape[1]
+    observation_width = frame.shape[2]
+    actor_count = actor_x.shape[1]
+    block_height = triton.next_power_of_2(observation_height)
+    projected_depth = torch.empty_like(actor_x)
+    projected_left = torch.empty_like(actor_x)
+    projected_right = torch.empty_like(actor_x)
+    projection_block = 256
+    torch.library.wrap_triton(_project_fast_native_sprites_kernel)[
+        (triton.cdiv(actor_x.numel(), projection_block),)
+    ](
+        actor_x,
+        actor_y,
+        actor_sprite,
+        player_x,
+        player_y,
+        player_angle,
+        sprite_widths,
+        sprite_left_offsets,
+        projected_depth,
+        projected_left,
+        projected_right,
+        actor_x.numel(),
+        actor_count,
+        projection_block,
+        num_warps=4,
+    )
+    # Paint far-to-near so transparent foreground texels preserve an already
+    # rendered farther actor, matching Doom's masked-sprite composition.
+    for sprite_rank in reversed(range(_FAST_NATIVE_SPRITE_LAYERS)):
+        torch.library.wrap_triton(_render_fast_native_sprites_kernel)[
+            (frame.shape[0] * observation_width,)
+        ](
+            frame,
+            blocking_distance,
+            surface_depth,
+            actor_x,
+            actor_y,
+            actor_z,
+            actor_alive,
+            actor_sprite,
+            actor_fullbright,
+            player_x,
+            player_y,
+            player_angle,
+            projected_depth,
+            projected_left,
+            projected_right,
+            view_z,
+            center,
+            sprite_widths,
+            sprite_heights,
+            sprite_left_offsets,
+            sprite_top_offsets,
+            sprite_atlas,
+            sprite_opaque,
+            sector_lookup,
+            lookup_metadata,
+            sector_lights,
+            flash_light,
+            colormap,
+            observation_height,
+            observation_width,
+            actor_count,
+            sprite_atlas.stride(0),
+            sprite_atlas.stride(1),
+            sprite_atlas.stride(2),
+            sector_lookup.shape[0],
+            sector_lookup.shape[1],
+            triton.next_power_of_2(actor_count),
+            block_height,
+            sprite_rank,
+            num_warps=4,
+        )
+
+
+@render_fast_native_sprites_.register_fake
+def _render_fast_native_sprites_fake(
+    frame: torch.Tensor,
+    blocking_distance: torch.Tensor,
+    surface_depth: torch.Tensor,
+    actor_x: torch.Tensor,
+    actor_y: torch.Tensor,
+    actor_z: torch.Tensor,
+    actor_alive: torch.Tensor,
+    actor_sprite: torch.Tensor,
+    actor_fullbright: torch.Tensor,
+    player_x: torch.Tensor,
+    player_y: torch.Tensor,
+    player_angle: torch.Tensor,
+    view_z: torch.Tensor,
+    center: torch.Tensor,
+    sprite_widths: torch.Tensor,
+    sprite_heights: torch.Tensor,
+    sprite_left_offsets: torch.Tensor,
+    sprite_top_offsets: torch.Tensor,
+    sprite_atlas: torch.Tensor,
+    sprite_opaque: torch.Tensor,
+    sector_lookup: torch.Tensor,
+    lookup_metadata: torch.Tensor,
+    sector_lights: torch.Tensor,
+    flash_light: torch.Tensor,
+    colormap: torch.Tensor,
+) -> None:
+    del (
+        frame,
+        blocking_distance,
+        surface_depth,
+        actor_x,
+        actor_y,
+        actor_z,
+        actor_alive,
+        actor_sprite,
+        actor_fullbright,
+        player_x,
+        player_y,
+        player_angle,
+        view_z,
+        center,
+        sprite_widths,
+        sprite_heights,
+        sprite_left_offsets,
+        sprite_top_offsets,
+        sprite_atlas,
+        sprite_opaque,
+        sector_lookup,
+        lookup_metadata,
+        sector_lights,
+        flash_light,
+        colormap,
+    )
+
+
+@triton.jit
+def _render_native_weapon_kernel(
+    frame,
+    frame_ids,
+    flash_ids,
+    horizontal_offsets_fixed,
+    vertical_offsets_fixed,
+    visible,
+    patch_atlas,
+    patch_opaque,
+    patch_widths,
+    patch_heights,
+    patch_left_offsets,
+    patch_top_offsets,
+    output,
+    total_pixels: tl.constexpr,
+    view_height: tl.constexpr,
+    view_width: tl.constexpr,
+    atlas_stride_type: tl.constexpr,
+    atlas_stride_y: tl.constexpr,
+    atlas_stride_x: tl.constexpr,
+    block: tl.constexpr,
+):
+    """Composite the weapon and muzzle-flash patches in one native-pixel pass."""
+
+    offset = tl.program_id(0) * block + tl.arange(0, block)
+    valid = offset < total_pixels
+    pixels_per_env = view_height * view_width
+    env = offset // pixels_per_env
+    pixel = offset - env * pixels_per_env
+    pixel_y = pixel // view_width
+    pixel_x = pixel - pixel_y * view_width
+    prior = tl.load(frame + offset, mask=valid, other=0)
+    lane_visible = tl.load(visible + env, mask=valid, other=0).to(tl.int1)
+    horizontal_offset = tl.load(horizontal_offsets_fixed + env, mask=valid, other=0)
+    vertical_offset = tl.load(vertical_offsets_fixed + env, mask=valid, other=0)
+
+    frame_id = tl.load(frame_ids + env, mask=valid, other=0).to(tl.int64)
+    frame_width = tl.load(patch_widths + frame_id).to(tl.int64)
+    frame_height = tl.load(patch_heights + frame_id).to(tl.int64)
+    frame_left_offset = tl.load(patch_left_offsets + frame_id).to(tl.int64)
+    frame_top_offset = tl.load(patch_top_offsets + frame_id).to(tl.int64)
+    frame_screen_left = (horizontal_offset - frame_left_offset * 65536) >> 16
+    frame_source_x = pixel_x - frame_screen_left
+    # R_DrawPSprite uses BASEYCENTER=100, weapon top 32+0x6000/FRACUNIT,
+    # and the reciprocal scale of the full 320x240 target.
+    frame_texture_mid = 4431872 - vertical_offset + frame_top_offset * 65536
+    frame_source_y = (frame_texture_mid + (pixel_y - 103) * 54613) >> 16
+    frame_inside = (
+        valid
+        & lane_visible
+        & (frame_source_x >= 0)
+        & (frame_source_x < frame_width)
+        & (frame_source_y >= 0)
+        & (frame_source_y < frame_height)
+    )
+    safe_frame_x = tl.maximum(0, tl.minimum(frame_source_x, frame_width - 1))
+    safe_frame_y = tl.maximum(0, tl.minimum(frame_source_y, frame_height - 1))
+    frame_atlas_index = (
+        frame_id * atlas_stride_type
+        + safe_frame_y * atlas_stride_y
+        + safe_frame_x * atlas_stride_x
+    )
+    frame_value = tl.load(patch_atlas + frame_atlas_index, mask=frame_inside, other=0)
+    frame_alpha = tl.load(patch_opaque + frame_atlas_index, mask=frame_inside, other=0).to(
+        tl.int1
+    )
+    composited = tl.where(frame_inside & frame_alpha, frame_value, prior)
+
+    raw_flash_id = tl.load(flash_ids + env, mask=valid, other=-1).to(tl.int64)
+    has_flash = raw_flash_id >= 0
+    flash_id = tl.maximum(raw_flash_id, 0)
+    flash_width = tl.load(patch_widths + flash_id).to(tl.int64)
+    flash_height = tl.load(patch_heights + flash_id).to(tl.int64)
+    flash_left_offset = tl.load(patch_left_offsets + flash_id).to(tl.int64)
+    flash_top_offset = tl.load(patch_top_offsets + flash_id).to(tl.int64)
+    flash_screen_left = (horizontal_offset - flash_left_offset * 65536) >> 16
+    flash_source_x = pixel_x - flash_screen_left
+    flash_texture_mid = 4431872 - vertical_offset + flash_top_offset * 65536
+    flash_source_y = (flash_texture_mid + (pixel_y - 103) * 54613) >> 16
+    flash_inside = (
+        valid
+        & lane_visible
+        & has_flash
+        & (flash_source_x >= 0)
+        & (flash_source_x < flash_width)
+        & (flash_source_y >= 0)
+        & (flash_source_y < flash_height)
+    )
+    safe_flash_x = tl.maximum(0, tl.minimum(flash_source_x, flash_width - 1))
+    safe_flash_y = tl.maximum(0, tl.minimum(flash_source_y, flash_height - 1))
+    flash_atlas_index = (
+        flash_id * atlas_stride_type
+        + safe_flash_y * atlas_stride_y
+        + safe_flash_x * atlas_stride_x
+    )
+    flash_value = tl.load(patch_atlas + flash_atlas_index, mask=flash_inside, other=0)
+    flash_alpha = tl.load(
+        patch_opaque + flash_atlas_index,
+        mask=flash_inside,
+        other=0,
+    ).to(tl.int1)
+    tl.store(
+        output + offset,
+        tl.where(flash_inside & flash_alpha, flash_value, composited),
+        mask=valid,
+    )
+
+
+@torch.library.custom_op(
+    "gradoom::render_native_weapon",
+    mutates_args=(),
+    device_types="cuda",
+)
+def render_native_weapon(
+    frame: torch.Tensor,
+    frame_ids: torch.Tensor,
+    flash_ids: torch.Tensor,
+    horizontal_offsets_fixed: torch.Tensor,
+    vertical_offsets_fixed: torch.Tensor,
+    visible: torch.Tensor,
+    patch_atlas: torch.Tensor,
+    patch_opaque: torch.Tensor,
+    patch_widths: torch.Tensor,
+    patch_heights: torch.Tensor,
+    patch_left_offsets: torch.Tensor,
+    patch_top_offsets: torch.Tensor,
+) -> torch.Tensor:
+    """Return the exact native psprite composition without dense gather tensors."""
+
+    output = torch.empty_like(frame)
+    block = 256
+    torch.library.wrap_triton(_render_native_weapon_kernel)[
+        (triton.cdiv(frame.numel(), block),)
+    ](
+        frame,
+        frame_ids,
+        flash_ids,
+        horizontal_offsets_fixed,
+        vertical_offsets_fixed,
+        visible,
+        patch_atlas,
+        patch_opaque,
+        patch_widths,
+        patch_heights,
+        patch_left_offsets,
+        patch_top_offsets,
+        output,
+        frame.numel(),
+        frame.shape[1],
+        frame.shape[2],
+        patch_atlas.stride(0),
+        patch_atlas.stride(1),
+        patch_atlas.stride(2),
+        block,
+        num_warps=4,
+    )
+    return output
+
+
+@render_native_weapon.register_fake
+def _render_native_weapon_fake(
+    frame: torch.Tensor,
+    frame_ids: torch.Tensor,
+    flash_ids: torch.Tensor,
+    horizontal_offsets_fixed: torch.Tensor,
+    vertical_offsets_fixed: torch.Tensor,
+    visible: torch.Tensor,
+    patch_atlas: torch.Tensor,
+    patch_opaque: torch.Tensor,
+    patch_widths: torch.Tensor,
+    patch_heights: torch.Tensor,
+    patch_left_offsets: torch.Tensor,
+    patch_top_offsets: torch.Tensor,
+) -> torch.Tensor:
+    del (
+        frame_ids,
+        flash_ids,
+        horizontal_offsets_fixed,
+        vertical_offsets_fixed,
+        visible,
+        patch_atlas,
+        patch_opaque,
+        patch_widths,
+        patch_heights,
+        patch_left_offsets,
+        patch_top_offsets,
+    )
+    return torch.empty_like(frame)
 
 
 @triton.jit

@@ -47,7 +47,7 @@ def square_scenario() -> CompiledScenario:
         ),
         item_spawns=np.empty((0, 3), dtype=np.float32),
         item_types=np.empty((0,), dtype=np.int32),
-        playpal=np.zeros((256, 3), dtype=np.uint8),
+        playpal=np.repeat(np.arange(256, dtype=np.uint8)[:, None], 3, axis=1),
         texture_names=("TEST",),
         texture_atlas=np.full((1, 1, 1), 192, dtype=np.uint8),
         texture_widths=np.ones(1, dtype=np.int32),

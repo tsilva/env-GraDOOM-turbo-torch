@@ -185,6 +185,16 @@ def grayscale_palette(playpal: np.ndarray) -> np.ndarray:
     return values.astype(np.uint8)
 
 
+def policy_grayscale_palette(playpal: np.ndarray) -> np.ndarray:
+    """Map PLAYPAL indices through the pinned RGB-policy luminance transform."""
+
+    if playpal.shape != (256, 3):
+        raise ValueError("PLAYPAL must contain exactly 256 RGB colors")
+    colors = playpal.astype(np.int32)
+    values = (colors[:, 0] * 77 + colors[:, 1] * 150 + colors[:, 2] * 29 + 128) >> 8
+    return values.astype(np.uint8)
+
+
 def compile_grayscale_atlas(
     wad: WadArchive,
     names: tuple[str, ...],
@@ -194,7 +204,7 @@ def compile_grayscale_atlas(
     if len(palette_bytes) < 256 * 3:
         raise ValueError("IWAD PLAYPAL lump is too small")
     playpal = np.frombuffer(palette_bytes[: 256 * 3], dtype=np.uint8).reshape(256, 3)
-    grayscale = grayscale_palette(playpal)
+    grayscale = policy_grayscale_palette(playpal)
     textures = tuple(catalog.decode(wad, name) for name in names)
     max_height = max((texture.height for texture in textures), default=1)
     max_width = max((texture.width for texture in textures), default=1)
@@ -375,7 +385,7 @@ def compile_sprite_atlas(
     if len(palette_bytes) < 256 * 3:
         raise ValueError("IWAD PLAYPAL lump is too small")
     playpal = np.frombuffer(palette_bytes[: 256 * 3], dtype=np.uint8).reshape(256, 3)
-    grayscale = grayscale_palette(playpal)
+    grayscale = policy_grayscale_palette(playpal)
     resolved_names: list[str] = []
     sprites: list[IndexedTexture] = []
     for requested_name in frame_names:
@@ -428,7 +438,7 @@ def compile_weapon_overlays(
     if len(palette_bytes) < 256 * 3:
         raise ValueError("IWAD PLAYPAL lump is too small")
     playpal = np.frombuffer(palette_bytes[: 256 * 3], dtype=np.uint8).reshape(256, 3)
-    grayscale = grayscale_palette(playpal)
+    grayscale = policy_grayscale_palette(playpal)
     resolved_names: list[str] = []
     values: list[np.ndarray] = []
     alphas: list[np.ndarray] = []
@@ -545,4 +555,5 @@ __all__ = [
     "compile_weapon_overlays",
     "decode_patch",
     "grayscale_palette",
+    "policy_grayscale_palette",
 ]

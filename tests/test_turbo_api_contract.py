@@ -139,6 +139,19 @@ def test_torch_is_the_only_transition_transport(square_scenario) -> None:
         env.close()
 
 
+def test_reference_incoming_damage_variables_are_selectable(square_scenario) -> None:
+    env = _env(
+        square_scenario,
+        game_variables=("health", "hits_taken", "damage_taken"),
+    )
+    try:
+        _observations, infos = env.reset(seed=7)
+        assert infos["hits_taken"].tolist() == [0.0, 0.0]
+        assert infos["damage_taken"].tolist() == [0.0, 0.0]
+    finally:
+        env.close()
+
+
 def test_seed_and_manual_lifecycle_match_turbo_semantics(square_scenario) -> None:
     left = _env(square_scenario)
     right = _env(square_scenario)

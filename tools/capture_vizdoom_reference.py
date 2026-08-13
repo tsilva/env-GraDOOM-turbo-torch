@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import tempfile
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -87,6 +88,7 @@ def main() -> int:
     parser.add_argument("--config", required=True)
     parser.add_argument("--iwad", required=True)
     parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument("--doom-skill", type=int, default=1)
     parser.add_argument("--steps", type=int, default=128)
     parser.add_argument("--frame-skip", type=int, default=2)
     parser.add_argument("--compact", action="store_true")
@@ -114,8 +116,14 @@ def main() -> int:
     import vizdoom as vzd
 
     game = vzd.DoomGame()
+    config_directory = tempfile.TemporaryDirectory(prefix="gradoom-vizdoom-trace-")
     game.load_config(str(Path(args.config).expanduser().resolve()))
+    game.set_doom_config_path(str(Path(config_directory.name) / "engine.ini"))
+    game.set_window_visible(False)
+    game.set_sound_enabled(False)
+    game.set_audio_buffer_enabled(False)
     game.set_doom_game_path(str(Path(args.iwad).expanduser().resolve()))
+    game.set_doom_skill(args.doom_skill)
     game.set_screen_format(vzd.ScreenFormat.GRAY8)
     game.set_objects_info_enabled(True)
     for name in VARIABLES:
@@ -208,6 +216,7 @@ def main() -> int:
             previous_reward = float(game.make_action(action, args.frame_skip))
     finally:
         game.close()
+        config_directory.cleanup()
     return 0
 
 

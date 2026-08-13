@@ -15,6 +15,21 @@ from gradoom.engine import TorchDeathmatchEngine
 from gradoom.scenario import compile_deathmatch_scenario
 
 
+def _reference_policy_frame(reference_rgb: torch.Tensor) -> torch.Tensor:
+    """Apply the pinned ViZDoom-turbo deathmatch observation transform."""
+
+    try:
+        from vizdoom_turbo._vizdoom_turbo import preprocess_into
+    except ImportError as exc:
+        raise RuntimeError(
+            "compare_renderer.py requires the reference vizdoom_turbo package"
+        ) from exc
+    current = reference_rgb.to(torch.uint8).numpy()[None]
+    output = np.empty((1, 84, 84, 1), dtype=np.uint8)
+    preprocess_into(current, output, [0, 32, 0, 0], True, 0, "area")
+    return torch.from_numpy(output[0, ..., 0]).to(torch.float32)
+
+
 def _write_comparison(
     output: Path,
     reference: torch.Tensor,
@@ -33,6 +48,36 @@ def _write_comparison(
             "rgb24",
             "-video_size",
             "960x240",
+            "-i",
+            "pipe:0",
+            "-frames:v",
+            "1",
+            "-y",
+            str(output),
+        ),
+        input=comparison.numpy().tobytes(),
+        check=True,
+    )
+
+
+def _write_policy_comparison(
+    output: Path,
+    reference: torch.Tensor,
+    actual: torch.Tensor,
+) -> None:
+    difference = torch.abs(reference - actual).mul(3).clamp(0, 255)
+    comparison = torch.cat((reference, actual, difference), dim=1).to(torch.uint8)
+    subprocess.run(
+        (
+            "ffmpeg",
+            "-loglevel",
+            "error",
+            "-f",
+            "rawvideo",
+            "-pixel_format",
+            "gray",
+            "-video_size",
+            "252x84",
             "-i",
             "pipe:0",
             "-frames:v",
@@ -164,18 +209,41 @@ def main() -> int:
         engine.weapon_raise_cooldown.zero_()
         matched_mugshot_face_index = _match_reference_mugshot(engine, reference)
         actual = engine.render_native_frame(include_hud=True)[0].to(torch.float32)
+        expected_policy = _reference_policy_frame(reference)
+        actual_policy = engine.render_reference_frame()[0].to(torch.float32)
+        approximate_policy = engine.render_approximate_frame()[0].to(torch.float32)
         flattened = torch.stack((reference.flatten(), actual.flatten()))
+        policy_flattened = torch.stack((expected_policy.flatten(), actual_policy.flatten()))
+        approximate_policy_flattened = torch.stack(
+            (expected_policy.flatten(), approximate_policy.flatten())
+        )
         absolute_error = torch.abs(reference - actual)
+        policy_absolute_error = torch.abs(expected_policy - actual_policy)
+        approximate_policy_absolute_error = torch.abs(expected_policy - approximate_policy)
         if args.output_dir is not None:
             _write_comparison(
                 args.output_dir / f"seed-{seed}-reference-actual-diff.png",
                 reference,
                 actual,
             )
+            _write_policy_comparison(
+                args.output_dir / f"seed-{seed}-policy-reference-actual-diff.png",
+                expected_policy,
+                actual_policy,
+            )
+            _write_policy_comparison(
+                args.output_dir / f"seed-{seed}-policy-reference-approximate-diff.png",
+                expected_policy,
+                approximate_policy,
+            )
         records.append(
             {
                 "actual_mean": float(actual.mean()),
                 "angle": angle_degrees,
+                "approximate_policy_correlation": float(
+                    torch.corrcoef(approximate_policy_flattened)[0, 1]
+                ),
+                "approximate_policy_mae": float(approximate_policy_absolute_error.mean()),
                 "camera_z": camera_z,
                 "channel_mae_b": float(absolute_error[..., 2].mean()),
                 "channel_mae_g": float(absolute_error[..., 1].mean()),
@@ -187,6 +255,11 @@ def main() -> int:
                 "mae_hud": float(absolute_error[208:].mean()),
                 "matched_mugshot_face_index": matched_mugshot_face_index,
                 "pitch": pitch_degrees,
+                "policy_actual_mean": float(actual_policy.mean()),
+                "policy_correlation": float(torch.corrcoef(policy_flattened)[0, 1]),
+                "policy_mae": float(policy_absolute_error.mean()),
+                "policy_max_error": float(policy_absolute_error.max()),
+                "policy_reference_mean": float(expected_policy.mean()),
                 "reference_mean": float(reference.mean()),
                 "seed": seed,
                 "x": x,
@@ -197,17 +270,35 @@ def main() -> int:
 
     correlations = np.asarray([record["correlation"] for record in records], dtype=np.float64)
     errors = np.asarray([record["mae"] for record in records], dtype=np.float64)
+    approximate_policy_correlations = np.asarray(
+        [record["approximate_policy_correlation"] for record in records], dtype=np.float64
+    )
+    approximate_policy_errors = np.asarray(
+        [record["approximate_policy_mae"] for record in records], dtype=np.float64
+    )
+    policy_correlations = np.asarray(
+        [record["policy_correlation"] for record in records], dtype=np.float64
+    )
+    policy_errors = np.asarray([record["policy_mae"] for record in records], dtype=np.float64)
     print(
         json.dumps(
             {
+                "approximate_policy_mean_correlation": float(
+                    approximate_policy_correlations.mean()
+                ),
+                "approximate_policy_mean_mae": float(approximate_policy_errors.mean()),
                 "iwad_sha256": scenario.iwad_sha256,
                 "mean_correlation": float(correlations.mean()),
                 "mean_mae": float(errors.mean()),
                 "median_correlation": float(np.median(correlations)),
                 "median_mae": float(np.median(errors)),
+                "policy_mean_correlation": float(policy_correlations.mean()),
+                "policy_mean_mae": float(policy_errors.mean()),
+                "policy_median_correlation": float(np.median(policy_correlations)),
+                "policy_median_mae": float(np.median(policy_errors)),
                 "records": records,
                 "scenario_sha256": scenario.scenario_sha256,
-                "schema": "gradoom.renderer-parity.raw-rgb-hud.v1",
+                "schema": "gradoom.renderer-parity.raw-and-policy.v2",
                 "stochastic_state_alignment": ["mugshot_face_index"],
             },
             sort_keys=True,

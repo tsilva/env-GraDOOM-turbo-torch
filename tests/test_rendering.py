@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import replace
 from pathlib import Path
 
@@ -11,8 +12,13 @@ import torch
 from gradoom.engine import TorchDeathmatchEngine
 from gradoom.scenario import compile_deathmatch_scenario
 
-SCENARIO = Path("/Users/tsilva/repos/tsilva/ViZDoom-turbo/scenarios/deathmatch.wad")
-DOOM2 = Path("/Users/tsilva/roms/vizdoom/doom2.wad")
+SCENARIO = Path(
+    os.environ.get(
+        "GRADOOM_DEATHMATCH_WAD",
+        "/Users/tsilva/repos/tsilva/ViZDoom-turbo/scenarios/deathmatch.wad",
+    )
+)
+DOOM2 = Path(os.environ.get("GRADOOM_IWAD", "/Users/tsilva/roms/vizdoom/doom2.wad"))
 
 
 @pytest.fixture(scope="module")
@@ -32,6 +38,143 @@ def test_doom_sprite_rotation_uses_actor_to_viewer_angle() -> None:
     )
 
     assert rotation.tolist() == [0, 2, 4, 6]
+
+
+def test_doom_sprite_rotation_wraps_float32_upper_boundary() -> None:
+    boundary = torch.tensor(-math.pi / 8, dtype=torch.float32)
+    viewer_angle = torch.nextafter(boundary, torch.tensor(float("-inf")))
+
+    rotation = TorchDeathmatchEngine._doom_sprite_rotation(
+        viewer_angle,
+        torch.zeros_like(viewer_angle),
+    )
+
+    assert rotation.item() == 0
+
+
+def test_policy_area_weights_preserve_each_reference_pixel_footprint() -> None:
+    vertical = TorchDeathmatchEngine._policy_area_axis(
+        240,
+        84,
+        device=torch.device("cpu"),
+    )
+    horizontal = TorchDeathmatchEngine._policy_area_axis(
+        320,
+        84,
+        device=torch.device("cpu"),
+    )
+
+    assert torch.allclose(vertical.sum(dim=1), torch.ones(84))
+    assert torch.allclose(horizontal.sum(dim=1), torch.ones(84))
+    assert torch.all(torch.count_nonzero(vertical, dim=1) <= 4)
+    assert torch.all(torch.count_nonzero(horizontal, dim=1) <= 5)
+
+
+def test_approximate_renderer_alias_ignores_instance_renderer_rebinding(square_scenario) -> None:
+    engine = TorchDeathmatchEngine(square_scenario, 1, device=torch.device("cpu"))
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([123]))
+    expected = engine.render_approximate_frame()
+    engine.render_frame = engine.render_reference_frame
+
+    actual = engine.render_approximate_frame()
+
+    assert torch.equal(actual, expected)
+
+
+def test_approximate_renderer_draws_front_side_of_one_sided_wall(square_scenario) -> None:
+    walls = square_scenario.wall_segments.copy()
+    walls[0] = walls[0, (2, 3, 0, 1)]
+    sectors = square_scenario.wall_sectors.copy()
+    sectors[:, 1] = -1
+    scenario = replace(
+        square_scenario,
+        wall_segments=walls,
+        blocking_segments=walls.copy(),
+        wall_sectors=sectors,
+    )
+    engine = TorchDeathmatchEngine(scenario, 1, device=torch.device("cpu"))
+    engine.x.zero_()
+    engine.y.zero_()
+    frame = torch.zeros((1, 84, 84))
+
+    actual = engine._render_portal_walls(
+        frame,
+        torch.tensor([41.0]),
+        torch.tensor([36.4]),
+        torch.full((1, 84, 1), 100.0),
+        torch.zeros((1, 84, 1), dtype=torch.int64),
+        torch.full((1, 84, 1), 0.5),
+    )
+
+    assert torch.count_nonzero(actual) > 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+def test_cuda_policy_preprocessing_matches_cpu_reference_arithmetic() -> None:
+    from gradoom._triton_kernels import policy_area_grayscale
+
+    generator = torch.Generator().manual_seed(20260813)
+    indexed = torch.randint(0, 256, (2, 208, 320), generator=generator, dtype=torch.uint8)
+    palette = torch.randint(0, 256, (256, 3), generator=generator, dtype=torch.uint8)
+    rgb = palette[indexed.to(torch.int64)]
+    rgb = torch.cat((rgb, torch.zeros((2, 32, 320, 3), dtype=torch.uint8)), dim=1)
+    y_weights = TorchDeathmatchEngine._policy_area_axis(
+        240,
+        84,
+        device=torch.device("cpu"),
+    )
+    x_weights = TorchDeathmatchEngine._policy_area_axis(
+        320,
+        84,
+        device=torch.device("cpu"),
+    ).transpose(0, 1)
+    pooled = torch.matmul(y_weights, rgb.float().permute(0, 3, 1, 2))
+    pooled = torch.matmul(pooled, x_weights)
+    rounded = torch.floor(pooled + 0.5).to(torch.int32)
+    expected = (
+        rounded[:, 0] * 77
+        + rounded[:, 1] * 150
+        + rounded[:, 2] * 29
+        + 128
+    ) >> 8
+
+    actual = policy_area_grayscale(indexed.cuda(), palette.cuda()).cpu().to(torch.int32)
+
+    assert torch.max(torch.abs(expected - actual)).item() <= 1
+    assert torch.mean(torch.abs(expected - actual).float()).item() < 0.001
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+def test_reference_background_cuda_graph_tracks_mutable_pose(square_scenario) -> None:
+    engine = TorchDeathmatchEngine(
+        square_scenario,
+        1,
+        device=torch.device("cuda"),
+        debug_checks=False,
+    )
+    engine.reset(
+        torch.ones(1, device="cuda", dtype=torch.bool),
+        torch.tensor([123], device="cuda"),
+    )
+    engine.render_reference_frame()
+    assert engine._reference_background_graph is not None
+    assert engine._reference_background_outputs is not None
+
+    engine.angle.add_(0.25)
+    engine._angle_bam.copy_(
+        torch.remainder(
+            torch.round(engine.angle / (2 * torch.pi) * (1 << 32)).to(torch.int64),
+            1 << 32,
+        )
+    )
+    engine._reference_background_graph.replay()
+    captured = tuple(tensor.clone() for tensor in engine._reference_background_outputs)
+    eager = engine._render_native_background()
+
+    assert all(
+        torch.equal(actual, expected)
+        for actual, expected in zip(captured, eager, strict=True)
+    )
 
 
 def test_pitch_view_pan_uses_reference_fixed_tangent_projection(
@@ -2602,6 +2745,50 @@ def test_native_transparent_sprites_reveal_fifth_farther_actor(square_scenario) 
     )
 
     assert rendered[0, 103, 160].item() == 20
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+def test_fast_native_sprite_respects_portal_surface_depth() -> None:
+    from gradoom._triton_kernels import render_fast_native_sprites_
+
+    device = torch.device("cuda")
+    frame = torch.full((1, 208, 320), 7, dtype=torch.uint8, device=device)
+    atlas = torch.full((1, 3, 3), 20, dtype=torch.uint8, device=device)
+    opaque = torch.ones_like(atlas, dtype=torch.bool)
+    identity_colormap = torch.arange(256, dtype=torch.uint8, device=device).repeat(32, 1)
+    surface_depth = torch.full_like(frame, torch.inf, dtype=torch.float32)
+    surface_depth[0, 104, 160] = 50.0
+
+    render_fast_native_sprites_(
+        frame,
+        torch.full((1, 320), torch.inf, device=device),
+        surface_depth,
+        torch.tensor([[64.0]], device=device),
+        torch.zeros((1, 1), device=device),
+        torch.zeros((1, 1), device=device),
+        torch.ones((1, 1), dtype=torch.bool, device=device),
+        torch.zeros((1, 1), dtype=torch.int64, device=device),
+        torch.ones((1, 1), dtype=torch.bool, device=device),
+        torch.zeros(1, device=device),
+        torch.zeros(1, device=device),
+        torch.zeros(1, device=device),
+        torch.zeros(1, device=device),
+        torch.full((1,), 104.0, device=device),
+        torch.full((1,), 3, dtype=torch.int32, device=device),
+        torch.full((1,), 3, dtype=torch.int32, device=device),
+        torch.ones(1, dtype=torch.int32, device=device),
+        torch.ones(1, dtype=torch.int32, device=device),
+        atlas,
+        opaque,
+        torch.zeros((1, 1), dtype=torch.int64, device=device),
+        torch.tensor([-1_000.0, -1_000.0, 2_000.0], device=device),
+        torch.full((1,), 255, dtype=torch.int64, device=device),
+        torch.zeros(1, dtype=torch.int64, device=device),
+        identity_colormap,
+    )
+
+    assert frame[0, 103, 160].item() == 20
+    assert frame[0, 104, 160].item() == 7
 
 
 def test_native_teleport_fog_uses_reference_animation_and_lifetime(square_scenario) -> None:

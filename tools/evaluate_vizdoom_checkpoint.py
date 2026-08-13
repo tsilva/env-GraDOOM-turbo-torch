@@ -26,6 +26,16 @@ DEFAULT_EPISODES = 100
 DEFAULT_NUM_ENVS = 16
 REFERENCE_KILLS_TARGET = 31.78
 REFERENCE_RENDER_HUD = True
+TRACE_GAME_VARIABLES = (
+    "POSITION_X",
+    "POSITION_Y",
+    "POSITION_Z",
+    "CAMERA_POSITION_Z",
+    "ANGLE",
+)
+TRACE_INFO_NAMES = tuple(name.casefold() for name in TRACE_GAME_VARIABLES)
+SURVIVAL_GAME_VARIABLES = ("HITS_TAKEN", "DAMAGE_TAKEN")
+SURVIVAL_INFO_NAMES = tuple(name.casefold() for name in SURVIVAL_GAME_VARIABLES)
 
 
 def _load_standalone_train() -> ModuleType:
@@ -71,6 +81,25 @@ def _parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
     )
+    parser.add_argument(
+        "--stochastic-actions",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Sample policy actions (default) or select argmax actions for parity diagnostics.",
+    )
+    parser.add_argument(
+        "--include-action-traces",
+        action="store_true",
+        help="Embed each completed episode's restricted-action indices in the result.",
+    )
+    parser.add_argument(
+        "--include-survival-diagnostics",
+        action="store_true",
+        help=(
+            "Embed cumulative post-armor incoming damage/hit counters and summarize "
+            "their rate per 1000 decisions."
+        ),
+    )
     return parser
 
 
@@ -107,7 +136,7 @@ def _summary(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     if not kills:
         raise ValueError("zero-shot evaluation requires completed episodes")
     mean_kills = statistics.fmean(kills)
-    return {
+    summary = {
         "evaluation/episode/count": len(records),
         "evaluation/kills/mean": mean_kills,
         "evaluation/kills/median": statistics.median(kills),
@@ -120,6 +149,54 @@ def _summary(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "evaluation/target/kills/mean": REFERENCE_KILLS_TARGET,
         "evaluation/target/passed": mean_kills >= REFERENCE_KILLS_TARGET,
     }
+    if all("damage_taken" in record and "hits_taken" in record for record in records):
+        damage_taken = [float(record["damage_taken"]) for record in records]
+        hits_taken = [float(record["hits_taken"]) for record in records]
+        total_decisions = sum(float(record["length"]) for record in records)
+        summary.update(
+            {
+                "evaluation/survival/damage_taken/mean": statistics.fmean(damage_taken),
+                "evaluation/survival/damage_taken/per_1000_decisions": (
+                    1000.0 * sum(damage_taken) / total_decisions
+                ),
+                "evaluation/survival/hits_taken/mean": statistics.fmean(hits_taken),
+                "evaluation/survival/hits_taken/per_1000_decisions": (
+                    1000.0 * sum(hits_taken) / total_decisions
+                ),
+                "evaluation/survival/truncation_rate": statistics.fmean(
+                    float(bool(record["truncated"])) for record in records
+                ),
+            }
+        )
+    observed_names = (
+        "observed_health_loss",
+        "observed_health_gain",
+        "observed_armor_loss",
+        "observed_armor_gain",
+    )
+    if all(all(name in record for name in observed_names) for record in records):
+        total_decisions = sum(float(record["length"]) for record in records)
+        for name in observed_names:
+            values = [float(record[name]) for record in records]
+            metric = name.removeprefix("observed_")
+            summary[f"evaluation/survival/{metric}/mean"] = statistics.fmean(values)
+            summary[f"evaluation/survival/{metric}/per_1000_decisions"] = (
+                1000.0 * sum(values) / total_decisions
+            )
+    if all("actions" in record for record in records):
+        counts = np.zeros(17, dtype=np.int64)
+        for record in records:
+            counts += np.bincount(
+                np.asarray(record["actions"], dtype=np.int64),
+                minlength=len(counts),
+            )
+        total_actions = int(counts.sum())
+        if total_actions <= 0:
+            raise ValueError("zero-shot action traces must contain at least one action")
+        for index, count in enumerate(counts.tolist()):
+            summary[f"evaluation/actions/{index}/count"] = int(count)
+            summary[f"evaluation/actions/{index}/fraction"] = float(count / total_actions)
+    return summary
 
 
 def _evaluate(args: argparse.Namespace, train: ModuleType) -> dict[str, Any]:
@@ -143,6 +220,16 @@ def _evaluate(args: argparse.Namespace, train: ModuleType) -> dict[str, Any]:
     if not scenario_wad.is_file():
         raise FileNotFoundError(f"scenario WAD does not exist beside config: {scenario_wad}")
 
+    extra_game_variables = (
+        (TRACE_GAME_VARIABLES if args.include_action_traces else ())
+        + (SURVIVAL_GAME_VARIABLES if args.include_survival_diagnostics else ())
+    )
+    extra_info_names = (
+        (TRACE_INFO_NAMES if args.include_action_traces else ())
+        + (SURVIVAL_INFO_NAMES if args.include_survival_diagnostics else ())
+    )
+    game_variables = (*train.GAME_VARIABLES, *extra_game_variables)
+    info_keys = (*train.INFO_SIGNALS, *extra_info_names)
     env = VizdoomTurboVecEnv(
         str(args.scenario_config),
         use_restricted_actions=train.RESTRICTED_ACTIONS,
@@ -164,9 +251,9 @@ def _evaluate(args: argparse.Namespace, train: ModuleType) -> dict[str, Any]:
         sticky_action_prob=0.0,
         reward_clip=False,
         info="data",
-        info_filter={"mode": "all", "keys": list(train.INFO_SIGNALS)},
+        info_filter={"mode": "all", "keys": list(info_keys)},
         doom_skill=train.REFERENCE_RECIPE.doom_skill,
-        game_variables=train.GAME_VARIABLES,
+        game_variables=game_variables,
         treat_episode_timeout_as_truncation=True,
         vizdoom_config={
             "episode_timeout": train.REFERENCE_RECIPE.episode_timeout,
@@ -180,7 +267,26 @@ def _evaluate(args: argparse.Namespace, train: ModuleType) -> dict[str, Any]:
         loaded = torch.load(args.checkpoint, map_location=device, weights_only=False)
         if not isinstance(loaded, Mapping) or loaded.get("format") != "standalone-gradoom-ppo-v1":
             raise ValueError(f"unsupported standalone checkpoint: {args.checkpoint}")
-        policy = train.NatureActorCritic().to(device)
+        checkpoint_config = loaded.get("config", {})
+        effective_recipe = (
+            checkpoint_config.get("effective_recipe", {})
+            if isinstance(checkpoint_config, Mapping)
+            else {}
+        )
+        observation_invariance = (
+            checkpoint_config.get("observation_invariance", {})
+            if isinstance(checkpoint_config, Mapping)
+            else {}
+        )
+        observation_blur_kernel = int(
+            effective_recipe.get(
+                "observation_blur_kernel",
+                observation_invariance.get("observation_blur_kernel", 1),
+            )
+        )
+        policy = train.NatureActorCritic(
+            observation_blur_kernel=observation_blur_kernel
+        ).to(device)
         policy.load_state_dict(loaded["policy_state_dict"])
         policy.eval()
         calls = train.PolicyCalls(policy, compile_policy=bool(args.compile_policy))
@@ -190,6 +296,14 @@ def _evaluate(args: argparse.Namespace, train: ModuleType) -> dict[str, Any]:
         episode_indices = np.zeros(num_envs, dtype=np.int64)
         provider_seeds = [_provider_seed(int(args.seed), lane, 0) for lane in range(num_envs)]
         observations, infos = env.reset(seed=provider_seeds)
+        initial_poses = (
+            [
+                {name: float(np.asarray(infos[name])[lane]) for name in TRACE_INFO_NAMES}
+                for lane in range(num_envs)
+            ]
+            if args.include_action_traces
+            else []
+        )
         initial_values = _info_values(infos, train.MODEL_HISTORY_SIGNALS, num_envs)
         histories = (
             torch.as_tensor(initial_values, device=device)[..., None]
@@ -202,6 +316,13 @@ def _evaluate(args: argparse.Namespace, train: ModuleType) -> dict[str, Any]:
         )
         episode_returns = np.zeros(num_envs, dtype=np.float64)
         episode_lengths = np.zeros(num_envs, dtype=np.int64)
+        episode_health_loss = np.zeros(num_envs, dtype=np.float64)
+        episode_health_gain = np.zeros(num_envs, dtype=np.float64)
+        episode_armor_loss = np.zeros(num_envs, dtype=np.float64)
+        episode_armor_gain = np.zeros(num_envs, dtype=np.float64)
+        previous_health = np.asarray(infos["health"], dtype=np.float64).copy()
+        previous_armor = np.asarray(infos["armor"], dtype=np.float64).copy()
+        action_traces: list[list[int]] = [[] for _ in range(num_envs)]
         records_by_grid: dict[tuple[int, int], dict[str, Any]] = {}
         watchdog = train.REFERENCE_RECIPE.episode_timeout // train.REFERENCE_RECIPE.frame_skip + 1
         maximum_decisions = watchdog * max(quotas)
@@ -210,13 +331,27 @@ def _evaluate(args: argparse.Namespace, train: ModuleType) -> dict[str, Any]:
             observation_device = torch.as_tensor(observations, device=device)
             context = context_encoder.encode(histories)
             with torch.no_grad(), precision.autocast():
-                actions, _values, _log_probs = calls.act(observation_device, context)
-            next_observations, rewards, terminated, truncated, step_infos = env.step(
-                actions.cpu().numpy()
-            )
+                if args.stochastic_actions:
+                    actions, _values, _log_probs = calls.act(observation_device, context)
+                else:
+                    actions = calls.deterministic_action(observation_device, context)
+            action_values = actions.cpu().numpy()
+            if args.include_action_traces:
+                for lane in range(num_envs):
+                    if int(episode_indices[lane]) < quotas[lane]:
+                        action_traces[lane].append(int(action_values[lane]))
+            next_observations, rewards, terminated, truncated, step_infos = env.step(action_values)
             done = np.asarray(terminated) | np.asarray(truncated)
             episode_returns += np.asarray(rewards, dtype=np.float64)
             episode_lengths += 1
+            current_health = np.asarray(step_infos["health"], dtype=np.float64)
+            current_armor = np.asarray(step_infos["armor"], dtype=np.float64)
+            health_delta = current_health - previous_health
+            armor_delta = current_armor - previous_armor
+            episode_health_loss += np.maximum(-health_delta, 0.0)
+            episode_health_gain += np.maximum(health_delta, 0.0)
+            episode_armor_loss += np.maximum(-armor_delta, 0.0)
+            episode_armor_gain += np.maximum(armor_delta, 0.0)
             step_values = _info_values(step_infos, train.MODEL_HISTORY_SIGNALS, num_envs)
             histories = torch.roll(histories, shifts=-1, dims=2)
             histories[:, :, -1].copy_(torch.as_tensor(step_values, device=device))
@@ -225,7 +360,7 @@ def _evaluate(args: argparse.Namespace, train: ModuleType) -> dict[str, Any]:
                 lane_episode = int(episode_indices[lane])
                 if lane_episode < quotas[lane]:
                     provider_seed = _provider_seed(int(args.seed), lane, lane_episode)
-                    records_by_grid[(lane, lane_episode)] = {
+                    record = {
                         "lane": lane,
                         "lane_episode": lane_episode,
                         "provider_seed": provider_seed,
@@ -237,7 +372,27 @@ def _evaluate(args: argparse.Namespace, train: ModuleType) -> dict[str, Any]:
                         "truncated": bool(np.asarray(truncated)[lane]),
                         "completion_decision": decision + 1,
                     }
+                    if args.include_action_traces:
+                        record["actions"] = action_traces[lane].copy()
+                        record["initial_pose"] = initial_poses[lane].copy()
+                    if args.include_survival_diagnostics:
+                        record.update(
+                            {
+                                name: float(np.asarray(step_infos[name])[lane])
+                                for name in SURVIVAL_INFO_NAMES
+                            }
+                        )
+                        record.update(
+                            {
+                                "observed_health_loss": float(episode_health_loss[lane]),
+                                "observed_health_gain": float(episode_health_gain[lane]),
+                                "observed_armor_loss": float(episode_armor_loss[lane]),
+                                "observed_armor_gain": float(episode_armor_gain[lane]),
+                            }
+                        )
+                    records_by_grid[(lane, lane_episode)] = record
                 episode_indices[lane] += 1
+                action_traces[lane].clear()
 
             if len(records_by_grid) == int(args.episodes):
                 observations = next_observations
@@ -268,11 +423,33 @@ def _evaluate(args: argparse.Namespace, train: ModuleType) -> dict[str, Any]:
                     train.FRAME_STACK,
                 )
                 done_device = torch.as_tensor(done, device=device)
+                if args.include_action_traces:
+                    for lane in np.flatnonzero(done).tolist():
+                        initial_poses[lane] = {
+                            name: float(np.asarray(reset_infos[name])[lane])
+                            for name in TRACE_INFO_NAMES
+                        }
                 histories.copy_(torch.where(done_device[:, None, None], reset_history, histories))
                 episode_returns[done] = 0.0
                 episode_lengths[done] = 0
+                episode_health_loss[done] = 0.0
+                episode_health_gain[done] = 0.0
+                episode_armor_loss[done] = 0.0
+                episode_armor_gain[done] = 0.0
+                previous_health = np.where(
+                    done,
+                    np.asarray(reset_infos["health"], dtype=np.float64),
+                    current_health,
+                )
+                previous_armor = np.where(
+                    done,
+                    np.asarray(reset_infos["armor"], dtype=np.float64),
+                    current_armor,
+                )
                 observations = reset_observations
             else:
+                previous_health = current_health.copy()
+                previous_armor = current_armor.copy()
                 observations = next_observations
         else:
             missing = [
@@ -294,7 +471,7 @@ def _evaluate(args: argparse.Namespace, train: ModuleType) -> dict[str, Any]:
             "type": "evaluation",
             "status": "completed",
             "protocol": "standalone-zero-shot-vizdoom-turbo-v2-fixed-seed-grid",
-            "action_sampling": "stochastic",
+            "action_sampling": "stochastic" if args.stochastic_actions else "argmax",
             "checkpoint": str(args.checkpoint),
             "checkpoint_sha256": train._file_sha256(args.checkpoint),
             "checkpoint_step": int(loaded.get("step", 0)),
@@ -304,6 +481,8 @@ def _evaluate(args: argparse.Namespace, train: ModuleType) -> dict[str, Any]:
             "evaluation_seed": int(args.seed),
             "evaluation_num_envs": num_envs,
             "evaluation_seconds": time.perf_counter() - started,
+            "deterministic_actions": not bool(args.stochastic_actions),
+            "survival_diagnostics": bool(args.include_survival_diagnostics),
             "iwad_sha256": train._file_sha256(args.iwad),
             "scenario_config_sha256": train._file_sha256(args.scenario_config),
             "scenario_sha256": train._file_sha256(scenario_wad),

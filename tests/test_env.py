@@ -161,6 +161,32 @@ def test_device_step_and_reset_retains_terminal_observation(square_scenario) -> 
         env.close()
 
 
+def test_reference_eager_step_skips_empty_reset_mask(square_scenario) -> None:
+    env = _env(square_scenario)
+    try:
+        env.reset_device(torch.ones(2, dtype=torch.bool), torch.tensor([9, 10]))
+        env.observation_renderer = "reference"
+        reset_device = env.reset_device
+        reset_calls = 0
+
+        def counted_reset(mask: torch.Tensor, seeds: torch.Tensor):
+            nonlocal reset_calls
+            reset_calls += 1
+            return reset_device(mask, seeds)
+
+        env.reset_device = counted_reset
+        transition = env.step_and_reset_device(
+            torch.zeros(2, dtype=torch.int64),
+            torch.tensor([11, 12]),
+        )
+
+        assert reset_calls == 0
+        assert not torch.any(transition.terminated | transition.truncated)
+        assert transition.observations.data_ptr() == env._engine.frames.data_ptr()
+    finally:
+        env.close()
+
+
 def test_info_frame_stacks_stay_on_device_and_reset_per_lane(square_scenario) -> None:
     env = _env(
         square_scenario,

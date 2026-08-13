@@ -112,6 +112,28 @@ def test_player_combat_counters_match_vizdoom_game_variables(square_scenario) ->
     assert engine.player_damagecount.tolist() == [0.0, 5.0]
 
 
+def test_player_damage_taken_counters_match_post_armor_health_damage(square_scenario) -> None:
+    engine = _engine(square_scenario)
+    engine.armor.copy_(torch.tensor([20.0, 4.0]))
+    engine.armor_save_fraction.fill_(0.5)
+
+    engine._apply_player_damage(torch.tensor([10.0, 10.0]))
+    engine._apply_player_damage(torch.tensor([0.0, 6.0]))
+
+    assert engine.player_hits_taken.tolist() == [1, 2]
+    assert engine.player_damage_taken.tolist() == [5.0, 12.0]
+    engine._update_signal_buffer()
+    signal_indices = {
+        name: index for index, name in enumerate(engine.signals())
+    }
+    assert engine.signal_buffer[:, signal_indices["hits_taken"]].tolist() == [1.0, 2.0]
+    assert engine.signal_buffer[:, signal_indices["damage_taken"]].tolist() == [5.0, 12.0]
+
+    engine.reset(torch.tensor([True, False]), torch.tensor([789, 0]))
+    assert engine.player_hits_taken.tolist() == [0, 2]
+    assert engine.player_damage_taken.tolist() == [0.0, 12.0]
+
+
 def test_certified_enemy_actor_radii_match_reference(square_scenario) -> None:
     engine = _engine(square_scenario)
 

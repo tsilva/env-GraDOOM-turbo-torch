@@ -153,12 +153,60 @@ proves throughput and behavior preservation, not a 10x reduction in
 end-to-end time-to-quality.
 
 Parity remains the blocking issue for a certified result. The converted
-GradLab reference policy scored 35.11 mean kills over 100 episodes in ViZDoom
-but only 3.59 in the current GraDOOM environment on the corresponding fixed
-seed grid. An exact reference-recipe GraDOOM reproduction also peaked at only
-7.30 rolling kills by 10.0M steps. These results point to observation or
-simulation incompatibility rather than a PPO-throughput limitation.
+GradLab reference policy scores 35.11 mean kills over 100 episodes in ViZDoom.
+It originally scored only 3.59 with GraDOOM's approximate policy renderer, but
+the fast native renderer now recovers 28.09 mean kills, median 26, and maximum
+62 without changing gameplay mechanics. This is substantial useful one-way
+transfer, but it is only 80.0% of the ViZDoom source mean and remains below the
+90% release gate.
+
+The localized observation defect is quantified. At identical static
+poses, the raw native RGB renderer averages 0.999998 correlation with ViZDoom,
+but the compiled direct-84 policy renderer averages only 0.528 correlation and
+20.34/255 MAE across four pinned seeds. Passing the native indexed frame
+through the exact ViZDoom-turbo area/grayscale transform restores 0.999998
+policy-frame correlation and 0.00266/255 MAE. The retained `native-fused` path
+renders native indexed flats, portal walls, actors, and the exact weapon layer
+with compact Triton kernels before the reference 84x84 policy transform.
+
+Isolated statistical oracles now cover all six scenario monster classes and a
+two-monster infighting setup. Across 128 aligned Zombieman/ShotgunGuy trials,
+GraDOOM's kill-observed rate is 44.53% versus 45.31% in ViZDoom, with first-kill
+means of 26.82 and 27.71 decisions. These results, together with the matching
+pre-spawn deterministic prefix and early ACS spawn distribution, rule out
+several broad mechanics hypotheses. Long-horizon stochastic amplification and
+remaining observation sensitivity are still plausible.
+
+## Unmodified kill-count continuation milestone
+
+The strongest unmodified GraDOOM checkpoint in this milestone initializes from
+the converted reference policy, freezes its visual encoder, and trains the
+policy/value head with uniform kill-count reward. It uses 2,048 environments x
+16 steps, batch size 4,096, two epochs, learning rate 1e-6, entropy coefficient
+zero, frame skip 2, Doom skill 1, and wall damage scale 1.0. At 4,030,464
+samples it scores **25.93 mean kills over 100 balanced seed-123 episodes**.
+
+An optimizer- and RNG-state continuation to 8,028,160 total samples added
+3,997,696 samples in 182.24 seconds and sustained 22,707 median loop
+transitions/s. Its rolling-100 metric peaked at 28.56 at step 7,897,088 and
+ended at 23.66. With thousands of synchronously reset lanes, episode completions
+arrive in length-sorted cohorts, so that rolling window is retained for GradLab
+metric compatibility but is not used as a checkpoint acceptance gate.
+
+The balanced fixed-seed evaluation of the final continuation scores **25.63
+mean kills over 100 episodes**, median 22, and maximum 63. It preserves but does
+not improve the 25.93 parent, and the required unmodified >=30 result remains
+unmet. The continuation checkpoint SHA-256 is
+`67989a0ca18c38602cacb5c955bcc68b91c25f433739a6b45fa603e1dcefaae2`.
+W&B run `11p5nezd` in `tsilva/VizdoomDeathmatch-v1` carries the mandatory
+`env_provider:gradoom` tag and the comparable return, rolling-kill, throughput,
+and PPO diagnostics.
 
 The retained evidence is under
 `/home/tsilva/gradoom-runs/20260813-native-wall025-mature-seed789-goal30` and
-`/home/tsilva/gradoom-runs/20260813-wall025-goal30-throughput10x` on Beast-3.
+`/home/tsilva/gradoom-runs/20260813-wall025-goal30-throughput10x` for the
+experimental result, and under
+`/home/tsilva/gradoom-runs/20260813-depth-vizinit-killcount-standardconv-lr1e6-4m`
+and
+`/home/tsilva/gradoom-runs/20260813-parity-killcount-standardconv-lr1e6-resume8m`
+for the unmodified milestone on Beast-3.

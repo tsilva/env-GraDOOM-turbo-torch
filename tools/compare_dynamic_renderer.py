@@ -238,6 +238,14 @@ def main() -> int:
     )
     parser.add_argument("--frame-skip", type=int, default=2)
     parser.add_argument(
+        "--allow-stochastic-state-divergence",
+        action="store_true",
+        help=(
+            "sample after the first ACS spawn for diagnosis; post-spawn image errors "
+            "then combine renderer differences with permitted RNG-state divergence"
+        ),
+    )
+    parser.add_argument(
         "--compare-item-occlusion",
         action="store_true",
         help="compare isolated GraDOOM item pixels with ViZDoom's label buffer",
@@ -251,7 +259,7 @@ def main() -> int:
         parser.error("sample steps must contain non-negative values")
     if args.frame_skip <= 0:
         parser.error("frame skip must be positive")
-    if sample_steps[-1] * args.frame_skip >= 106:
+    if sample_steps[-1] * args.frame_skip >= 106 and not args.allow_stochastic_state_divergence:
         parser.error(
             "comparison must stop before the first stochastic ACS monster spawn "
             "at episode time 106"
@@ -319,6 +327,7 @@ def main() -> int:
         "records": records,
         "sample_steps": sample_steps,
         "schema": "gradoom.renderer-parity.dynamic-raw-rgb-hud.v1",
+        "stochastic_phase_included": sample_steps[-1] * args.frame_skip >= 106,
         "stochastic_state_alignment": ["mugshot_face_index"],
         "top": [record for _mae, record, _reference, _actual in top],
     }

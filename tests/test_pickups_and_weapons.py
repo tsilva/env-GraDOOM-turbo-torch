@@ -878,7 +878,7 @@ def test_monster_drop_is_independently_tossed_and_gravity_driven(square_scenario
     assert not torch.any(engine.drop_spawned[:, 0])
 
 
-def test_policy_observation_contains_available_pickups(square_scenario) -> None:
+def test_approximate_observation_contains_available_pickups(square_scenario) -> None:
     scenario = replace(
         square_scenario,
         item_spawns=np.asarray([(48.0, 0.0, 0.0)], dtype=np.float32),
@@ -887,14 +887,14 @@ def test_policy_observation_contains_available_pickups(square_scenario) -> None:
     engine = _engine(scenario)
     engine.angle.zero_()
 
-    visible = engine.render_frame()
+    visible = engine.render_approximate_frame()
     engine.item_available.fill_(False)
-    absent = engine.render_frame()
+    absent = engine.render_approximate_frame()
 
     assert not torch.equal(visible, absent)
 
 
-def test_policy_observation_contains_selected_first_person_weapon(square_scenario) -> None:
+def test_approximate_observation_contains_selected_first_person_weapon(square_scenario) -> None:
     values = np.zeros((8, 84, 84), dtype=np.float32)
     alpha = np.zeros_like(values)
     values[0, 63:73, 31:53] = 48
@@ -908,9 +908,9 @@ def test_policy_observation_contains_selected_first_person_weapon(square_scenari
     engine = _engine(scenario)
     engine.weapon_raise_cooldown.zero_()
     engine.selected_weapon.zero_()
-    fist = engine.render_frame()
+    fist = engine.render_approximate_frame()
     engine.selected_weapon.fill_(2)
-    pistol = engine.render_frame()
+    pistol = engine.render_approximate_frame()
 
     assert not torch.equal(fist, pistol)
     assert torch.all(
@@ -919,7 +919,7 @@ def test_policy_observation_contains_selected_first_person_weapon(square_scenari
     )
 
 
-def test_first_person_weapon_resolves_shared_slot_variants(square_scenario) -> None:
+def test_approximate_weapon_resolves_shared_slot_variants(square_scenario) -> None:
     values = np.zeros((8, 84, 84), dtype=np.float32)
     alpha = np.zeros_like(values)
     for weapon in (0, 1, 3, 4):
@@ -936,14 +936,14 @@ def test_first_person_weapon_resolves_shared_slot_variants(square_scenario) -> N
 
     engine.selected_weapon.fill_(1)
     engine.selected_weapon_variant.fill_(False)
-    fist = engine.render_frame()
+    fist = engine.render_approximate_frame()
     engine.selected_weapon_variant.fill_(True)
-    chainsaw = engine.render_frame()
+    chainsaw = engine.render_approximate_frame()
     engine.selected_weapon.fill_(3)
     engine.selected_weapon_variant.fill_(False)
-    shotgun = engine.render_frame()
+    shotgun = engine.render_approximate_frame()
     engine.selected_weapon_variant.fill_(True)
-    super_shotgun = engine.render_frame()
+    super_shotgun = engine.render_approximate_frame()
 
     means = [
         frame[:, 63:73, 31:53].to(torch.float32).mean().item()

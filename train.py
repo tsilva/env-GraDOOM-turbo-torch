@@ -36,7 +36,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from gradoom._triton_kernels import frozen_nature_conv1
+from gradoom._triton_kernels import bounded_observation_augment, frozen_nature_conv1
 
 REFERENCE_NAME = "GradLab VizdoomDeathmatch-v1/ppo"
 REFERENCE_CAPTURED_AT = "2026-08-11"
@@ -272,6 +272,16 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--observation-renderer",
+        choices=("approximate", "native-fused", "reference"),
+        default="approximate",
+        help=(
+            "Select the compiled direct-84 approximation, fused native-projection "
+            "policy path, or exact ViZDoom-turbo native render. Gameplay phases "
+            "remain compiled around the eager native renderers."
+        ),
+    )
+    parser.add_argument(
         "--reward-shape",
         choices=(
             "native-v1",
@@ -300,6 +310,16 @@ def _parser() -> argparse.ArgumentParser:
             "Training-only cross-entropy coefficient for GraDOOM's visible-enemy "
             "combat teacher (default: 0, disabled). The saved policy remains "
             "pixels/context-only."
+        ),
+    )
+    parser.add_argument(
+        "--encoder-anchor-coef",
+        type=float,
+        default=0.0,
+        help=(
+            "L2-SP coefficient that anchors the trainable observation encoder to "
+            "its weights at training start (default: 0, disabled). This permits "
+            "bounded provider adaptation without unconstrained representation drift."
         ),
     )
     parser.add_argument(
@@ -336,12 +356,42 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--observation-blur-kernel",
+        type=int,
+        default=1,
+        help=(
+            "Apply the same odd-width average blur inside the policy for both providers "
+            "(default: 1, disabled)."
+        ),
+    )
+    parser.add_argument(
+        "--observation-augmentation",
+        choices=("none", "bounded-shift-gray-v1"),
+        default="none",
+        help=(
+            "Training-only observation-domain randomization (default: none). "
+            "bounded-shift-gray-v1 applies a stack-consistent <=2-pixel shift, "
+            "grayscale gain in [0.9, 1.1), and bias in [-8, 8); evaluation "
+            "always uses unmodified provider observations."
+        ),
+    )
+    parser.add_argument(
         "--freeze-observation-encoder",
         action=argparse.BooleanOptionalAction,
         default=False,
         help=(
             "Freeze the visual encoder and cache its rollout features during PPO updates. "
             "Intended for a resumed late training stage after the encoder has learned."
+        ),
+    )
+    parser.add_argument(
+        "--train-observation-projection-only",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Freeze the convolutional visual features and train only the encoder's "
+            "final linear projection (default: disabled). Unlike a fully frozen "
+            "encoder, rollout pixels remain available for projection updates."
         ),
     )
     parser.add_argument(
@@ -474,6 +524,24 @@ def _parser() -> argparse.ArgumentParser:
         help="Sample policy actions during evaluation, matching GradLab (default: enabled).",
     )
     parser.add_argument(
+        "--evaluation-survival-diagnostics",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Include ViZDoom-compatible cumulative incoming-damage and hit counters "
+            "in checkpoint evaluation records (default: disabled)."
+        ),
+    )
+    parser.add_argument(
+        "--evaluation-action-diagnostics",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Include per-episode restricted-action histograms in checkpoint "
+            "evaluation records (default: disabled)."
+        ),
+    )
+    parser.add_argument(
         "--config-only",
         action="store_true",
         help="Print the effective contract and exit before CUDA/environment setup.",
@@ -516,6 +584,14 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("death-penalty must be finite and non-negative")
     if not math.isfinite(args.privileged_imitation_coef) or args.privileged_imitation_coef < 0.0:
         raise ValueError("privileged-imitation-coef must be finite and non-negative")
+    if not math.isfinite(args.encoder_anchor_coef) or args.encoder_anchor_coef < 0.0:
+        raise ValueError("encoder-anchor-coef must be finite and non-negative")
+    if args.encoder_anchor_coef > 0.0 and bool(args.freeze_observation_encoder):
+        raise ValueError("encoder anchoring requires a trainable observation encoder")
+    if bool(args.freeze_observation_encoder) and bool(args.train_observation_projection_only):
+        raise ValueError(
+            "freeze-observation-encoder and train-observation-projection-only are exclusive"
+        )
     if (
         not math.isfinite(args.wall_contact_damage_scale)
         or args.wall_contact_damage_scale < 0.0
@@ -526,6 +602,16 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("steady-state-after-rollouts must be non-negative")
     if args.checkpoint_every_rollouts < 0:
         raise ValueError("checkpoint-every-rollouts must be non-negative")
+    if int(args.observation_blur_kernel) <= 0 or int(args.observation_blur_kernel) % 2 == 0:
+        raise ValueError("observation-blur-kernel must be a positive odd integer")
+    if (
+        int(args.observation_blur_kernel) > 1
+        and bool(args.freeze_observation_encoder)
+        and bool(args.frozen_encoder_custom_conv)
+    ):
+        raise ValueError(
+            "observation blur is incompatible with the frozen-encoder custom convolution"
+        )
     rollout_transitions = int(args.num_envs) * int(args.n_steps)
     if int(args.batch_size) > rollout_transitions:
         raise ValueError("batch-size cannot exceed num-envs * n-steps")
@@ -595,13 +681,18 @@ def _audit_config(args: argparse.Namespace) -> dict[str, Any]:
         "ent_coef": float(args.ent_coef),
         "death_penalty": float(args.death_penalty),
         "privileged_imitation_coef": float(args.privileged_imitation_coef),
+        "encoder_anchor_coef": float(args.encoder_anchor_coef),
         "wall_contact_damage_scale": float(args.wall_contact_damage_scale),
+        "observation_renderer": str(args.observation_renderer),
         "reward_shape": str(args.reward_shape),
         "precision": str(args.precision),
         "float32_matmul_precision": str(args.float32_matmul_precision),
         "policy_architecture": str(args.policy_architecture),
         "policy_memory_format": str(args.policy_memory_format),
+        "observation_blur_kernel": int(args.observation_blur_kernel),
+        "observation_augmentation": str(args.observation_augmentation),
         "freeze_observation_encoder": bool(args.freeze_observation_encoder),
+        "train_observation_projection_only": bool(args.train_observation_projection_only),
         "frozen_encoder_custom_conv": bool(args.frozen_encoder_custom_conv),
         "compile_policy": bool(args.compile_policy),
         "compile_engine": bool(args.compile_engine),
@@ -663,6 +754,8 @@ def _audit_config(args: argparse.Namespace) -> dict[str, Any]:
             "num_envs": int(args.evaluation_num_envs),
             "seed": int(args.evaluation_seed),
             "stochastic_actions": bool(args.evaluation_stochastic),
+            "survival_diagnostics": bool(args.evaluation_survival_diagnostics),
+            "action_diagnostics": bool(args.evaluation_action_diagnostics),
             "kills_target": REFERENCE_KILLS_TARGET,
         },
         "effective_recipe": effective,
@@ -682,8 +775,17 @@ def _audit_config(args: argparse.Namespace) -> dict[str, Any]:
             "fusion_activation": "tanh",
             "shared_actor_critic_features": True,
             "normalize_images": True,
+            "observation_blur_kernel": int(args.observation_blur_kernel),
+            "training_only_observation_augmentation": str(args.observation_augmentation),
             "orthogonal_init": True,
             "observation_encoder_trainable": not bool(args.freeze_observation_encoder),
+            "observation_encoder_train_mode": (
+                "frozen"
+                if bool(args.freeze_observation_encoder)
+                else "projection-only"
+                if bool(args.train_observation_projection_only)
+                else "all"
+            ),
             "frozen_encoder_custom_conv": bool(
                 args.freeze_observation_encoder and args.frozen_encoder_custom_conv
             ),
@@ -691,6 +793,10 @@ def _audit_config(args: argparse.Namespace) -> dict[str, Any]:
                 "cached_observation_features" if bool(args.freeze_observation_encoder) else "pixels"
             ),
             "training_only_privileged_imitation": (float(args.privileged_imitation_coef) > 0.0),
+            "encoder_anchor": {
+                "coefficient": float(args.encoder_anchor_coef),
+                "penalty": "sum_squared_distance_from_training_start",
+            },
         },
         "environment": {
             "provider": "gradoom",
@@ -704,6 +810,7 @@ def _audit_config(args: argparse.Namespace) -> dict[str, Any]:
             "observation_shape": [4, 84, 84],
             "observation_grayscale": True,
             "observation_layout": "chw",
+            "observation_renderer": str(args.observation_renderer),
             "observation_resize_algorithm": "area",
             "hud_mask": [0, 32, 0, 0],
             "action_count": REFERENCE_RECIPE.action_count,
@@ -1129,11 +1236,13 @@ class NatureActorCritic(nn.Module):
         self,
         architecture: str = "nature",
         memory_format: str = "contiguous",
+        observation_blur_kernel: int = 1,
     ) -> None:
         super().__init__()
         if memory_format not in ("contiguous", "channels-last"):
             raise ValueError(f"unsupported policy memory format: {memory_format}")
         self.channels_last = memory_format == "channels-last"
+        self.observation_blur_kernel = int(observation_blur_kernel)
         self.use_frozen_encoder_custom_conv = False
         profile = POLICY_ARCHITECTURES[architecture]
         self.observation_feature_count = profile.observation_features
@@ -1194,6 +1303,13 @@ class NatureActorCritic(nn.Module):
             encoded = torch.flatten(encoded, start_dim=1)
             return F.relu(self.observation_encoder[7](encoded))
         normalized = observations.float() / 255.0
+        if self.observation_blur_kernel > 1:
+            normalized = F.avg_pool2d(
+                normalized,
+                kernel_size=self.observation_blur_kernel,
+                stride=1,
+                padding=self.observation_blur_kernel // 2,
+            )
         if self.channels_last:
             normalized = normalized.contiguous(memory_format=torch.channels_last)
         return self.observation_encoder(normalized)
@@ -1499,6 +1615,7 @@ def _bootstrap_time_limits(
     context_encoder: CombatContextEncoder,
     precision: Precision,
     gamma: float,
+    observation_augmentation: str = "none",
 ) -> None:
     flat_truncated = buffer.truncated.flatten()
     indices = torch.nonzero(flat_truncated, as_tuple=False).flatten()
@@ -1506,6 +1623,10 @@ def _bootstrap_time_limits(
     flat_observations = buffer.final_observations.flatten(0, 1)
     flat_histories = buffer.final_histories.flatten(0, 1)
     selected_observations = flat_observations.index_select(0, safe_indices)
+    selected_observations = _augment_training_observations(
+        selected_observations,
+        observation_augmentation,
+    )
     selected_histories = flat_histories.index_select(0, safe_indices)
     selected_context = context_encoder.encode(selected_histories)
     with torch.no_grad(), precision.autocast():
@@ -1515,8 +1636,38 @@ def _bootstrap_time_limits(
     buffer.rewards.add_(bootstrap.view_as(buffer.rewards) * float(gamma))
 
 
+def _augment_training_observations(
+    observations: torch.Tensor,
+    mode: str,
+) -> torch.Tensor:
+    """Return rollout-stable augmented pixels; evaluation never calls this helper."""
+
+    if mode == "none":
+        return observations
+    if mode != "bounded-shift-gray-v1":  # pragma: no cover - argparse validates choices
+        raise ValueError(f"unsupported observation augmentation: {mode}")
+    randoms = torch.rand(
+        (observations.shape[0], 4),
+        dtype=torch.float32,
+        device=observations.device,
+    )
+    return bounded_observation_augment(observations, randoms)
+
+
 def _flatten(value: torch.Tensor, *, env_major: bool) -> torch.Tensor:
     return value.transpose(0, 1).flatten(0, 1) if env_major else value.flatten(0, 1)
+
+
+def _encoder_anchor_loss(
+    anchors: tuple[tuple[torch.Tensor, torch.Tensor], ...],
+    *,
+    fallback: torch.Tensor,
+) -> torch.Tensor:
+    if not anchors:
+        return fallback.sum() * 0.0
+    return torch.stack(
+        tuple(torch.sum((parameter - anchor) ** 2) for parameter, anchor in anchors)
+    ).sum()
 
 
 def _ppo_update(
@@ -1527,6 +1678,7 @@ def _ppo_update(
     calls: PolicyCalls,
     precision: Precision,
     args: argparse.Namespace,
+    encoder_anchors: tuple[tuple[torch.Tensor, torch.Tensor], ...] = (),
 ) -> dict[str, float]:
     policy.train()
     env_major = not bool(args.torch_permutation)
@@ -1551,7 +1703,7 @@ def _ppo_update(
     old_log_probs = _flatten(buffer.log_probs, env_major=env_major)
     advantages = _flatten(buffer.advantages, env_major=env_major)
     returns = _flatten(buffer.returns, env_major=env_major)
-    metric_sums = torch.zeros(6, dtype=torch.float32, device=buffer.rewards.device)
+    metric_sums = torch.zeros(7, dtype=torch.float32, device=buffer.rewards.device)
     metric_count = 0
     last_epoch_kl_sum = torch.zeros((), dtype=torch.float32, device=buffer.rewards.device)
     last_epoch_kl_count = 0
@@ -1630,11 +1782,16 @@ def _ppo_update(
                 else:
                     imitation_loss = logits.sum() * 0.0
                     imitation_accuracy = logits.new_zeros(())
+                encoder_anchor_loss = _encoder_anchor_loss(
+                    encoder_anchors,
+                    fallback=logits,
+                )
                 loss = (
                     policy_loss
                     + float(args.ent_coef) * entropy_loss
                     + REFERENCE_RECIPE.vf_coef * value_loss
                     + float(args.privileged_imitation_coef) * imitation_loss
+                    + float(args.encoder_anchor_coef) * encoder_anchor_loss
                 )
 
             with torch.no_grad():
@@ -1652,6 +1809,7 @@ def _ppo_update(
                             clip_fraction,
                             imitation_loss.detach().float(),
                             imitation_accuracy.detach().float(),
+                            encoder_anchor_loss.detach().float(),
                         )
                     )
                 )
@@ -1702,6 +1860,7 @@ def _ppo_update(
         "train/algorithm/imitation/loss": float(means[4].detach().cpu()),
         "train/algorithm/imitation/accuracy": float(means[5].detach().cpu()),
         "train/algorithm/imitation/valid_rate": float(buffer.teacher_valid.float().mean().cpu()),
+        "train/algorithm/ppo/encoder/anchor_loss": float(means[6].detach().cpu()),
     }
     if math.isfinite(tensors[5]):
         metrics["train/algorithm/ppo/value/explained_variance"] = float(tensors[5])
@@ -1751,6 +1910,27 @@ def _make_optimizer(
         foreach=False if fused else None,
         capturable=False,
     )
+
+
+def _configure_observation_encoder_trainability(
+    policy: NatureActorCritic,
+    *,
+    freeze: bool,
+    projection_only: bool,
+) -> None:
+    if freeze:
+        policy.observation_encoder.requires_grad_(False)
+        return
+    policy.observation_encoder.requires_grad_(True)
+    if not projection_only:
+        return
+    policy.observation_encoder.requires_grad_(False)
+    projections = tuple(
+        module for module in policy.observation_encoder.modules() if isinstance(module, nn.Linear)
+    )
+    if len(projections) != 1:  # pragma: no cover - architecture invariant
+        raise RuntimeError(f"expected one observation projection, found {len(projections)}")
+    projections[0].requires_grad_(True)
 
 
 def _load_optimizer_state(
@@ -1810,6 +1990,7 @@ def _make_env(
         info_frame_stack_keys=MODEL_HISTORY_SIGNALS,
         doom_skill=REFERENCE_RECIPE.doom_skill,
         wall_contact_damage_scale=float(args.wall_contact_damage_scale),
+        observation_renderer=str(args.observation_renderer),
         game_variables=GAME_VARIABLES,
         treat_episode_timeout_as_truncation=True,
         vizdoom_config={"episode_timeout": REFERENCE_RECIPE.episode_timeout},
@@ -1944,7 +2125,7 @@ def _evaluation_aggregate(records: Sequence[Mapping[str, Any]]) -> dict[str, Any
     returns = [float(record["return"]) for record in records]
     lengths = [float(record["length"]) for record in records]
     mean_kills = statistics.fmean(kills)
-    return {
+    aggregate = {
         "evaluation/episode/count": len(records),
         "evaluation/kills/mean": mean_kills,
         "evaluation/kills/median": statistics.median(kills),
@@ -1956,6 +2137,59 @@ def _evaluation_aggregate(records: Sequence[Mapping[str, Any]]) -> dict[str, Any
         "evaluation/target/kills/mean": REFERENCE_KILLS_TARGET,
         "evaluation/target/passed": mean_kills >= REFERENCE_KILLS_TARGET,
     }
+    if all("damage_taken" in record and "hits_taken" in record for record in records):
+        damage_taken = [float(record["damage_taken"]) for record in records]
+        hits_taken = [float(record["hits_taken"]) for record in records]
+        total_decisions = sum(lengths)
+        aggregate.update(
+            {
+                "evaluation/survival/damage_taken/mean": statistics.fmean(damage_taken),
+                "evaluation/survival/damage_taken/per_1000_decisions": (
+                    1000.0 * sum(damage_taken) / total_decisions
+                ),
+                "evaluation/survival/hits_taken/mean": statistics.fmean(hits_taken),
+                "evaluation/survival/hits_taken/per_1000_decisions": (
+                    1000.0 * sum(hits_taken) / total_decisions
+                ),
+                "evaluation/survival/truncation_rate": statistics.fmean(
+                    float(bool(record["truncated"])) for record in records
+                ),
+            }
+        )
+    observed_names = (
+        "observed_health_loss",
+        "observed_health_gain",
+        "observed_armor_loss",
+        "observed_armor_gain",
+    )
+    if all(all(name in record for name in observed_names) for record in records):
+        total_decisions = sum(lengths)
+        for name in observed_names:
+            values = [float(record[name]) for record in records]
+            metric = name.removeprefix("observed_")
+            aggregate[f"evaluation/survival/{metric}/mean"] = statistics.fmean(values)
+            aggregate[f"evaluation/survival/{metric}/per_1000_decisions"] = (
+                1000.0 * sum(values) / total_decisions
+            )
+    if all("action_counts" in record for record in records):
+        action_counts = np.asarray(
+            [record["action_counts"] for record in records],
+            dtype=np.int64,
+        )
+        expected_shape = (len(records), len(RESTRICTED_ACTIONS))
+        if action_counts.shape != expected_shape:
+            raise ValueError(
+                f"evaluation action counts must have shape {expected_shape}, "
+                f"got {action_counts.shape}"
+            )
+        totals = action_counts.sum(axis=0)
+        total_actions = int(totals.sum())
+        if total_actions <= 0:
+            raise ValueError("evaluation action counts must contain at least one action")
+        for index, count in enumerate(totals.tolist()):
+            aggregate[f"evaluation/actions/{index}/count"] = int(count)
+            aggregate[f"evaluation/actions/{index}/fraction"] = float(count / total_actions)
+    return aggregate
 
 
 def _evaluate(
@@ -1983,6 +2217,7 @@ def _evaluate(
         policy = NatureActorCritic(
             str(args.policy_architecture),
             str(args.policy_memory_format),
+            int(args.observation_blur_kernel),
         ).to(
             device=device,
             memory_format=(
@@ -2006,16 +2241,35 @@ def _evaluate(
             device,
         )
         current_seeds = episode_seeds.lookup(episode_index)
-        observations, _signals = env.reset_device(
+        observations, signals = env.reset_device(
             torch.ones(evaluation_envs, dtype=torch.bool, device=device),
             current_seeds,
         )
         context = context_encoder.encode(env.device_info_histories())
         episode_returns = torch.zeros(evaluation_envs, dtype=torch.float32, device=device)
         episode_lengths = torch.zeros(evaluation_envs, dtype=torch.int32, device=device)
-        kill_index = {name: index for index, name in enumerate(env.device_signal_names)}[
-            "killcount"
-        ]
+        signal_indices = {name: index for index, name in enumerate(env.device_signal_names)}
+        kill_index = signal_indices["killcount"]
+        hits_taken_index = signal_indices["hits_taken"]
+        damage_taken_index = signal_indices["damage_taken"]
+        health_index = signal_indices["health"]
+        armor_index = signal_indices["armor"]
+        previous_health = signals[:, health_index].clone()
+        previous_armor = signals[:, armor_index].clone()
+        episode_health_loss = torch.zeros_like(previous_health)
+        episode_health_gain = torch.zeros_like(previous_health)
+        episode_armor_loss = torch.zeros_like(previous_armor)
+        episode_armor_gain = torch.zeros_like(previous_armor)
+        episode_action_counts = torch.zeros(
+            (evaluation_envs, len(RESTRICTED_ACTIONS)),
+            dtype=torch.int32,
+            device=device,
+        )
+        action_count_increment = torch.ones(
+            (evaluation_envs, 1),
+            dtype=episode_action_counts.dtype,
+            device=device,
+        )
         episode_quotas = _episode_quotas(int(args.evaluation_episodes), evaluation_envs)
         decisions_per_episode = math.ceil(
             REFERENCE_RECIPE.episode_timeout / REFERENCE_RECIPE.frame_skip
@@ -2034,6 +2288,17 @@ def _evaluate(
             device=device,
         )
         completed_returns = torch.empty_like(completed_kills)
+        completed_hits_taken = torch.empty_like(completed_kills)
+        completed_damage_taken = torch.empty_like(completed_kills)
+        completed_health_loss = torch.empty_like(completed_kills)
+        completed_health_gain = torch.empty_like(completed_kills)
+        completed_armor_loss = torch.empty_like(completed_kills)
+        completed_armor_gain = torch.empty_like(completed_kills)
+        completed_action_counts = torch.empty(
+            (maximum_decisions, evaluation_envs, len(RESTRICTED_ACTIONS)),
+            dtype=torch.int32,
+            device=device,
+        )
         completed_lengths = torch.empty(
             (maximum_decisions, evaluation_envs),
             dtype=torch.int32,
@@ -2068,14 +2333,38 @@ def _evaluate(
                     actions, _values, _log_probs = calls.act(observations, context)
                 else:
                     actions = calls.deterministic_action(observations, context)
+            episode_action_counts.scatter_add_(
+                1,
+                actions[:, None],
+                action_count_increment,
+            )
             next_episode_index = episode_index + 1
             next_seeds = episode_seeds.lookup(next_episode_index)
             transition = env.step_and_reset_device(actions, next_seeds)
             episode_returns.add_(transition.rewards)
             episode_lengths.add_(1)
+            current_health = transition.final_signals[:, health_index]
+            current_armor = transition.final_signals[:, armor_index]
+            health_delta = current_health - previous_health
+            armor_delta = current_armor - previous_armor
+            episode_health_loss.add_(torch.clamp_min(-health_delta, 0))
+            episode_health_gain.add_(torch.clamp_min(health_delta, 0))
+            episode_armor_loss.add_(torch.clamp_min(-armor_delta, 0))
+            episode_armor_gain.add_(torch.clamp_min(armor_delta, 0))
             done = transition.terminated | transition.truncated
             completed[decision].copy_(done)
             completed_kills[decision].copy_(transition.final_signals[:, kill_index])
+            completed_hits_taken[decision].copy_(
+                transition.final_signals[:, hits_taken_index]
+            )
+            completed_damage_taken[decision].copy_(
+                transition.final_signals[:, damage_taken_index]
+            )
+            completed_health_loss[decision].copy_(episode_health_loss)
+            completed_health_gain[decision].copy_(episode_health_gain)
+            completed_armor_loss[decision].copy_(episode_armor_loss)
+            completed_armor_gain[decision].copy_(episode_armor_gain)
+            completed_action_counts[decision].copy_(episode_action_counts)
             completed_returns[decision].copy_(episode_returns)
             completed_lengths[decision].copy_(episode_lengths)
             completed_seeds[decision].copy_(current_seeds)
@@ -2084,9 +2373,16 @@ def _evaluate(
             completed_truncated[decision].copy_(transition.truncated)
             episode_returns.masked_fill_(done, 0.0)
             episode_lengths.masked_fill_(done, 0)
+            episode_health_loss.masked_fill_(done, 0.0)
+            episode_health_gain.masked_fill_(done, 0.0)
+            episode_armor_loss.masked_fill_(done, 0.0)
+            episode_armor_gain.masked_fill_(done, 0.0)
+            episode_action_counts.masked_fill_(done[:, None], 0)
             episode_index.add_(done.to(torch.int64))
             current_seeds.copy_(torch.where(done, next_seeds, current_seeds))
             observations = transition.observations
+            previous_health.copy_(transition.signals[:, health_index])
+            previous_armor.copy_(transition.signals[:, armor_index])
             context = context_encoder.encode(transition.info_histories)
             if decision % int(args.n_steps) == int(args.n_steps) - 1 and bool(
                 torch.all(episode_index >= quota_tensor)
@@ -2099,6 +2395,17 @@ def _evaluate(
         completed_cpu = completed[:executed_decisions].cpu().numpy()
         kills_cpu = completed_kills[:executed_decisions].cpu().numpy()
         returns_cpu = completed_returns[:executed_decisions].cpu().numpy()
+        hits_taken_cpu = completed_hits_taken[:executed_decisions].cpu().numpy()
+        damage_taken_cpu = completed_damage_taken[:executed_decisions].cpu().numpy()
+        health_loss_cpu = completed_health_loss[:executed_decisions].cpu().numpy()
+        health_gain_cpu = completed_health_gain[:executed_decisions].cpu().numpy()
+        armor_loss_cpu = completed_armor_loss[:executed_decisions].cpu().numpy()
+        armor_gain_cpu = completed_armor_gain[:executed_decisions].cpu().numpy()
+        action_counts_cpu = (
+            completed_action_counts[:executed_decisions].cpu().numpy()
+            if args.evaluation_action_diagnostics
+            else None
+        )
         lengths_cpu = completed_lengths[:executed_decisions].cpu().numpy()
         seeds_cpu = completed_seeds[:executed_decisions].cpu().numpy()
         episode_indices_cpu = completed_episode_indices[:executed_decisions].cpu().numpy()
@@ -2113,7 +2420,7 @@ def _evaluate(
                 key = (int(lane), lane_episode)
                 if key in records_by_seed_grid:
                     raise RuntimeError(f"duplicate evaluation seed-grid completion: {key}")
-                records_by_seed_grid[key] = {
+                record = {
                     "lane": int(lane),
                     "lane_episode": lane_episode,
                     "game_seed": int(seeds_cpu[completion_decision, lane]),
@@ -2124,6 +2431,36 @@ def _evaluate(
                     "truncated": bool(truncated_cpu[completion_decision, lane]),
                     "completion_decision": completion_decision + 1,
                 }
+                if args.evaluation_survival_diagnostics:
+                    record.update(
+                        {
+                            "hits_taken": float(
+                                hits_taken_cpu[completion_decision, lane]
+                            ),
+                            "damage_taken": float(
+                                damage_taken_cpu[completion_decision, lane]
+                            ),
+                            "observed_health_loss": float(
+                                health_loss_cpu[completion_decision, lane]
+                            ),
+                            "observed_health_gain": float(
+                                health_gain_cpu[completion_decision, lane]
+                            ),
+                            "observed_armor_loss": float(
+                                armor_loss_cpu[completion_decision, lane]
+                            ),
+                            "observed_armor_gain": float(
+                                armor_gain_cpu[completion_decision, lane]
+                            ),
+                        }
+                    )
+                if args.evaluation_action_diagnostics:
+                    if action_counts_cpu is None:  # pragma: no cover - guarded above
+                        raise RuntimeError("evaluation action counts were not copied")
+                    record["action_counts"] = action_counts_cpu[
+                        completion_decision, lane
+                    ].tolist()
+                records_by_seed_grid[key] = record
         expected_grid = [
             (lane, lane_episode)
             for lane in range(evaluation_envs)
@@ -2214,6 +2551,7 @@ def _train(
         policy = NatureActorCritic(
             str(args.policy_architecture),
             str(args.policy_memory_format),
+            int(args.observation_blur_kernel),
         ).to(
             device=device,
             memory_format=(
@@ -2222,8 +2560,11 @@ def _train(
                 else torch.contiguous_format
             ),
         )
-        if bool(args.freeze_observation_encoder):
-            policy.observation_encoder.requires_grad_(False)
+        _configure_observation_encoder_trainability(
+            policy,
+            freeze=bool(args.freeze_observation_encoder),
+            projection_only=bool(args.train_observation_projection_only),
+        )
         policy.use_frozen_encoder_custom_conv = bool(
             args.freeze_observation_encoder and args.frozen_encoder_custom_conv
         )
@@ -2265,6 +2606,14 @@ def _train(
                 learning_rate=float(args.learning_rate),
             )
             resume_payload = loaded
+        encoder_anchors = (
+            tuple(
+                (parameter, parameter.detach().clone())
+                for parameter in policy.observation_encoder.parameters()
+            )
+            if float(args.encoder_anchor_coef) > 0.0
+            else ()
+        )
         calls = PolicyCalls(policy, compile_policy=bool(args.compile_policy))
         precision = Precision(str(args.precision), device)
         buffer = RolloutBuffer(
@@ -2427,8 +2776,12 @@ def _train(
                 else:
                     with torch.no_grad():
                         teacher_actions, teacher_valid = combat_teacher.actions()
-                staged_observations, staged_context = buffer.stage(
+                policy_observations = _augment_training_observations(
                     observations,
+                    str(args.observation_augmentation),
+                )
+                staged_observations, staged_context = buffer.stage(
+                    policy_observations,
                     context,
                     episode_starts,
                 )
@@ -2499,13 +2852,20 @@ def _train(
                 rolling_success.append(float(success))
                 completed_episodes += 1
             with torch.no_grad(), precision.autocast():
-                last_values = calls.value(observations, context)
+                last_values = calls.value(
+                    _augment_training_observations(
+                        observations,
+                        str(args.observation_augmentation),
+                    ),
+                    context,
+                )
             _bootstrap_time_limits(
                 buffer,
                 calls=calls,
                 context_encoder=context_encoder,
                 precision=precision,
                 gamma=REFERENCE_RECIPE.gamma,
+                observation_augmentation=str(args.observation_augmentation),
             )
             buffer.finish(
                 last_values=last_values,
@@ -2524,6 +2884,7 @@ def _train(
                 calls=calls,
                 precision=precision,
                 args=args,
+                encoder_anchors=encoder_anchors,
             )
             torch.cuda.synchronize(device)
             update_seconds = time.perf_counter() - update_started

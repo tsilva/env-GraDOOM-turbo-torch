@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -10,9 +11,19 @@ from gradoom.scenario import (
     compile_deathmatch_scenario,
 )
 
-SCENARIO = Path("/Users/tsilva/repos/tsilva/ViZDoom-turbo/scenarios/deathmatch.wad")
-DOOM2 = Path("/Users/tsilva/roms/vizdoom/doom2.wad")
-FREEDOOM2 = Path("/Users/tsilva/repos/tsilva/ViZDoom-turbo/bin/python3.14/vizdoom/freedoom2.wad")
+SCENARIO = Path(
+    os.environ.get(
+        "GRADOOM_DEATHMATCH_WAD",
+        "/Users/tsilva/repos/tsilva/ViZDoom-turbo/scenarios/deathmatch.wad",
+    )
+)
+DOOM2 = Path(os.environ.get("GRADOOM_IWAD", "/Users/tsilva/roms/vizdoom/doom2.wad"))
+FREEDOOM2 = Path(
+    os.environ.get(
+        "GRADOOM_FREEDOOM_IWAD",
+        "/Users/tsilva/repos/tsilva/ViZDoom-turbo/bin/python3.14/vizdoom/freedoom2.wad",
+    )
+)
 
 
 @pytest.mark.skipif(not SCENARIO.is_file() or not DOOM2.is_file(), reason="operator WADs absent")

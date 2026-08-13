@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import struct
 from pathlib import Path
 
@@ -13,11 +14,17 @@ from gradoom.textures import (
     compile_sprite_atlas,
     decode_patch,
     grayscale_palette,
+    policy_grayscale_palette,
 )
 from gradoom.wad import WadArchive
 
-DOOM2 = Path("/Users/tsilva/roms/vizdoom/doom2.wad")
-FREEDOOM2 = Path("/Users/tsilva/repos/tsilva/ViZDoom-turbo/bin/python3.14/vizdoom/freedoom2.wad")
+DOOM2 = Path(os.environ.get("GRADOOM_IWAD", "/Users/tsilva/roms/vizdoom/doom2.wad"))
+FREEDOOM2 = Path(
+    os.environ.get(
+        "GRADOOM_FREEDOOM_IWAD",
+        "/Users/tsilva/repos/tsilva/ViZDoom-turbo/bin/python3.14/vizdoom/freedoom2.wad",
+    )
+)
 DEATHMATCH_TEXTURES = ("BIGBRIK1", "BRICK12", "BFALL1", "FLAT5_3", "COMPBLUE")
 
 
@@ -50,6 +57,16 @@ def test_grayscale_palette_matches_vizdoom_gray8_coefficients() -> None:
 
     assert grayscale.dtype == np.uint8
     assert int(grayscale[0]) == 168
+
+
+def test_policy_grayscale_palette_matches_reference_rgb_pipeline() -> None:
+    playpal = np.zeros((256, 3), dtype=np.uint8)
+    playpal[0] = (100, 200, 50)
+
+    grayscale = policy_grayscale_palette(playpal)
+
+    assert grayscale.dtype == np.uint8
+    assert int(grayscale[0]) == 153
 
 
 @pytest.mark.skipif(not DOOM2.is_file(), reason="operator Doom2 IWAD absent")

@@ -36,6 +36,90 @@ def test_checkpoint_evaluation_defaults_to_exact_stochastic_100() -> None:
     assert args.wandb is False
     assert args.wandb_project == "VizdoomDeathmatch-v1"
     assert args.wandb_mode == "online"
+    assert args.observation_blur_kernel == 1
+    assert args.observation_augmentation == "none"
+
+
+def test_observation_blur_is_audited_and_rejects_even_kernels() -> None:
+    args = _args("--observation-blur-kernel", "9")
+    train._validate_args(args)
+
+    audit = train._audit_config(args)
+
+    assert audit["effective_recipe"]["observation_blur_kernel"] == 9
+    assert audit["policy_model"]["observation_blur_kernel"] == 9
+    with pytest.raises(ValueError, match="positive odd"):
+        train._validate_args(_args("--observation-blur-kernel", "4"))
+
+
+def test_bounded_observation_augmentation_is_training_only_and_audited() -> None:
+    args = _args("--observation-augmentation", "bounded-shift-gray-v1")
+
+    train._validate_args(args)
+    audit = train._audit_config(args)
+
+    assert audit["effective_recipe"]["observation_augmentation"] == "bounded-shift-gray-v1"
+    assert (
+        audit["policy_model"]["training_only_observation_augmentation"]
+        == "bounded-shift-gray-v1"
+    )
+
+
+def test_encoder_anchor_is_audited_and_rejects_frozen_encoder() -> None:
+    args = _args("--encoder-anchor-coef", "0.001")
+
+    train._validate_args(args)
+    audit = train._audit_config(args)
+
+    assert audit["effective_recipe"]["encoder_anchor_coef"] == 0.001
+    assert audit["policy_model"]["encoder_anchor"] == {
+        "coefficient": 0.001,
+        "penalty": "sum_squared_distance_from_training_start",
+    }
+    with pytest.raises(ValueError, match="requires a trainable"):
+        train._validate_args(
+            _args("--encoder-anchor-coef", "0.001", "--freeze-observation-encoder")
+        )
+
+
+def test_encoder_anchor_loss_measures_sum_squared_distance() -> None:
+    parameter = torch.nn.Parameter(torch.tensor((1.0, 2.0)))
+    anchor = parameter.detach().clone()
+
+    parameter.data.add_(torch.tensor((2.0, -1.0)))
+    actual = train._encoder_anchor_loss(((parameter, anchor),), fallback=parameter)
+
+    assert actual.item() == 5.0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_bounded_observation_augmentation_is_stack_consistent() -> None:
+    device = torch.device("cuda")
+    base = torch.arange(84, dtype=torch.uint8, device=device).view(1, 1, 1, 84)
+    observations = base.expand(2, 4, 84, 84).contiguous()
+    randoms = torch.tensor(
+        (
+            (0.5, 0.5, 0.5, 0.5),
+            (0.999, 0.5, 0.5, 0.5),
+        ),
+        dtype=torch.float32,
+        device=device,
+    )
+
+    actual = train.bounded_observation_augment(observations, randoms)
+
+    torch.testing.assert_close(actual[0], observations[0])
+    assert torch.count_nonzero(actual[1, :, :, :2]) == 0
+    torch.testing.assert_close(actual[1, :, :, 2:], observations[1, :, :, :-2])
+
+
+def test_reference_observations_allow_compiled_gameplay_phases() -> None:
+    args = _args("--config-only", "--observation-renderer", "reference")
+
+    train._validate_args(args)
+
+    assert args.compile_engine is True
+    assert train._audit_config(args)["environment"]["observation_renderer"] == "reference"
 
 
 def test_wandb_uses_gradlab_project_metrics_and_gradoom_provider_tag(
@@ -164,6 +248,32 @@ def test_frozen_encoder_feature_cache_is_explicitly_audited() -> None:
     assert enabled_config["policy_model"]["observation_encoder_trainable"] is False
     assert enabled_config["policy_model"]["frozen_encoder_custom_conv"] is True
     assert enabled_config["policy_model"]["ppo_update_input"] == "cached_observation_features"
+
+
+def test_projection_only_encoder_mode_freezes_convolutions_and_is_audited() -> None:
+    args = _args("--train-observation-projection-only")
+    policy = train.NatureActorCritic()
+
+    train._validate_args(args)
+    train._configure_observation_encoder_trainability(
+        policy,
+        freeze=False,
+        projection_only=True,
+    )
+
+    trainable = {
+        name
+        for name, parameter in policy.observation_encoder.named_parameters()
+        if parameter.requires_grad
+    }
+    assert trainable == {"7.weight", "7.bias"}
+    assert train._audit_config(args)["policy_model"]["observation_encoder_train_mode"] == (
+        "projection-only"
+    )
+    with pytest.raises(ValueError, match="are exclusive"):
+        train._validate_args(
+            _args("--freeze-observation-encoder", "--train-observation-projection-only")
+        )
 
 
 def test_encoded_action_evaluation_matches_pixel_path() -> None:
@@ -367,6 +477,24 @@ def test_evaluation_aggregate_uses_exact_records_and_reference_target() -> None:
 def test_evaluation_aggregate_rejects_no_completed_episodes() -> None:
     with pytest.raises(ValueError, match="at least one completed episode"):
         train._evaluation_aggregate([])
+
+
+def test_evaluation_aggregate_summarizes_action_histograms() -> None:
+    first = [0] * len(train.RESTRICTED_ACTIONS)
+    second = [0] * len(train.RESTRICTED_ACTIONS)
+    first[2] = 3
+    second[9] = 1
+    records = [
+        {"kills": 1, "return": 2, "length": 3, "action_counts": first},
+        {"kills": 2, "return": 4, "length": 1, "action_counts": second},
+    ]
+
+    result = train._evaluation_aggregate(records)
+
+    assert result["evaluation/actions/2/count"] == 3
+    assert result["evaluation/actions/2/fraction"] == pytest.approx(0.75)
+    assert result["evaluation/actions/9/count"] == 1
+    assert result["evaluation/actions/9/fraction"] == pytest.approx(0.25)
 
 
 def test_killcount_reward_is_uniform_and_resets_at_episode_boundaries() -> None:

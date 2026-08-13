@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import json
 import math
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -188,6 +189,7 @@ def _run_case(
     frame_skip: int,
     program: str,
     tolerance: float,
+    device: torch.device,
 ) -> dict[str, Any]:
     try:
         import vizdoom as vzd
@@ -195,7 +197,14 @@ def _run_case(
         raise RuntimeError("compare_behavior.py requires the reference vizdoom package") from exc
 
     game = vzd.DoomGame()
+    config_directory = tempfile.TemporaryDirectory(prefix="gradoom-vizdoom-parity-")
     game.load_config(str(config))
+    game.set_doom_config_path(str(Path(config_directory.name) / "engine.ini"))
+    game.set_window_visible(False)
+    game.set_sound_enabled(False)
+    game.set_audio_buffer_enabled(False)
+    game.set_screen_format(vzd.ScreenFormat.RGB24)
+    game.set_mode(vzd.Mode.PLAYER)
     game.set_doom_game_path(str(iwad))
     variable_types = tuple(getattr(vzd.GameVariable, name) for name in VARIABLES)
     for variable in variable_types:
@@ -212,12 +221,15 @@ def _run_case(
         engine = TorchDeathmatchEngine(
             scenario,
             1,
-            device=torch.device("cpu"),
+            device=device,
             frame_skip=frame_skip,
             debug_checks=False,
         )
-        engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([seed]))
-        blank = torch.zeros((1, 84, 84), dtype=torch.uint8)
+        engine.reset(
+            torch.ones(1, dtype=torch.bool, device=device),
+            torch.tensor([seed], device=device),
+        )
+        blank = torch.zeros((1, 84, 84), dtype=torch.uint8, device=device)
 
         def render_blank() -> torch.Tensor:
             return blank
@@ -274,7 +286,7 @@ def _run_case(
                 game.make_action(actions[action_index], frame_skip)
             )
             _frames, reward, _terminated, _truncated = engine.step(
-                torch.tensor(actions[action_index], dtype=torch.bool)
+                torch.tensor(actions[action_index], dtype=torch.bool, device=device)
             )
             previous_engine_reward = float(reward[0])
             if program in {"weapon-next-fire", "weapon-switch-fire"} and step == 0:
@@ -287,6 +299,7 @@ def _run_case(
         }
     finally:
         game.close()
+        config_directory.cleanup()
 
 
 def main() -> int:
@@ -299,6 +312,11 @@ def main() -> int:
     parser.add_argument("--steps", type=int, default=50)
     parser.add_argument("--frame-skip", type=int, default=2)
     parser.add_argument("--tolerance", type=float, default=2e-4)
+    parser.add_argument(
+        "--device",
+        choices=("cpu", "cuda"),
+        default="cuda" if torch.cuda.is_available() else "cpu",
+    )
     args = parser.parse_args()
     if args.steps < 0:
         parser.error("--steps must be non-negative")
@@ -323,6 +341,7 @@ def main() -> int:
             frame_skip=args.frame_skip,
             program=program,
             tolerance=args.tolerance,
+            device=torch.device(args.device),
         )
         for seed in args.seeds
         for program in args.programs

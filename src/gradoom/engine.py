@@ -24,8 +24,13 @@ from ._triton_kernels import (
     move_drops_,
     move_enemy_thrust,
     player_projectile_move,
+    policy_area_grayscale,
     portal_intersections,
     random_spawn_candidates,
+    render_fast_native_flats,
+    render_fast_native_portal_walls_,
+    render_fast_native_sprites_,
+    render_native_weapon,
     render_portal_walls_,
     rocket_splash_blocked,
     select_enemy_spawn_position,
@@ -524,7 +529,74 @@ DEVICE_SIGNAL_NAMES = (
     "deathcount",
     "hitcount",
     "damagecount",
+    "hits_taken",
+    "damage_taken",
 )
+
+
+def _build_sector_lookup(
+    scenario: CompiledScenario,
+    *,
+    max_cells: int = 4_194_304,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Rasterize first-owning sector polygons for the native policy kernel.
+
+    ``_sector_at`` resolves overlapping polygon parity by taking the first
+    sector.  Matching that ownership here is important around the map's outer
+    and nested sectors.  Very large user WADs automatically use coarser cells
+    so this optional acceleration structure has a bounded footprint.
+    """
+
+    minimum_x = math.floor(float(scenario.bounds[0]))
+    maximum_x = math.ceil(float(scenario.bounds[1]))
+    minimum_y = math.floor(float(scenario.bounds[2]))
+    maximum_y = math.ceil(float(scenario.bounds[3]))
+    span_x = max(maximum_x - minimum_x, 1)
+    span_y = max(maximum_y - minimum_y, 1)
+    cell_size = max(1, math.ceil(math.sqrt(span_x * span_y / max_cells)))
+    width = math.ceil(span_x / cell_size)
+    height = math.ceil(span_y / cell_size)
+    lookup = np.full((height, width), -1, dtype=np.int16)
+
+    for sector_index in range(len(scenario.sector_heights)):
+        edges = scenario.wall_segments[scenario.sector_edge_mask[sector_index]]
+        if not len(edges):
+            continue
+        first_row = max(
+            0,
+            math.floor((float(np.min(edges[:, (1, 3)])) - minimum_y) / cell_size),
+        )
+        last_row = min(
+            height,
+            math.ceil((float(np.max(edges[:, (1, 3)])) - minimum_y) / cell_size),
+        )
+        for row in range(first_row, last_row):
+            world_y = minimum_y + (row + 0.5) * cell_size
+            crossings = sorted(
+                float(x1 + (world_y - y1) * (x2 - x1) / (y2 - y1))
+                for x1, y1, x2, y2 in edges
+                if (y1 > world_y) != (y2 > world_y)
+            )
+            # Synthetic mechanics fixtures and permissive user maps can include
+            # non-boundary linedefs in ``sector_edge_mask``.  Such a line leaves
+            # one unmatched scanline crossing; it cannot bound an owned span, so
+            # pair only complete crossings instead of rejecting the scenario.
+            for left, right in zip(crossings[0::2], crossings[1::2], strict=False):
+                first_column = max(
+                    0,
+                    math.ceil((left - minimum_x) / cell_size - 0.5),
+                )
+                last_column = min(
+                    width,
+                    math.ceil((right - minimum_x) / cell_size - 0.5),
+                )
+                if last_column <= first_column:
+                    continue
+                row_slice = lookup[row, first_column:last_column]
+                row_slice[row_slice < 0] = sector_index
+
+    metadata = np.asarray((minimum_x, minimum_y, cell_size), dtype=np.float32)
+    return lookup, metadata
 
 
 @dataclass(frozen=True)
@@ -563,6 +635,10 @@ class DeviceScenario:
     sector_lights: torch.Tensor
     sector_floor_texture_ids: torch.Tensor
     sector_ceiling_texture_ids: torch.Tensor
+    sector_lookup: torch.Tensor
+    sector_lookup_metadata: torch.Tensor
+    floor_plane_heights: torch.Tensor
+    ceiling_plane_heights: torch.Tensor
     sprite_atlas: torch.Tensor
     sprite_opaque: torch.Tensor
     sprite_widths: torch.Tensor
@@ -795,6 +871,9 @@ class DeviceScenario:
             if scenario.colormap is None
             else scenario.colormap
         )
+        sector_lookup, sector_lookup_metadata = _build_sector_lookup(scenario)
+        floor_plane_heights = np.unique(scenario.sector_heights[:, 0]).astype(np.float32)
+        ceiling_plane_heights = np.unique(scenario.sector_heights[:, 1]).astype(np.float32)
         texture_animation_ids = (
             np.arange(len(scenario.texture_atlas), dtype=np.int32)[:, None]
             if scenario.texture_animation_ids is None
@@ -1199,6 +1278,19 @@ class DeviceScenario:
             sector_ceiling_texture_ids=torch.as_tensor(
                 scenario.sector_ceiling_texture_ids, device=device, dtype=torch.int64
             ),
+            sector_lookup=torch.as_tensor(sector_lookup, device=device),
+            sector_lookup_metadata=torch.as_tensor(
+                sector_lookup_metadata,
+                device=device,
+            ),
+            floor_plane_heights=torch.as_tensor(
+                floor_plane_heights,
+                device=device,
+            ),
+            ceiling_plane_heights=torch.as_tensor(
+                ceiling_plane_heights,
+                device=device,
+            ),
             sprite_atlas=torch.as_tensor(scenario.sprite_atlas, device=device),
             sprite_opaque=torch.as_tensor(scenario.sprite_opaque, device=device),
             sprite_widths=torch.as_tensor(scenario.sprite_widths, device=device, dtype=torch.int64),
@@ -1428,6 +1520,10 @@ class TorchDeathmatchEngine:
         self.render_screen_flashes = render_screen_flashes
         self.debug_checks = device.type == "cpu" if debug_checks is None else debug_checks
         self.map = DeviceScenario.from_host(scenario, device)
+        palette = self.map.playpal.to(torch.int32)
+        self._policy_grayscale_palette = (
+            palette[:, 0] * 77 + palette[:, 1] * 150 + palette[:, 2] * 29 + 128
+        ) >> 8
         self._native_split_projection_wall_indices = torch.nonzero(
             torch.sum(
                 self.map.portal_projection_fragment_mask.to(torch.int64),
@@ -1436,6 +1532,14 @@ class TorchDeathmatchEngine:
             > 1,
             as_tuple=False,
         ).flatten()
+        self._native_blocking_wall_indices = torch.nonzero(
+            self.map.portal_wall_blocks_sight,
+            as_tuple=False,
+        ).flatten()
+        self._native_sector_edges = tuple(
+            self.map.sector_edges[self.map.sector_edge_mask[sector_index]]
+            for sector_index in range(len(self.map.sector_heights))
+        )
         endpoint_neighbor_starts = self.map.portal_endpoint_neighbor_starts
         endpoint_neighbor_ends = self.map.portal_endpoint_neighbor_ends
         start_neighbor_counts = torch.sum(
@@ -1588,6 +1692,8 @@ class TorchDeathmatchEngine:
         self.player_deathcount = torch.zeros(n, device=device, dtype=torch.int32)
         self.player_hitcount = torch.zeros(n, device=device, dtype=torch.int32)
         self.player_damagecount = torch.zeros(n, device=device)
+        self.player_hits_taken = torch.zeros(n, device=device, dtype=torch.int32)
+        self.player_damage_taken = torch.zeros(n, device=device)
         self.selected_weapon = torch.full((n,), 2, device=device, dtype=torch.int64)
         self.selected_weapon_variant = torch.zeros(n, device=device, dtype=torch.bool)
         self.weapons = torch.zeros((n, 6), device=device)
@@ -1919,12 +2025,11 @@ class TorchDeathmatchEngine:
         self._slot_base_weapon = torch.tensor(
             (0, 0, 2, 3, 5, 6, 7), device=device, dtype=torch.int64
         )
-        self._ray_offsets = torch.linspace(
-            math.pi / 4,
-            -math.pi / 4,
-            self.observation_width,
-            device=device,
+        policy_columns = (
+            torch.arange(self.observation_width, device=device, dtype=torch.float32) + 0.5
+            - self.observation_width / 2.0
         )
+        self._ray_offsets = -torch.atan(policy_columns / _PROJECTION_FOCAL_X)
         self._pixel_x = torch.arange(self.observation_width, device=device).view(1, 1, -1)
         self._pixel_y = torch.arange(self.observation_height, device=device).view(1, -1, 1)
         native_columns = (
@@ -1937,6 +2042,18 @@ class TorchDeathmatchEngine:
         ) - (self.native_screen_width // 2 - 1)
         self._native_pixel_x = torch.arange(self.native_screen_width, device=device).view(1, 1, -1)
         self._native_pixel_y = torch.arange(self.native_view_height, device=device).view(1, -1, 1)
+        self._policy_area_y = self._policy_area_axis(
+            self.native_screen_height,
+            self.observation_height,
+            device=device,
+        )
+        self._policy_area_x_t = self._policy_area_axis(
+            self.native_screen_width,
+            self.observation_width,
+            device=device,
+        ).transpose(0, 1)
+        self._reference_background_graph: torch.cuda.CUDAGraph | None = None
+        self._reference_background_outputs: tuple[torch.Tensor, ...] | None = None
         self._raw_sprite_post_tops: torch.Tensor | None = None
         player_start_sectors = self._sector_at(
             self.map.player_starts[:, 0], self.map.player_starts[:, 1]
@@ -2232,6 +2349,8 @@ class TorchDeathmatchEngine:
         self.player_deathcount.masked_fill_(mask, 0)
         self.player_hitcount.masked_fill_(mask, 0)
         self.player_damagecount.masked_fill_(mask, 0)
+        self.player_hits_taken.masked_fill_(mask, 0)
+        self.player_damage_taken.masked_fill_(mask, 0)
         self.episode_time.masked_fill_(mask, 1)
         self.selected_weapon.masked_fill_(mask, 2)
         self.selected_weapon_variant.masked_fill_(mask, False)
@@ -3936,6 +4055,7 @@ class TorchDeathmatchEngine:
         thrust_x_fixed: torch.Tensor | None = None,
         thrust_y_fixed: torch.Tensor | None = None,
         armor_absorb_request: torch.Tensor | None = None,
+        hits_taken_request: torch.Tensor | None = None,
         damage_scale: torch.Tensor | None = None,
         skill_adjusted: bool = False,
     ) -> None:
@@ -3993,6 +4113,14 @@ class TorchDeathmatchEngine:
         self.health.sub_(actual)
         self.damage_count.add_(actual.to(torch.int32)).clamp_max_(100)
         damaged = actual > 0
+        # ViZDoom's VIZ_LogDmg updates these counters after skill and armor
+        # adjustment, immediately before subtracting the same health damage.
+        self.player_hits_taken.add_(
+            damaged.to(torch.int32)
+            if hits_taken_request is None
+            else hits_taken_request.to(torch.int32)
+        )
+        self.player_damage_taken.add_(actual)
         if attacker_x is None or attacker_y is None:
             direction = torch.ones_like(self.mugshot_pain_direction)
         else:
@@ -5430,6 +5558,13 @@ class TorchDeathmatchEngine:
                 )
                 + doll_armor_absorb_request
             ),
+            hits_taken_request=(
+                torch.sum(player_splash_damage > 0, dim=1)
+                + torch.sum(direct_doll_damage > 0, dim=1)
+                + torch.sum(doll_splash_damage > 0, dim=(1, 2))
+                if doll_count
+                else torch.sum(player_splash_damage > 0, dim=1)
+            ),
         )
         reward = self._apply_enemy_damage(
             damage_by_enemy,
@@ -5552,7 +5687,10 @@ class TorchDeathmatchEngine:
             enemy_target[:, None],
             torch.where(hits_enemy, damage, torch.zeros_like(damage))[:, None],
         )
-        self._apply_player_damage(torch.where(hits_doll, damage, torch.zeros_like(damage)))
+        self._apply_player_damage(
+            torch.where(hits_doll, damage, torch.zeros_like(damage)),
+            hits_taken_request=hits_doll,
+        )
         kickback = torch.where(
             weapon == 1,
             torch.zeros_like(damage),
@@ -6104,6 +6242,7 @@ class TorchDeathmatchEngine:
                 torch.floor(damage_by_doll * self.armor_save_fraction[:, None]),
                 dim=1,
             ),
+            hits_taken_request=torch.sum(damage_by_doll > 0, dim=1),
         )
         thrust_x, thrust_y = self._enemy_damage_thrust_components(
             damage_by_enemy,
@@ -7356,6 +7495,7 @@ class TorchDeathmatchEngine:
             thrust_x_fixed=torch.sum(thrust_x_by_projectile, dim=1),
             thrust_y_fixed=torch.sum(thrust_y_by_projectile, dim=1),
             armor_absorb_request=armor_absorb_request,
+            hits_taken_request=torch.sum(adjusted_player_damage > 0, dim=1),
             damage_scale=self._wall_contact_enemy_damage_scale(),
             skill_adjusted=True,
         )
@@ -8124,6 +8264,8 @@ class TorchDeathmatchEngine:
             thrust_y_fixed=torch.sum(melee_thrust_y, dim=1)
             + torch.sum(hitscan_thrust_y, dim=(1, 2)),
             armor_absorb_request=armor_absorb_request,
+            hits_taken_request=torch.sum(adjusted_direct_player_damage > 0, dim=1)
+            + torch.sum(adjusted_hitscan_player_damage > 0, dim=(1, 2)),
             damage_scale=self._wall_contact_enemy_damage_scale(),
             skill_adjusted=True,
         )
@@ -9110,7 +9252,9 @@ class TorchDeathmatchEngine:
         )
         ceiling_height = self.map.sector_heights[sector, 1] - view_z
         ceiling_depth = (
-            ceiling_height[:, None, None] * _PROJECTION_FOCAL_Y / (-pixel_delta).clamp_min(0.25)
+            ceiling_height[:, None, None]
+            * _PROJECTION_FOCAL_Y
+            / (-pixel_delta).clamp_min(0.25)
         )
         perpendicular_depth = torch.where(pixel_delta > 0, floor_depth, ceiling_depth)
         ray_distance = perpendicular_depth / cosine_correction[:, None, :]
@@ -9127,10 +9271,18 @@ class TorchDeathmatchEngine:
         texture_height = self.map.texture_heights[texture_id]
         texture_u = torch.remainder(torch.floor(world_x).to(torch.int64), texture_width)
         texture_v = torch.remainder(torch.floor(-world_y).to(torch.int64), texture_height)
-        value = self.map.texture_atlas[texture_id, texture_v, texture_u].to(torch.float32)
         light = self.map.sector_lights[sector][:, None, None]
-        attenuation = light.clamp(24, 220)
-        return (value * attenuation / 210.0).clamp(0, 255)
+        palette_index = self.map.texture_index_atlas[
+            texture_id,
+            texture_v,
+            texture_u,
+        ]
+        lit_index = self._native_apply_colormap(
+            palette_index,
+            light,
+            perpendicular_depth,
+        )
+        return self._policy_grayscale_palette[lit_index.to(torch.int64)].to(torch.float32)
 
     def _portal_intersections(
         self,
@@ -9227,7 +9379,9 @@ class TorchDeathmatchEngine:
                 self.map.portal_wall_lengths,
                 self.map.texture_widths,
                 self.map.texture_heights,
-                self.map.texture_atlas,
+                self.map.texture_index_atlas,
+                self.map.colormap,
+                self._policy_grayscale_palette,
                 self.map.sector_lights,
             )
             return frame
@@ -9273,7 +9427,12 @@ class TorchDeathmatchEngine:
             camera_cross = segment_x * (self.y[:, None] - wall[..., 1]) - segment_y * (
                 self.x[:, None] - wall[..., 0]
             )
-            side_index = (camera_cross < 0).to(torch.int64)
+            # UDMF's front sidedef lies on the negative cross-product side in
+            # Doom's map coordinates.  The old comparison inverted front and
+            # back, suppressing one-sided walls whenever the player occupied
+            # their actual front sector and selecting the wrong texture on
+            # two-sided walls.
+            side_index = (camera_cross > 0).to(torch.int64)
             from_front = side_index == 0
             view_floor = torch.where(from_front, front_floor, back_floor)
             other_floor = torch.where(from_front, back_floor, front_floor)
@@ -9330,11 +9489,21 @@ class TorchDeathmatchEngine:
             )
             texture_u = texture_u.expand(-1, self.observation_height, -1)
             texture_index = safe_texture_id
-            texture = self.map.texture_atlas[texture_index, texture_v, texture_u].to(torch.float32)
             view_sector = torch.where(from_front, front, back)
             light = self.map.sector_lights[view_sector]
-            attenuation = light.clamp(24, 220)
-            wall_value = (texture * attenuation[:, None, :] / 210.0).clamp(0, 255)
+            palette_index = self.map.texture_index_atlas[
+                texture_index,
+                texture_v,
+                texture_u,
+            ]
+            lit_index = self._native_apply_colormap(
+                palette_index,
+                light[:, None, :],
+                distance[:, None, :],
+            )
+            wall_value = self._policy_grayscale_palette[lit_index.to(torch.int64)].to(
+                torch.float32
+            )
             frame = torch.where(span, wall_value, frame)
             filled |= span
         return frame
@@ -9370,21 +9539,10 @@ class TorchDeathmatchEngine:
         alpha *= visible
         return value + frame * (1.0 - alpha)
 
-    def render_frame(self, active: torch.Tensor | None = None) -> torch.Tensor:
-        distances, wall_indices, wall_along, distance = self._portal_intersections(active)
-        center = _PROJECTION_CENTER_Y + self._pitch_projection_offset(_PROJECTION_FOCAL_Y)
-        sector = self._current_sector()
-        view_z = self.view_z
-        frame = self._render_flats(sector, view_z, center)
-        frame = self._render_portal_walls(
-            frame,
-            view_z,
-            center,
-            distances,
-            wall_indices,
-            wall_along,
-            active,
-        )
+    def _approximate_actor_state(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Pack the fixed policy-sprite slots used by both fast renderers."""
 
         doll_count = max(len(self.map.player_starts) - 1, 0)
         if doll_count:
@@ -9448,16 +9606,129 @@ class TorchDeathmatchEngine:
         drop_visual_type = torch.full_like(self.drop_type, 18)
         drop_visual_type = torch.where(self.drop_type == 2007, 12, drop_visual_type)
         drop_visual_type = torch.where(self.drop_type == 2002, 20, drop_visual_type)
-        actor_x = torch.cat((actor_x, map_item_x, self.drop_x), dim=1)
-        actor_y = torch.cat((actor_y, map_item_y, self.drop_y), dim=1)
-        actor_z = torch.cat((actor_z, map_item_z, self.drop_z), dim=1)
-        actor_alive = torch.cat((actor_alive, self.item_available, drop_visible), dim=1)
-        actor_type = torch.cat((actor_type, map_item_type, drop_visual_type), dim=1)
+        return (
+            torch.cat((actor_x, map_item_x, self.drop_x), dim=1),
+            torch.cat((actor_y, map_item_y, self.drop_y), dim=1),
+            torch.cat((actor_z, map_item_z, self.drop_z), dim=1),
+            torch.cat((actor_alive, self.item_available, drop_visible), dim=1),
+            torch.cat((actor_type, map_item_type, drop_visual_type), dim=1),
+        )
+
+    def _fast_native_actor_state(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Pack fixed-shape native enemy, doll, pickup, and drop sprite state."""
+
+        enemy_type = self.enemy_type.clamp(0, 5)
+        actor_x = self.enemy_x
+        actor_y = self.enemy_y
+        actor_z = self.enemy_z
+        actor_alive = self.enemy_alive
+        actor_sprite = self._native_enemy_sprite_ids()
+        actor_fullbright = self._native_enemy_fullbright(
+            enemy_type,
+            self.enemy_attack_phase,
+            self.enemy_cooldown,
+            self._enemy_attack_recovery[enemy_type],
+        )
+
+        doll_count = max(len(self.map.player_starts) - 1, 0)
+        if doll_count:
+            dolls = self.map.player_starts[:-1]
+            doll_x = dolls[None, :, 0].expand(self.num_envs, -1)
+            doll_y = dolls[None, :, 1].expand(self.num_envs, -1)
+            doll_angle = torch.deg2rad(dolls[None, :, 2]).expand(self.num_envs, -1)
+            viewer_angle = torch.atan2(
+                self.y[:, None] - doll_y,
+                self.x[:, None] - doll_x,
+            )
+            doll_rotation = self._doom_sprite_rotation(viewer_angle, doll_angle)
+            doll_sprite = self.map.enemy_walk_sprite_ids[2, 0, doll_rotation]
+            actor_x = torch.cat((actor_x, doll_x), dim=1)
+            actor_y = torch.cat((actor_y, doll_y), dim=1)
+            actor_z = torch.cat(
+                (
+                    actor_z,
+                    self._player_start_z[:-1][None, :].expand(self.num_envs, -1),
+                ),
+                dim=1,
+            )
+            actor_alive = torch.cat(
+                (
+                    actor_alive,
+                    (~self.player_dead)[:, None].expand(-1, doll_count),
+                ),
+                dim=1,
+            )
+            actor_sprite = torch.cat((actor_sprite, doll_sprite), dim=1)
+            actor_fullbright = torch.cat(
+                (actor_fullbright, torch.zeros_like(doll_sprite, dtype=torch.bool)),
+                dim=1,
+            )
+
+        map_item_sprite, map_item_fullbright = self._native_item_sprite_ids()
+        actor_x = torch.cat(
+            (actor_x, self.map.item_spawns[None, :, 0].expand(self.num_envs, -1)),
+            dim=1,
+        )
+        actor_y = torch.cat(
+            (actor_y, self.map.item_spawns[None, :, 1].expand(self.num_envs, -1)),
+            dim=1,
+        )
+        actor_z = torch.cat(
+            (actor_z, self._item_z[None, :].expand(self.num_envs, -1)),
+            dim=1,
+        )
+        actor_alive = torch.cat((actor_alive, self.item_available), dim=1)
+        actor_sprite = torch.cat((actor_sprite, map_item_sprite), dim=1)
+        actor_fullbright = torch.cat((actor_fullbright, map_item_fullbright), dim=1)
+
+        static = self.map.raw_static_sprite_ids
+        drop_visible = (self.drop_type >= 0) & self.drop_spawned
+        drop_sprite = static[12].expand_as(self.drop_type)
+        drop_sprite = torch.where(self.drop_type == 2007, static[6], drop_sprite)
+        drop_sprite = torch.where(self.drop_type == 2002, static[14], drop_sprite)
+        return (
+            torch.cat((actor_x, self.drop_x), dim=1),
+            torch.cat((actor_y, self.drop_y), dim=1),
+            torch.cat((actor_z, self.drop_z), dim=1),
+            torch.cat((actor_alive, drop_visible), dim=1),
+            torch.cat((actor_sprite, drop_sprite), dim=1),
+            torch.cat(
+                (actor_fullbright, torch.zeros_like(drop_sprite, dtype=torch.bool)),
+                dim=1,
+            ),
+        )
+
+    def render_frame(self, active: torch.Tensor | None = None) -> torch.Tensor:
+        """Render the legacy direct 84x84 approximation.
+
+        This path remains useful for renderer development and performance
+        comparisons, but it does not yet reproduce the RGB area resize used by
+        the pinned ViZDoom-turbo observation pipeline.  It remains the policy
+        hot path while the reference renderer is being fused.
+        """
+        distances, wall_indices, wall_along, distance = self._portal_intersections(active)
+        center = _PROJECTION_CENTER_Y + self._pitch_projection_offset(_PROJECTION_FOCAL_Y)
+        sector = self._current_sector()
+        view_z = self.view_z
+        frame = self._render_flats(sector, view_z, center)
+        frame = self._render_portal_walls(
+            frame,
+            view_z,
+            center,
+            distances,
+            wall_indices,
+            wall_along,
+            active,
+        )
+
+        actor_x, actor_y, actor_z, actor_alive, actor_type = self._approximate_actor_state()
         dx = actor_x - self.x[:, None]
         dy = actor_y - self.y[:, None]
         actor_distance = torch.sqrt(dx * dx + dy * dy).clamp_min_(1)
         relative = self._wrap_angle(torch.atan2(dy, dx) - self.angle[:, None])
-        screen_center = (0.5 - relative / (math.pi / 2)) * self.observation_width
+        screen_center = self.observation_width / 2.0 - torch.tan(relative) * _PROJECTION_FOCAL_X
         safe_actor_type = actor_type.clamp_min(0)
         projection_scale = _PROJECTION_FOCAL_X / actor_distance
         vertical_projection_scale = _PROJECTION_FOCAL_Y / actor_distance
@@ -9544,6 +9815,137 @@ class TorchDeathmatchEngine:
             frame[:, -11:, :] = 0
         return frame.clamp(0, 255).to(torch.uint8)
 
+    def render_approximate_frame(self, active: torch.Tensor | None = None) -> torch.Tensor:
+        """Explicit alias for the current compiled policy hot path."""
+
+        # ``GraDoomVecEnv`` selects the reference renderer by rebinding the
+        # instance's ``render_frame`` method. Keep this diagnostic entry point
+        # pinned to the class implementation so paired-render comparisons do
+        # not silently compare the reference renderer with itself.
+        return TorchDeathmatchEngine.render_frame(self, active)
+
+    def _render_fast_native_background(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Render fused native flats/walls and return column and pixel depths."""
+
+        focal_length = self.native_screen_width / 2.0 * self.native_vertical_aspect
+        pitch_offset = self._pitch_projection_offset(focal_length)
+        flat_center = self.native_view_height / 2.0 - 0.5 + pitch_offset
+        wall_center = self.native_view_height / 2.0 - 1.0 + pitch_offset
+        _weapon_frame, _weapon_flash, flash_light = self._native_weapon_frame_selection()
+        frame, surface_depth = render_fast_native_flats(
+            self.x,
+            self.y,
+            self.angle,
+            self.view_z,
+            flat_center,
+            self._native_ray_offsets,
+            self.map.floor_plane_heights,
+            self.map.ceiling_plane_heights,
+            self.map.sector_lookup,
+            self.map.sector_lookup_metadata,
+            self.map.sector_heights,
+            self.map.sector_floor_texture_ids,
+            self.map.sector_ceiling_texture_ids,
+            self.map.texture_widths,
+            self.map.texture_heights,
+            self.map.texture_index_atlas,
+            self.map.sector_lights,
+            flash_light,
+            self.map.colormap,
+        )
+        distances, wall_indices, wall_along, blocking_distance = portal_intersections(
+            self.x,
+            self.y,
+            self.angle,
+            self._native_ray_offsets,
+            self.map.portal_walls,
+            self.map.portal_wall_blocks_sight,
+        )
+        render_fast_native_portal_walls_(
+            frame,
+            surface_depth,
+            self.view_z,
+            wall_center,
+            distances,
+            wall_indices,
+            wall_along,
+            self.x,
+            self.y,
+            self.map.portal_walls,
+            self.map.portal_wall_sectors,
+            self.map.sector_heights,
+            self.map.portal_side_texture_ids,
+            self.map.portal_side_texture_offsets,
+            self.map.portal_wall_lengths,
+            self.map.texture_widths,
+            self.map.texture_heights,
+            self.map.texture_index_atlas,
+            self.map.colormap,
+            self.map.sector_lights,
+            flash_light,
+        )
+        return frame, blocking_distance, surface_depth
+
+    def render_fast_native_policy_frame(
+        self,
+        active: torch.Tensor | None = None,
+        *,
+        exact_weapon: bool = True,
+    ) -> torch.Tensor:
+        """Render the native-resolution fused policy observation.
+
+        This diagnostic path keeps the reference 320-wide projection and area
+        preprocessing while replacing the expensive per-sector visplane and
+        portal-wall graph with compact Triton kernels. Native indexed actors
+        and the exact weapon layer are composited before area pooling.
+        """
+
+        del active  # Reset masks the destination stack after fixed-shape rendering.
+        if self.device.type != "cuda":
+            raise RuntimeError("fast native policy rendering requires CUDA")
+        focal_length = self.native_screen_width / 2.0 * self.native_vertical_aspect
+        pitch_offset = self._pitch_projection_offset(focal_length)
+        _weapon_frame, _weapon_flash, flash_light = self._native_weapon_frame_selection()
+        frame, blocking_distance, surface_depth = self._render_fast_native_background()
+        actor_x, actor_y, actor_z, actor_alive, actor_sprite, actor_fullbright = (
+            self._fast_native_actor_state()
+        )
+        render_fast_native_sprites_(
+            frame,
+            blocking_distance,
+            surface_depth,
+            actor_x,
+            actor_y,
+            actor_z,
+            actor_alive,
+            actor_sprite,
+            actor_fullbright,
+            self.x,
+            self.y,
+            self.angle,
+            self.view_z,
+            self.native_view_height / 2.0 + pitch_offset,
+            self.map.raw_sprite_widths,
+            self.map.raw_sprite_heights,
+            self.map.raw_sprite_left_offsets,
+            self.map.raw_sprite_top_offsets,
+            self.map.raw_sprite_atlas,
+            self.map.raw_sprite_opaque,
+            self.map.sector_lookup,
+            self.map.sector_lookup_metadata,
+            self.map.sector_lights,
+            flash_light,
+            self.map.colormap,
+        )
+        if exact_weapon:
+            frame = self._native_render_weapon(frame)
+            return policy_area_grayscale(frame, self.map.playpal)
+        policy_frame = policy_area_grayscale(frame, self.map.playpal).to(torch.float32)
+        policy_frame = self._render_weapon(policy_frame)
+        return policy_frame.clamp(0, 255).to(torch.uint8)
+
     def _native_blocking_raycast(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Return nearest blocking-line depth and its portal wall index."""
 
@@ -9566,11 +9968,7 @@ class TorchDeathmatchEngine:
         nearest_distance, nearest_blocking_slot = torch.min(distance, dim=2)
         # blocking_segments retains linedef order, so the true entries in this
         # static mask map each compact raycast slot back to portal_walls.
-        blocking_wall_indices = torch.nonzero(
-            self.map.portal_wall_blocks_sight,
-            as_tuple=False,
-        ).flatten()
-        nearest_wall = blocking_wall_indices[nearest_blocking_slot]
+        nearest_wall = self._native_blocking_wall_indices[nearest_blocking_slot]
         return nearest_distance.clamp(1, 4096), nearest_wall
 
     def _native_raycast(self) -> torch.Tensor:
@@ -9744,13 +10142,9 @@ class TorchDeathmatchEngine:
         # are known. PrepWallRoundFix deliberately leaves a negative leading
         # column untouched when a clipped drawseg begins at screen x == 0.
 
-        inverse_vertical_aspect = torch.tensor(
-            self.native_screen_width * 200.0,
-            device=self.device,
-            dtype=torch.float32,
+        inverse_vertical_aspect = (
+            self.native_screen_width * 200.0 / 320.0 / self.native_screen_height
         )
-        inverse_vertical_aspect /= 320.0
-        inverse_vertical_aspect /= float(self.native_screen_height)
         wall_map_scale = inverse_vertical_aspect * 64.0 / (self.native_screen_width / 2.0)
         depth_scale = (inv_z_step_float * wall_map_scale).to(torch.float64)
         depth_origin = (-u_over_z_step.to(torch.float32) * wall_map_scale).to(torch.float64)
@@ -10012,7 +10406,7 @@ class TorchDeathmatchEngine:
             candidate_x = self.x[:, None, None] + ray_cos * candidate_distance
             candidate_y = self.y[:, None, None] + ray_sin * candidate_distance
 
-            edges = self.map.sector_edges[self.map.sector_edge_mask[sector_index]]
+            edges = self._native_sector_edges[sector_index]
             edge_x1 = edges[:, 0]
             edge_y1 = edges[:, 1]
             edge_x2 = edges[:, 2]
@@ -10781,7 +11175,12 @@ class TorchDeathmatchEngine:
         pending_portal_bridge_index = torch.zeros_like(current_sector)
         pending_portal_bridge_sector = torch.full_like(current_sector, -1)
         pending_portal_bridge_exit_distance = torch.zeros_like(previous_distance)
-        for _ in range(32):
+        # A ray advances monotonically through one sector boundary per pass.
+        # It therefore cannot visit more sectors than exist in the compiled
+        # map.  The old fixed bound of 32 performed eighteen provably dead
+        # passes for the certified 14-sector deathmatch map and dominated the
+        # captured reference renderer.
+        for _ in range(len(self.map.sector_heights)):
             current = current_sector.clamp_min(0)
             incident = (all_sectors[None, None, :, 0] == current[:, :, None]) | (
                 all_sectors[None, None, :, 1] == current[:, :, None]
@@ -13016,7 +13415,13 @@ class TorchDeathmatchEngine:
             viewer_angle - actor_angle + math.pi / 8,
             2 * math.pi,
         )
-        return torch.floor(relative / (math.pi / 4)).to(torch.int64)
+        # Float32 remainder can round a value infinitesimally below 2*pi up to
+        # the represented divisor.  Keep the circular table index in [0, 7]
+        # even at that boundary (where rotation 8 is rotation 0).
+        return torch.remainder(
+            torch.floor(relative / (math.pi / 4)).to(torch.int64),
+            8,
+        )
 
     def _native_enemy_sprite_ids(self) -> torch.Tensor:
         enemy_type = self.enemy_type.clamp(0, 5)
@@ -14100,6 +14505,21 @@ class TorchDeathmatchEngine:
             # Keep that and weapon bob in 16.16 until R_DrawPSprite converts
             # texturemid through the 320x240 target's reciprocal y scale.
             vertical_offset_fixed = vertical_tics.to(torch.int64) * 6 * _FIXED_UNIT + bob_y_fixed
+            if frame.is_cuda:
+                return render_native_weapon(
+                    frame,
+                    frame_id,
+                    flash_id,
+                    bob_x_fixed,
+                    vertical_offset_fixed,
+                    visible,
+                    self.map.native_weapon_patch_atlas,
+                    self.map.native_weapon_patch_opaque,
+                    self.map.native_weapon_patch_widths,
+                    self.map.native_weapon_patch_heights,
+                    self.map.native_weapon_patch_left_offsets,
+                    self.map.native_weapon_patch_top_offsets,
+                )
             frame = self._native_composite_weapon_patch(
                 frame,
                 frame_id,
@@ -14261,8 +14681,17 @@ class TorchDeathmatchEngine:
                 self._native_draw_hud_number(canvas, maximum, 314, y, small=True)
         return hud
 
-    def render_native_frame(self, *, include_hud: bool = True) -> torch.Tensor:
-        """Render the unprocessed ViZDoom-compatible 320x240 RGB24 view."""
+    def _render_native_background(
+        self,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """Render the fixed-shape native world layers needed before actors."""
 
         wall_distance, blocking_wall = self._native_blocking_raycast()
         sector = self._current_sector()
@@ -14282,6 +14711,74 @@ class TorchDeathmatchEngine:
             surface_depth,
             scene_surface_depth,
         )
+        return (
+            frame,
+            scene_depth,
+            sprite_clip_depth,
+            sprite_clip_wall,
+            wall_distance,
+            blocking_wall,
+        )
+
+    def _capture_reference_background_graph(
+        self,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """Capture native fixed-world rendering without freezing mutable state values."""
+
+        capture_stream = torch.cuda.Stream(device=self.device)
+        capture_stream.wait_stream(torch.cuda.current_stream(self.device))
+        with torch.cuda.stream(capture_stream):
+            self._render_native_background()
+        capture_stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=capture_stream):
+            outputs = self._render_native_background()
+        torch.cuda.current_stream(self.device).wait_stream(capture_stream)
+        # Captured kernels are not required to leave their destination
+        # buffers populated for ordinary eager consumers.  Replay once before
+        # returning the first frame so reset does not seed the policy stack
+        # with warm-up/capture residue.
+        graph.replay()
+        self._reference_background_graph = graph
+        self._reference_background_outputs = outputs
+        return outputs
+
+    def _render_native_indexed_frame(self, *, include_hud: bool = True) -> torch.Tensor:
+        """Render the ViZDoom-compatible 320-wide palette-indexed view."""
+
+        if self.device.type == "cuda":
+            if self._reference_background_graph is None:
+                outputs = self._capture_reference_background_graph()
+            else:
+                self._reference_background_graph.replay()
+                if self._reference_background_outputs is None:  # pragma: no cover
+                    raise RuntimeError("reference background graph has no output buffers")
+                outputs = self._reference_background_outputs
+            (
+                frame,
+                scene_depth,
+                sprite_clip_depth,
+                sprite_clip_wall,
+                wall_distance,
+                blocking_wall,
+            ) = outputs
+        else:
+            (
+                frame,
+                scene_depth,
+                sprite_clip_depth,
+                sprite_clip_wall,
+                wall_distance,
+                blocking_wall,
+            ) = self._render_native_background()
+        view_z = self.view_z
         frame = self._native_render_hitscan_decals(frame, view_z, scene_depth)
         frame = self._native_render_sprites(
             frame,
@@ -14294,6 +14791,11 @@ class TorchDeathmatchEngine:
         frame = self._native_render_weapon(frame)
         if include_hud:
             frame = torch.cat((frame, self._native_render_hud()), dim=1)
+        return frame
+
+    def _native_indexed_to_rgb(self, frame: torch.Tensor) -> torch.Tensor:
+        """Apply PLAYPAL and the configured screen blends to an indexed frame."""
+
         rgb = self.map.playpal[frame.to(torch.int64)]
         if self.render_screen_flashes:
             bonus = torch.minimum(
@@ -14309,6 +14811,70 @@ class TorchDeathmatchEngine:
             rgb = rgb * (1 - flash) + red * flash
             rgb = rgb.clamp(0, 255).to(torch.uint8)
         return rgb
+
+    @staticmethod
+    def _policy_area_axis(
+        source: int,
+        output: int,
+        *,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Return ViZDoom-turbo's rational area weights, normalized per row."""
+
+        weights = torch.zeros((output, source), device=device, dtype=torch.float32)
+        for coordinate in range(output):
+            start = coordinate * source
+            end = (coordinate + 1) * source
+            first_source = start // output
+            source_end = min((end + output - 1) // output, source)
+            for source_coordinate in range(first_source, source_end):
+                source_start = source_coordinate * output
+                source_stop = (source_coordinate + 1) * output
+                overlap = min(end, source_stop) - max(start, source_start)
+                weights[coordinate, source_coordinate] = overlap / source
+        return weights
+
+    def _preprocess_policy_rgb(self, rgb: torch.Tensor) -> torch.Tensor:
+        """Match the pinned ViZDoom-turbo 320x240 -> 84x84 area pipeline."""
+
+        # The Rust reference pools RGB independently, rounds each channel, and
+        # only then converts to grayscale with its 77/150/29 coefficients.
+        # Keeping these operations explicit avoids both the different GRAY8
+        # coefficients and the direct-projection geometry of the legacy path.
+        channels_first = rgb.to(torch.float32).permute(0, 3, 1, 2)
+        vertically_pooled = torch.matmul(self._policy_area_y, channels_first)
+        pooled = torch.matmul(vertically_pooled, self._policy_area_x_t)
+        rounded = torch.floor(pooled + 0.5).to(torch.int32)
+        grayscale = (
+            rounded[:, 0] * 77
+            + rounded[:, 1] * 150
+            + rounded[:, 2] * 29
+            + 128
+        ) >> 8
+        return grayscale.clamp(0, 255).to(torch.uint8)
+
+    def render_reference_frame(self, active: torch.Tensor | None = None) -> torch.Tensor:
+        """Render the reference-equivalent ViZDoom-turbo policy observation."""
+
+        del active  # Native rendering currently evaluates all fixed batch lanes.
+        indexed = self._render_native_indexed_frame(include_hud=not self.mask_hud)
+        if indexed.is_cuda and self.mask_hud and not self.render_screen_flashes:
+            return policy_area_grayscale(indexed, self.map.playpal)
+        rgb = self._native_indexed_to_rgb(indexed)
+        if self.mask_hud:
+            masked_hud = torch.zeros(
+                (self.num_envs, self.native_screen_height - self.native_view_height, 320, 3),
+                device=self.device,
+                dtype=torch.uint8,
+            )
+            rgb = torch.cat((rgb, masked_hud), dim=1)
+        return self._preprocess_policy_rgb(rgb)
+
+    def render_native_frame(self, *, include_hud: bool = True) -> torch.Tensor:
+        """Render the unprocessed ViZDoom-compatible 320x240 RGB24 view."""
+
+        indexed = self._render_native_indexed_frame(include_hud=include_hud)
+        return self._native_indexed_to_rgb(indexed)
 
     def _update_signal_buffer(self) -> None:
         weapon_index = (self.selected_weapon - 1)[:, None]
@@ -14327,6 +14893,8 @@ class TorchDeathmatchEngine:
         self.signal_buffer[:, 21].copy_(self.player_deathcount)
         self.signal_buffer[:, 22].copy_(self.player_hitcount)
         self.signal_buffer[:, 23].copy_(self.player_damagecount)
+        self.signal_buffer[:, 24].copy_(self.player_hits_taken)
+        self.signal_buffer[:, 25].copy_(self.player_damage_taken)
 
     def signals(self) -> dict[str, torch.Tensor]:
         return {
