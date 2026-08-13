@@ -1,9 +1,10 @@
-"""Compare early ACS monster-spawn distributions with ViZDoom.
+"""Compare ACS monster-spawn distributions with ViZDoom.
 
-The comparison stops soon after the first spawn checks, before policy feedback
-or long combat trajectories can amplify the intentionally independent random
-streams.  ViZDoom object IDs provide cumulative successful spawns by class;
-GraDOOM records the corresponding inactive-to-alive slot transitions.
+Short runs isolate the first spawn checks before policy feedback can amplify
+the intentionally independent random streams.  Long runs expose population
+pressure over a full combat trajectory.  ViZDoom object IDs provide cumulative
+successful spawns by class; GraDOOM records the corresponding inactive-to-alive
+slot transitions.
 """
 
 from __future__ import annotations
@@ -60,6 +61,7 @@ def _parser() -> argparse.ArgumentParser:
         choices=("noop", "forward-fire"),
         default="noop",
     )
+    parser.add_argument("--output", type=Path)
     return parser
 
 
@@ -276,13 +278,29 @@ def _run_gradoom(
 
 def _summary(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     totals = [sum(record["spawn_counts"].values()) for record in records]
+    decisions = [int(record["decisions"]) for record in records]
+    total_decisions = sum(decisions)
     spawn_times = [record["first_spawn_time"] for record in records]
     observed_times = [float(value) for value in spawn_times if value is not None]
     return {
         "episodes": len(records),
+        "decisions_mean": statistics.fmean(decisions),
         "spawn_count_mean": statistics.fmean(totals),
+        "spawn_count_per_1000_decisions": (
+            1_000.0 * sum(totals) / total_decisions if total_decisions else None
+        ),
         "spawn_count_by_class_mean": {
             name: statistics.fmean(float(record["spawn_counts"][name]) for record in records)
+            for name in MONSTER_NAMES
+        },
+        "spawn_count_by_class_per_1000_decisions": {
+            name: (
+                1_000.0
+                * sum(int(record["spawn_counts"][name]) for record in records)
+                / total_decisions
+                if total_decisions
+                else None
+            )
             for name in MONSTER_NAMES
         },
         "first_spawn_observed_rate": len(observed_times) / len(records),
@@ -335,7 +353,12 @@ def main() -> int:
         "vizdoom": _summary(reference),
         "gradoom": _summary(gradoom),
     }
-    print(json.dumps(result, sort_keys=True), flush=True)
+    serialized = json.dumps(result, sort_keys=True)
+    if args.output is not None:
+        output = args.output.expanduser().resolve()
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(serialized + "\n")
+    print(serialized, flush=True)
     return 0
 
 
