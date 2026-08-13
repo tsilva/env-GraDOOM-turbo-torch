@@ -142,6 +142,7 @@ def test_public_surface_matches_turbo_vector_api_v2(square_scenario) -> None:
         "device",
         "doom_map",
         "doom_skill",
+        "observation_renderer",
         "wall_contact_damage_scale",
         "game_args",
         "game_variables",
