@@ -2029,6 +2029,57 @@ def test_spawn_reaction_time_counts_chase_actions_and_only_blocks_missiles(
     assert engine.enemy_reaction_time[0, 0].item() == 6
 
 
+def test_failed_chase_keeps_negative_movecount_and_blocks_missiles(
+    square_scenario,
+) -> None:
+    engine = _engine(square_scenario)
+    engine.x.fill_(100)
+    engine.y.zero_()
+    engine._x_fixed.fill_(100 * 65536)
+    engine._y_fixed.zero_()
+    engine.enemy_alive.zero_()
+    engine.enemy_x[:, 0].zero_()
+    engine.enemy_y[:, 0].zero_()
+    engine._enemy_x_fixed[:, 0].zero_()
+    engine._enemy_y_fixed[:, 0].zero_()
+    engine.enemy_type[:, 0] = 3
+    engine.enemy_health[:, 0] = 70
+    engine.enemy_alive[:, 0] = True
+    engine.enemy_target_slot[:, 0] = -1
+    engine.enemy_reaction_time[:, 0] = 2
+    engine.enemy_move_direction[:, 0] = 8
+    engine.enemy_move_count[:, 0] = 0
+    engine.enemy_move_cooldown[:, 0] = 0
+
+    blocker_x = torch.tensor([40.0, -40.0, 0.0, 0.0])
+    blocker_y = torch.tensor([0.0, 0.0, 40.0, -40.0])
+    engine.enemy_x[:, 1:5] = blocker_x
+    engine.enemy_y[:, 1:5] = blocker_y
+    engine._enemy_x_fixed[:, 1:5] = (blocker_x * 65536).to(torch.int64)
+    engine._enemy_y_fixed[:, 1:5] = (blocker_y * 65536).to(torch.int64)
+    engine.enemy_type[:, 1:5] = 0
+    engine.enemy_health[:, 1:5] = 20
+    engine.enemy_alive[:, 1:5] = True
+    engine.enemy_target_slot[:, 1:5] = -2
+    engine.enemy_pain_tics[:, 1:5] = 999
+
+    engine._enemy_tick()
+
+    assert engine.enemy_x[:, 0].tolist() == [0.0, 0.0]
+    assert engine.enemy_move_count[:, 0].tolist() == [-1, -1]
+    assert engine.enemy_attack_phase[:, 0].tolist() == [0, 0]
+
+    # Skip the actor-state wait to exercise the next A_Chase action. Doom's
+    # `if (movecount)` missile guard treats a failed negative count as busy,
+    # while the movement branch pre-decrements it and retries P_NewChaseDir.
+    engine.enemy_move_cooldown[:, 0] = 0
+    engine._enemy_tick()
+
+    assert engine.enemy_move_count[:, 0].tolist() == [-2, -2]
+    assert engine.enemy_attack_phase[:, 0].tolist() == [0, 0]
+    assert engine.health.tolist() == [100.0, 100.0]
+
+
 def test_pain_wakes_spawned_monster_and_forces_next_eligible_retaliation(
     square_scenario,
 ) -> None:

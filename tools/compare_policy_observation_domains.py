@@ -24,6 +24,7 @@ import torch.nn.functional as F
 
 _DEATH_VISIBILITY_STATE = ("enemy_death_tics",)
 _LIVE_ENEMY_VISIBILITY_STATE = ("enemy_alive",)
+_DECAL_VISIBILITY_STATE = ("hitscan_decal_serial",)
 _EFFECT_VISIBILITY_STATE = (
     "projectile_alive",
     "projectile_impact_tics",
@@ -31,6 +32,7 @@ _EFFECT_VISIBILITY_STATE = (
     "enemy_projectile_impact_tics",
     "teleport_fog_tics",
     "hitscan_puff_tics",
+    "hitscan_decal_serial",
 )
 _COMBAT_VISIBILITY_STATE = (
     "enemy_alive",
@@ -41,6 +43,7 @@ _COMBAT_VISIBILITY_STATE = (
     "enemy_projectile_impact_tics",
     "teleport_fog_tics",
     "hitscan_puff_tics",
+    "hitscan_decal_serial",
     "drop_spawned",
 )
 
@@ -94,6 +97,11 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="also compare matched frame stacks with combat effects hidden",
     )
+    parser.add_argument(
+        "--decal-ablation",
+        action="store_true",
+        help="also compare matched frame stacks with persistent hitscan decals hidden",
+    )
     parser.add_argument("--output", type=Path)
     return parser
 
@@ -113,6 +121,7 @@ def _validate(args: argparse.Namespace) -> None:
                 args.combat_actor_ablation,
                 args.live_enemy_ablation,
                 args.effect_ablation,
+                args.decal_ablation,
             )
         )
         > 1
@@ -187,6 +196,12 @@ def _kl_from_reference(reference_logits: torch.Tensor, candidate_logits: torch.T
     )
 
 
+def _visibility_state_active(state_name: str, state: torch.Tensor) -> torch.Tensor:
+    if state_name == "hitscan_decal_serial":
+        return state >= 0
+    return state != 0
+
+
 def _per_sample_metrics(
     exact: torch.Tensor,
     fast: torch.Tensor,
@@ -220,7 +235,11 @@ def _current_ablation_frames(
     engine = env._engine
     saved_state = {name: getattr(engine, name).clone() for name in state_names}
     for name in state_names:
-        getattr(engine, name).zero_()
+        state = getattr(engine, name)
+        if name == "hitscan_decal_serial":
+            state.fill_(-1)
+        else:
+            state.zero_()
     try:
         exact_frame = engine.render_reference_frame()
         if fast_renderer == "direct":
@@ -288,6 +307,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     elif args.effect_ablation:
         ablation_state_names = _EFFECT_VISIBILITY_STATE
         ablation_mode = "combat_effects"
+    elif args.decal_ablation:
+        ablation_state_names = _DECAL_VISIBILITY_STATE
+        ablation_mode = "persistent_hitscan_decals"
     elif args.combat_actor_ablation:
         ablation_state_names = _COMBAT_VISIBILITY_STATE
         ablation_mode = "combat_actors_effects_and_drops"
@@ -391,8 +413,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "any_death_or_corpse": corpse_count > 0,
                     "active_death_animation": torch.any(death_tics > 1, dim=1),
                     "persistent_corpse": torch.any(death_tics == 1, dim=1),
-                    "one_to_four_deaths_or_corpses": (corpse_count >= 1)
-                    & (corpse_count <= 4),
+                    "one_to_four_deaths_or_corpses": (corpse_count >= 1) & (corpse_count <= 4),
                     "five_or_more_deaths_or_corpses": corpse_count >= 5,
                 }
                 for cohort_name, mask in cohort_masks.items():
@@ -448,12 +469,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                         ablation_mask = torch.zeros_like(ablation_mask)
                         for state_name in _EFFECT_VISIBILITY_STATE:
                             state = getattr(env._engine, state_name)
-                            ablation_mask |= torch.any(state != 0, dim=1)
+                            visible = _visibility_state_active(state_name, state)
+                            ablation_mask |= torch.any(visible, dim=1)
+                    elif args.decal_ablation:
+                        ablation_mask = torch.any(env._engine.hitscan_decal_serial >= 0, dim=1)
                     elif args.combat_actor_ablation:
                         ablation_mask = torch.zeros_like(ablation_mask)
                         for state_name in _COMBAT_VISIBILITY_STATE:
                             state = getattr(env._engine, state_name)
-                            ablation_mask |= torch.any(state != 0, dim=1)
+                            visible = _visibility_state_active(state_name, state)
+                            ablation_mask |= torch.any(visible, dim=1)
                     ablation_count = int(ablation_mask.sum())
                     ablation_samples += ablation_count
                     for comparison, metrics in ablation_comparisons.items():

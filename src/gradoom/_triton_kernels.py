@@ -8,7 +8,6 @@ import triton.language as tl
 from triton.language.extra import libdevice
 
 _FAST_NATIVE_PORTAL_LAYERS = 16
-_FAST_NATIVE_SPRITE_LAYERS = 1
 
 
 @triton.jit
@@ -2257,9 +2256,8 @@ def _render_fast_native_sprites_kernel(
     lookup_width: tl.constexpr,
     block_actors: tl.constexpr,
     block_height: tl.constexpr,
-    sprite_rank: tl.constexpr,
 ):
-    """Composite one depth-ranked native indexed actor per screen column."""
+    """Composite the nearest two indexed actors per column in one launch."""
 
     ray_index = tl.program_id(0)
     env_index = ray_index // observation_width
@@ -2279,112 +2277,123 @@ def _render_fast_native_sprites_kernel(
         & (depth < tl.load(blocking_distance + ray_index))
     )
     candidate_depth = tl.where(candidate, depth, float("inf"))
-    # The wrapper invokes ranks far-to-near.  Retaining several horizontally
-    # overlapping sprites is necessary because a nearer sprite can be short
-    # or transparent at this row; selecting only one actor for the whole
-    # column incorrectly erased every actor behind it.
-    selected_depth = float("inf")
-    selected_actor = 0
-    for _rank in range(sprite_rank + 1):
-        selected_depth = tl.min(candidate_depth, axis=0)
-        selected_actor = tl.argmin(candidate_depth, axis=0, tie_break_left=True)
-        candidate_depth = tl.where(
-            candidate_slot == selected_actor,
-            float("inf"),
-            candidate_depth,
-        )
-    selected_index = env_index * actor_count + selected_actor
-    selected_sprite = tl.maximum(tl.load(actor_sprite + selected_index), 0)
-    selected_width = tl.load(sprite_widths + selected_sprite).to(tl.int64)
-    selected_height = tl.load(sprite_heights + selected_sprite).to(tl.int64)
-    selected_scale_x = 160.0 / selected_depth
-    selected_scale_y = 192.0 / selected_depth
-    selected_x = tl.load(actor_x + selected_index)
-    selected_y = tl.load(actor_y + selected_index)
-    selected_left = tl.load(projected_left + selected_index)
-    selected_top = (
-        tl.load(center + env_index)
-        + (tl.load(view_z + env_index) - tl.load(actor_z + selected_index)) * selected_scale_y
-        - tl.load(sprite_top_offsets + selected_sprite) * selected_scale_y
+    nearest_depth = tl.min(candidate_depth, axis=0)
+    nearest_actor = tl.argmin(candidate_depth, axis=0, tie_break_left=True)
+    remaining_depth = tl.where(
+        candidate_slot == nearest_actor,
+        float("inf"),
+        candidate_depth,
     )
-    sprite_u = tl.floor((column.to(tl.float32) - selected_left) / selected_scale_x).to(tl.int64)
+    farther_depth = tl.min(remaining_depth, axis=0)
+    farther_actor = tl.argmin(remaining_depth, axis=0, tie_break_left=True)
     pixel_y = tl.arange(0, block_height)
     valid_pixel = pixel_y < observation_height
-    sprite_v = tl.floor((pixel_y.to(tl.float32) - selected_top) / selected_scale_y).to(tl.int64)
-    inside = (
-        valid_pixel
-        & (selected_depth != float("inf"))
-        & (sprite_u >= 0)
-        & (sprite_u < selected_width)
-        & (sprite_v >= 0)
-        & (sprite_v < selected_height)
-    )
-    safe_u = tl.maximum(0, tl.minimum(sprite_u, selected_width - 1))
-    safe_v = tl.maximum(0, tl.minimum(sprite_v, selected_height - 1))
-    atlas_index = (
-        selected_sprite * atlas_stride_type + safe_v * atlas_stride_y + safe_u * atlas_stride_x
-    )
-    opaque = tl.load(sprite_opaque + atlas_index, mask=inside, other=0).to(tl.int1)
-    palette_index = tl.load(sprite_atlas + atlas_index, mask=inside, other=0).to(tl.int64)
-    origin_x = tl.load(lookup_metadata)
-    origin_y = tl.load(lookup_metadata + 1)
-    cell_size = tl.load(lookup_metadata + 2)
-    lookup_x = tl.floor((selected_x - origin_x) / cell_size).to(tl.int64)
-    lookup_y = tl.floor((selected_y - origin_y) / cell_size).to(tl.int64)
-    in_lookup = (
-        (lookup_x >= 0) & (lookup_x < lookup_width) & (lookup_y >= 0) & (lookup_y < lookup_height)
-    )
-    sector = tl.load(
-        sector_lookup + lookup_y * lookup_width + lookup_x,
-        mask=in_lookup,
-        other=0,
-    ).to(tl.int64)
-    sector = tl.maximum(sector, 0)
-    light = tl.load(sector_lights + sector).to(tl.float32)
-    light += tl.load(flash_light + env_index).to(tl.float32) * 16.0
-    light = tl.where(tl.load(actor_fullbright + selected_index), 255.0, light)
-    base_shade = 61.0 - light / 4.0
-    visibility = tl.minimum(24.0, 1280.0 / tl.maximum(selected_depth, 1.0))
-    shade = tl.maximum(0, tl.minimum(31, tl.floor(base_shade - visibility))).to(tl.int64)
-    lit_index = tl.load(
-        colormap + shade * 256 + palette_index,
-        mask=inside & opaque,
-        other=0,
-    ).to(tl.uint8)
     frame_index = (
         env_index * observation_height * observation_width + pixel_y * observation_width + column
     )
-    visible_against_scene = selected_depth < tl.load(
+    scene_depth = tl.load(
         surface_depth + frame_index,
         mask=valid_pixel,
         other=float("inf"),
     )
     prior = tl.load(frame + frame_index, mask=valid_pixel, other=0)
-    additive_style = tl.load(actor_additive_style + selected_index).to(tl.int64)
-    clamped_additive_style = tl.maximum(0, tl.minimum(additive_style, 1))
-    effect_mask = inside & opaque & visible_against_scene
-    additive_index = clamped_additive_style * 256 * 256 + prior.to(tl.int64) * 256 + lit_index
-    additive_pixel = tl.load(
-        projectile_additive_luts + additive_index,
-        mask=effect_mask & (additive_style >= 0),
-        other=0,
-    ).to(tl.uint8)
-    translucent_index = prior.to(tl.int64) * 256 + lit_index
-    translucent_pixel = tl.load(
-        sprite_translucent_lut + translucent_index,
-        mask=effect_mask & (additive_style == -2),
-        other=0,
-    ).to(tl.uint8)
-    rendered_pixel = tl.where(
-        additive_style == -2,
-        translucent_pixel,
-        tl.where(additive_style >= 0, additive_pixel, lit_index),
-    )
-    tl.store(
-        frame + frame_index,
-        tl.where(effect_mask, rendered_pixel, prior),
-        mask=valid_pixel,
-    )
+    # Composite farther then nearer in registers. A transparent or vertically
+    # short foreground actor therefore reveals the next actor without a second
+    # kernel launch or another candidate-array load.
+    for layer in range(2):
+        if layer == 0:
+            selected_depth = farther_depth
+            selected_actor = farther_actor
+        else:
+            selected_depth = nearest_depth
+            selected_actor = nearest_actor
+        selected_index = env_index * actor_count + selected_actor
+        selected_sprite = tl.maximum(tl.load(actor_sprite + selected_index), 0)
+        selected_width = tl.load(sprite_widths + selected_sprite).to(tl.int64)
+        selected_height = tl.load(sprite_heights + selected_sprite).to(tl.int64)
+        selected_scale_x = 160.0 / selected_depth
+        selected_scale_y = 192.0 / selected_depth
+        selected_x = tl.load(actor_x + selected_index)
+        selected_y = tl.load(actor_y + selected_index)
+        selected_left = tl.load(projected_left + selected_index)
+        selected_top = (
+            tl.load(center + env_index)
+            + (tl.load(view_z + env_index) - tl.load(actor_z + selected_index))
+            * selected_scale_y
+            - tl.load(sprite_top_offsets + selected_sprite) * selected_scale_y
+        )
+        sprite_u = tl.floor((column.to(tl.float32) - selected_left) / selected_scale_x).to(tl.int64)
+        sprite_v = tl.floor((pixel_y.to(tl.float32) - selected_top) / selected_scale_y).to(tl.int64)
+        inside = (
+            valid_pixel
+            & (selected_depth != float("inf"))
+            & (sprite_u >= 0)
+            & (sprite_u < selected_width)
+            & (sprite_v >= 0)
+            & (sprite_v < selected_height)
+        )
+        safe_u = tl.maximum(0, tl.minimum(sprite_u, selected_width - 1))
+        safe_v = tl.maximum(0, tl.minimum(sprite_v, selected_height - 1))
+        atlas_index = (
+            selected_sprite * atlas_stride_type
+            + safe_v * atlas_stride_y
+            + safe_u * atlas_stride_x
+        )
+        opaque = tl.load(sprite_opaque + atlas_index, mask=inside, other=0).to(tl.int1)
+        palette_index = tl.load(sprite_atlas + atlas_index, mask=inside, other=0).to(tl.int64)
+        origin_x = tl.load(lookup_metadata)
+        origin_y = tl.load(lookup_metadata + 1)
+        cell_size = tl.load(lookup_metadata + 2)
+        lookup_x = tl.floor((selected_x - origin_x) / cell_size).to(tl.int64)
+        lookup_y = tl.floor((selected_y - origin_y) / cell_size).to(tl.int64)
+        in_lookup = (
+            (lookup_x >= 0)
+            & (lookup_x < lookup_width)
+            & (lookup_y >= 0)
+            & (lookup_y < lookup_height)
+        )
+        sector = tl.load(
+            sector_lookup + lookup_y * lookup_width + lookup_x,
+            mask=in_lookup,
+            other=0,
+        ).to(tl.int64)
+        sector = tl.maximum(sector, 0)
+        light = tl.load(sector_lights + sector).to(tl.float32)
+        light += tl.load(flash_light + env_index).to(tl.float32) * 16.0
+        light = tl.where(tl.load(actor_fullbright + selected_index), 255.0, light)
+        base_shade = 61.0 - light / 4.0
+        visibility = tl.minimum(24.0, 1280.0 / tl.maximum(selected_depth, 1.0))
+        shade = tl.maximum(0, tl.minimum(31, tl.floor(base_shade - visibility))).to(tl.int64)
+        lit_index = tl.load(
+            colormap + shade * 256 + palette_index,
+            mask=inside & opaque,
+            other=0,
+        ).to(tl.uint8)
+        visible_against_scene = selected_depth < scene_depth
+        additive_style = tl.load(actor_additive_style + selected_index).to(tl.int64)
+        clamped_additive_style = tl.maximum(0, tl.minimum(additive_style, 1))
+        effect_mask = inside & opaque & visible_against_scene
+        additive_index = (
+            clamped_additive_style * 256 * 256 + prior.to(tl.int64) * 256 + lit_index
+        )
+        additive_pixel = tl.load(
+            projectile_additive_luts + additive_index,
+            mask=effect_mask & (additive_style >= 0),
+            other=0,
+        ).to(tl.uint8)
+        translucent_index = prior.to(tl.int64) * 256 + lit_index
+        translucent_pixel = tl.load(
+            sprite_translucent_lut + translucent_index,
+            mask=effect_mask & (additive_style == -2),
+            other=0,
+        ).to(tl.uint8)
+        rendered_pixel = tl.where(
+            additive_style == -2,
+            translucent_pixel,
+            tl.where(additive_style >= 0, additive_pixel, lit_index),
+        )
+        prior = tl.where(effect_mask, rendered_pixel, prior)
+    tl.store(frame + frame_index, prior, mask=valid_pixel)
 
 
 @torch.library.custom_op(
@@ -2451,12 +2460,11 @@ def render_fast_native_sprites_(
         projection_block,
         num_warps=4,
     )
-    # Paint far-to-near so transparent foreground texels preserve an already
-    # rendered farther actor, matching Doom's masked-sprite composition.
-    for sprite_rank in reversed(range(_FAST_NATIVE_SPRITE_LAYERS)):
-        torch.library.wrap_triton(_render_fast_native_sprites_kernel)[
-            (frame.shape[0] * observation_width,)
-        ](
+    # Select and paint two layers far-to-near in one launch so transparent
+    # foreground texels preserve an already rendered farther actor.
+    torch.library.wrap_triton(_render_fast_native_sprites_kernel)[
+        (frame.shape[0] * observation_width,)
+    ](
             frame,
             blocking_distance,
             surface_depth,
@@ -2498,7 +2506,6 @@ def render_fast_native_sprites_(
             sector_lookup.shape[1],
             triton.next_power_of_2(actor_count),
             block_height,
-            sprite_rank,
             num_warps=4,
         )
 

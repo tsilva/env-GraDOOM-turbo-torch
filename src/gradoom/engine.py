@@ -8294,7 +8294,7 @@ class TorchDeathmatchEngine:
                 torch.bitwise_and(walk_roll, 15),
                 torch.where(
                     remaining,
-                    torch.zeros_like(self.enemy_move_count),
+                    decremented_count,
                     self.enemy_move_count,
                 ),
             )
@@ -8809,7 +8809,7 @@ class TorchDeathmatchEngine:
             attack_ready
             & line_of_sight
             & ranged_type
-            & (self.enemy_move_count <= 0)
+            & (self.enemy_move_count == 0)
             & (distance < self._enemy_attack_range[enemy_type])
             & ~((enemy_type == 5) & melee_vertical_overlap & in_melee_range)
         )

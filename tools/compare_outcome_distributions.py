@@ -12,7 +12,7 @@ import argparse
 import json
 import math
 import statistics
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -126,6 +126,109 @@ def _summary(records: Sequence[dict[str, Any]]) -> dict[str, float | int]:
         summary[f"{name}_mean"] = total / len(records)
         summary[f"{name}_per_1000_decisions"] = total / total_length * 1_000.0
     return summary
+
+
+def _normal_summary(values: Sequence[float]) -> dict[str, Any]:
+    """Summarize independent outcome samples with an explicit uncertainty bound."""
+
+    count = len(values)
+    if count == 0:
+        return {
+            "count": 0,
+            "mean": None,
+            "normal_95_ci": None,
+            "sample_stddev": None,
+            "standard_error": None,
+        }
+    mean = statistics.fmean(values)
+    if count == 1:
+        sample_stddev = None
+        standard_error = None
+        interval = None
+    else:
+        sample_stddev = statistics.stdev(values)
+        standard_error = sample_stddev / math.sqrt(count)
+        interval = [mean - 1.96 * standard_error, mean + 1.96 * standard_error]
+    return {
+        "count": count,
+        "mean": mean,
+        "normal_95_ci": interval,
+        "sample_stddev": sample_stddev,
+        "standard_error": standard_error,
+    }
+
+
+def _outcome_values(records: Sequence[Mapping[str, Any]]) -> dict[str, list[float]]:
+    values = {
+        name: [float(record[name]) for record in records]
+        for name in (
+            "kills",
+            "length",
+            "return",
+            "terminated",
+            "hitcount",
+            "damagecount",
+            "hits_taken",
+            "damage_taken",
+            "health_gain",
+            "health_loss",
+            "armor_gain",
+            "armor_loss",
+        )
+    }
+    for name in (
+        "hitcount",
+        "damagecount",
+        "hits_taken",
+        "damage_taken",
+        "health_gain",
+        "health_loss",
+        "armor_gain",
+        "armor_loss",
+    ):
+        values[f"{name}_per_1000_decisions"] = [
+            1_000.0 * float(record[name]) / float(record["length"])
+            for record in records
+        ]
+    return values
+
+
+def _distribution_comparison(
+    reference: Sequence[Mapping[str, Any]],
+    gradoom: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Compare aggregate distributions without treating trajectories as paired."""
+
+    reference_values = _outcome_values(reference)
+    gradoom_values = _outcome_values(gradoom)
+    comparison: dict[str, Any] = {}
+    for name in reference_values:
+        reference_summary = _normal_summary(reference_values[name])
+        gradoom_summary = _normal_summary(gradoom_values[name])
+        reference_mean = reference_summary["mean"]
+        gradoom_mean = gradoom_summary["mean"]
+        reference_error = reference_summary["standard_error"]
+        gradoom_error = gradoom_summary["standard_error"]
+        if reference_mean is None or gradoom_mean is None:
+            delta = None
+            delta_error = None
+            interval = None
+        else:
+            delta = gradoom_mean - reference_mean
+            if reference_error is None or gradoom_error is None:
+                delta_error = None
+                interval = None
+            else:
+                delta_error = math.hypot(reference_error, gradoom_error)
+                interval = [delta - 1.96 * delta_error, delta + 1.96 * delta_error]
+        comparison[name] = {
+            "gradoom": gradoom_summary,
+            "gradoom_minus_vizdoom": delta,
+            "gradoom_minus_vizdoom_normal_95_ci": interval,
+            "gradoom_minus_vizdoom_standard_error": delta_error,
+            "vizdoom": reference_summary,
+        }
+    return comparison
 
 
 def main() -> int:
@@ -338,6 +441,10 @@ def main() -> int:
         gradoom_complete = [record for record in gradoom_records if record is not None]
         results.append(
             {
+                "comparison": _distribution_comparison(
+                    reference_complete,
+                    gradoom_complete,
+                ),
                 "program": program,
                 "vizdoom": _summary(reference_complete),
                 "gradoom": _summary(gradoom_complete),

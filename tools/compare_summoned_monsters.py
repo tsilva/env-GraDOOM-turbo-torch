@@ -422,6 +422,102 @@ def _optional_mean(records: Sequence[Mapping[str, Any]], name: str) -> float | N
     return None if not values else statistics.fmean(values)
 
 
+def _normal_summary(values: Sequence[float]) -> dict[str, Any]:
+    """Summarize an isolated outcome distribution without pairing RNG streams."""
+
+    count = len(values)
+    if count == 0:
+        return {
+            "count": 0,
+            "mean": None,
+            "normal_95_ci": None,
+            "sample_stddev": None,
+            "standard_error": None,
+        }
+    mean = statistics.fmean(values)
+    if count == 1:
+        sample_stddev = None
+        standard_error = None
+        interval = None
+    else:
+        sample_stddev = statistics.stdev(values)
+        standard_error = sample_stddev / math.sqrt(count)
+        interval = [mean - 1.96 * standard_error, mean + 1.96 * standard_error]
+    return {
+        "count": count,
+        "mean": mean,
+        "normal_95_ci": interval,
+        "sample_stddev": sample_stddev,
+        "standard_error": standard_error,
+    }
+
+
+def _outcome_values(records: Sequence[Mapping[str, Any]]) -> dict[str, list[float]]:
+    return {
+        "damage_taken": [float(record["damage_taken"]) for record in records],
+        "final_displacement": [float(record["final_displacement"]) for record in records],
+        "first_damage_decision_when_observed": [
+            float(record["first_damage_decision"])
+            for record in records
+            if record["first_damage_decision"] is not None
+        ],
+        "first_damage_observed": [
+            float(record["first_damage_decision"] is not None) for record in records
+        ],
+        "first_motion_decision_when_observed": [
+            float(record["first_motion_decision"])
+            for record in records
+            if record["first_motion_decision"] is not None
+        ],
+        "first_motion_observed": [
+            float(record["first_motion_decision"] is not None) for record in records
+        ],
+        "hits_taken": [float(record["hits_taken"]) for record in records],
+        "minimum_monster_player_distance": [
+            float(record["minimum_monster_player_distance"]) for record in records
+        ],
+        "player_displacement": [float(record["player_displacement"]) for record in records],
+    }
+
+
+def _distribution_comparison(
+    reference: Sequence[Mapping[str, Any]],
+    gradoom: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Report unpaired provider deltas; trajectories intentionally need not align."""
+
+    reference_values = _outcome_values(reference)
+    gradoom_values = _outcome_values(gradoom)
+    comparison: dict[str, Any] = {}
+    for name in reference_values:
+        reference_summary = _normal_summary(reference_values[name])
+        gradoom_summary = _normal_summary(gradoom_values[name])
+        reference_mean = reference_summary["mean"]
+        gradoom_mean = gradoom_summary["mean"]
+        reference_error = reference_summary["standard_error"]
+        gradoom_error = gradoom_summary["standard_error"]
+        if reference_mean is None or gradoom_mean is None:
+            delta = None
+            delta_error = None
+            interval = None
+        else:
+            delta = gradoom_mean - reference_mean
+            if reference_error is None or gradoom_error is None:
+                delta_error = None
+                interval = None
+            else:
+                delta_error = math.hypot(reference_error, gradoom_error)
+                interval = [delta - 1.96 * delta_error, delta + 1.96 * delta_error]
+        comparison[name] = {
+            "gradoom": gradoom_summary,
+            "gradoom_minus_reference": delta,
+            "gradoom_minus_reference_normal_95_ci": interval,
+            "gradoom_minus_reference_standard_error": delta_error,
+            "reference": reference_summary,
+        }
+    return comparison
+
+
 def _summary(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     return {
         "episodes": len(records),
@@ -499,6 +595,7 @@ def main() -> int:
             results.append(
                 {
                     "class": monster_name,
+                    "distribution_comparison": _distribution_comparison(reference, gradoom),
                     "program": program,
                     "gradoom": _summary(gradoom),
                     "reference": _summary(reference),
@@ -509,7 +606,7 @@ def main() -> int:
         "episodes": args.episodes,
         "frame_skip": args.frame_skip,
         "results": results,
-        "schema": "gradoom.summoned-monster-outcomes.v4",
+        "schema": "gradoom.summoned-monster-outcomes.v5",
         "seed": args.seed,
     }
     serialized = json.dumps(result, indent=2, sort_keys=True)

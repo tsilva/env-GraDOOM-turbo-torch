@@ -2795,6 +2795,56 @@ def test_fast_native_sprite_respects_portal_surface_depth() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+def test_fast_native_transparent_foreground_reveals_farther_actor() -> None:
+    from gradoom._triton_kernels import render_fast_native_sprites_
+
+    device = torch.device("cuda")
+    frame = torch.full((1, 208, 320), 7, dtype=torch.uint8, device=device)
+    atlas = torch.stack(
+        (
+            torch.full((3, 3), 10, dtype=torch.uint8, device=device),
+            torch.full((3, 3), 20, dtype=torch.uint8, device=device),
+        )
+    )
+    opaque = torch.ones_like(atlas, dtype=torch.bool)
+    opaque[0] = False
+    identity_colormap = torch.arange(256, dtype=torch.uint8, device=device).repeat(32, 1)
+
+    render_fast_native_sprites_(
+        frame,
+        torch.full((1, 320), torch.inf, device=device),
+        torch.full_like(frame, torch.inf, dtype=torch.float32),
+        torch.tensor([[64.0, 96.0]], device=device),
+        torch.zeros((1, 2), device=device),
+        torch.zeros((1, 2), device=device),
+        torch.ones((1, 2), dtype=torch.bool, device=device),
+        torch.tensor([[0, 1]], dtype=torch.int64, device=device),
+        torch.ones((1, 2), dtype=torch.bool, device=device),
+        torch.full((1, 2), -1, dtype=torch.int64, device=device),
+        torch.zeros(1, device=device),
+        torch.zeros(1, device=device),
+        torch.zeros(1, device=device),
+        torch.zeros(1, device=device),
+        torch.full((1,), 104.0, device=device),
+        torch.full((2,), 3, dtype=torch.int32, device=device),
+        torch.full((2,), 3, dtype=torch.int32, device=device),
+        torch.ones(2, dtype=torch.int32, device=device),
+        torch.ones(2, dtype=torch.int32, device=device),
+        atlas,
+        opaque,
+        torch.zeros((1, 1), dtype=torch.int64, device=device),
+        torch.tensor([-1_000.0, -1_000.0, 2_000.0], device=device),
+        torch.full((1,), 255, dtype=torch.int64, device=device),
+        torch.zeros(1, dtype=torch.int64, device=device),
+        identity_colormap,
+        torch.zeros((2, 256, 256), dtype=torch.uint8, device=device),
+        torch.zeros((256, 256), dtype=torch.uint8, device=device),
+    )
+
+    assert frame[0, 103, 160].item() == 20
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 def test_fast_native_sprite_applies_reference_render_styles() -> None:
     from gradoom._triton_kernels import render_fast_native_sprites_
 
