@@ -1700,6 +1700,29 @@ def test_player_cannot_move_through_solid_monster(square_scenario) -> None:
     assert engine.momentum_x.tolist() == [0.0, 0.0]
 
 
+def test_player_retries_single_axis_step_when_blocked_by_monster(square_scenario) -> None:
+    engine = _engine(square_scenario)
+    engine.x.zero_()
+    engine.y.zero_()
+    engine.momentum_x.fill_(20)
+    engine.momentum_y.fill_(20)
+    engine.reaction_time.zero_()
+    engine.enemy_x[:, 0] = 40
+    engine.enemy_y[:, 0] = 30
+    engine.enemy_type[:, 0] = 0
+    engine.enemy_health[:, 0] = 20
+    engine.enemy_alive[:, 0] = True
+
+    engine._move_player(torch.zeros((2, 20), dtype=torch.bool))
+
+    # P_XYMovement tries the Y-only substep first when another actor blocks
+    # the combined move, then clears only the rejected X velocity component.
+    assert engine.x.tolist() == [0.0, 0.0]
+    assert engine.y.tolist() == [10.0, 10.0]
+    assert engine.momentum_x.tolist() == [0.0, 0.0]
+    assert engine.momentum_y.tolist() == [18.125, 18.125]
+
+
 def test_monster_chase_step_does_not_penetrate_player_radius(square_scenario) -> None:
     engine = _engine(square_scenario)
     engine.x.zero_()

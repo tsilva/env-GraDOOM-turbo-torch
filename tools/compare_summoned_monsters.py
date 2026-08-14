@@ -172,12 +172,20 @@ def _run_vizdoom_episode(
         }
         initial_x = float(monster.position_x)
         initial_y = float(monster.position_y)
+        initial_player_x = values["position_x"]
+        initial_player_y = values["position_y"]
         initial_hits = values["hits_taken"]
         initial_damage = values["damage_taken"]
         first_damage_decision: int | None = None
         first_motion_decision: int | None = None
         last_x = initial_x
         last_y = initial_y
+        last_player_x = initial_player_x
+        last_player_y = initial_player_y
+        minimum_distance = math.hypot(
+            initial_x - initial_player_x,
+            initial_y - initial_player_y,
+        )
         executed = 0
         for decision in range(1, decisions + 1):
             if game.is_episode_finished() or game.is_player_dead():
@@ -190,10 +198,16 @@ def _run_vizdoom_episode(
             hits = float(game.get_game_variable(vzd.GameVariable.HITS_TAKEN))
             if first_damage_decision is None and hits > initial_hits:
                 first_damage_decision = decision
+            last_player_x = float(game.get_game_variable(vzd.GameVariable.POSITION_X))
+            last_player_y = float(game.get_game_variable(vzd.GameVariable.POSITION_Y))
             monster = _monster_object(game.get_state(), monster_name)
             if monster is not None:
                 last_x = float(monster.position_x)
                 last_y = float(monster.position_y)
+                minimum_distance = min(
+                    minimum_distance,
+                    math.hypot(last_x - last_player_x, last_y - last_player_y),
+                )
                 displacement = math.hypot(last_x - initial_x, last_y - initial_y)
                 if first_motion_decision is None and displacement > 0.5:
                     first_motion_decision = decision
@@ -209,6 +223,11 @@ def _run_vizdoom_episode(
             "health": float(game.get_game_variable(vzd.GameVariable.HEALTH)),
             "hits_taken": float(game.get_game_variable(vzd.GameVariable.HITS_TAKEN)) - initial_hits,
             "initial": initial,
+            "minimum_monster_player_distance": minimum_distance,
+            "player_displacement": math.hypot(
+                last_player_x - initial_player_x,
+                last_player_y - initial_player_y,
+            ),
         }
     finally:
         game.close()
@@ -319,6 +338,11 @@ def _run_gradoom(
     engine.next_spawn_check.fill_(1 << 30)
     initial_x = engine.enemy_x[:, 0].clone()
     initial_y = engine.enemy_y[:, 0].clone()
+    initial_player_x = engine.x.clone()
+    initial_player_y = engine.y.clone()
+    minimum_distance = torch.sqrt(
+        (initial_x - initial_player_x) ** 2 + (initial_y - initial_player_y) ** 2
+    )
     first_damage = torch.full((num_envs,), -1, device=device, dtype=torch.int32)
     first_motion = torch.full((num_envs,), -1, device=device, dtype=torch.int32)
     done = torch.zeros(num_envs, device=device, dtype=torch.bool)
@@ -343,6 +367,10 @@ def _run_gradoom(
         displacement = torch.sqrt(
             (engine.enemy_x[:, 0] - initial_x) ** 2 + (engine.enemy_y[:, 0] - initial_y) ** 2
         )
+        current_distance = torch.sqrt(
+            (engine.enemy_x[:, 0] - engine.x) ** 2 + (engine.enemy_y[:, 0] - engine.y) ** 2
+        )
+        minimum_distance.copy_(torch.minimum(minimum_distance, current_distance))
         first_motion.copy_(
             torch.where(
                 (first_motion < 0) & (displacement > 0.5),
@@ -369,6 +397,13 @@ def _run_gradoom(
             "game_seed": int(game_seeds[lane]),
             "health": float(engine.health[lane]),
             "hits_taken": float(engine.player_hits_taken[lane]),
+            "minimum_monster_player_distance": float(minimum_distance[lane]),
+            "player_displacement": float(
+                torch.sqrt(
+                    (engine.x[lane] - initial_player_x[lane]) ** 2
+                    + (engine.y[lane] - initial_player_y[lane]) ** 2
+                )
+            ),
         }
         for lane in range(num_envs)
     ]
@@ -401,6 +436,12 @@ def _summary(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         ),
         "health_mean": statistics.fmean(float(record["health"]) for record in records),
         "hits_taken_mean": statistics.fmean(float(record["hits_taken"]) for record in records),
+        "minimum_monster_player_distance_mean": statistics.fmean(
+            float(record["minimum_monster_player_distance"]) for record in records
+        ),
+        "player_displacement_mean": statistics.fmean(
+            float(record["player_displacement"]) for record in records
+        ),
     }
 
 
@@ -460,7 +501,7 @@ def main() -> int:
         "episodes": args.episodes,
         "frame_skip": args.frame_skip,
         "results": results,
-        "schema": "gradoom.summoned-monster-outcomes.v2",
+        "schema": "gradoom.summoned-monster-outcomes.v3",
         "seed": args.seed,
     }
     serialized = json.dumps(result, indent=2, sort_keys=True)

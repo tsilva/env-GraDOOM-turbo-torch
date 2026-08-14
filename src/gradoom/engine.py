@@ -2910,39 +2910,52 @@ class TorchDeathmatchEngine:
             floor, ceiling = self._player_opening_at(x, y)
         collision |= floor > self.z + 24.0
         collision |= ceiling - torch.maximum(self.z, floor) < 56.0
+        collision |= self._player_actor_collides(x, y)
+        return collision
+
+    def _player_actor_collides(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return solid actor overlap for one or more player XY candidates."""
+
+        candidate_dims = (1,) * (x.ndim - 1)
+        enemy_shape = (self.num_envs, *candidate_dims, self.enemy_slots)
         enemy_type = self._effective_enemy_type()
-        enemy_radius = self._enemy_radius[enemy_type]
-        enemy_dx = x[:, None] - self.enemy_x
-        enemy_dy = y[:, None] - self.enemy_y
+        enemy_radius = self._enemy_radius[enemy_type].reshape(enemy_shape)
+        enemy_dx = x[..., None] - self.enemy_x.reshape(enemy_shape)
+        enemy_dy = y[..., None] - self.enemy_y.reshape(enemy_shape)
         enemy_vertical_overlap = self._vertical_overlap(
-            self.z[:, None],
+            self.z.reshape((self.num_envs, *candidate_dims, 1)),
             _PLAYER_HEIGHT,
-            self.enemy_z,
-            self._effective_enemy_height(),
+            self.enemy_z.reshape(enemy_shape),
+            self._effective_enemy_height().reshape(enemy_shape),
         )
-        collision |= torch.any(
-            self._enemy_solid_mask()
+        collision = torch.any(
+            self._enemy_solid_mask().reshape(enemy_shape)
             & enemy_vertical_overlap
             & (enemy_dx.abs() < _PLAYER_RADIUS + enemy_radius)
             & (enemy_dy.abs() < _PLAYER_RADIUS + enemy_radius),
-            dim=1,
+            dim=-1,
         )
         doll_count = max(len(self.map.player_starts) - 1, 0)
         if doll_count:
             dolls = self.map.player_starts[:-1, :2]
-            doll_dx = x[:, None] - dolls[None, :, 0]
-            doll_dy = y[:, None] - dolls[None, :, 1]
+            doll_shape = (1,) * x.ndim + (doll_count,)
+            doll_dx = x[..., None] - dolls[:, 0].reshape(doll_shape)
+            doll_dy = y[..., None] - dolls[:, 1].reshape(doll_shape)
             doll_overlap = self._vertical_overlap(
-                self.z[:, None],
+                self.z.reshape((self.num_envs, *candidate_dims, 1)),
                 _PLAYER_HEIGHT,
-                self._player_start_z[:-1][None, :],
+                self._player_start_z[:-1].reshape(doll_shape),
                 _PLAYER_HEIGHT,
             )
             collision |= torch.any(
                 doll_overlap
                 & (doll_dx.abs() < 2 * _PLAYER_RADIUS)
                 & (doll_dy.abs() < 2 * _PLAYER_RADIUS),
-                dim=1,
+                dim=-1,
             )
         return collision
 
@@ -3200,6 +3213,22 @@ class TorchDeathmatchEngine:
             1 + torch.div(dominant_speed, max_step, rounding_mode="floor"),
             torch.ones_like(dominant_speed),
         ).clamp_max(3)
+        step_number = torch.arange(1, 4, device=self.device, dtype=torch.int64)[None, :]
+        step_valid = step_number <= steps[:, None]
+        step_x = start_x[:, None] + self._trunc_divide(
+            move_x[:, None] * step_number,
+            steps[:, None],
+        )
+        step_y = start_y[:, None] + self._trunc_divide(
+            move_y[:, None] * step_number,
+            steps[:, None],
+        )
+        actor_blocked_step = step_valid & self._player_actor_collides(
+            step_x.to(torch.float32) / _FIXED_UNIT,
+            step_y.to(torch.float32) / _FIXED_UNIT,
+        )
+        actor_blocked = torch.any(actor_blocked_step, dim=1)
+        first_actor_step = torch.argmax(actor_blocked_step.to(torch.int64), dim=1) + 1
         proposed_x = start_x + move_x
         proposed_y = start_y + move_y
         proposed_x_float = proposed_x.to(torch.float32) / _FIXED_UNIT
@@ -3231,6 +3260,75 @@ class TorchDeathmatchEngine:
             + 1
         )
         collision_step = torch.minimum(collision_step, steps)
+        actor_collision = (
+            playing
+            & actor_blocked
+            & (~full_contact | (first_actor_step <= collision_step))
+        )
+        actor_prior_x = start_x + self._trunc_divide(
+            move_x * (first_actor_step - 1),
+            steps,
+        )
+        actor_prior_y = start_y + self._trunc_divide(
+            move_y * (first_actor_step - 1),
+            steps,
+        )
+        actor_step_x = self._trunc_divide(move_x, steps)
+        actor_step_y = self._trunc_divide(move_y, steps)
+        actor_y_x = actor_prior_x
+        actor_y_y = actor_prior_y + actor_step_y
+        actor_y_floor, actor_y_ceiling = self._player_opening_at(
+            actor_y_x.to(torch.float32) / _FIXED_UNIT,
+            actor_y_y.to(torch.float32) / _FIXED_UNIT,
+        )
+        actor_y_succeeds = ~self._player_collides(
+            actor_y_x.to(torch.float32) / _FIXED_UNIT,
+            actor_y_y.to(torch.float32) / _FIXED_UNIT,
+            actor_y_floor,
+            actor_y_ceiling,
+        )
+        actor_x_x = actor_prior_x + actor_step_x
+        actor_x_y = actor_prior_y
+        actor_x_floor, actor_x_ceiling = self._player_opening_at(
+            actor_x_x.to(torch.float32) / _FIXED_UNIT,
+            actor_x_y.to(torch.float32) / _FIXED_UNIT,
+        )
+        actor_x_succeeds = ~actor_y_succeeds & ~self._player_collides(
+            actor_x_x.to(torch.float32) / _FIXED_UNIT,
+            actor_x_y.to(torch.float32) / _FIXED_UNIT,
+            actor_x_floor,
+            actor_x_ceiling,
+        )
+        actor_position_x = torch.where(
+            actor_y_succeeds,
+            actor_y_x,
+            torch.where(actor_x_succeeds, actor_x_x, actor_prior_x),
+        )
+        actor_position_y = torch.where(
+            actor_y_succeeds,
+            actor_y_y,
+            torch.where(actor_x_succeeds, actor_x_y, actor_prior_y),
+        )
+        actor_momentum_x = torch.where(
+            actor_y_succeeds,
+            torch.zeros_like(move_x),
+            torch.where(actor_x_succeeds, move_x, torch.zeros_like(move_x)),
+        )
+        actor_momentum_y = torch.where(
+            actor_y_succeeds,
+            move_y,
+            torch.zeros_like(move_y),
+        )
+        actor_floor = torch.where(
+            actor_y_succeeds,
+            actor_y_floor,
+            torch.where(actor_x_succeeds, actor_x_floor, self.player_floor_z),
+        )
+        actor_ceiling = torch.where(
+            actor_y_succeeds,
+            actor_y_ceiling,
+            torch.where(actor_x_succeeds, actor_x_ceiling, self.player_ceiling_z),
+        )
         prior_x = start_x + self._trunc_divide(
             move_x * (collision_step - 1),
             steps,
@@ -3354,9 +3452,13 @@ class TorchDeathmatchEngine:
         clipped_y = torch.where(retry_slide, retry_slide_y, slide_y) * steps
         result_move_x = torch.where(slide, clipped_x, move_x)
         result_move_y = torch.where(slide, clipped_y, move_y)
+        position_x = torch.where(actor_collision, actor_position_x, position_x)
+        position_y = torch.where(actor_collision, actor_position_y, position_y)
+        result_move_x = torch.where(actor_collision, actor_momentum_x, result_move_x)
+        result_move_y = torch.where(actor_collision, actor_momentum_y, result_move_y)
         position_x = torch.where(playing, position_x, start_x)
         position_y = torch.where(playing, position_y, start_y)
-        fallback = blocked & ~slide
+        fallback = blocked & ~slide & ~actor_collision
         preserve_opening = blocked | ~moved
         result_floor = torch.where(
             preserve_opening,
@@ -3368,6 +3470,8 @@ class TorchDeathmatchEngine:
             self.player_ceiling_z,
             proposed_ceiling,
         )
+        result_floor = torch.where(actor_collision, actor_floor, result_floor)
+        result_ceiling = torch.where(actor_collision, actor_ceiling, result_ceiling)
         return (
             position_x,
             position_y,
