@@ -67,6 +67,13 @@ def _parser() -> argparse.ArgumentParser:
         nargs="+",
         default=MONSTER_NAMES,
     )
+    parser.add_argument(
+        "--programs",
+        choices=("noop", "forward", "forward-fire", "spiral"),
+        nargs="+",
+        default=("noop",),
+    )
+    parser.add_argument("--output", type=Path)
     return parser
 
 
@@ -86,6 +93,18 @@ def _action_matrix(available: tuple[str, ...]) -> np.ndarray:
     return rows
 
 
+def _action_index(program: str, decision: int) -> int:
+    if program == "noop":
+        return 0
+    if program == "forward":
+        return 2
+    if program == "forward-fire":
+        return 9
+    if program == "spiral":
+        return 13 if (decision // 20) % 2 == 0 else 14
+    raise ValueError(f"unsupported program: {program}")
+
+
 def _monster_object(state: Any, monster_name: str) -> Any | None:
     if state is None:
         return None
@@ -101,6 +120,7 @@ def _run_vizdoom_episode(
     iwad: Path,
     game_seed: int,
     monster_name: str,
+    program: str,
     decisions: int,
     frame_skip: int,
 ) -> dict[str, Any]:
@@ -162,7 +182,10 @@ def _run_vizdoom_episode(
         for decision in range(1, decisions + 1):
             if game.is_episode_finished() or game.is_player_dead():
                 break
-            game.make_action(noop, frame_skip)
+            game.make_action(
+                actions[_action_index(program, decision - 1)].tolist(),
+                frame_skip,
+            )
             executed = decision
             hits = float(game.get_game_variable(vzd.GameVariable.HITS_TAKEN))
             if first_damage_decision is None and hits > initial_hits:
@@ -268,6 +291,7 @@ def _run_gradoom(
     iwad: Path,
     reference: Sequence[Mapping[str, Any]],
     enemy_type: int,
+    program: str,
     decisions: int,
     frame_skip: int,
 ) -> list[dict[str, Any]]:
@@ -299,8 +323,13 @@ def _run_gradoom(
     first_motion = torch.full((num_envs,), -1, device=device, dtype=torch.int32)
     done = torch.zeros(num_envs, device=device, dtype=torch.bool)
     completed = torch.zeros(num_envs, device=device, dtype=torch.int32)
-    action = torch.zeros((num_envs, len(DEATHMATCH_BUTTONS)), device=device, dtype=torch.bool)
+    actions = torch.as_tensor(
+        _action_matrix(DEATHMATCH_BUTTONS),
+        device=device,
+        dtype=torch.bool,
+    )
     for decision in range(1, decisions + 1):
+        action = actions[_action_index(program, decision - 1)].expand(num_envs, -1)
         _frames, _rewards, terminated, truncated = engine.step(action)
         active = ~done
         completed.copy_(torch.where(active, torch.full_like(completed, decision), completed))
@@ -391,48 +420,55 @@ def main() -> int:
     for enemy_type, monster_name in enumerate(MONSTER_NAMES):
         if monster_name not in args.classes:
             continue
-        with ThreadPoolExecutor(max_workers=min(args.workers, args.episodes)) as executor:
-            reference = list(
-                executor.map(
-                    lambda game_seed, monster_name=monster_name: _run_vizdoom_episode(
-                        config=config,
-                        iwad=iwad,
-                        game_seed=game_seed,
-                        monster_name=monster_name,
-                        decisions=args.decisions,
-                        frame_skip=args.frame_skip,
-                    ),
-                    game_seeds,
+        for program in args.programs:
+            with ThreadPoolExecutor(max_workers=min(args.workers, args.episodes)) as executor:
+                reference = list(
+                    executor.map(
+                        lambda game_seed, monster_name=monster_name, program=program: (
+                            _run_vizdoom_episode(
+                                config=config,
+                                iwad=iwad,
+                                game_seed=game_seed,
+                                monster_name=monster_name,
+                                program=program,
+                                decisions=args.decisions,
+                                frame_skip=args.frame_skip,
+                            )
+                        ),
+                        game_seeds,
+                    )
                 )
+            gradoom = _run_gradoom(
+                scenario_path=scenario,
+                iwad=iwad,
+                reference=reference,
+                enemy_type=enemy_type,
+                program=program,
+                decisions=args.decisions,
+                frame_skip=args.frame_skip,
             )
-        gradoom = _run_gradoom(
-            scenario_path=scenario,
-            iwad=iwad,
-            reference=reference,
-            enemy_type=enemy_type,
-            decisions=args.decisions,
-            frame_skip=args.frame_skip,
-        )
-        results.append(
-            {
-                "class": monster_name,
-                "gradoom": _summary(gradoom),
-                "reference": _summary(reference),
-            }
-        )
-    print(
-        json.dumps(
-            {
-                "decisions": args.decisions,
-                "episodes": args.episodes,
-                "frame_skip": args.frame_skip,
-                "results": results,
-                "seed": args.seed,
-            },
-            indent=2,
-            sort_keys=True,
-        )
-    )
+            results.append(
+                {
+                    "class": monster_name,
+                    "program": program,
+                    "gradoom": _summary(gradoom),
+                    "reference": _summary(reference),
+                }
+            )
+    result = {
+        "decisions": args.decisions,
+        "episodes": args.episodes,
+        "frame_skip": args.frame_skip,
+        "results": results,
+        "schema": "gradoom.summoned-monster-outcomes.v2",
+        "seed": args.seed,
+    }
+    serialized = json.dumps(result, indent=2, sort_keys=True)
+    if args.output is not None:
+        output = args.output.expanduser().resolve()
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(serialized + "\n")
+    print(serialized)
     return 0
 
 

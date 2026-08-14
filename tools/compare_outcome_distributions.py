@@ -143,6 +143,7 @@ def main() -> int:
         nargs="+",
         default=("noop", "forward-fire", "spiral"),
     )
+    parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     if args.num_envs <= 0:
         parser.error("--num-envs must be positive")
@@ -343,21 +344,22 @@ def main() -> int:
             }
         )
 
-    print(
-        json.dumps(
-            {
-                "doom_skill": 1,
-                "episode_timeout": args.episode_timeout,
-                "frame_skip": args.frame_skip,
-                "initial_pose_alignment": True,
-                "num_envs": args.num_envs,
-                "results": results,
-                "schema": "gradoom.outcome-distributions.aligned-pose.v2",
-                "seed": args.seed,
-            },
-            sort_keys=True,
-        )
-    )
+    result = {
+        "doom_skill": 1,
+        "episode_timeout": args.episode_timeout,
+        "frame_skip": args.frame_skip,
+        "initial_pose_alignment": True,
+        "num_envs": args.num_envs,
+        "results": results,
+        "schema": "gradoom.outcome-distributions.aligned-pose.v2",
+        "seed": args.seed,
+    }
+    serialized = json.dumps(result, sort_keys=True)
+    if args.output is not None:
+        output = args.output.expanduser().resolve()
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(serialized + "\n")
+    print(serialized)
     return 0
 
 

@@ -9623,9 +9623,14 @@ class TorchDeathmatchEngine:
         actor_x = self.enemy_x
         actor_y = self.enemy_y
         actor_z = self.enemy_z
-        actor_alive = self.enemy_alive
-        actor_sprite = self._native_enemy_sprite_ids()
-        actor_fullbright = self._native_enemy_fullbright(
+        death_visible = self.enemy_death_tics > 0
+        actor_alive = self.enemy_alive | death_visible
+        actor_sprite = torch.where(
+            death_visible,
+            self._native_enemy_death_sprite_ids(),
+            self._native_enemy_sprite_ids(),
+        )
+        actor_fullbright = self.enemy_alive & self._native_enemy_fullbright(
             enemy_type,
             self.enemy_attack_phase,
             self.enemy_cooldown,

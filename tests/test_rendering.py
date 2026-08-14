@@ -3316,6 +3316,17 @@ def test_enemy_overkill_uses_reference_extreme_death_states(
         engine.map.enemy_xdeath_sprite_ids[2, 0].item(),
         engine.map.enemy_death_sprite_ids[4, 0].item(),
     ]
+    (
+        _actor_x,
+        _actor_y,
+        _actor_z,
+        fast_actor_visible,
+        fast_actor_sprites,
+        fast_actor_fullbright,
+    ) = engine._fast_native_actor_state()
+    assert fast_actor_visible[:, 0].tolist() == [True, True, True, True]
+    assert torch.equal(fast_actor_sprites[:, 0], death_sprites)
+    assert not fast_actor_fullbright[:, 0].any()
 
     engine.enemy_death_elapsed[:, 0] = 10
     assert engine._enemy_solid_mask()[:, 0].tolist() == [False, False, False, True]
