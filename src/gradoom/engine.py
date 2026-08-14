@@ -4160,28 +4160,71 @@ class TorchDeathmatchEngine:
         thrust_y_fixed: torch.Tensor | None = None,
         armor_absorb_request: torch.Tensor | None = None,
         hits_taken_request: torch.Tensor | None = None,
+        taken_incoming: torch.Tensor | None = None,
+        taken_armor_absorb_request: torch.Tensor | None = None,
+        credited_incoming: torch.Tensor | None = None,
+        credited_armor_absorb_request: torch.Tensor | None = None,
+        credited_hits_request: torch.Tensor | None = None,
         damage_scale: torch.Tensor | None = None,
         skill_adjusted: bool = False,
     ) -> None:
         incoming = torch.floor(incoming)
+        taken_incoming = (
+            incoming
+            if taken_incoming is None
+            else torch.floor(taken_incoming)
+        )
+        credited_incoming = (
+            torch.zeros_like(incoming)
+            if credited_incoming is None
+            else torch.floor(credited_incoming)
+        )
         if self.doom_skill == 1 and not skill_adjusted:
             # Doom's baby skill applies a 0.5 fixed-point factor to player
             # damage greater than one before thrust and armor absorption.
             incoming = torch.where(incoming > 1, torch.floor(incoming * 0.5), incoming)
+            taken_incoming = torch.where(
+                taken_incoming > 1,
+                torch.floor(taken_incoming * 0.5),
+                taken_incoming,
+            )
+            credited_incoming = torch.where(
+                credited_incoming > 1,
+                torch.floor(credited_incoming * 0.5),
+                credited_incoming,
+            )
             if thrust_x_fixed is not None:
                 thrust_x_fixed = torch.div(thrust_x_fixed, 2, rounding_mode="trunc")
             if thrust_y_fixed is not None:
                 thrust_y_fixed = torch.div(thrust_y_fixed, 2, rounding_mode="trunc")
             if armor_absorb_request is not None:
                 armor_absorb_request = torch.floor(armor_absorb_request * 0.5)
+            if taken_armor_absorb_request is not None:
+                taken_armor_absorb_request = torch.floor(
+                    taken_armor_absorb_request * 0.5
+                )
+            if credited_armor_absorb_request is not None:
+                credited_armor_absorb_request = torch.floor(
+                    credited_armor_absorb_request * 0.5
+                )
         if damage_scale is not None:
             incoming = torch.floor(incoming * damage_scale)
+            taken_incoming = torch.floor(taken_incoming * damage_scale)
+            credited_incoming = torch.floor(credited_incoming * damage_scale)
             if thrust_x_fixed is not None:
                 thrust_x_fixed = torch.trunc(thrust_x_fixed * damage_scale).to(torch.int64)
             if thrust_y_fixed is not None:
                 thrust_y_fixed = torch.trunc(thrust_y_fixed * damage_scale).to(torch.int64)
             if armor_absorb_request is not None:
                 armor_absorb_request = torch.floor(armor_absorb_request * damage_scale)
+            if taken_armor_absorb_request is not None:
+                taken_armor_absorb_request = torch.floor(
+                    taken_armor_absorb_request * damage_scale
+                )
+            if credited_armor_absorb_request is not None:
+                credited_armor_absorb_request = torch.floor(
+                    credited_armor_absorb_request * damage_scale
+                )
         if attacker_x is not None and attacker_y is not None:
             # P_DamageMobj applies thrust before armor absorption. DoomPlayer's
             # mass and Doom's default monster kickback are both 100, reducing
@@ -4199,6 +4242,16 @@ class TorchDeathmatchEngine:
                 thrust_y_fixed,
             )
 
+        requested_taken_absorb = (
+            torch.floor(taken_incoming * self.armor_save_fraction)
+            if taken_armor_absorb_request is None
+            else taken_armor_absorb_request
+        )
+        requested_credited_absorb = (
+            torch.floor(credited_incoming * self.armor_save_fraction)
+            if credited_armor_absorb_request is None
+            else credited_armor_absorb_request
+        )
         absorbed = (
             torch.floor(incoming * self.armor_save_fraction)
             if armor_absorb_request is None
@@ -4217,14 +4270,33 @@ class TorchDeathmatchEngine:
         self.health.sub_(actual)
         self.damage_count.add_(actual.to(torch.int32)).clamp_max_(100)
         damaged = actual > 0
-        # ViZDoom's VIZ_LogDmg updates these counters after skill and armor
-        # adjustment, immediately before subtracting the same health damage.
+        # Voodoo dolls share player health and armor, but ViZDoom's logger
+        # identifies only ``players[i].mo`` as the incoming-damage target.
+        # Damage to a doll is therefore excluded from HITS_TAKEN/DAMAGE_TAKEN;
+        # when the real player body is its source, it is instead outgoing
+        # HITCOUNT/DAMAGECOUNT. Allocate the aggregate armor absorption to the
+        # explicitly logged body component first, then to credited doll hits.
+        remaining_absorbed = absorbed
+        taken_absorbed = torch.minimum(remaining_absorbed, requested_taken_absorb)
+        remaining_absorbed = remaining_absorbed - taken_absorbed
+        credited_absorbed = torch.minimum(
+            remaining_absorbed,
+            requested_credited_absorb,
+        )
+        taken_actual = torch.clamp_min(taken_incoming - taken_absorbed, 0)
+        credited_actual = torch.clamp_min(
+            credited_incoming - credited_absorbed,
+            0,
+        )
         self.player_hits_taken.add_(
             damaged.to(torch.int32)
             if hits_taken_request is None
             else hits_taken_request.to(torch.int32)
         )
-        self.player_damage_taken.add_(actual)
+        self.player_damage_taken.add_(taken_actual)
+        if credited_hits_request is not None:
+            self.player_hitcount.add_(credited_hits_request.to(torch.int32))
+        self.player_damagecount.add_(credited_actual)
         if attacker_x is None or attacker_y is None:
             direction = torch.ones_like(self.mugshot_pain_direction)
         else:
@@ -5588,11 +5660,25 @@ class TorchDeathmatchEngine:
                 torch.floor(doll_splash_damage * self.armor_save_fraction[:, None, None]),
                 dim=(1, 2),
             )
+            doll_splash_hits = torch.sum(doll_splash_damage > 0, dim=(1, 2))
         else:
             total_doll_splash_damage = torch.zeros_like(self.health)
             doll_armor_absorb_request = torch.zeros_like(self.health)
+            doll_splash_hits = torch.zeros_like(self.player_hits_taken)
+        player_splash_total = torch.sum(player_splash_damage, dim=1)
+        player_splash_armor_absorb_request = torch.sum(
+            torch.floor(player_splash_damage * self.armor_save_fraction[:, None]),
+            dim=1,
+        )
+        player_splash_hits = torch.sum(player_splash_damage > 0, dim=1)
+        doll_damage_total = direct_doll_total + total_doll_splash_damage
+        doll_armor_total = torch.sum(
+            torch.floor(direct_doll_damage * self.armor_save_fraction[:, None]),
+            dim=1,
+        ) + doll_armor_absorb_request
+        doll_hits = torch.sum(direct_doll_damage > 0, dim=1) + doll_splash_hits
         self_damage = (
-            torch.sum(player_splash_damage, dim=1) + direct_doll_total + total_doll_splash_damage
+            player_splash_total + doll_damage_total
         )
 
         player_fine_angle = self._doom_fine_angle(
@@ -5652,23 +5738,14 @@ class TorchDeathmatchEngine:
         self._apply_player_damage(
             self_damage,
             armor_absorb_request=(
-                torch.sum(
-                    torch.floor(player_splash_damage * self.armor_save_fraction[:, None]),
-                    dim=1,
-                )
-                + torch.sum(
-                    torch.floor(direct_doll_damage * self.armor_save_fraction[:, None]),
-                    dim=1,
-                )
-                + doll_armor_absorb_request
+                player_splash_armor_absorb_request + doll_armor_total
             ),
-            hits_taken_request=(
-                torch.sum(player_splash_damage > 0, dim=1)
-                + torch.sum(direct_doll_damage > 0, dim=1)
-                + torch.sum(doll_splash_damage > 0, dim=(1, 2))
-                if doll_count
-                else torch.sum(player_splash_damage > 0, dim=1)
-            ),
+            hits_taken_request=player_splash_hits,
+            taken_incoming=player_splash_total,
+            taken_armor_absorb_request=player_splash_armor_absorb_request,
+            credited_incoming=doll_damage_total,
+            credited_armor_absorb_request=doll_armor_total,
+            credited_hits_request=doll_hits,
         )
         reward = self._apply_enemy_damage(
             damage_by_enemy,
@@ -5793,7 +5870,14 @@ class TorchDeathmatchEngine:
         )
         self._apply_player_damage(
             torch.where(hits_doll, damage, torch.zeros_like(damage)),
-            hits_taken_request=hits_doll,
+            hits_taken_request=torch.zeros_like(hits_doll),
+            taken_incoming=torch.zeros_like(damage),
+            credited_incoming=torch.where(
+                hits_doll,
+                damage,
+                torch.zeros_like(damage),
+            ),
+            credited_hits_request=hits_doll,
         )
         kickback = torch.where(
             weapon == 1,
@@ -6346,7 +6430,14 @@ class TorchDeathmatchEngine:
                 torch.floor(damage_by_doll * self.armor_save_fraction[:, None]),
                 dim=1,
             ),
-            hits_taken_request=torch.sum(damage_by_doll > 0, dim=1),
+            hits_taken_request=torch.zeros_like(self.player_hits_taken),
+            taken_incoming=torch.zeros_like(self.health),
+            credited_incoming=torch.sum(damage_by_doll, dim=1),
+            credited_armor_absorb_request=torch.sum(
+                torch.floor(damage_by_doll * self.armor_save_fraction[:, None]),
+                dim=1,
+            ),
+            credited_hits_request=torch.sum(damage_by_doll > 0, dim=1),
         )
         thrust_x, thrust_y = self._enemy_damage_thrust_components(
             damage_by_enemy,
@@ -7573,6 +7664,11 @@ class TorchDeathmatchEngine:
             torch.zeros_like(damage),
         )
         adjusted_player_damage = self._skill_adjust_player_damage(damage_by_projectile)
+        adjusted_actual_player_damage = torch.where(
+            player_impact,
+            adjusted_player_damage,
+            torch.zeros_like(adjusted_player_damage),
+        )
         incoming = torch.sum(adjusted_player_damage, dim=1)
         damaging_slot = torch.argmax(
             adjusted_player_damage,
@@ -7599,7 +7695,14 @@ class TorchDeathmatchEngine:
             thrust_x_fixed=torch.sum(thrust_x_by_projectile, dim=1),
             thrust_y_fixed=torch.sum(thrust_y_by_projectile, dim=1),
             armor_absorb_request=armor_absorb_request,
-            hits_taken_request=torch.sum(adjusted_player_damage > 0, dim=1),
+            hits_taken_request=torch.sum(adjusted_actual_player_damage > 0, dim=1),
+            taken_incoming=torch.sum(adjusted_actual_player_damage, dim=1),
+            taken_armor_absorb_request=torch.sum(
+                torch.floor(
+                    adjusted_actual_player_damage * self.armor_save_fraction[:, None]
+                ),
+                dim=1,
+            ),
             damage_scale=self._wall_contact_enemy_damage_scale(),
             skill_adjusted=True,
         )
@@ -8358,6 +8461,19 @@ class TorchDeathmatchEngine:
             torch.floor(adjusted_hitscan_player_damage * self.armor_save_fraction[:, None, None]),
             dim=(1, 2),
         )
+        taken_incoming = torch.sum(adjusted_direct_player_damage, dim=1) + torch.sum(
+            adjusted_hitscan_actual_player_damage,
+            dim=(1, 2),
+        )
+        taken_armor_absorb_request = torch.sum(
+            torch.floor(adjusted_direct_player_damage * self.armor_save_fraction[:, None]),
+            dim=1,
+        ) + torch.sum(
+            torch.floor(
+                adjusted_hitscan_actual_player_damage * self.armor_save_fraction[:, None, None]
+            ),
+            dim=(1, 2),
+        )
         row = torch.arange(self.num_envs, device=self.device)
         self._apply_player_damage(
             incoming,
@@ -8369,7 +8485,9 @@ class TorchDeathmatchEngine:
             + torch.sum(hitscan_thrust_y, dim=(1, 2)),
             armor_absorb_request=armor_absorb_request,
             hits_taken_request=torch.sum(adjusted_direct_player_damage > 0, dim=1)
-            + torch.sum(adjusted_hitscan_player_damage > 0, dim=(1, 2)),
+            + torch.sum(adjusted_hitscan_actual_player_damage > 0, dim=(1, 2)),
+            taken_incoming=taken_incoming,
+            taken_armor_absorb_request=taken_armor_absorb_request,
             damage_scale=self._wall_contact_enemy_damage_scale(),
             skill_adjusted=True,
         )

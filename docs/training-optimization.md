@@ -210,3 +210,48 @@ experimental result, and under
 and
 `/home/tsilva/gradoom-runs/20260813-parity-killcount-standardconv-lr1e6-resume8m`
 for the unmodified milestone on Beast-3.
+
+## Actor-slide and damage-diagnostic parity follow-up
+
+A 2026-08-14 mechanics follow-up matched Doom's actor-blocked player movement
+fallback: when diagonal movement is blocked, the engine now attempts the y-only
+move before the x-only move. In a controlled Chaingunner-forward oracle this
+raised GraDOOM player displacement from 314.71 to 406.22 map units versus
+410.08 in ViZDoom, while mean health damage fell from 23.875 to 15.844 versus
+14.641. The fixed 100-episode seed-10000 evaluation of the retained unmodified
+checkpoint then scored 25.67 mean kills, 19.5 median, and 63 maximum in
+GraDOOM.
+
+The same investigation found a diagnostics-only mismatch around voodoo dolls.
+ViZDoom records incoming `HITS_TAKEN` and `DAMAGE_TAKEN` only when the damaged
+actor is the real player body. Damage to a health-sharing voodoo doll is not
+incoming damage; if the real player caused it, it is instead outgoing
+`HITCOUNT` and `DAMAGECOUNT`. GraDOOM now follows those categories while
+preserving the existing shared health, armor, thrust, and gameplay effects.
+Replaying the same 100 open-loop ViZDoom action traces before and after the
+change reproduced kills, returns, episode lengths, and termination rates
+exactly, while mean reported incoming damage fell from 112.14 to 92.14 and
+mean incoming hits from 27.35 to 24.46. These traces use independent stochastic
+monster streams and are a diagnostics check, not a policy-quality gate.
+
+A bounded unmodified refinement initialized from the retained checkpoint and
+used 2,048 environments x 16 steps, batch size 4,096, two epochs, learning rate
+1e-6, a frozen standard Nature encoder, kill-count reward, frame skip 2, Doom
+skill 1, and wall damage scale 1.0. It executed 8,028,160 samples in 450.95
+seconds end to end and sustained a median 21,412 steady-state transitions/s.
+The GradLab-compatible rolling-100 metric peaked at 43.64 kills at step
+4,325,376 but ended at 21.93. A fixed balanced 100-episode seed-10000 gate
+scored only **24.69 mean kills** in GraDOOM (median 19.5, maximum 63), versus
+**36.40 mean kills** in zero-shot ViZDoom (median 36, maximum 75). The apparent
+greater-than-30 training peak was therefore a synchronized-completion cohort,
+not a fixed-grid quality breakthrough; this checkpoint is not selected over
+the 25.67-mean parent.
+
+The run and comparable PPO diagnostics are in W&B run `jxga8pbb` under
+`tsilva/VizdoomDeathmatch-v1` with the `env_provider:gradoom` tag. Its final
+checkpoint SHA-256 is
+`1fbd6885a516ff2a3afebde5c42e914b65cc7d115b65419893077e66b4b793ba`,
+and the retained local evidence is under
+`/home/tsilva/gradoom-runs/20260814-actor-slide-refine-killcount-lr1e6-8m-seed1597`.
+The unmodified fixed-grid greater-than-30 and bidirectional transfer goals
+remain unmet.

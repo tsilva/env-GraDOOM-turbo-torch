@@ -401,6 +401,10 @@ def test_voodoo_doll_hits_damage_shared_player_health(square_scenario) -> None:
 
     assert reward.tolist() == [0.0, 0.0]
     assert torch.all(engine.health < 100)
+    assert engine.player_hits_taken.tolist() == [0, 0]
+    assert engine.player_damage_taken.tolist() == [0.0, 0.0]
+    assert torch.all(engine.player_hitcount > 0)
+    assert torch.all(engine.player_damagecount > 0)
 
 
 def test_projectile_hit_damages_shared_health_through_voodoo_doll(
@@ -422,6 +426,10 @@ def test_projectile_hit_damages_shared_health_through_voodoo_doll(
     engine._projectile_tick(torch.ones(2, dtype=torch.bool))
 
     assert engine.health.tolist() == [70.0, 85.0]
+    assert engine.player_hits_taken.tolist() == [0, 0]
+    assert engine.player_damage_taken.tolist() == [0.0, 0.0]
+    assert engine.player_hitcount.tolist() == [1, 1]
+    assert engine.player_damagecount.tolist() == [30.0, 15.0]
     assert not torch.any(engine.projectile_alive[:, 0])
     assert engine.projectile_impact_tics[:, 0].tolist() == [20, 20]
     # Voodoo dolls share health and armor, but not the camera body's momentum.
@@ -484,6 +492,8 @@ def test_enemy_projectile_hits_voodoo_doll_without_moving_player(
     engine._enemy_projectile_tick(active)
 
     assert engine.health.tolist() == [52.0, 76.0]
+    assert engine.player_hits_taken.tolist() == [0, 0]
+    assert engine.player_damage_taken.tolist() == [0.0, 0.0]
     assert not torch.any(engine.enemy_projectile_alive[:, 0])
     assert engine.enemy_projectile_impact_tics[:, 0].tolist() == [18, 18]
     assert torch.equal(engine.momentum_x, torch.zeros(2))
@@ -917,6 +927,8 @@ def test_monster_hitscan_hits_intervening_voodoo_doll_without_player_thrust(
     # The first static Player 1 body at (-128, -128) intercepts both spread
     # bullets before they can reach the controlled body at (-200, -128).
     assert engine.health.tolist() == [91.0, 94.0]
+    assert engine.player_hits_taken.tolist() == [0, 0]
+    assert engine.player_damage_taken.tolist() == [0.0, 0.0]
     assert torch.equal(engine.momentum_x, torch.zeros(2))
     assert torch.equal(engine.momentum_y, torch.zeros(2))
     assert engine.enemy_attack_phase[:, 0].tolist() == [2, 2]
