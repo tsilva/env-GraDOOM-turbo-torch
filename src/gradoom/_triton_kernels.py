@@ -2250,6 +2250,7 @@ def _render_fast_native_sprites_kernel(
     actor_alive,
     actor_sprite,
     actor_fullbright,
+    actor_additive_style,
     player_x,
     player_y,
     player_angle,
@@ -2269,6 +2270,8 @@ def _render_fast_native_sprites_kernel(
     sector_lights,
     flash_light,
     colormap,
+    projectile_additive_luts,
+    sprite_translucent_lut,
     observation_height: tl.constexpr,
     observation_width: tl.constexpr,
     actor_count: tl.constexpr,
@@ -2394,9 +2397,29 @@ def _render_fast_native_sprites_kernel(
         other=float("inf"),
     )
     prior = tl.load(frame + frame_index, mask=valid_pixel, other=0)
+    additive_style = tl.load(actor_additive_style + selected_index).to(tl.int64)
+    clamped_additive_style = tl.maximum(0, tl.minimum(additive_style, 1))
+    effect_mask = inside & opaque & visible_against_scene
+    additive_index = clamped_additive_style * 256 * 256 + prior.to(tl.int64) * 256 + lit_index
+    additive_pixel = tl.load(
+        projectile_additive_luts + additive_index,
+        mask=effect_mask & (additive_style >= 0),
+        other=0,
+    ).to(tl.uint8)
+    translucent_index = prior.to(tl.int64) * 256 + lit_index
+    translucent_pixel = tl.load(
+        sprite_translucent_lut + translucent_index,
+        mask=effect_mask & (additive_style == -2),
+        other=0,
+    ).to(tl.uint8)
+    rendered_pixel = tl.where(
+        additive_style == -2,
+        translucent_pixel,
+        tl.where(additive_style >= 0, additive_pixel, lit_index),
+    )
     tl.store(
         frame + frame_index,
-        tl.where(inside & opaque & visible_against_scene, lit_index, prior),
+        tl.where(effect_mask, rendered_pixel, prior),
         mask=valid_pixel,
     )
 
@@ -2416,6 +2439,7 @@ def render_fast_native_sprites_(
     actor_alive: torch.Tensor,
     actor_sprite: torch.Tensor,
     actor_fullbright: torch.Tensor,
+    actor_additive_style: torch.Tensor,
     player_x: torch.Tensor,
     player_y: torch.Tensor,
     player_angle: torch.Tensor,
@@ -2432,6 +2456,8 @@ def render_fast_native_sprites_(
     sector_lights: torch.Tensor,
     flash_light: torch.Tensor,
     colormap: torch.Tensor,
+    projectile_additive_luts: torch.Tensor,
+    sprite_translucent_lut: torch.Tensor,
 ) -> None:
     """Composite fixed-shape native indexed actors in one kernel launch."""
 
@@ -2477,6 +2503,7 @@ def render_fast_native_sprites_(
             actor_alive,
             actor_sprite,
             actor_fullbright,
+            actor_additive_style,
             player_x,
             player_y,
             player_angle,
@@ -2496,6 +2523,8 @@ def render_fast_native_sprites_(
             sector_lights,
             flash_light,
             colormap,
+            projectile_additive_luts,
+            sprite_translucent_lut,
             observation_height,
             observation_width,
             actor_count,
@@ -2522,6 +2551,7 @@ def _render_fast_native_sprites_fake(
     actor_alive: torch.Tensor,
     actor_sprite: torch.Tensor,
     actor_fullbright: torch.Tensor,
+    actor_additive_style: torch.Tensor,
     player_x: torch.Tensor,
     player_y: torch.Tensor,
     player_angle: torch.Tensor,
@@ -2538,6 +2568,8 @@ def _render_fast_native_sprites_fake(
     sector_lights: torch.Tensor,
     flash_light: torch.Tensor,
     colormap: torch.Tensor,
+    projectile_additive_luts: torch.Tensor,
+    sprite_translucent_lut: torch.Tensor,
 ) -> None:
     del (
         frame,
@@ -2549,6 +2581,7 @@ def _render_fast_native_sprites_fake(
         actor_alive,
         actor_sprite,
         actor_fullbright,
+        actor_additive_style,
         player_x,
         player_y,
         player_angle,
@@ -2565,6 +2598,8 @@ def _render_fast_native_sprites_fake(
         sector_lights,
         flash_light,
         colormap,
+        projectile_additive_luts,
+        sprite_translucent_lut,
     )
 
 
@@ -6006,6 +6041,7 @@ def _sight_blocked_point(
     origin_x,
     origin_y,
     sight_z,
+    aim_z,
     target_x,
     target_y,
     target_z,
@@ -6084,16 +6120,38 @@ def _sight_blocked_point(
         (opening_top - sight_z) / safe_fraction,
         float("inf"),
     )
-    bottom_slope = tl.maximum(
+    sight_bottom_slope = tl.maximum(
         target_z - sight_z,
         tl.max(bottom_clip, axis=0),
     )
-    top_slope = tl.minimum(
+    sight_top_slope = tl.minimum(
         target_z + target_height - sight_z,
         tl.min(top_clip, axis=0),
     )
+    aim_bottom_clip = tl.where(
+        portal,
+        (opening_bottom - aim_z) / safe_fraction,
+        -float("inf"),
+    )
+    aim_top_clip = tl.where(
+        portal,
+        (opening_top - aim_z) / safe_fraction,
+        float("inf"),
+    )
+    aim_bottom_slope = tl.maximum(
+        target_z - aim_z,
+        tl.max(aim_bottom_clip, axis=0),
+    )
+    aim_top_slope = tl.minimum(
+        target_z + target_height - aim_z,
+        tl.min(aim_top_clip, axis=0),
+    )
     solid_blocked = tl.max(solid.to(tl.int32), axis=0) != 0
-    return solid_blocked | (top_slope <= bottom_slope)
+    return (
+        solid_blocked | (sight_top_slope <= sight_bottom_slope),
+        aim_bottom_slope,
+        aim_top_slope,
+    )
 
 
 @triton.jit
@@ -6126,9 +6184,10 @@ def _enemy_sight_blocked_kernel(
         actor_slot,
         target_slots - 1,
     )
-    blocked = _sight_blocked_point(
+    blocked, _bottom_slope, _top_slope = _sight_blocked_point(
         tl.load(origin_x + actor_index),
         tl.load(origin_y + actor_index),
+        tl.load(sight_z + actor_index),
         tl.load(sight_z + actor_index),
         tl.load(target_x + target_index),
         tl.load(target_y + target_index),
@@ -6142,6 +6201,62 @@ def _enemy_sight_blocked_kernel(
         block_walls,
     )
     tl.store(blocked_output + actor_index, blocked)
+
+
+@triton.jit
+def _enemy_sight_opening_kernel(
+    requested,
+    origin_x,
+    origin_y,
+    sight_z,
+    aim_z,
+    target_x,
+    target_y,
+    target_z,
+    target_height,
+    portal_walls,
+    portal_wall_sectors,
+    portal_wall_blocks_sight,
+    sector_heights,
+    blocked_output,
+    bottom_slope_output,
+    top_slope_output,
+    enemy_slots: tl.constexpr,
+    target_slots: tl.constexpr,
+    wall_count: tl.constexpr,
+    block_walls: tl.constexpr,
+):
+    actor_index = tl.program_id(0)
+    tl.store(blocked_output + actor_index, 1)
+    tl.store(bottom_slope_output + actor_index, 0.0)
+    tl.store(top_slope_output + actor_index, 0.0)
+    if not tl.load(requested + actor_index):
+        return
+    env_index = actor_index // enemy_slots
+    actor_slot = actor_index - env_index * enemy_slots
+    target_index = env_index * target_slots + tl.minimum(
+        actor_slot,
+        target_slots - 1,
+    )
+    blocked, bottom_slope, top_slope = _sight_blocked_point(
+        tl.load(origin_x + actor_index),
+        tl.load(origin_y + actor_index),
+        tl.load(sight_z + actor_index),
+        tl.load(aim_z + actor_index),
+        tl.load(target_x + target_index),
+        tl.load(target_y + target_index),
+        tl.load(target_z + target_index),
+        tl.load(target_height + target_index),
+        portal_walls,
+        portal_wall_sectors,
+        portal_wall_blocks_sight,
+        sector_heights,
+        wall_count,
+        block_walls,
+    )
+    tl.store(blocked_output + actor_index, blocked)
+    tl.store(bottom_slope_output + actor_index, bottom_slope)
+    tl.store(top_slope_output + actor_index, top_slope)
 
 
 @torch.library.custom_op(
@@ -6222,6 +6337,93 @@ def _enemy_sight_blocked_fake(
         sector_heights,
     )
     return torch.empty_like(requested)
+
+
+@torch.library.custom_op(
+    "gradoom::enemy_sight_opening",
+    mutates_args=(),
+    device_types="cuda",
+)
+def enemy_sight_opening(
+    requested: torch.Tensor,
+    origin_x: torch.Tensor,
+    origin_y: torch.Tensor,
+    sight_z: torch.Tensor,
+    aim_z: torch.Tensor,
+    target_x: torch.Tensor,
+    target_y: torch.Tensor,
+    target_z: torch.Tensor,
+    target_height: torch.Tensor,
+    portal_walls: torch.Tensor,
+    portal_wall_sectors: torch.Tensor,
+    portal_wall_blocks_sight: torch.Tensor,
+    sector_heights: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return blockage and the portal-clipped target Z interval on CUDA."""
+
+    blocked = torch.empty_like(requested)
+    bottom_slope = torch.empty_like(origin_x)
+    top_slope = torch.empty_like(origin_x)
+    enemy_slots = origin_x.shape[1]
+    target_slots = target_x.numel() // origin_x.shape[0]
+    wall_count = portal_walls.shape[0]
+    grid = (requested.numel(),)
+    torch.library.wrap_triton(_enemy_sight_opening_kernel)[grid](
+        requested,
+        origin_x,
+        origin_y,
+        sight_z,
+        aim_z,
+        target_x,
+        target_y,
+        target_z,
+        target_height,
+        portal_walls,
+        portal_wall_sectors,
+        portal_wall_blocks_sight,
+        sector_heights,
+        blocked,
+        bottom_slope,
+        top_slope,
+        enemy_slots,
+        target_slots,
+        wall_count,
+        triton.next_power_of_2(wall_count),
+        num_warps=8,
+    )
+    return blocked, bottom_slope, top_slope
+
+
+@enemy_sight_opening.register_fake
+def _enemy_sight_opening_fake(
+    requested: torch.Tensor,
+    origin_x: torch.Tensor,
+    origin_y: torch.Tensor,
+    sight_z: torch.Tensor,
+    aim_z: torch.Tensor,
+    target_x: torch.Tensor,
+    target_y: torch.Tensor,
+    target_z: torch.Tensor,
+    target_height: torch.Tensor,
+    portal_walls: torch.Tensor,
+    portal_wall_sectors: torch.Tensor,
+    portal_wall_blocks_sight: torch.Tensor,
+    sector_heights: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    del (
+        origin_y,
+        sight_z,
+        aim_z,
+        target_x,
+        target_y,
+        target_z,
+        target_height,
+        portal_walls,
+        portal_wall_sectors,
+        portal_wall_blocks_sight,
+        sector_heights,
+    )
+    return torch.empty_like(requested), torch.empty_like(origin_x), torch.empty_like(origin_x)
 
 
 @triton.jit

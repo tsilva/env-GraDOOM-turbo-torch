@@ -870,7 +870,46 @@ def test_monster_reacquires_player_after_infighting_target_dies(
 
     assert engine.enemy_target_slot[:, 1].tolist() == [-1, -1]
     assert engine.enemy_target_threshold[:, 1].tolist() == [0, 0]
-    assert torch.all(engine.enemy_x[:, 1] > 100)
+    assert engine.enemy_x[:, 1].tolist() == [100.0, 100.0]
+
+
+def test_monster_keeps_dead_target_until_chaingun_refire_exits(square_scenario) -> None:
+    engine = _engine(square_scenario)
+    engine.x.fill_(200)
+    engine.y.zero_()
+    engine.enemy_alive.zero_()
+    engine.enemy_death_type[:, 0] = 0
+    engine.enemy_death_tics[:, 0] = 20
+    engine.enemy_x[:, 0] = 100
+    engine.enemy_y[:, 0] = 0
+    engine.enemy_x[:, 1] = 0
+    engine.enemy_y[:, 1] = 0
+    engine.enemy_z[:, 1] = 0
+    engine.enemy_type[:, 1] = 3
+    engine.enemy_health[:, 1] = 70
+    engine.enemy_alive[:, 1] = True
+    engine.enemy_target_slot[:, 1] = 0
+    engine.enemy_target_threshold[:, 1] = 50
+    engine.enemy_attack_phase[:, 1] = 2
+    engine.enemy_cooldown[:, 1] = 1
+    engine.enemy_move_cooldown[:, 1] = 0
+
+    engine._enemy_tick()
+
+    assert engine.enemy_target_slot[:, 1].tolist() == [0, 0]
+    assert engine.enemy_attack_phase[:, 1].tolist() == [3, 3]
+
+    engine.enemy_cooldown[:, 1] = 1
+    engine._enemy_chaingun_refire_decision = lambda candidates: torch.zeros_like(candidates)
+    engine._enemy_tick()
+
+    assert engine.enemy_target_slot[:, 1].tolist() == [0, 0]
+    assert engine.enemy_attack_phase[:, 1].tolist() == [0, 0]
+
+    engine._enemy_tick()
+
+    assert engine.enemy_target_slot[:, 1].tolist() == [-1, -1]
+    assert engine.enemy_x[:, 1].tolist() == [0.0, 0.0]
 
 
 def test_enemy_projectile_only_passes_corpse_after_no_block_frame(
@@ -2675,6 +2714,67 @@ def test_height_transition_portal_clips_sight_from_deep_pit(square_scenario) -> 
         torch.full((2, 1), 56.0),
     )
     assert rocket_blocked[:, 0, 0].tolist() == [True, False]
+
+
+def test_monster_hitscan_autoaim_uses_portal_clipped_target_window(square_scenario) -> None:
+    portal = np.asarray([(0, -256, 0, 256)], dtype=np.float32)
+    walls = np.concatenate((square_scenario.wall_segments, portal), axis=0)
+    scenario = replace(
+        square_scenario,
+        wall_segments=walls,
+        wall_texture_ids=np.zeros(5, dtype=np.int32),
+        wall_texture_offsets=np.zeros((5, 2), dtype=np.float32),
+        wall_side_texture_ids=np.concatenate(
+            (
+                np.zeros((5, 1, 1), dtype=np.int32),
+                np.full((5, 1, 1), -1, dtype=np.int32),
+            ),
+            axis=1,
+        ).repeat(3, axis=2),
+        wall_side_texture_offsets=np.zeros((5, 2, 2), dtype=np.float32),
+        wall_sectors=np.asarray(
+            [[0, -1], [0, -1], [1, -1], [1, -1], [0, 1]],
+            dtype=np.int32,
+        ),
+        sector_edge_mask=np.ones((2, 5), dtype=np.bool_),
+        sector_heights=np.asarray([(-128, 128), (0, 128)], dtype=np.float32),
+        sector_lights=np.asarray([192, 192], dtype=np.int16),
+        sector_floor_texture_ids=np.zeros(2, dtype=np.int32),
+        sector_ceiling_texture_ids=np.zeros(2, dtype=np.int32),
+    )
+    engine = _engine(scenario)
+    engine.x.fill_(-64)
+    engine.y.zero_()
+    engine.z.fill_(-80)
+    engine._x_fixed.fill_(-64 * 65536)
+    engine._y_fixed.zero_()
+    engine.enemy_alive.zero_()
+    engine.enemy_x[:, 0] = 64
+    engine.enemy_y[:, 0] = 0
+    engine.enemy_z[:, 0] = 0
+    engine._enemy_x_fixed[:, 0] = 64 * 65536
+    engine._enemy_y_fixed[:, 0] = 0
+    engine.enemy_type[:, 0] = 3
+    engine.enemy_health[:, 0] = 70
+    engine.enemy_alive[:, 0] = True
+    engine.enemy_target_slot[:, 0] = -1
+    engine.enemy_attack_phase[:, 0] = 1
+    engine.enemy_cooldown[:, 0] = 1
+
+    def centered_chaingun_pellet(
+        _enemy_type: torch.Tensor,
+        fires: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        damage = torch.zeros((*fires.shape, 3), dtype=torch.float32)
+        damage[:, :, 0] = fires.to(torch.float32) * 3.0
+        return damage, torch.zeros_like(damage, dtype=torch.int64)
+
+    engine._enemy_hitscan_rolls = centered_chaingun_pellet
+    engine._enemy_tick()
+
+    # The raw midpoint ray strikes the high side of the portal floor. Doom
+    # clips the target interval to the opening and aims at its visible portion.
+    assert torch.all(engine.health < 100)
 
 
 def test_reference_monster_damage_distributions(square_scenario) -> None:

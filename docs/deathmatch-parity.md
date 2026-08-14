@@ -74,6 +74,46 @@ The retained aggregate evidence is under `/home/tsilva/gradoom-runs` in
 `20260813-source-layer16-sprite1-depth-eval100-n100-seed10000`, and
 `20260813-reference-frozenenc-sidedsign-seed789-20m`.
 
+## 2026-08-14 bug-first parity milestone
+
+Two production parity defects were isolated and corrected without changing
+damage scales, rewards, episode rules, or policy inputs:
+
+- The fast native renderer omitted every dynamic combat effect. It now renders
+  mutually exclusive player and enemy projectiles, impacts and explosions,
+  teleport fog, and hitscan puffs with their reference additive or translucent
+  composition styles. In an exact-weapon policy-observation comparison, mean
+  absolute error fell from 4.134 to 2.678/255, action-distribution KL divergence
+  fell from 0.225 to 0.163, and action argmax agreement rose from 66.1% to
+  71.1%. A raw plasma-fire comparison with the weapon hidden reaches
+  0.382/255 mean absolute error and 0.9885 correlation over 16 frames.
+- Monster hitscan autoaim used the raw target midpoint instead of the target
+  vertical interval clipped through portal openings. The corrected CUDA path
+  returns the clipped aim interval and preserves ViZDoom attack/chase target
+  state timing. Across 1,024 aligned Zombieman/ChaingunGuy infighting trials,
+  GraDOOM versus ViZDoom records 4.650 versus 4.558 mean damage, 1.082 versus
+  1.104 mean hits, 61.82% versus 62.01% kill observation, and 32.06 versus
+  32.21 mean first-kill decision. Post-kill damage, previously exactly zero in
+  GraDOOM, is now 6.250 versus 5.872.
+
+The untouched converted reference policy now scores 25.23 mean kills over 100
+fixed-seed GraDOOM episodes, up from 23.36 immediately before these fixes. The
+same policy scores 35.11 in ViZDoom, so GraDOOM retains 71.9% of the source
+mean. This confirms that the fixes improve real policy transfer, but it remains
+below both the 30-kill training target and the 90% release gate and is not
+certification. The combined corrections sustain 22,639 median environment
+transitions per second at 2,048 environments on the reference RTX 4090
+benchmark, within 1.7% of the effects-disabled implementation.
+
+Reproducible evidence is retained in:
+
+- `/home/tsilva/gradoom-runs/20260814-effect-ablation-u300-n32-seed10000.json`
+- `/home/tsilva/gradoom-runs/20260814-optimized-correct-effect-styles-exact-weapon-u300-n32-seed10000.json`
+- `/home/tsilva/gradoom-runs/20260814-raw-plasma-fire-hide-weapon-seed1337/`
+- `/home/tsilva/gradoom-runs/20260814-infighting-zombie-chaingun1024-portal-autoaim-target-state-fix-seed10000.json`
+- `/home/tsilva/gradoom-runs/20260814-summoned-zombieman1024-noop-d44-autoaim-state-fix-seed10000.json`
+- `/home/tsilva/gradoom-runs/20260814-render-effects-autoaim-state-reference-eval100-seed10000.jsonl`
+
 ## Release gates
 
 1. Differential micro-scenarios pass for all deterministic mechanics.

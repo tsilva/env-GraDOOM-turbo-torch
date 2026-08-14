@@ -287,6 +287,14 @@ def _initialize_monsters(
     slot = torch.zeros(engine.num_envs, device=engine.device, dtype=torch.int64)
     engine._initialize_enemy_spawn_cuda(enemy_type, spawn, slot, x, y, angle)
     rows = torch.arange(engine.num_envs, device=engine.device)
+    # The reference snapshot is captured after the summon command has already
+    # advanced two tics.  GraDOOM's spawn helper stores the first A_Look
+    # transition as a check-before-decrement countdown, so one less than the
+    # observed DECORATE state tic count represents the same next action tic.
+    engine.enemy_move_cooldown[rows, slot] = torch.clamp_min(
+        engine.enemy_move_cooldown[rows, slot] - 1,
+        0,
+    )
     sector = engine._sector_at(x, y)
     floor = engine.map.sector_heights[sector, 0]
     ceiling = engine.map.sector_heights[sector, 1]
@@ -501,7 +509,7 @@ def main() -> int:
         "episodes": args.episodes,
         "frame_skip": args.frame_skip,
         "results": results,
-        "schema": "gradoom.summoned-monster-outcomes.v3",
+        "schema": "gradoom.summoned-monster-outcomes.v4",
         "seed": args.seed,
     }
     serialized = json.dumps(result, indent=2, sort_keys=True)

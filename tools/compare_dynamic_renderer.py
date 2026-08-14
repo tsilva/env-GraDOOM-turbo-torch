@@ -11,12 +11,19 @@ from __future__ import annotations
 import argparse
 import json
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
-from compare_behavior import PROGRAMS, _action_index, _action_matrix, _align_pose
+from compare_behavior import (
+    PROGRAMS,
+    _action_index,
+    _action_matrix,
+    _align_give_all,
+    _align_pose,
+)
 from compare_renderer import _match_reference_mugshot
 
 from gradoom.engine import TorchDeathmatchEngine
@@ -32,6 +39,11 @@ NON_FIRING_PROGRAMS = (
     "turn-left",
     "turn-right",
 )
+PROJECTILE_PROGRAM_WEAPONS = {
+    "rocket-fire": "SELECT_WEAPON5",
+    "plasma-fire": "SELECT_WEAPON6",
+}
+DYNAMIC_PROGRAMS = PROGRAMS + tuple(PROJECTILE_PROGRAM_WEAPONS)
 ITEM_LABEL_CATEGORIES = frozenset(("Ammo", "Armor", "Health", "Powerup", "Weapon"))
 
 
@@ -65,6 +77,30 @@ def _write_comparison(
     )
 
 
+def _render_without_weapon(engine: TorchDeathmatchEngine) -> torch.Tensor:
+    """Render the raw full-HUD oracle path while ablating only the psprite."""
+
+    (
+        frame,
+        scene_depth,
+        sprite_clip_depth,
+        sprite_clip_wall,
+        wall_distance,
+        blocking_wall,
+    ) = engine._render_native_background()
+    frame = engine._native_render_hitscan_decals(frame, engine.view_z, scene_depth)
+    frame = engine._native_render_sprites(
+        frame,
+        wall_distance,
+        engine.view_z,
+        sprite_clip_depth,
+        sprite_clip_wall,
+        blocking_wall,
+    )
+    indexed = torch.cat((frame, engine._native_render_hud()), dim=1)
+    return engine._native_indexed_to_rgb(indexed)
+
+
 def _run_case(
     *,
     config: Path,
@@ -75,6 +111,7 @@ def _run_case(
     sample_steps: tuple[int, ...],
     frame_skip: int,
     compare_item_occlusion: bool,
+    hide_weapon: bool,
 ) -> tuple[list[dict[str, Any]], list[tuple[float, dict[str, Any], torch.Tensor, torch.Tensor]]]:
     try:
         import vizdoom as vzd
@@ -84,11 +121,17 @@ def _run_case(
         ) from exc
 
     game = vzd.DoomGame()
+    config_directory = tempfile.TemporaryDirectory(prefix="gradoom-vizdoom-renderer-")
     game.load_config(str(config))
+    game.set_doom_config_path(str(Path(config_directory.name) / "engine.ini"))
+    game.set_window_visible(False)
+    game.set_sound_enabled(False)
+    game.set_audio_buffer_enabled(False)
     game.set_doom_game_path(str(iwad))
     game.set_screen_resolution(vzd.ScreenResolution.RES_320X240)
     game.set_screen_format(vzd.ScreenFormat.RGB24)
     game.set_render_hud(True)
+    game.set_render_weapon(not hide_weapon)
     game.set_labels_buffer_enabled(compare_item_occlusion)
     variables = (
         vzd.GameVariable.POSITION_X,
@@ -104,7 +147,10 @@ def _run_case(
     game.init()
     try:
         game.new_episode()
-        actions = _action_matrix(tuple(value.name for value in game.get_available_buttons()))
+        available_buttons = tuple(value.name for value in game.get_available_buttons())
+        actions = _action_matrix(available_buttons)
+        if program in PROJECTILE_PROGRAM_WEAPONS:
+            game.send_game_command("give all")
         engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([seed]))
         initial = {
             variable.name: float(game.get_game_variable(variable))
@@ -127,7 +173,11 @@ def _run_case(
                     np.asarray(state.screen_buffer).copy()
                 ).to(torch.float32)
                 mugshot = _match_reference_mugshot(engine, reference)
-                actual = engine.render_native_frame(include_hud=True)[0].to(torch.float32)
+                actual = (
+                    _render_without_weapon(engine)
+                    if hide_weapon
+                    else engine.render_native_frame(include_hud=True)
+                )[0].to(torch.float32)
                 absolute_error = torch.abs(reference - actual)
                 flattened = torch.stack((reference.flatten(), actual.flatten()))
                 record = {
@@ -210,12 +260,26 @@ def _run_case(
                 )
             if step == last_step:
                 break
-            action_index = _action_index(program, step)
-            game.make_action(actions[action_index], frame_skip)
-            engine.step(torch.tensor(actions[action_index], dtype=torch.bool))
+            if program in PROJECTILE_PROGRAM_WEAPONS:
+                if step == 0:
+                    action = actions[0]
+                elif step == 1:
+                    action = [0.0] * len(available_buttons)
+                    action[
+                        available_buttons.index(PROJECTILE_PROGRAM_WEAPONS[program])
+                    ] = 1.0
+                else:
+                    action = actions[1]
+            else:
+                action = actions[_action_index(program, step)]
+            game.make_action(action, frame_skip)
+            engine.step(torch.tensor(action, dtype=torch.bool))
+            if program in PROJECTILE_PROGRAM_WEAPONS and step == 0:
+                _align_give_all(engine)
         return records, ranked
     finally:
         game.close()
+        config_directory.cleanup()
 
 
 def main() -> int:
@@ -226,7 +290,7 @@ def main() -> int:
     parser.add_argument("--seeds", type=int, nargs="+", default=(123, 456, 789, 1_337))
     parser.add_argument(
         "--programs",
-        choices=PROGRAMS,
+        choices=DYNAMIC_PROGRAMS,
         nargs="+",
         default=NON_FIRING_PROGRAMS,
     )
@@ -250,8 +314,14 @@ def main() -> int:
         action="store_true",
         help="compare isolated GraDOOM item pixels with ViZDoom's label buffer",
     )
+    parser.add_argument(
+        "--hide-weapon",
+        action="store_true",
+        help="ablate the first-person weapon in both renderers while retaining the full HUD",
+    )
     parser.add_argument("--top-k", type=int, default=8)
     parser.add_argument("--output-dir", type=Path)
+    parser.add_argument("--output", type=Path)
     args = parser.parse_args()
 
     sample_steps = tuple(sorted(set(args.sample_steps)))
@@ -291,6 +361,7 @@ def main() -> int:
                 sample_steps=sample_steps,
                 frame_skip=args.frame_skip,
                 compare_item_occlusion=args.compare_item_occlusion,
+                hide_weapon=args.hide_weapon,
             )
             records.extend(case_records)
             ranked.extend(case_ranked)
@@ -319,6 +390,7 @@ def main() -> int:
     )
     result = {
         "frame_skip": args.frame_skip,
+        "first_person_weapon_hidden": args.hide_weapon,
         "mean_correlation": float(correlations.mean()),
         "mean_mae": float(errors.mean()),
         "median_correlation": float(np.median(correlations)),
@@ -326,7 +398,7 @@ def main() -> int:
         "programs": args.programs,
         "records": records,
         "sample_steps": sample_steps,
-        "schema": "gradoom.renderer-parity.dynamic-raw-rgb-hud.v1",
+        "schema": "gradoom.renderer-parity.dynamic-raw-rgb-hud.v2",
         "stochastic_phase_included": sample_steps[-1] * args.frame_skip >= 106,
         "stochastic_state_alignment": ["mugshot_face_index"],
         "top": [record for _mae, record, _reference, _actual in top],
@@ -362,7 +434,12 @@ def main() -> int:
                 record["item_reference_only_pixels"] for record in records
             ),
         }
-    print(json.dumps(result, sort_keys=True))
+    serialized = json.dumps(result, sort_keys=True)
+    if args.output is not None:
+        output = args.output.expanduser().resolve()
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(serialized + "\n")
+    print(serialized)
     return 0
 
 

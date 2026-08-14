@@ -2769,6 +2769,7 @@ def test_fast_native_sprite_respects_portal_surface_depth() -> None:
         torch.ones((1, 1), dtype=torch.bool, device=device),
         torch.zeros((1, 1), dtype=torch.int64, device=device),
         torch.ones((1, 1), dtype=torch.bool, device=device),
+        torch.full((1, 1), -1, dtype=torch.int64, device=device),
         torch.zeros(1, device=device),
         torch.zeros(1, device=device),
         torch.zeros(1, device=device),
@@ -2785,10 +2786,62 @@ def test_fast_native_sprite_respects_portal_surface_depth() -> None:
         torch.full((1,), 255, dtype=torch.int64, device=device),
         torch.zeros(1, dtype=torch.int64, device=device),
         identity_colormap,
+        torch.zeros((2, 256, 256), dtype=torch.uint8, device=device),
+        torch.zeros((256, 256), dtype=torch.uint8, device=device),
     )
 
     assert frame[0, 103, 160].item() == 20
     assert frame[0, 104, 160].item() == 7
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+def test_fast_native_sprite_applies_reference_render_styles() -> None:
+    from gradoom._triton_kernels import render_fast_native_sprites_
+
+    device = torch.device("cuda")
+    lanes = 4
+    frame = torch.full((lanes, 208, 320), 7, dtype=torch.uint8, device=device)
+    atlas = torch.full((1, 3, 3), 20, dtype=torch.uint8, device=device)
+    opaque = torch.ones_like(atlas, dtype=torch.bool)
+    identity_colormap = torch.arange(256, dtype=torch.uint8, device=device).repeat(32, 1)
+    additive_luts = torch.zeros((2, 256, 256), dtype=torch.uint8, device=device)
+    additive_luts[0, 7, 20] = 31
+    additive_luts[1, 7, 20] = 41
+    translucent_lut = torch.zeros((256, 256), dtype=torch.uint8, device=device)
+    translucent_lut[7, 20] = 51
+
+    render_fast_native_sprites_(
+        frame,
+        torch.full((lanes, 320), torch.inf, device=device),
+        torch.full_like(frame, torch.inf, dtype=torch.float32),
+        torch.full((lanes, 1), 64.0, device=device),
+        torch.zeros((lanes, 1), device=device),
+        torch.zeros((lanes, 1), device=device),
+        torch.ones((lanes, 1), dtype=torch.bool, device=device),
+        torch.zeros((lanes, 1), dtype=torch.int64, device=device),
+        torch.ones((lanes, 1), dtype=torch.bool, device=device),
+        torch.tensor([[-1], [0], [1], [-2]], dtype=torch.int64, device=device),
+        torch.zeros(lanes, device=device),
+        torch.zeros(lanes, device=device),
+        torch.zeros(lanes, device=device),
+        torch.zeros(lanes, device=device),
+        torch.full((lanes,), 104.0, device=device),
+        torch.full((1,), 3, dtype=torch.int32, device=device),
+        torch.full((1,), 3, dtype=torch.int32, device=device),
+        torch.ones(1, dtype=torch.int32, device=device),
+        torch.ones(1, dtype=torch.int32, device=device),
+        atlas,
+        opaque,
+        torch.zeros((1, 1), dtype=torch.int64, device=device),
+        torch.tensor([-1_000.0, -1_000.0, 2_000.0], device=device),
+        torch.full((1,), 255, dtype=torch.int64, device=device),
+        torch.zeros(lanes, dtype=torch.int64, device=device),
+        identity_colormap,
+        additive_luts,
+        translucent_lut,
+    )
+
+    assert frame[:, 103, 160].tolist() == [20, 31, 41, 51]
 
 
 def test_native_teleport_fog_uses_reference_animation_and_lifetime(square_scenario) -> None:
@@ -2837,6 +2890,80 @@ def test_native_teleport_fog_uses_reference_animation_and_lifetime(square_scenar
     assert center_pixel(60) == 12
     assert center_pixel(1) == 21
     assert center_pixel(0) == 0
+
+    engine.teleport_fog_tics[:, 0] = 66
+    (
+        _actor_x,
+        _actor_y,
+        _actor_z,
+        fast_actor_visible,
+        fast_actor_sprites,
+        fast_actor_fullbright,
+        fast_actor_additive_style,
+    ) = engine._fast_native_actor_state()
+    fog_start = (
+        engine.enemy_slots
+        + max(len(engine.map.player_starts) - 1, 0)
+        + engine.projectile_alive.shape[1]
+        + engine.enemy_projectile_alive.shape[1]
+    )
+    assert fast_actor_visible[0, fog_start]
+    assert fast_actor_sprites[0, fog_start] == engine.map.raw_teleport_fog_sprite_ids[1]
+    assert fast_actor_fullbright[0, fog_start]
+    assert fast_actor_additive_style[0, fog_start] == 1
+
+
+def test_fast_native_actor_state_includes_combat_effects(square_scenario) -> None:
+    engine = TorchDeathmatchEngine(
+        square_scenario,
+        1,
+        device=torch.device("cpu"),
+    )
+    engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([123]))
+    engine.projectile_alive[0, 0] = True
+    engine.projectile_type[0, 0] = 1
+    engine.projectile_age[0, 0] = 6
+    engine.projectile_x[0, 0] = engine.x[0] + 64
+    engine.projectile_y[0, 0] = engine.y[0]
+    engine.projectile_velocity_x[0, 0] = 1
+    engine.enemy_projectile_alive[0, 0] = True
+    engine.enemy_projectile_age[0, 0] = 4
+    engine.enemy_projectile_x[0, 0] = engine.x[0] + 64
+    engine.enemy_projectile_y[0, 0] = engine.y[0]
+    engine.enemy_projectile_velocity_x[0, 0] = 1
+    engine.teleport_fog_tics[0, 0] = 66
+    engine.hitscan_puff_tics[0, 0] = 13
+
+    (
+        _actor_x,
+        _actor_y,
+        _actor_z,
+        actor_visible,
+        actor_sprites,
+        actor_fullbright,
+        actor_additive_style,
+    ) = engine._fast_native_actor_state()
+
+    doll_count = max(len(engine.map.player_starts) - 1, 0)
+    player_projectile = engine.enemy_slots + doll_count
+    enemy_projectile = player_projectile + engine.player_projectile_slots
+    fog = enemy_projectile + engine.enemy_projectile_slots
+    puff = fog + engine.enemy_slots
+    effect_indices = torch.tensor(
+        (player_projectile, enemy_projectile, fog, puff),
+        dtype=torch.int64,
+    )
+    assert actor_visible[0, effect_indices].tolist() == [True, True, True, True]
+    assert actor_fullbright[0, effect_indices].tolist() == [True, True, True, True]
+    assert actor_additive_style[0, effect_indices].tolist() == [0, 1, 1, -2]
+    assert actor_sprites[0, player_projectile] == (
+        engine.map.raw_projectile_flight_sprite_ids[1, 1, 4]
+    )
+    assert actor_sprites[0, enemy_projectile] == (
+        engine.map.raw_projectile_flight_sprite_ids[2, 1, 4]
+    )
+    assert actor_sprites[0, fog] == engine.map.raw_teleport_fog_sprite_ids[1]
+    assert actor_sprites[0, puff] == engine.map.raw_bullet_puff_sprite_ids[0]
 
 
 @pytest.mark.skipif(not SCENARIO.is_file() or not DOOM2.is_file(), reason="operator WADs absent")
@@ -3323,10 +3450,12 @@ def test_enemy_overkill_uses_reference_extreme_death_states(
         fast_actor_visible,
         fast_actor_sprites,
         fast_actor_fullbright,
+        fast_actor_additive_style,
     ) = engine._fast_native_actor_state()
     assert fast_actor_visible[:, 0].tolist() == [True, True, True, True]
     assert torch.equal(fast_actor_sprites[:, 0], death_sprites)
     assert not fast_actor_fullbright[:, 0].any()
+    assert fast_actor_additive_style[:, 0].tolist() == [-1, -1, -1, -1]
 
     engine.enemy_death_elapsed[:, 0] = 10
     assert engine._enemy_solid_mask()[:, 0].tolist() == [False, False, False, True]

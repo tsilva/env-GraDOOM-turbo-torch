@@ -66,6 +66,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--rear-class", choices=MONSTER_NAMES, default="ShotgunGuy")
     parser.add_argument("--front-distance", type=float, default=100.0)
     parser.add_argument("--rear-distance", type=float, default=200.0)
+    parser.add_argument("--trace-gradoom-lane", type=int)
+    parser.add_argument("--output", type=Path)
     return parser
 
 
@@ -211,6 +213,8 @@ def _run_vizdoom_episode(
         attack = noop.copy()
         attack[buttons.index("ATTACK")] = 1.0
         first_kill: int | None = None
+        damage_at_first_kill: float | None = None
+        hits_at_first_kill: float | None = None
         executed = 0
         for decision in range(1, decisions + 1):
             if game.is_episode_finished() or game.is_player_dead():
@@ -220,22 +224,38 @@ def _run_vizdoom_episode(
             kills = float(game.get_game_variable(vzd.GameVariable.KILLCOUNT)) - initial_kills
             if first_kill is None and kills > 0:
                 first_kill = decision
+                damage_at_first_kill = (
+                    float(game.get_game_variable(vzd.GameVariable.DAMAGE_TAKEN))
+                    - initial_damage
+                )
+                hits_at_first_kill = (
+                    float(game.get_game_variable(vzd.GameVariable.HITS_TAKEN)) - initial_hits
+                )
+        final_damage = (
+            float(game.get_game_variable(vzd.GameVariable.DAMAGE_TAKEN)) - initial_damage
+        )
+        final_hits = float(game.get_game_variable(vzd.GameVariable.HITS_TAKEN)) - initial_hits
         return {
-            "damage_taken": float(game.get_game_variable(vzd.GameVariable.DAMAGE_TAKEN))
-            - initial_damage,
+            "damage_taken": final_damage,
             "decisions": executed,
             "died": bool(game.is_player_dead()),
             "first_infighting_decision": None,
             "first_kill_decision": first_kill,
             "game_seed": game_seed,
             "health": float(game.get_game_variable(vzd.GameVariable.HEALTH)),
-            "hits_taken": float(game.get_game_variable(vzd.GameVariable.HITS_TAKEN)) - initial_hits,
+            "hits_taken": final_hits,
             "initial": {
                 "episode_time": int(game.get_episode_time()) - executed * frame_skip,
                 "monsters": monsters,
                 "player": values,
             },
             "kills": float(game.get_game_variable(vzd.GameVariable.KILLCOUNT)) - initial_kills,
+            "post_kill_damage": (
+                None if damage_at_first_kill is None else final_damage - damage_at_first_kill
+            ),
+            "post_kill_hits": (
+                None if hits_at_first_kill is None else final_hits - hits_at_first_kill
+            ),
         }
     finally:
         game.close()
@@ -297,6 +317,13 @@ def _initialize_monster(
     slot = torch.full((engine.num_envs,), slot_index, device=engine.device, dtype=torch.int64)
     engine._initialize_enemy_spawn_cuda(enemy_type, spawn, slot, x, y, angle)
     rows = torch.arange(engine.num_envs, device=engine.device)
+    # The reference actor snapshot follows the two-tic materialization action.
+    # Convert the spawn helper's check-before-decrement A_Look countdown to
+    # the equivalent state at that capture boundary.
+    engine.enemy_move_cooldown[rows, slot] = torch.clamp_min(
+        engine.enemy_move_cooldown[rows, slot] - 1,
+        0,
+    )
     sector = engine._sector_at(x, y)
     floor = engine.map.sector_heights[sector, 0]
     ceiling = engine.map.sector_heights[sector, 1]
@@ -321,7 +348,8 @@ def _run_gradoom(
     rear_type: int,
     decisions: int,
     frame_skip: int,
-) -> list[dict[str, Any]]:
+    trace_lane: int | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     device = torch.device("cuda")
     num_envs = len(reference)
     engine = TorchDeathmatchEngine(
@@ -364,11 +392,35 @@ def _run_gradoom(
     engine.next_spawn_check.fill_(1 << 30)
     first_infighting = torch.full((num_envs,), -1, device=device, dtype=torch.int32)
     first_kill = torch.full((num_envs,), -1, device=device, dtype=torch.int32)
+    damage_at_first_kill = torch.full((num_envs,), -1.0, device=device)
+    hits_at_first_kill = torch.full((num_envs,), -1.0, device=device)
+    survivor_slot_at_first_kill = torch.full(
+        (num_envs,), -1, device=device, dtype=torch.int64
+    )
+    survivor_target_at_first_kill = torch.full(
+        (num_envs,), -3, device=device, dtype=torch.int64
+    )
+    survivor_phase_at_first_kill = torch.full(
+        (num_envs,), -1, device=device, dtype=torch.int32
+    )
+    survivor_cooldown_at_first_kill = torch.full(
+        (num_envs,), -1, device=device, dtype=torch.int32
+    )
+    survivor_move_cooldown_at_first_kill = torch.full(
+        (num_envs,), -1, device=device, dtype=torch.int32
+    )
+    survivor_just_attacked_at_first_kill = torch.zeros(
+        num_envs, device=device, dtype=torch.bool
+    )
+    survivor_selected_player_attack_after_kill = torch.zeros(
+        num_envs, device=device, dtype=torch.bool
+    )
     completed = torch.zeros(num_envs, device=device, dtype=torch.int32)
     done = torch.zeros(num_envs, device=device, dtype=torch.bool)
     noop = torch.zeros((num_envs, len(DEATHMATCH_BUTTONS)), device=device, dtype=torch.bool)
     attack = noop.clone()
     attack[:, DEATHMATCH_BUTTONS.index("ATTACK")] = True
+    trace: list[dict[str, Any]] = []
     for decision in range(1, decisions + 1):
         _frames, _rewards, terminated, truncated = engine.step(attack if decision == 1 else noop)
         active = ~done
@@ -381,15 +433,83 @@ def _run_gradoom(
                 first_infighting,
             )
         )
-        first_kill.copy_(
+        new_kill = (first_kill < 0) & (engine.killcount > 0)
+        first_kill.masked_fill_(new_kill, decision)
+        damage_at_first_kill.copy_(
+            torch.where(new_kill, engine.player_damage_taken, damage_at_first_kill)
+        )
+        hits_at_first_kill.copy_(
+            torch.where(new_kill, engine.player_hits_taken, hits_at_first_kill)
+        )
+        current_survivor_slot = torch.argmax(engine.enemy_alive.to(torch.int32), dim=1)
+        rows = torch.arange(num_envs, device=device)
+        current_survivor_target = engine.enemy_target_slot[rows, current_survivor_slot]
+        current_survivor_phase = engine.enemy_attack_phase[rows, current_survivor_slot]
+        current_survivor_cooldown = engine.enemy_cooldown[rows, current_survivor_slot]
+        current_survivor_move_cooldown = engine.enemy_move_cooldown[
+            rows, current_survivor_slot
+        ]
+        current_survivor_just_attacked = engine.enemy_just_attacked[
+            rows, current_survivor_slot
+        ]
+        survivor_slot_at_first_kill.copy_(
+            torch.where(new_kill, current_survivor_slot, survivor_slot_at_first_kill)
+        )
+        survivor_target_at_first_kill.copy_(
+            torch.where(new_kill, current_survivor_target, survivor_target_at_first_kill)
+        )
+        survivor_phase_at_first_kill.copy_(
+            torch.where(new_kill, current_survivor_phase, survivor_phase_at_first_kill)
+        )
+        survivor_cooldown_at_first_kill.copy_(
+            torch.where(new_kill, current_survivor_cooldown, survivor_cooldown_at_first_kill)
+        )
+        survivor_move_cooldown_at_first_kill.copy_(
             torch.where(
-                (first_kill < 0) & (engine.killcount > 0),
-                torch.full_like(first_kill, decision),
-                first_kill,
+                new_kill,
+                current_survivor_move_cooldown,
+                survivor_move_cooldown_at_first_kill,
             )
         )
+        survivor_just_attacked_at_first_kill.copy_(
+            torch.where(
+                new_kill,
+                current_survivor_just_attacked,
+                survivor_just_attacked_at_first_kill,
+            )
+        )
+        after_kill = first_kill >= 0
+        survivor_selected_player_attack_after_kill |= (
+            after_kill
+            & (current_survivor_target == -1)
+            & (current_survivor_phase > 0)
+        )
+        if trace_lane is not None:
+            trace.append(
+                {
+                    "decision": decision,
+                    "enemy_alive": engine.enemy_alive[trace_lane, :2].tolist(),
+                    "enemy_angle": engine.enemy_angle[trace_lane, :2].tolist(),
+                    "enemy_attack_phase": engine.enemy_attack_phase[trace_lane, :2].tolist(),
+                    "enemy_cooldown": engine.enemy_cooldown[trace_lane, :2].tolist(),
+                    "enemy_death_elapsed": engine.enemy_death_elapsed[trace_lane, :2].tolist(),
+                    "enemy_death_type": engine.enemy_death_type[trace_lane, :2].tolist(),
+                    "enemy_health": engine.enemy_health[trace_lane, :2].tolist(),
+                    "enemy_just_attacked": engine.enemy_just_attacked[trace_lane, :2].tolist(),
+                    "enemy_move_cooldown": engine.enemy_move_cooldown[
+                        trace_lane, :2
+                    ].tolist(),
+                    "enemy_target_slot": engine.enemy_target_slot[trace_lane, :2].tolist(),
+                    "enemy_x": engine.enemy_x[trace_lane, :2].tolist(),
+                    "enemy_y": engine.enemy_y[trace_lane, :2].tolist(),
+                    "killcount": int(engine.killcount[trace_lane]),
+                    "player_damage_taken": float(engine.player_damage_taken[trace_lane]),
+                    "player_health": float(engine.health[trace_lane]),
+                    "player_hits_taken": float(engine.player_hits_taken[trace_lane]),
+                }
+            )
         done |= terminated | truncated
-    return [
+    records = [
         {
             "damage_taken": float(engine.player_damage_taken[lane]),
             "decisions": int(completed[lane]),
@@ -402,13 +522,66 @@ def _run_gradoom(
             "health": float(engine.health[lane]),
             "hits_taken": float(engine.player_hits_taken[lane]),
             "kills": float(engine.killcount[lane]),
+            "post_kill_damage": (
+                None
+                if int(first_kill[lane]) < 0
+                else float(engine.player_damage_taken[lane] - damage_at_first_kill[lane])
+            ),
+            "post_kill_hits": (
+                None
+                if int(first_kill[lane]) < 0
+                else float(engine.player_hits_taken[lane] - hits_at_first_kill[lane])
+            ),
+            "survivor_cooldown_at_first_kill": (
+                None
+                if int(first_kill[lane]) < 0
+                else int(survivor_cooldown_at_first_kill[lane])
+            ),
+            "survivor_just_attacked_at_first_kill": (
+                None
+                if int(first_kill[lane]) < 0
+                else bool(survivor_just_attacked_at_first_kill[lane])
+            ),
+            "survivor_move_cooldown_at_first_kill": (
+                None
+                if int(first_kill[lane]) < 0
+                else int(survivor_move_cooldown_at_first_kill[lane])
+            ),
+            "survivor_phase_at_first_kill": (
+                None
+                if int(first_kill[lane]) < 0
+                else int(survivor_phase_at_first_kill[lane])
+            ),
+            "survivor_selected_player_attack_after_kill": (
+                None
+                if int(first_kill[lane]) < 0
+                else bool(survivor_selected_player_attack_after_kill[lane])
+            ),
+            "survivor_slot_at_first_kill": (
+                None
+                if int(first_kill[lane]) < 0
+                else int(survivor_slot_at_first_kill[lane])
+            ),
+            "survivor_target_at_first_kill": (
+                None
+                if int(first_kill[lane]) < 0
+                else int(survivor_target_at_first_kill[lane])
+            ),
+            "survivor_target_final": (
+                None
+                if int(first_kill[lane]) < 0
+                else int(
+                    engine.enemy_target_slot[lane, survivor_slot_at_first_kill[lane]]
+                )
+            ),
         }
         for lane in range(num_envs)
     ]
+    return records, trace
 
 
 def _optional_mean(records: Sequence[Mapping[str, Any]], name: str) -> float | None:
-    values = [float(record[name]) for record in records if record[name] is not None]
+    values = [float(record[name]) for record in records if record.get(name) is not None]
     return None if not values else statistics.fmean(values)
 
 
@@ -425,6 +598,57 @@ def _summary(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "hits_taken_mean": statistics.fmean(float(record["hits_taken"]) for record in records),
         "kill_observed_rate": statistics.fmean(float(record["kills"] > 0) for record in records),
         "kills_mean": statistics.fmean(float(record["kills"]) for record in records),
+        "post_kill_damage_mean_when_observed": _optional_mean(records, "post_kill_damage"),
+        "post_kill_hits_mean_when_observed": _optional_mean(records, "post_kill_hits"),
+        "survivor_cooldown_at_first_kill_mean": _optional_mean(
+            records, "survivor_cooldown_at_first_kill"
+        ),
+        "survivor_just_attacked_rate_at_first_kill": _optional_mean(
+            [
+                {"value": float(record["survivor_just_attacked_at_first_kill"])}
+                for record in records
+                if record.get("survivor_just_attacked_at_first_kill") is not None
+            ],
+            "value",
+        ),
+        "survivor_move_cooldown_at_first_kill_mean": _optional_mean(
+            records, "survivor_move_cooldown_at_first_kill"
+        ),
+        "survivor_phase_at_first_kill_mean": _optional_mean(
+            records, "survivor_phase_at_first_kill"
+        ),
+        "surviving_front_rate_when_kill_observed": _optional_mean(
+            [
+                {"value": float(record["survivor_slot_at_first_kill"] == 0)}
+                for record in records
+                if record.get("survivor_slot_at_first_kill") is not None
+            ],
+            "value",
+        ),
+        "survivor_selected_player_attack_rate_after_kill": _optional_mean(
+            [
+                {"value": float(record["survivor_selected_player_attack_after_kill"])}
+                for record in records
+                if record.get("survivor_selected_player_attack_after_kill") is not None
+            ],
+            "value",
+        ),
+        "survivor_target_player_rate_at_first_kill": _optional_mean(
+            [
+                {"value": float(record["survivor_target_at_first_kill"] == -1)}
+                for record in records
+                if record.get("survivor_target_at_first_kill") is not None
+            ],
+            "value",
+        ),
+        "survivor_target_player_rate_final": _optional_mean(
+            [
+                {"value": float(record["survivor_target_final"] == -1)}
+                for record in records
+                if record.get("survivor_target_final") is not None
+            ],
+            "value",
+        ),
     }
 
 
@@ -438,6 +662,8 @@ def main() -> int:
         raise ValueError("front and rear classes must differ for object-pose alignment")
     if args.front_distance >= args.rear_distance:
         raise ValueError("front-distance must be less than rear-distance")
+    if args.trace_gradoom_lane is not None and not 0 <= args.trace_gradoom_lane < args.episodes:
+        raise ValueError("trace-gradoom-lane must select an episode lane")
     config = args.config.expanduser().resolve()
     scenario = args.scenario.expanduser().resolve()
     iwad = args.iwad.expanduser().resolve()
@@ -459,7 +685,7 @@ def main() -> int:
                 game_seeds,
             )
         )
-    gradoom = _run_gradoom(
+    gradoom, gradoom_trace = _run_gradoom(
         scenario_path=scenario,
         iwad=iwad,
         reference=reference,
@@ -467,23 +693,26 @@ def main() -> int:
         rear_type=MONSTER_NAMES.index(args.rear_class),
         decisions=args.decisions,
         frame_skip=args.frame_skip,
+        trace_lane=args.trace_gradoom_lane,
     )
-    print(
-        json.dumps(
-            {
-                "decisions": args.decisions,
-                "episodes": args.episodes,
-                "frame_skip": args.frame_skip,
-                "front_class": args.front_class,
-                "gradoom": _summary(gradoom),
-                "rear_class": args.rear_class,
-                "reference": _summary(reference),
-                "seed": args.seed,
-            },
-            indent=2,
-            sort_keys=True,
-        )
-    )
+    result = {
+        "decisions": args.decisions,
+        "episodes": args.episodes,
+        "frame_skip": args.frame_skip,
+        "front_class": args.front_class,
+        "gradoom": _summary(gradoom),
+        "gradoom_trace": gradoom_trace,
+        "rear_class": args.rear_class,
+        "reference": _summary(reference),
+        "schema": "gradoom.infighting-outcomes.v3",
+        "seed": args.seed,
+    }
+    serialized = json.dumps(result, indent=2, sort_keys=True)
+    if args.output is not None:
+        output = args.output.expanduser().resolve()
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(serialized + "\n")
+    print(serialized)
     return 0
 
 

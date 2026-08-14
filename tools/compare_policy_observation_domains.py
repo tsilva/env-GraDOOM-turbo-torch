@@ -22,6 +22,28 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+_DEATH_VISIBILITY_STATE = ("enemy_death_tics",)
+_LIVE_ENEMY_VISIBILITY_STATE = ("enemy_alive",)
+_EFFECT_VISIBILITY_STATE = (
+    "projectile_alive",
+    "projectile_impact_tics",
+    "enemy_projectile_alive",
+    "enemy_projectile_impact_tics",
+    "teleport_fog_tics",
+    "hitscan_puff_tics",
+)
+_COMBAT_VISIBILITY_STATE = (
+    "enemy_alive",
+    "enemy_death_tics",
+    "projectile_alive",
+    "projectile_impact_tics",
+    "enemy_projectile_alive",
+    "enemy_projectile_impact_tics",
+    "teleport_fog_tics",
+    "hitscan_puff_tics",
+    "drop_spawned",
+)
+
 
 def _load_train() -> ModuleType:
     path = Path(__file__).parents[1] / "train.py"
@@ -52,6 +74,27 @@ def _parser() -> argparse.ArgumentParser:
         choices=("direct", "native-fused", "native-fused-exact-weapon"),
         default="direct",
     )
+    parser.add_argument(
+        "--death-ablation",
+        action="store_true",
+        help="also compare matched frame stacks with death/corpse sprites hidden",
+    )
+    parser.add_argument(
+        "--combat-actor-ablation",
+        action="store_true",
+        help="also compare matched frame stacks with combat actors and effects hidden",
+    )
+    parser.add_argument(
+        "--live-enemy-ablation",
+        action="store_true",
+        help="also compare matched frame stacks with live enemy sprites hidden",
+    )
+    parser.add_argument(
+        "--effect-ablation",
+        action="store_true",
+        help="also compare matched frame stacks with combat effects hidden",
+    )
+    parser.add_argument("--output", type=Path)
     return parser
 
 
@@ -63,6 +106,18 @@ def _validate(args: argparse.Namespace) -> None:
         setattr(args, name, value)
     if args.updates <= 0 or args.num_envs <= 0:
         raise ValueError("updates and num-envs must be positive")
+    if (
+        sum(
+            (
+                args.death_ablation,
+                args.combat_actor_ablation,
+                args.live_enemy_ablation,
+                args.effect_ablation,
+            )
+        )
+        > 1
+    ):
+        raise ValueError("observation-ablation modes are mutually exclusive")
 
 
 def _policy_outputs(
@@ -132,6 +187,54 @@ def _kl_from_reference(reference_logits: torch.Tensor, candidate_logits: torch.T
     )
 
 
+def _per_sample_metrics(
+    exact: torch.Tensor,
+    fast: torch.Tensor,
+    exact_encoded: torch.Tensor,
+    fast_encoded: torch.Tensor,
+    exact_logits: torch.Tensor,
+    fast_logits: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    exact_log_probabilities = F.log_softmax(exact_logits, dim=1)
+    fast_log_probabilities = F.log_softmax(fast_logits, dim=1)
+    exact_probabilities = torch.exp(exact_log_probabilities)
+    return {
+        "feature_cosine": F.cosine_similarity(exact_encoded, fast_encoded, dim=1),
+        "feature_l1": torch.abs(exact_encoded - fast_encoded).mean(dim=1),
+        "frame_mae": torch.abs(exact.float() - fast.float()).mean(dim=(1, 2, 3)),
+        "policy_kl_exact_to_fast": torch.sum(
+            exact_probabilities * (exact_log_probabilities - fast_log_probabilities),
+            dim=1,
+        ),
+        "argmax_agreement": (
+            torch.argmax(exact_logits, dim=1) == torch.argmax(fast_logits, dim=1)
+        ).to(torch.float32),
+    }
+
+
+def _current_ablation_frames(
+    env: Any,
+    fast_renderer: str,
+    state_names: tuple[str, ...],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    engine = env._engine
+    saved_state = {name: getattr(engine, name).clone() for name in state_names}
+    for name in state_names:
+        getattr(engine, name).zero_()
+    try:
+        exact_frame = engine.render_reference_frame()
+        if fast_renderer == "direct":
+            fast_frame = engine.render_approximate_frame()
+        else:
+            fast_frame = engine.render_fast_native_policy_frame(
+                exact_weapon=fast_renderer == "native-fused-exact-weapon"
+            )
+    finally:
+        for name, value in saved_state.items():
+            getattr(engine, name).copy_(value)
+    return exact_frame, fast_frame
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     train = _load_train()
     args = _parser().parse_args(argv)
@@ -174,6 +277,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         compile_engine=True,
     )
     env = train._make_env(env_args, device, num_envs=args.num_envs)
+    ablation_state_names: tuple[str, ...] | None = None
+    ablation_mode: str | None = None
+    if args.death_ablation:
+        ablation_state_names = _DEATH_VISIBILITY_STATE
+        ablation_mode = "death_and_corpse_sprites"
+    elif args.live_enemy_ablation:
+        ablation_state_names = _LIVE_ENEMY_VISIBILITY_STATE
+        ablation_mode = "live_enemy_sprites"
+    elif args.effect_ablation:
+        ablation_state_names = _EFFECT_VISIBILITY_STATE
+        ablation_mode = "combat_effects"
+    elif args.combat_actor_ablation:
+        ablation_state_names = _COMBAT_VISIBILITY_STATE
+        ablation_mode = "combat_actors_effects_and_drops"
     context_encoder = train.CombatContextEncoder(env.device_info_history_names, device)
     episode_indices = torch.zeros(args.num_envs, dtype=torch.int64, device=device)
     episode_seeds = train.GradLabEpisodeSeeds(args.seed, args.num_envs, device)
@@ -186,6 +303,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             exact_weapon=args.fast_renderer == "native-fused-exact-weapon"
         )
     fast = fast_frame[:, None].expand(-1, train.FRAME_STACK, -1, -1).clone()
+    death_hidden_exact: torch.Tensor | None = None
+    death_hidden_fast: torch.Tensor | None = None
+    if ablation_state_names is not None:
+        hidden_exact_frame, hidden_fast_frame = _current_ablation_frames(
+            env,
+            args.fast_renderer,
+            ablation_state_names,
+        )
+        death_hidden_exact = hidden_exact_frame[:, None].expand_as(exact).clone()
+        death_hidden_fast = hidden_fast_frame[:, None].expand_as(fast).clone()
     context = context_encoder.encode(env.device_info_histories())
 
     region_slices = {
@@ -203,6 +330,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         "policy_kl_exact_to_fast": 0.0,
         "argmax_agreement": 0.0,
     }
+    cohort_sums: dict[str, dict[str, float]] = {}
+    cohort_counts: dict[str, int] = {}
+    ablation_sums = {
+        comparison: dict.fromkeys(scalar_sums, 0.0)
+        for comparison in (
+            "hidden_exact_to_fast",
+            "reference_visible_to_hidden",
+            "fast_visible_to_hidden",
+        )
+    }
+    ablation_samples = 0
     hybrid_kl_sums = dict.fromkeys(region_slices, 0.0)
     exact_probability_sum = torch.zeros(len(train.RESTRICTED_ACTIONS), device=device)
     fast_probability_sum = torch.zeros_like(exact_probability_sum)
@@ -216,6 +354,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                     train.FRAME_STACK,
                     args.fast_renderer,
                 )
+                if ablation_state_names is not None:
+                    hidden_exact_frame, hidden_fast_frame = _current_ablation_frames(
+                        env,
+                        args.fast_renderer,
+                        ablation_state_names,
+                    )
+                    death_hidden_exact = hidden_exact_frame[:, None].expand_as(exact).clone()
+                    death_hidden_fast = hidden_fast_frame[:, None].expand_as(fast).clone()
             with torch.no_grad():
                 exact_encoded, exact_logits, exact_probabilities = _policy_outputs(
                     policy,
@@ -227,23 +373,94 @@ def main(argv: Sequence[str] | None = None) -> int:
                     fast,
                     context,
                 )
-                scalar_sums["feature_cosine"] += float(
-                    F.cosine_similarity(exact_encoded, fast_encoded, dim=1).sum()
+                per_sample = _per_sample_metrics(
+                    exact,
+                    fast,
+                    exact_encoded,
+                    fast_encoded,
+                    exact_logits,
+                    fast_logits,
                 )
-                scalar_sums["feature_l1"] += float(
-                    torch.abs(exact_encoded - fast_encoded).mean(dim=1).sum()
-                )
-                scalar_sums["frame_mae"] += float(
-                    torch.abs(exact.float() - fast.float()).mean(dim=(1, 2, 3)).sum()
-                )
-                scalar_sums["policy_kl_exact_to_fast"] += (
-                    _kl_from_reference(exact_logits, fast_logits) * args.num_envs
-                )
-                scalar_sums["argmax_agreement"] += float(
-                    (torch.argmax(exact_logits, dim=1) == torch.argmax(fast_logits, dim=1))
-                    .float()
-                    .sum()
-                )
+                for name, values in per_sample.items():
+                    scalar_sums[name] += float(values.sum())
+
+                death_tics = env._engine.enemy_death_tics
+                corpse_count = torch.sum(death_tics > 0, dim=1)
+                cohort_masks = {
+                    "no_death_or_corpse": corpse_count == 0,
+                    "any_death_or_corpse": corpse_count > 0,
+                    "active_death_animation": torch.any(death_tics > 1, dim=1),
+                    "persistent_corpse": torch.any(death_tics == 1, dim=1),
+                    "one_to_four_deaths_or_corpses": (corpse_count >= 1)
+                    & (corpse_count <= 4),
+                    "five_or_more_deaths_or_corpses": corpse_count >= 5,
+                }
+                for cohort_name, mask in cohort_masks.items():
+                    count = int(mask.sum())
+                    if not count:
+                        continue
+                    cohort_counts[cohort_name] = cohort_counts.get(cohort_name, 0) + count
+                    sums = cohort_sums.setdefault(
+                        cohort_name,
+                        dict.fromkeys(per_sample, 0.0),
+                    )
+                    for metric_name, values in per_sample.items():
+                        sums[metric_name] += float(values[mask].sum())
+                if ablation_state_names is not None:
+                    if death_hidden_exact is None or death_hidden_fast is None:
+                        raise RuntimeError("death-ablation frame stacks are unavailable")
+                    hidden_exact_encoded, hidden_exact_logits, _hidden_exact_probabilities = (
+                        _policy_outputs(policy, death_hidden_exact, context)
+                    )
+                    hidden_fast_encoded, hidden_fast_logits, _hidden_fast_probabilities = (
+                        _policy_outputs(policy, death_hidden_fast, context)
+                    )
+                    ablation_comparisons = {
+                        "hidden_exact_to_fast": _per_sample_metrics(
+                            death_hidden_exact,
+                            death_hidden_fast,
+                            hidden_exact_encoded,
+                            hidden_fast_encoded,
+                            hidden_exact_logits,
+                            hidden_fast_logits,
+                        ),
+                        "reference_visible_to_hidden": _per_sample_metrics(
+                            exact,
+                            death_hidden_exact,
+                            exact_encoded,
+                            hidden_exact_encoded,
+                            exact_logits,
+                            hidden_exact_logits,
+                        ),
+                        "fast_visible_to_hidden": _per_sample_metrics(
+                            fast,
+                            death_hidden_fast,
+                            fast_encoded,
+                            hidden_fast_encoded,
+                            fast_logits,
+                            hidden_fast_logits,
+                        ),
+                    }
+                    ablation_mask = cohort_masks["any_death_or_corpse"]
+                    if args.live_enemy_ablation:
+                        ablation_mask = torch.any(env._engine.enemy_alive, dim=1)
+                    elif args.effect_ablation:
+                        ablation_mask = torch.zeros_like(ablation_mask)
+                        for state_name in _EFFECT_VISIBILITY_STATE:
+                            state = getattr(env._engine, state_name)
+                            ablation_mask |= torch.any(state != 0, dim=1)
+                    elif args.combat_actor_ablation:
+                        ablation_mask = torch.zeros_like(ablation_mask)
+                        for state_name in _COMBAT_VISIBILITY_STATE:
+                            state = getattr(env._engine, state_name)
+                            ablation_mask |= torch.any(state != 0, dim=1)
+                    ablation_count = int(ablation_mask.sum())
+                    ablation_samples += ablation_count
+                    for comparison, metrics in ablation_comparisons.items():
+                        for metric_name, values in metrics.items():
+                            ablation_sums[comparison][metric_name] += float(
+                                values[ablation_mask].sum()
+                            )
                 exact_probability_sum.add_(exact_probabilities.sum(dim=0))
                 fast_probability_sum.add_(fast_probabilities.sum(dim=0))
                 for name, (rows, columns) in region_slices.items():
@@ -282,6 +499,28 @@ def main(argv: Sequence[str] | None = None) -> int:
                     fast_frame[:, None].expand(-1, train.FRAME_STACK, -1, -1),
                     rolled,
                 )
+                if ablation_state_names is not None:
+                    if death_hidden_exact is None or death_hidden_fast is None:
+                        raise RuntimeError("death-ablation frame stacks are unavailable")
+                    hidden_exact_frame, hidden_fast_frame = _current_ablation_frames(
+                        env,
+                        args.fast_renderer,
+                        ablation_state_names,
+                    )
+                    rolled_hidden_exact = torch.roll(death_hidden_exact, shifts=-1, dims=1)
+                    rolled_hidden_exact[:, -1].copy_(hidden_exact_frame)
+                    death_hidden_exact = torch.where(
+                        done[:, None, None, None],
+                        hidden_exact_frame[:, None].expand_as(death_hidden_exact),
+                        rolled_hidden_exact,
+                    )
+                    rolled_hidden_fast = torch.roll(death_hidden_fast, shifts=-1, dims=1)
+                    rolled_hidden_fast[:, -1].copy_(hidden_fast_frame)
+                    death_hidden_fast = torch.where(
+                        done[:, None, None, None],
+                        hidden_fast_frame[:, None].expand_as(death_hidden_fast),
+                        rolled_hidden_fast,
+                    )
                 context = context_encoder.encode(transition.info_histories)
     finally:
         env.close()
@@ -300,7 +539,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             }
         )
     result: dict[str, Any] = {
-        "schema": "gradoom.policy-observation-domain-comparison.v1",
+        "schema": "gradoom.policy-observation-domain-comparison.v4",
         "checkpoint": str(args.checkpoint),
         "checkpoint_sha256": train._file_sha256(args.checkpoint),
         "state_source": args.state_source,
@@ -310,12 +549,44 @@ def main(argv: Sequence[str] | None = None) -> int:
         "updates": args.updates,
         "samples": samples,
         **{name: value / samples for name, value in scalar_sums.items()},
+        "cohorts": {
+            cohort_name: {
+                "samples": cohort_counts[cohort_name],
+                **{
+                    metric_name: value / cohort_counts[cohort_name]
+                    for metric_name, value in sums.items()
+                },
+            }
+            for cohort_name, sums in cohort_sums.items()
+        },
+        "observation_ablation": (
+            {
+                "mode": ablation_mode,
+                "comparisons": {
+                    comparison: {
+                        "samples": ablation_samples,
+                        **{
+                            metric_name: value / ablation_samples
+                            for metric_name, value in sums.items()
+                        },
+                    }
+                    for comparison, sums in ablation_sums.items()
+                },
+            }
+            if ablation_samples
+            else None
+        ),
         "hybrid_region_kl_exact_to_candidate": {
             name: value / samples for name, value in hybrid_kl_sums.items()
         },
         "action_probabilities": action_probabilities,
     }
-    print(json.dumps(result, sort_keys=True), flush=True)
+    serialized = json.dumps(result, indent=2, sort_keys=True)
+    if args.output is not None:
+        output = args.output.expanduser().resolve()
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(serialized + "\n")
+    print(serialized, flush=True)
     return 0
 
 
