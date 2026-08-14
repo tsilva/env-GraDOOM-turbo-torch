@@ -276,3 +276,20 @@ also reduced renderer throughput. Those experiments were rejected and fully
 removed. `tools/benchmark_cuda.py` can now select `approximate`, `native-fused`,
 or `reference` observations so future renderer changes can report their cost
 under the same benchmark harness.
+
+## Reference-correct missile follow-up
+
+The subsequent missile-spawn and Rocket Launcher no-autofire corrections keep
+the workload-equivalent 2,048-environment `native-fused` benchmark at **22,961
+median environment transitions/s**, 1.42% above the preceding 22,639 result.
+The five measured samples are 24,726, 23,230, 22,270, 22,961, and 22,107
+transitions/s after 20 excluded warmup batches.
+
+The old checkpoints do not cross the quality gate under the corrected
+mechanics. On the balanced stochastic 100-episode seed-10000 grid, the
+untouched source policy scores 23.20 mean kills and the 4.03M-sample adapted
+policy scores 26.75. Their existing ViZDoom results are 35.11 and 39.38,
+respectively. The next optimization stage must therefore adapt or train on the
+corrected environment and pass a fresh fixed-grid gate; a GradLab-compatible
+rolling-100 peak alone remains insufficient because synchronized 2,048-lane
+completion cohorts are length biased.

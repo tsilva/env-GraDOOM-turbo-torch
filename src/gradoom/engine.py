@@ -124,6 +124,7 @@ _WEAPON_ACTION_DELAY = (4, 0, 4, 3, 3, 0, 8, 0)
 _WEAPON_READY_DURATION = (21, 7, 18, 43, 61, 7, 19, 22)
 _WEAPON_AMMO_SLOT = (-1, -1, 1, 2, 2, 1, 4, 5)
 _WEAPON_AMMO_COST = (0.0, 0.0, 1.0, 1.0, 2.0, 1.0, 1.0, 1.0)
+_WEAPON_NO_AUTOFIRE = (False, False, False, False, False, False, True, False)
 _HITSCAN_PELLET_COUNTS = (0, 0, 1, 7, 20, 1, 0, 0)
 _HITSCAN_MAX_PELLETS = 20
 _BULLET_PUFF_TOTAL_TICS = 16
@@ -1732,6 +1733,9 @@ class TorchDeathmatchEngine:
         )
         self.mugshot_rng_state = torch.ones(n, device=device, dtype=torch.int64)
         self.attack_held_tics = torch.zeros(n, device=device, dtype=torch.int32)
+        # ZDoom initializes attackdown so holding attack before a NOAUTOFIRE
+        # weapon reaches Ready cannot fire it without a release first.
+        self.attack_down = torch.ones(n, device=device, dtype=torch.bool)
         self.chainsaw_pull = torch.zeros(n, device=device, dtype=torch.bool)
         self.reaction_time = torch.zeros(n, device=device, dtype=torch.int32)
         self.enemy_x = torch.zeros((n, self.enemy_slots), device=device)
@@ -1993,6 +1997,11 @@ class TorchDeathmatchEngine:
         )
         self._weapon_ammo_slot = torch.tensor(_WEAPON_AMMO_SLOT, device=device, dtype=torch.int64)
         self._weapon_ammo_cost = torch.tensor(_WEAPON_AMMO_COST, device=device)
+        self._weapon_no_autofire = torch.tensor(
+            _WEAPON_NO_AUTOFIRE,
+            device=device,
+            dtype=torch.bool,
+        )
         self._hitscan_pellet_counts = torch.tensor(
             _HITSCAN_PELLET_COUNTS,
             device=device,
@@ -2027,7 +2036,8 @@ class TorchDeathmatchEngine:
             (0, 0, 2, 3, 5, 6, 7), device=device, dtype=torch.int64
         )
         policy_columns = (
-            torch.arange(self.observation_width, device=device, dtype=torch.float32) + 0.5
+            torch.arange(self.observation_width, device=device, dtype=torch.float32)
+            + 0.5
             - self.observation_width / 2.0
         )
         self._ray_offsets = -torch.atan(policy_columns / _PROJECTION_FOCAL_X)
@@ -2386,6 +2396,7 @@ class TorchDeathmatchEngine:
         )
         self.mugshot_face_tics.masked_fill_(mask, _MUGSHOT_NORMAL_FRAME_TICS)
         self.attack_held_tics.masked_fill_(mask, 0)
+        self.attack_down.masked_fill_(mask, True)
         self.turn_held_tics.masked_fill_(mask, 0)
         self.chainsaw_pull.masked_fill_(mask, False)
         self.reaction_time.masked_fill_(mask, _PLAYER_TELEPORT_LOCK_TICS)
@@ -3262,9 +3273,7 @@ class TorchDeathmatchEngine:
         )
         collision_step = torch.minimum(collision_step, steps)
         actor_collision = (
-            playing
-            & actor_blocked
-            & (~full_contact | (first_actor_step <= collision_step))
+            playing & actor_blocked & (~full_contact | (first_actor_step <= collision_step))
         )
         actor_prior_x = start_x + self._trunc_divide(
             move_x * (first_actor_step - 1),
@@ -4170,11 +4179,7 @@ class TorchDeathmatchEngine:
         skill_adjusted: bool = False,
     ) -> None:
         incoming = torch.floor(incoming)
-        taken_incoming = (
-            incoming
-            if taken_incoming is None
-            else torch.floor(taken_incoming)
-        )
+        taken_incoming = incoming if taken_incoming is None else torch.floor(taken_incoming)
         credited_incoming = (
             torch.zeros_like(incoming)
             if credited_incoming is None
@@ -4201,13 +4206,9 @@ class TorchDeathmatchEngine:
             if armor_absorb_request is not None:
                 armor_absorb_request = torch.floor(armor_absorb_request * 0.5)
             if taken_armor_absorb_request is not None:
-                taken_armor_absorb_request = torch.floor(
-                    taken_armor_absorb_request * 0.5
-                )
+                taken_armor_absorb_request = torch.floor(taken_armor_absorb_request * 0.5)
             if credited_armor_absorb_request is not None:
-                credited_armor_absorb_request = torch.floor(
-                    credited_armor_absorb_request * 0.5
-                )
+                credited_armor_absorb_request = torch.floor(credited_armor_absorb_request * 0.5)
         if damage_scale is not None:
             incoming = torch.floor(incoming * damage_scale)
             taken_incoming = torch.floor(taken_incoming * damage_scale)
@@ -4219,9 +4220,7 @@ class TorchDeathmatchEngine:
             if armor_absorb_request is not None:
                 armor_absorb_request = torch.floor(armor_absorb_request * damage_scale)
             if taken_armor_absorb_request is not None:
-                taken_armor_absorb_request = torch.floor(
-                    taken_armor_absorb_request * damage_scale
-                )
+                taken_armor_absorb_request = torch.floor(taken_armor_absorb_request * damage_scale)
             if credited_armor_absorb_request is not None:
                 credited_armor_absorb_request = torch.floor(
                     credited_armor_absorb_request * damage_scale
@@ -5300,6 +5299,7 @@ class TorchDeathmatchEngine:
             ) = player_projectile_move(
                 alive,
                 self.projectile_type,
+                self.projectile_age,
                 self.projectile_x,
                 self.projectile_y,
                 self.projectile_z,
@@ -5308,6 +5308,7 @@ class TorchDeathmatchEngine:
                 self.projectile_velocity_z,
                 self.map.blocking_walls,
                 self.map.portal_walls,
+                self.map.portal_wall_sectors,
                 self.map.sector_edge_mask,
                 self.map.sector_heights,
                 self.enemy_x,
@@ -5350,6 +5351,103 @@ class TorchDeathmatchEngine:
                 doll_x = self.map.player_starts[:-1, 0]
                 doll_y = self.map.player_starts[:-1, 1]
                 doll_z = self._player_start_z[:-1]
+            # P_CheckMissileSpawn advances a newly fired missile inside its
+            # shooter, then validates that exact half-step before the first
+            # normal P_XYMovement.  Without this check, close walls and actors
+            # are only noticed at the first movement subdivision, moving the
+            # explosion origin too far forward.
+            spawn_check = alive & (self.projectile_age == 0)
+            spawn_wall_impact = spawn_check & self._points_collide(
+                current_x,
+                current_y,
+                projectile_radius,
+            )
+            spawn_floor, spawn_ceiling = self._actor_opening_at(
+                current_x,
+                current_y,
+                projectile_radius,
+            )
+            spawn_opening_impact = spawn_check & (
+                (current_z < spawn_floor) | (current_z + projectile_height > spawn_ceiling)
+            )
+            spawn_enemy_dx = current_x[:, :, None] - self.enemy_x[:, None, :]
+            spawn_enemy_dy = current_y[:, :, None] - self.enemy_y[:, None, :]
+            spawn_enemy_distance = torch.sqrt(
+                spawn_enemy_dx * spawn_enemy_dx + spawn_enemy_dy * spawn_enemy_dy
+            )
+            spawn_enemy_overlap = self._vertical_overlap(
+                current_z[:, :, None],
+                projectile_height[:, :, None],
+                self.enemy_z[:, None, :],
+                self._enemy_height[enemy_type][:, None, :],
+            )
+            spawn_enemy_candidate = (
+                spawn_check[:, :, None]
+                & self.enemy_alive[:, None, :]
+                & spawn_enemy_overlap
+                & (
+                    spawn_enemy_dx.abs()
+                    < projectile_radius[:, :, None] + self._enemy_radius[enemy_type][:, None, :]
+                )
+                & (
+                    spawn_enemy_dy.abs()
+                    < projectile_radius[:, :, None] + self._enemy_radius[enemy_type][:, None, :]
+                )
+            )
+            spawn_enemy_candidate_distance = torch.where(
+                spawn_enemy_candidate,
+                spawn_enemy_distance,
+                torch.full_like(spawn_enemy_distance, torch.inf),
+            )
+            spawn_nearest_enemy_distance, spawn_nearest_enemy = torch.min(
+                spawn_enemy_candidate_distance,
+                dim=2,
+            )
+            spawn_enemy_impact = torch.isfinite(spawn_nearest_enemy_distance)
+            if doll_count:
+                spawn_doll_dx = current_x[:, :, None] - doll_x[None, None, :]
+                spawn_doll_dy = current_y[:, :, None] - doll_y[None, None, :]
+                spawn_doll_distance = torch.sqrt(
+                    spawn_doll_dx * spawn_doll_dx + spawn_doll_dy * spawn_doll_dy
+                )
+                spawn_doll_overlap = self._vertical_overlap(
+                    current_z[:, :, None],
+                    projectile_height[:, :, None],
+                    doll_z[None, None, :],
+                    _PLAYER_HEIGHT,
+                )
+                spawn_doll_candidate = (
+                    spawn_check[:, :, None]
+                    & ~self.player_dead[:, None, None]
+                    & spawn_doll_overlap
+                    & (spawn_doll_dx.abs() < projectile_radius[:, :, None] + _PLAYER_RADIUS)
+                    & (spawn_doll_dy.abs() < projectile_radius[:, :, None] + _PLAYER_RADIUS)
+                )
+                spawn_nearest_doll_distance, _ = torch.min(
+                    torch.where(
+                        spawn_doll_candidate,
+                        spawn_doll_distance,
+                        torch.full_like(spawn_doll_distance, torch.inf),
+                    ),
+                    dim=2,
+                )
+                spawn_doll_impact = torch.isfinite(spawn_nearest_doll_distance) & (
+                    spawn_nearest_doll_distance < spawn_nearest_enemy_distance
+                )
+                spawn_enemy_impact &= ~spawn_doll_impact
+            else:
+                spawn_doll_impact = torch.zeros_like(spawn_enemy_impact)
+            spawn_actor_impact = spawn_enemy_impact | spawn_doll_impact
+            spawn_impact = spawn_check & (
+                spawn_wall_impact | spawn_opening_impact | spawn_actor_impact
+            )
+            nearest_enemy.copy_(
+                torch.where(spawn_impact & spawn_enemy_impact, spawn_nearest_enemy, nearest_enemy)
+            )
+            enemy_impact |= spawn_impact & spawn_enemy_impact
+            doll_impact |= spawn_impact & spawn_doll_impact
+            impact |= spawn_impact
+            moving &= ~spawn_impact
             # Rocket and plasma definitions require at most three P_XYMovement
             # subdivisions. Keeping this bound static avoids a device sync per tic.
             for step in range(1, 4):
@@ -5362,12 +5460,11 @@ class TorchDeathmatchEngine:
                     candidate_y,
                     projectile_radius,
                 )
-                sector = self._sector_at(
-                    candidate_x.reshape(-1),
-                    candidate_y.reshape(-1),
-                ).reshape_as(candidate_x)
-                floor = self.map.sector_heights[sector, 0]
-                ceiling = self.map.sector_heights[sector, 1]
+                floor, ceiling = self._actor_opening_at(
+                    candidate_x,
+                    candidate_y,
+                    projectile_radius,
+                )
                 opening_impact = enabled & (
                     (current_z < floor) | (current_z + projectile_height > ceiling)
                 )
@@ -5673,14 +5770,15 @@ class TorchDeathmatchEngine:
         )
         player_splash_hits = torch.sum(player_splash_damage > 0, dim=1)
         doll_damage_total = direct_doll_total + total_doll_splash_damage
-        doll_armor_total = torch.sum(
-            torch.floor(direct_doll_damage * self.armor_save_fraction[:, None]),
-            dim=1,
-        ) + doll_armor_absorb_request
-        doll_hits = torch.sum(direct_doll_damage > 0, dim=1) + doll_splash_hits
-        self_damage = (
-            player_splash_total + doll_damage_total
+        doll_armor_total = (
+            torch.sum(
+                torch.floor(direct_doll_damage * self.armor_save_fraction[:, None]),
+                dim=1,
+            )
+            + doll_armor_absorb_request
         )
+        doll_hits = torch.sum(direct_doll_damage > 0, dim=1) + doll_splash_hits
+        self_damage = player_splash_total + doll_damage_total
 
         player_fine_angle = self._doom_fine_angle(
             torch.round((self.x[:, None] - current_x) * _FIXED_UNIT).to(torch.int64),
@@ -5738,9 +5836,7 @@ class TorchDeathmatchEngine:
         )
         self._apply_player_damage(
             self_damage,
-            armor_absorb_request=(
-                player_splash_armor_absorb_request + doll_armor_total
-            ),
+            armor_absorb_request=(player_splash_armor_absorb_request + doll_armor_total),
             hits_taken_request=player_splash_hits,
             taken_incoming=player_splash_total,
             taken_armor_absorb_request=player_splash_armor_absorb_request,
@@ -6509,14 +6605,22 @@ class TorchDeathmatchEngine:
             self._weapon_ready_duration[weapon] - self._weapon_cooldown[weapon],
             0,
         )
-        weapon_action_ready = (self.weapon_state_cooldown <= 0) | (
-            self.weapon_state_cooldown == refire_tail
+        weapon_idle_ready = (
+            (self.weapon_state_cooldown <= 0)
+            & (self.weapon_raise_cooldown <= 0)
+            & (self.pending_weapon < 0)
         )
+        weapon_action_ready = weapon_idle_ready | (
+            (self.weapon_state_cooldown == refire_tail)
+            & (self.weapon_raise_cooldown <= 0)
+            & (self.pending_weapon < 0)
+        )
+        fire_trigger = ~(weapon_idle_ready & self._weapon_no_autofire[weapon] & self.attack_down)
         attempted_empty_fire = (
             buttons[:, 0]
+            & fire_trigger
             & (self.attack_cooldown <= 0)
             & weapon_action_ready
-            & (self.weapon_raise_cooldown <= 0)
             & ~self.player_dead
             & (self.episode_time < self.episode_timeout)
             & self._weapon_owned(weapon)
@@ -6528,15 +6632,21 @@ class TorchDeathmatchEngine:
         self._set_active_weapon(replacement, attempted_empty_fire)
         fires = (
             buttons[:, 0]
+            & fire_trigger
             & (self.attack_cooldown <= 0)
             & weapon_action_ready
-            & (self.weapon_raise_cooldown <= 0)
-            & (self.pending_weapon < 0)
             & ~self.player_dead
             & (self.episode_time < self.episode_timeout)
             & self._weapon_owned(weapon)
             & ((ammo_slot < 0) | (ammo >= cost))
             & ~pending
+        )
+        self.attack_down.copy_(
+            torch.where(
+                weapon_idle_ready,
+                buttons[:, 0],
+                self.attack_down,
+            )
         )
         action_delay = self._weapon_action_delay[weapon]
         self.attack_cooldown.copy_(
@@ -7706,9 +7816,7 @@ class TorchDeathmatchEngine:
             hits_taken_request=torch.sum(adjusted_actual_player_damage > 0, dim=1),
             taken_incoming=torch.sum(adjusted_actual_player_damage, dim=1),
             taken_armor_absorb_request=torch.sum(
-                torch.floor(
-                    adjusted_actual_player_damage * self.armor_save_fraction[:, None]
-                ),
+                torch.floor(adjusted_actual_player_damage * self.armor_save_fraction[:, None]),
                 dim=1,
             ),
             damage_scale=self._wall_contact_enemy_damage_scale(),
@@ -8364,9 +8472,7 @@ class TorchDeathmatchEngine:
                 target_z,
                 target_height,
             )
-            target_sight_blockage = solid_sight_blockage | (
-                sight_top_delta <= sight_bottom_delta
-            )
+            target_sight_blockage = solid_sight_blockage | (sight_top_delta <= sight_bottom_delta)
             _, target_bottom_delta, target_top_delta = self._sight_opening(
                 self.enemy_x,
                 self.enemy_y,
@@ -8391,9 +8497,7 @@ class TorchDeathmatchEngine:
             & (target_top_slope >= -max_autoaim_slope)
             & (target_bottom_slope <= max_autoaim_slope)
         )
-        target_pitch = (
-            -torch.atan(target_top_slope) - torch.atan(target_bottom_slope)
-        ) * 0.5
+        target_pitch = (-torch.atan(target_top_slope) - torch.atan(target_bottom_slope)) * 0.5
         target_pitch_cosine, target_pitch_sine = self._fine_direction(target_pitch)
         target_vertical_slope = -target_pitch_sine / target_pitch_cosine.clamp_min_(
             1.0 / _FIXED_UNIT
@@ -8655,10 +8759,7 @@ class TorchDeathmatchEngine:
         # Returning from an attack state enters See, but its first A_Chase
         # action does not execute until the following state tic.
         move_ready = (
-            alive
-            & (attack_phase == 0)
-            & (next_phase == 0)
-            & (self.enemy_move_cooldown <= 0)
+            alive & (attack_phase == 0) & (next_phase == 0) & (self.enemy_move_cooldown <= 0)
         )
         # Doom sets MF_JUSTATTACKED when a missile state is selected. The
         # first A_Chase after that state completes must choose and attempt a
@@ -8671,10 +8772,7 @@ class TorchDeathmatchEngine:
         )
         self.enemy_reaction_time.copy_(next_reaction_time)
         attack_ready = (
-            move_ready
-            & (next_cooldown <= 0)
-            & ~self.enemy_just_attacked
-            & ~reacquired_player
+            move_ready & (next_cooldown <= 0) & ~self.enemy_just_attacked & ~reacquired_player
         )
         turning = move_ready & (self.enemy_move_direction < 8)
         quantized_direction = torch.floor(
@@ -8725,13 +8823,7 @@ class TorchDeathmatchEngine:
         )
         self.enemy_just_hit.masked_fill_(forced_retaliation, False)
         can_attack = melee_attack | ranged_attack
-        moving = (
-            move_ready
-            & ~post_attack_chase
-            & ~can_attack
-            & ~reacquired_player
-            & target_alive
-        )
+        moving = move_ready & ~post_attack_chase & ~can_attack & ~reacquired_player & target_alive
         forced_post_attack_move = post_attack_chase & target_alive
         self.enemy_move_count.masked_fill_(forced_post_attack_move, 0)
         self._enemy_chase_move(
@@ -9545,9 +9637,7 @@ class TorchDeathmatchEngine:
         )
         ceiling_height = self.map.sector_heights[sector, 1] - view_z
         ceiling_depth = (
-            ceiling_height[:, None, None]
-            * _PROJECTION_FOCAL_Y
-            / (-pixel_delta).clamp_min(0.25)
+            ceiling_height[:, None, None] * _PROJECTION_FOCAL_Y / (-pixel_delta).clamp_min(0.25)
         )
         perpendicular_depth = torch.where(pixel_delta > 0, floor_depth, ceiling_depth)
         ray_distance = perpendicular_depth / cosine_correction[:, None, :]
@@ -9794,9 +9884,7 @@ class TorchDeathmatchEngine:
                 light[:, None, :],
                 distance[:, None, :],
             )
-            wall_value = self._policy_grayscale_palette[lit_index.to(torch.int64)].to(
-                torch.float32
-            )
+            wall_value = self._policy_grayscale_palette[lit_index.to(torch.int64)].to(torch.float32)
             frame = torch.where(span, wall_value, frame)
             filled |= span
         return frame
@@ -10055,9 +10143,7 @@ class TorchDeathmatchEngine:
             enemy_projectile_viewer_angle,
             enemy_projectile_angle,
         )
-        enemy_projectile_frame = torch.remainder(self.enemy_projectile_age // 4, 2).to(
-            torch.int64
-        )
+        enemy_projectile_frame = torch.remainder(self.enemy_projectile_age // 4, 2).to(torch.int64)
         enemy_projectile_sprite = self.map.raw_projectile_flight_sprite_ids[
             2,
             enemy_projectile_frame,
@@ -15336,12 +15422,7 @@ class TorchDeathmatchEngine:
         vertically_pooled = torch.matmul(self._policy_area_y, channels_first)
         pooled = torch.matmul(vertically_pooled, self._policy_area_x_t)
         rounded = torch.floor(pooled + 0.5).to(torch.int32)
-        grayscale = (
-            rounded[:, 0] * 77
-            + rounded[:, 1] * 150
-            + rounded[:, 2] * 29
-            + 128
-        ) >> 8
+        grayscale = (rounded[:, 0] * 77 + rounded[:, 1] * 150 + rounded[:, 2] * 29 + 128) >> 8
         return grayscale.clamp(0, 255).to(torch.uint8)
 
     def render_reference_frame(self, active: torch.Tensor | None = None) -> torch.Tensor:

@@ -43,6 +43,34 @@ def _large_arena_scenario(square_scenario, half_extent: float = 4096.0):
     )
 
 
+def _height_transition_scenario(square_scenario, portal_x: float = 24.0):
+    portal = np.asarray([(portal_x, -256, portal_x, 256)], dtype=np.float32)
+    walls = np.concatenate((square_scenario.wall_segments, portal), axis=0)
+    return replace(
+        square_scenario,
+        wall_segments=walls,
+        wall_texture_ids=np.zeros(5, dtype=np.int32),
+        wall_texture_offsets=np.zeros((5, 2), dtype=np.float32),
+        wall_side_texture_ids=np.concatenate(
+            (
+                np.zeros((5, 1, 1), dtype=np.int32),
+                np.full((5, 1, 1), -1, dtype=np.int32),
+            ),
+            axis=1,
+        ).repeat(3, axis=2),
+        wall_side_texture_offsets=np.zeros((5, 2, 2), dtype=np.float32),
+        wall_sectors=np.asarray(
+            [[0, -1], [0, -1], [1, -1], [1, -1], [0, 1]],
+            dtype=np.int32,
+        ),
+        sector_edge_mask=np.ones((2, 5), dtype=np.bool_),
+        sector_heights=np.asarray([(-64, 128), (-24, 128)], dtype=np.float32),
+        sector_lights=np.asarray([192, 192], dtype=np.int16),
+        sector_floor_texture_ids=np.zeros(2, dtype=np.int32),
+        sector_ceiling_texture_ids=np.zeros(2, dtype=np.int32),
+    )
+
+
 def _engine(scenario) -> TorchDeathmatchEngine:
     engine = TorchDeathmatchEngine(
         scenario,
@@ -98,8 +126,7 @@ def test_hitscan_wall_puffs_use_separate_randomized_actor_state(square_scenario)
     assert engine.hitscan_puff_y[:, 0].tolist() == [0.0, 0.0]
     assert torch.all((engine.hitscan_puff_z[:, 0] >= 32) & (engine.hitscan_puff_z[:, 0] < 40))
     assert torch.all(
-        (engine.hitscan_puff_tics[:, 0] >= 13)
-        & (engine.hitscan_puff_tics[:, 0] <= 16)
+        (engine.hitscan_puff_tics[:, 0] >= 13) & (engine.hitscan_puff_tics[:, 0] <= 16)
     )
 
     previous_z = engine.hitscan_puff_z.clone()
@@ -489,6 +516,12 @@ def test_weapon_switch_waits_for_each_reference_fire_state(square_scenario) -> N
         select = torch.zeros_like(attack)
         select[:, 10 if weapon <= 1 else 9] = True
 
+        # This test measures the post-fire state sequence.  Doom's rocket
+        # launcher has WEAPON.NOAUTOFIRE, so seed the preceding release edge
+        # required to enter that sequence.
+        if weapon == 6:
+            engine.attack_down.zero_()
+
         engine.step(attack)
         transitions = 0
         while torch.all(engine._active_weapon() == weapon):
@@ -542,9 +575,7 @@ def test_hitscan_rolls_reference_pellet_counts_and_spread(square_scenario) -> No
 
     assert torch.count_nonzero(damage, dim=1).tolist() == [7, 20]
     live_damage = damage[damage > 0]
-    assert torch.all(
-        (live_damage == 5) | (live_damage == 10) | (live_damage == 15)
-    )
+    assert torch.all((live_damage == 5) | (live_damage == 10) | (live_damage == 15))
     assert torch.any(horizontal[0, :7] != 0)
     assert torch.any(horizontal[1] != 0)
     assert not torch.any(vertical[0])
@@ -1007,6 +1038,7 @@ def test_rocket_uses_delayed_projectile_impact_and_splash(square_scenario) -> No
     engine.weapons[:, 4].fill_(1)
     engine.ammo[:, 4].fill_(50)
     engine.selected_weapon.fill_(5)
+    engine.attack_down.zero_()
     engine.enemy_x[:, 0] = 100
     engine.enemy_y[:, 0] = 0
     engine.enemy_type[:, 0] = 5
@@ -1045,6 +1077,29 @@ def test_rocket_uses_delayed_projectile_impact_and_splash(square_scenario) -> No
     assert not torch.any(engine.projectile_alive)
     assert engine.projectile_impact_type[:, 0].tolist() == [0, 0]
     assert engine.projectile_impact_tics[:, 0].tolist() == [18, 18]
+
+
+def test_rocket_requires_release_after_becoming_ready(square_scenario) -> None:
+    engine = _engine(square_scenario)
+    engine.weapons[:, 4].fill_(1)
+    engine.ammo[:, 4].fill_(50)
+    engine.selected_weapon.fill_(5)
+    engine.weapon_raise_cooldown.zero_()
+    attack = torch.zeros((2, 20), dtype=torch.bool)
+    attack[:, 0] = True
+    noop = torch.zeros_like(attack)
+
+    engine._player_attack(attack)
+
+    assert engine.pending_attack_weapon.tolist() == [-1, -1]
+    assert engine.ammo[:, 4].tolist() == [50.0, 50.0]
+
+    engine._player_attack(noop)
+    engine._player_attack(attack)
+    _finish_pending_attack(engine)
+
+    assert engine.ammo[:, 4].tolist() == [49.0, 49.0]
+    assert torch.sum(engine.projectile_alive, dim=1).tolist() == [1, 1]
 
 
 def test_player_missile_uses_reference_side_probe_and_fine_angles(square_scenario) -> None:
@@ -1413,6 +1468,49 @@ def test_plasma_uses_delayed_projectile_without_splash(square_scenario) -> None:
     assert engine.health.tolist() == [100.0, 100.0]
     assert not torch.any(engine.projectile_alive)
     assert engine.projectile_impact_type[:, 0].tolist() == [1, 1]
+    assert engine.projectile_impact_tics[:, 0].tolist() == [20, 20]
+
+
+def test_missile_spawn_checks_radius_against_portal_opening(square_scenario) -> None:
+    engine = _engine(_height_transition_scenario(square_scenario))
+    engine.enemy_alive.zero_()
+    engine.projectile_x[:, 0] = 12.5
+    engine.projectile_y[:, 0] = 0
+    engine.projectile_z[:, 0] = -32
+    engine.projectile_velocity_x[:, 0] = 25
+    engine.projectile_type[:, 0] = 1
+    engine.projectile_age[:, 0] = 0
+    engine.projectile_alive[:, 0] = True
+
+    engine._projectile_tick(torch.ones(2, dtype=torch.bool))
+
+    assert not torch.any(engine.projectile_alive[:, 0])
+    assert engine.projectile_x[:, 0].tolist() == [12.5, 12.5]
+    assert engine.projectile_impact_tics[:, 0].tolist() == [20, 20]
+
+
+def test_missile_spawn_checks_actor_before_first_movement(square_scenario) -> None:
+    engine = _engine(_large_arena_scenario(square_scenario))
+    engine.enemy_alive.zero_()
+    engine.enemy_x[:, 0] = -20
+    engine.enemy_y[:, 0] = 0
+    engine.enemy_z[:, 0] = 0
+    engine.enemy_type[:, 0] = 0
+    engine.enemy_health[:, 0] = 100
+    engine.enemy_alive[:, 0] = True
+    engine.projectile_x[:, 0] = 12.5
+    engine.projectile_y[:, 0] = 0
+    engine.projectile_z[:, 0] = 32
+    engine.projectile_velocity_x[:, 0] = 25
+    engine.projectile_type[:, 0] = 1
+    engine.projectile_age[:, 0] = 0
+    engine.projectile_alive[:, 0] = True
+
+    engine._projectile_tick(torch.ones(2, dtype=torch.bool))
+
+    assert not torch.any(engine.projectile_alive[:, 0])
+    assert torch.all(engine.enemy_health[:, 0] < 100)
+    assert engine.projectile_x[:, 0].tolist() == [12.5, 12.5]
     assert engine.projectile_impact_tics[:, 0].tolist() == [20, 20]
 
 

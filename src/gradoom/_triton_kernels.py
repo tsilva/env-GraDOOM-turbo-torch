@@ -51,11 +51,7 @@ def _bounded_observation_augment_kernel(
     source_x = output_x - shift_x
     source_y = output_y - shift_y
     source_valid = (
-        output_valid
-        & (source_x >= 0)
-        & (source_x < width)
-        & (source_y >= 0)
-        & (source_y < height)
+        output_valid & (source_x >= 0) & (source_x < width) & (source_y >= 0) & (source_y < height)
     )
     source_offset = (
         env * observation_stride_n
@@ -63,9 +59,7 @@ def _bounded_observation_augment_kernel(
         + source_y * observation_stride_y
         + source_x * observation_stride_x
     )
-    pixel = tl.load(observations_ptr + source_offset, mask=source_valid, other=0.0).to(
-        tl.float32
-    )
+    pixel = tl.load(observations_ptr + source_offset, mask=source_valid, other=0.0).to(tl.float32)
     adjusted = tl.maximum(0.0, tl.minimum(255.0, pixel * gain + bias))
     adjusted = tl.where(source_valid, tl.floor(adjusted + 0.5), 0.0)
     tl.store(output_ptr + output_offset, adjusted, mask=output_valid)
@@ -153,12 +147,8 @@ def _policy_area_grayscale_kernel(
     x_end = (output_x[:, None] + 1) * 320
     source_y = y_start // 84 + sample_y[None, :]
     source_x = x_start // 84 + sample_x[None, :]
-    y_overlap = tl.minimum(y_end, (source_y + 1) * 84) - tl.maximum(
-        y_start, source_y * 84
-    )
-    x_overlap = tl.minimum(x_end, (source_x + 1) * 84) - tl.maximum(
-        x_start, source_x * 84
-    )
+    y_overlap = tl.minimum(y_end, (source_y + 1) * 84) - tl.maximum(y_start, source_y * 84)
+    x_overlap = tl.minimum(x_end, (source_x + 1) * 84) - tl.maximum(x_start, source_x * 84)
     sample_valid = (
         output_valid[:, None]
         & (source_y >= 0)
@@ -172,12 +162,8 @@ def _policy_area_grayscale_kernel(
     source_offset = env * source_height * 320 + source_y * 320 + source_x
     palette_index = tl.load(indexed_ptr + source_offset, mask=sample_valid, other=0).to(tl.int32)
     red = tl.load(palette_ptr + palette_index * 3, mask=sample_valid, other=0).to(tl.int32)
-    green = tl.load(palette_ptr + palette_index * 3 + 1, mask=sample_valid, other=0).to(
-        tl.int32
-    )
-    blue = tl.load(palette_ptr + palette_index * 3 + 2, mask=sample_valid, other=0).to(
-        tl.int32
-    )
+    green = tl.load(palette_ptr + palette_index * 3 + 1, mask=sample_valid, other=0).to(tl.int32)
+    blue = tl.load(palette_ptr + palette_index * 3 + 2, mask=sample_valid, other=0).to(tl.int32)
     red_sum = tl.sum(red * weight, axis=1)
     green_sum = tl.sum(green * weight, axis=1)
     blue_sum = tl.sum(blue * weight, axis=1)
@@ -385,9 +371,7 @@ def _render_fast_native_flats_kernel(
         current_view_z - selected_floor,
         selected_ceiling - current_view_z,
     )
-    fallback_distance = (
-        selected_plane_height * focal_y / denominator / cosine_correction
-    )
+    fallback_distance = selected_plane_height * focal_y / denominator / cosine_correction
     ray_distance = tl.where(best_distance == float("inf"), fallback_distance, best_distance)
     world_x = current_x + ray_cos * ray_distance
     world_y = current_y + ray_sin * ray_distance
@@ -1213,8 +1197,7 @@ def _move_drops_kernel(
         tl.maximum(side_top_left, side_top_right),
     )
     wall_collision = (
-        tl.max((overlap & (minimum_side <= 0.0) & (maximum_side >= 0.0)).to(tl.int32), axis=0)
-        != 0
+        tl.max((overlap & (minimum_side <= 0.0) & (maximum_side >= 0.0)).to(tl.int32), axis=0) != 0
     )
     horizontal_collision = (
         wall_collision
@@ -1229,10 +1212,7 @@ def _move_drops_kernel(
     retained_x = tl.where(moved, velocity_x_fixed, 0)
     retained_y = tl.where(moved, velocity_y_fixed, 0)
     stopped = (
-        (retained_x > -4096)
-        & (retained_x < 4096)
-        & (retained_y > -4096)
-        & (retained_y < 4096)
+        (retained_x > -4096) & (retained_x < 4096) & (retained_y > -4096) & (retained_y < 4096)
     )
     friction_x = tl.where(stopped, 0, (retained_x * 0xE800) >> 16)
     friction_y = tl.where(stopped, 0, (retained_y * 0xE800) >> 16)
@@ -1549,9 +1529,7 @@ def _render_portal_walls_kernel(
             light += tl.where(vertical_wall, 16.0, tl.where(horizontal_wall, -16.0, 0.0))
             base_shade = 61.0 - light / 4.0
             visibility = tl.minimum(24.0, 1280.0 / tl.maximum(distance, 1.0))
-            shade = tl.maximum(0, tl.minimum(31, tl.floor(base_shade - visibility))).to(
-                tl.int64
-            )
+            shade = tl.maximum(0, tl.minimum(31, tl.floor(base_shade - visibility))).to(tl.int64)
             lit_index = tl.load(
                 colormap + shade * 256 + palette_index,
                 mask=span,
@@ -2039,12 +2017,11 @@ def _render_sprites_kernel(
         - 3.141592653589793
     )
     selected_screen_center = (
-        observation_width * 0.5
-        - tl.sin(selected_relative) / tl.cos(selected_relative) * 42.0
+        observation_width * 0.5 - tl.sin(selected_relative) / tl.cos(selected_relative) * 42.0
     )
-    selected_left = selected_screen_center - tl.load(
-        sprite_left_offsets + selected_type
-    ) * selected_scale
+    selected_left = (
+        selected_screen_center - tl.load(sprite_left_offsets + selected_type) * selected_scale
+    )
     selected_top = (
         tl.load(center + env_index)
         + (tl.load(view_z + env_index) - tl.load(actor_z + selected_index))
@@ -2222,9 +2199,7 @@ def _project_fast_native_sprites_kernel(
     )
     relative = relative + 3.141592653589793
     relative = (
-        relative
-        - tl.floor(relative / 6.283185307179586) * 6.283185307179586
-        - 3.141592653589793
+        relative - tl.floor(relative / 6.283185307179586) * 6.283185307179586 - 3.141592653589793
     )
     depth = distance * tl.cos(relative)
     safe_depth = tl.maximum(depth, 1.0)
@@ -2329,18 +2304,13 @@ def _render_fast_native_sprites_kernel(
     selected_left = tl.load(projected_left + selected_index)
     selected_top = (
         tl.load(center + env_index)
-        + (tl.load(view_z + env_index) - tl.load(actor_z + selected_index))
-        * selected_scale_y
+        + (tl.load(view_z + env_index) - tl.load(actor_z + selected_index)) * selected_scale_y
         - tl.load(sprite_top_offsets + selected_sprite) * selected_scale_y
     )
-    sprite_u = tl.floor(
-        (column.to(tl.float32) - selected_left) / selected_scale_x
-    ).to(tl.int64)
+    sprite_u = tl.floor((column.to(tl.float32) - selected_left) / selected_scale_x).to(tl.int64)
     pixel_y = tl.arange(0, block_height)
     valid_pixel = pixel_y < observation_height
-    sprite_v = tl.floor(
-        (pixel_y.to(tl.float32) - selected_top) / selected_scale_y
-    ).to(tl.int64)
+    sprite_v = tl.floor((pixel_y.to(tl.float32) - selected_top) / selected_scale_y).to(tl.int64)
     inside = (
         valid_pixel
         & (selected_depth != float("inf"))
@@ -2352,9 +2322,7 @@ def _render_fast_native_sprites_kernel(
     safe_u = tl.maximum(0, tl.minimum(sprite_u, selected_width - 1))
     safe_v = tl.maximum(0, tl.minimum(sprite_v, selected_height - 1))
     atlas_index = (
-        selected_sprite * atlas_stride_type
-        + safe_v * atlas_stride_y
-        + safe_u * atlas_stride_x
+        selected_sprite * atlas_stride_type + safe_v * atlas_stride_y + safe_u * atlas_stride_x
     )
     opaque = tl.load(sprite_opaque + atlas_index, mask=inside, other=0).to(tl.int1)
     palette_index = tl.load(sprite_atlas + atlas_index, mask=inside, other=0).to(tl.int64)
@@ -2364,10 +2332,7 @@ def _render_fast_native_sprites_kernel(
     lookup_x = tl.floor((selected_x - origin_x) / cell_size).to(tl.int64)
     lookup_y = tl.floor((selected_y - origin_y) / cell_size).to(tl.int64)
     in_lookup = (
-        (lookup_x >= 0)
-        & (lookup_x < lookup_width)
-        & (lookup_y >= 0)
-        & (lookup_y < lookup_height)
+        (lookup_x >= 0) & (lookup_x < lookup_width) & (lookup_y >= 0) & (lookup_y < lookup_height)
     )
     sector = tl.load(
         sector_lookup + lookup_y * lookup_width + lookup_x,
@@ -2387,9 +2352,7 @@ def _render_fast_native_sprites_kernel(
         other=0,
     ).to(tl.uint8)
     frame_index = (
-        env_index * observation_height * observation_width
-        + pixel_y * observation_width
-        + column
+        env_index * observation_height * observation_width + pixel_y * observation_width + column
     )
     visible_against_scene = selected_depth < tl.load(
         surface_depth + frame_index,
@@ -2662,14 +2625,10 @@ def _render_native_weapon_kernel(
     safe_frame_x = tl.maximum(0, tl.minimum(frame_source_x, frame_width - 1))
     safe_frame_y = tl.maximum(0, tl.minimum(frame_source_y, frame_height - 1))
     frame_atlas_index = (
-        frame_id * atlas_stride_type
-        + safe_frame_y * atlas_stride_y
-        + safe_frame_x * atlas_stride_x
+        frame_id * atlas_stride_type + safe_frame_y * atlas_stride_y + safe_frame_x * atlas_stride_x
     )
     frame_value = tl.load(patch_atlas + frame_atlas_index, mask=frame_inside, other=0)
-    frame_alpha = tl.load(patch_opaque + frame_atlas_index, mask=frame_inside, other=0).to(
-        tl.int1
-    )
+    frame_alpha = tl.load(patch_opaque + frame_atlas_index, mask=frame_inside, other=0).to(tl.int1)
     composited = tl.where(frame_inside & frame_alpha, frame_value, prior)
 
     raw_flash_id = tl.load(flash_ids + env, mask=valid, other=-1).to(tl.int64)
@@ -2695,9 +2654,7 @@ def _render_native_weapon_kernel(
     safe_flash_x = tl.maximum(0, tl.minimum(flash_source_x, flash_width - 1))
     safe_flash_y = tl.maximum(0, tl.minimum(flash_source_y, flash_height - 1))
     flash_atlas_index = (
-        flash_id * atlas_stride_type
-        + safe_flash_y * atlas_stride_y
-        + safe_flash_x * atlas_stride_x
+        flash_id * atlas_stride_type + safe_flash_y * atlas_stride_y + safe_flash_x * atlas_stride_x
     )
     flash_value = tl.load(patch_atlas + flash_atlas_index, mask=flash_inside, other=0)
     flash_alpha = tl.load(
@@ -2735,9 +2692,7 @@ def render_native_weapon(
 
     output = torch.empty_like(frame)
     block = 256
-    torch.library.wrap_triton(_render_native_weapon_kernel)[
-        (triton.cdiv(frame.numel(), block),)
-    ](
+    torch.library.wrap_triton(_render_native_weapon_kernel)[(triton.cdiv(frame.numel(), block),)](
         frame,
         frame_ids,
         flash_ids,
@@ -4694,6 +4649,7 @@ def _enemy_projectile_move_fake(
 def _player_projectile_move_kernel(
     projectile_active,
     projectile_type,
+    projectile_age,
     projectile_x,
     projectile_y,
     projectile_z,
@@ -4702,6 +4658,7 @@ def _player_projectile_move_kernel(
     projectile_velocity_z,
     blocking_walls,
     portal_walls,
+    portal_wall_sectors,
     sector_edge_mask,
     sector_heights,
     enemy_x,
@@ -4768,6 +4725,111 @@ def _player_projectile_move_kernel(
     doll_impact = False
     nearest_enemy = 0
 
+    if tl.load(projectile_age + projectile_index) == 0:
+        wall_impact = _box_collides_blocking_walls(
+            current_x,
+            current_y,
+            radius,
+            blocking_walls,
+            blocking_wall_count,
+            block_blocking_walls,
+        )
+        floor, ceiling, _dropoff = _actor_opening_bounds_point(
+            current_x,
+            current_y,
+            radius,
+            portal_walls,
+            portal_wall_sectors,
+            sector_edge_mask,
+            sector_heights,
+            portal_wall_count,
+            sector_count,
+            block_portal_walls,
+        )
+        opening_impact = (current_z < floor) | (current_z + 8.0 > ceiling)
+
+        other_slot = tl.arange(0, block_enemies)
+        valid_enemy = other_slot < enemy_slots
+        other_index = env_index * enemy_slots + other_slot
+        other_type = tl.maximum(
+            tl.load(enemy_type + other_index, mask=valid_enemy, other=-1),
+            0,
+        )
+        other_alive = valid_enemy & tl.load(
+            enemy_alive + other_index,
+            mask=valid_enemy,
+            other=0,
+        ).to(tl.int1)
+        other_radius = tl.load(enemy_radius + other_type)
+        other_height = tl.load(enemy_height + other_type)
+        other_x = tl.load(enemy_x + other_index, mask=valid_enemy, other=0.0)
+        other_y = tl.load(enemy_y + other_index, mask=valid_enemy, other=0.0)
+        other_z = tl.load(enemy_z + other_index, mask=valid_enemy, other=0.0)
+        enemy_dx = current_x - other_x
+        enemy_dy = current_y - other_y
+        enemy_distance = tl.sqrt(enemy_dx * enemy_dx + enemy_dy * enemy_dy)
+        enemy_vertical_overlap = (current_z < other_z + other_height) & (other_z < current_z + 8.0)
+        enemy_candidate = (
+            other_alive
+            & enemy_vertical_overlap
+            & (tl.abs(enemy_dx) < radius + other_radius)
+            & (tl.abs(enemy_dy) < radius + other_radius)
+        )
+        candidate_distance = tl.where(
+            enemy_candidate,
+            enemy_distance,
+            float("inf"),
+        )
+        nearest_enemy_distance = tl.min(candidate_distance, axis=0)
+        spawn_nearest_enemy = tl.argmin(
+            candidate_distance,
+            axis=0,
+            tie_break_left=True,
+        )
+        spawn_enemy_impact = nearest_enemy_distance != float("inf")
+
+        doll_slot = tl.arange(0, block_dolls)
+        valid_doll = doll_slot < doll_count
+        doll_x = tl.load(doll_starts + doll_slot * 3, mask=valid_doll, other=0.0)
+        doll_y = tl.load(
+            doll_starts + doll_slot * 3 + 1,
+            mask=valid_doll,
+            other=0.0,
+        )
+        current_doll_z = tl.load(doll_z + doll_slot, mask=valid_doll, other=0.0)
+        doll_dx = current_x - doll_x
+        doll_dy = current_y - doll_y
+        doll_distance = tl.sqrt(doll_dx * doll_dx + doll_dy * doll_dy)
+        doll_vertical_overlap = (current_z < current_doll_z + 56.0) & (
+            current_doll_z < current_z + 8.0
+        )
+        doll_candidate = (
+            valid_doll
+            & ~tl.load(player_dead + env_index).to(tl.int1)
+            & doll_vertical_overlap
+            & (tl.abs(doll_dx) < radius + 16.0)
+            & (tl.abs(doll_dy) < radius + 16.0)
+        )
+        nearest_doll_distance = tl.min(
+            tl.where(doll_candidate, doll_distance, float("inf")),
+            axis=0,
+        )
+        spawn_doll_impact = (nearest_doll_distance != float("inf")) & (
+            nearest_doll_distance < nearest_enemy_distance
+        )
+        spawn_enemy_impact = spawn_enemy_impact & ~spawn_doll_impact
+        spawn_actor_impact = spawn_enemy_impact | spawn_doll_impact
+        spawn_impact = wall_impact | opening_impact | spawn_actor_impact
+        nearest_enemy = tl.where(
+            spawn_impact & spawn_enemy_impact,
+            spawn_nearest_enemy,
+            nearest_enemy,
+        )
+        enemy_impact = enemy_impact | (spawn_impact & spawn_enemy_impact)
+        doll_impact = doll_impact | (spawn_impact & spawn_doll_impact)
+        impact = impact | spawn_impact
+        moving = moving & ~spawn_impact
+
     for step in tl.static_range(1, 4):
         enabled = moving & (movement_steps >= step)
         step_value = tl.full((), step, tl.float32)
@@ -4819,17 +4881,18 @@ def _player_projectile_move_kernel(
             blocking_wall_count,
             block_blocking_walls,
         )
-        sector = _sector_at_point(
+        floor, ceiling, _dropoff = _actor_opening_bounds_point(
             candidate_x,
             candidate_y,
+            radius,
             portal_walls,
+            portal_wall_sectors,
             sector_edge_mask,
+            sector_heights,
             portal_wall_count,
             sector_count,
             block_portal_walls,
         )
-        floor = tl.load(sector_heights + sector * 2)
-        ceiling = tl.load(sector_heights + sector * 2 + 1)
         opening_impact = enabled & ((current_z < floor) | (current_z + 8.0 > ceiling))
 
         other_slot = tl.arange(0, block_enemies)
@@ -4956,6 +5019,7 @@ def _player_projectile_move_kernel(
 def player_projectile_move(
     projectile_active: torch.Tensor,
     projectile_type: torch.Tensor,
+    projectile_age: torch.Tensor,
     projectile_x: torch.Tensor,
     projectile_y: torch.Tensor,
     projectile_z: torch.Tensor,
@@ -4964,6 +5028,7 @@ def player_projectile_move(
     projectile_velocity_z: torch.Tensor,
     blocking_walls: torch.Tensor,
     portal_walls: torch.Tensor,
+    portal_wall_sectors: torch.Tensor,
     sector_edge_mask: torch.Tensor,
     sector_heights: torch.Tensor,
     enemy_x: torch.Tensor,
@@ -5004,6 +5069,7 @@ def player_projectile_move(
     torch.library.wrap_triton(_player_projectile_move_kernel)[grid](
         projectile_active,
         projectile_type,
+        projectile_age,
         projectile_x,
         projectile_y,
         projectile_z,
@@ -5012,6 +5078,7 @@ def player_projectile_move(
         projectile_velocity_z,
         blocking_walls,
         portal_walls,
+        portal_wall_sectors,
         sector_edge_mask,
         sector_heights,
         enemy_x,
@@ -5058,6 +5125,7 @@ def player_projectile_move(
 def _player_projectile_move_fake(
     projectile_active: torch.Tensor,
     projectile_type: torch.Tensor,
+    projectile_age: torch.Tensor,
     projectile_x: torch.Tensor,
     projectile_y: torch.Tensor,
     projectile_z: torch.Tensor,
@@ -5066,6 +5134,7 @@ def _player_projectile_move_fake(
     projectile_velocity_z: torch.Tensor,
     blocking_walls: torch.Tensor,
     portal_walls: torch.Tensor,
+    portal_wall_sectors: torch.Tensor,
     sector_edge_mask: torch.Tensor,
     sector_heights: torch.Tensor,
     enemy_x: torch.Tensor,
