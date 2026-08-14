@@ -26,6 +26,11 @@ def main() -> int:
     parser.add_argument("--sample-steps", type=int, default=100)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--eager", action="store_true")
+    parser.add_argument(
+        "--observation-renderer",
+        choices=("approximate", "native-fused", "reference"),
+        default="approximate",
+    )
     args = parser.parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
@@ -46,6 +51,7 @@ def main() -> int:
         obs_crop_mode="mask",
         frame_skip=2,
         compile_engine=not args.eager,
+        observation_renderer=args.observation_renderer,
     )
     try:
         lane = torch.arange(args.num_envs, device=device, dtype=torch.int64)
@@ -96,6 +102,7 @@ def main() -> int:
             "iwad_sha256": env.iwad_sha256,
             "num_envs": args.num_envs,
             "observation_shape": list(env.observation_space.shape),
+            "observation_renderer": args.observation_renderer,
             "repeats": args.repeats,
             "sample_steps_per_repeat": args.sample_steps,
             "scenario_sha256": env.scenario_sha256,

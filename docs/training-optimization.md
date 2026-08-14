@@ -255,3 +255,24 @@ and the retained local evidence is under
 `/home/tsilva/gradoom-runs/20260814-actor-slide-refine-killcount-lr1e6-8m-seed1597`.
 The unmodified fixed-grid greater-than-30 and bidirectional transfer goals
 remain unmet.
+
+The current production-renderer transfer baseline was remeasured after the
+death-state rendering and actor-slide parity fixes. On the fixed 100-episode
+seed-10000 grid, the untouched converted ViZDoom reference policy scores
+**23.36 mean kills** in GraDOOM (median 16.5, maximum 63, mean episode length
+1,043.57), versus its existing **35.11 mean kills** in ViZDoom (median 38.5,
+maximum 68). Current zero-shot transfer is therefore 66.5% of the source mean.
+The earlier 28.09/35.11, or 80.0%, comparison remains useful historical
+evidence but is not the current production baseline: its fast observation path
+predated restoration of enemy death animations and persistent corpses.
+
+An observation-only follow-up did not justify another renderer change. At
+identical trajectory states, the production `native-fused` renderer reaches
+82.66% policy-argmax agreement, 0.9707 feature cosine similarity, 1.662/255
+frame MAE, and 0.0811 policy KL against the reference renderer. Adding transient
+effects and extra sprite layers improved those static similarity measures, but
+reduced the untouched policy's full fixed-grid score to 21.35 mean kills and
+also reduced renderer throughput. Those experiments were rejected and fully
+removed. `tools/benchmark_cuda.py` can now select `approximate`, `native-fused`,
+or `reference` observations so future renderer changes can report their cost
+under the same benchmark harness.
