@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=78,<81", "wheel>=0.45,<1"]
+requires = ["setuptools>=83,<84", "wheel>=0.45,<1"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -14,12 +14,13 @@ authors = [{name = "Tiago Silva"}]
 dependencies = [
   "gymnasium>=1.2,<2",
   "numpy>=1.26,<3",
-  "torch>=2.12,<2.13",
+  "torch>=2.13,<2.14",
   "wandb>=0.18,<0.23",
 ]
 
 [dependency-groups]
 dev = [
+  "pip-audit>=2.9,<3",
   "pygame-ce>=2.5,<3",
   "pytest>=8,<10",
   "ruff>=0.12,<1",
@@ -41,10 +42,3 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
-
-[tool.uv]
-exclude-newer = "7 days"
-constraint-dependencies = [
-  "guardrails-ai!=0.10.1",
-  "mistralai!=2.4.6",
-]
