@@ -55,7 +55,13 @@ def _select_action(
     action_index: dict[tuple[str, ...], int],
     weapon_action: int | None = None,
 ) -> int:
-    """Resolve held keys into the closest action in the pinned 17-action table."""
+    """Resolve held keys into the closest action in the server-provided table.
+
+    Builds the full attack+move+turn chord, then degrades gracefully when the
+    table lacks it: the run modifier is sacrificed first, firing second
+    (maneuvering decides fights), turning third. Candidates follow
+    DEATHMATCH_BUTTONS order.
+    """
 
     if weapon_action is not None:
         return weapon_action
@@ -67,34 +73,36 @@ def _select_action(
     turn_left = controls.turn_left and not controls.turn_right
     turn_right = controls.turn_right and not controls.turn_left
 
-    if controls.attack:
-        if forward:
-            return action_index[("ATTACK", "MOVE_FORWARD")]
-        if backward:
-            return action_index[("ATTACK", "MOVE_BACKWARD")]
-        if strafe_left:
-            return action_index[("ATTACK", "MOVE_LEFT")]
-        if strafe_right:
-            return action_index[("ATTACK", "MOVE_RIGHT")]
-        if turn_left:
-            return action_index[("ATTACK", "TURN_LEFT")]
-        if turn_right:
-            return action_index[("ATTACK", "TURN_RIGHT")]
-        return action_index[("ATTACK",)]
-
     if forward:
-        buttons = ("SPEED", "MOVE_FORWARD") if controls.run else ("MOVE_FORWARD",)
-        return action_index[buttons]
-    if backward:
-        return action_index[("MOVE_BACKWARD",)]
-    if strafe_left:
-        return action_index[("MOVE_LEFT",)]
-    if strafe_right:
-        return action_index[("MOVE_RIGHT",)]
-    if turn_left:
-        return action_index[("TURN_LEFT",)]
-    if turn_right:
-        return action_index[("TURN_RIGHT",)]
+        move = ("SPEED", "MOVE_FORWARD") if controls.run else ("MOVE_FORWARD",)
+    elif backward:
+        move = ("MOVE_BACKWARD",)
+    elif strafe_left:
+        move = ("MOVE_LEFT",)
+    elif strafe_right:
+        move = ("MOVE_RIGHT",)
+    else:
+        move = ()
+    turn = ("TURN_LEFT",) if turn_left else ("TURN_RIGHT",) if turn_right else ()
+    attack = ("ATTACK",) if controls.attack else ()
+    walk = move[1:] if move[:1] == ("SPEED",) else move
+
+    for candidate in (
+        attack + move + turn,  # full chord
+        attack + walk + turn,  # drop the run modifier first
+        move + turn,  # maneuver without firing
+        walk + turn,
+        attack + move,  # fire on the move, going straight
+        attack + walk,
+        attack + turn,
+        move,
+        walk,
+        turn,
+        attack,
+        (),
+    ):
+        if candidate in action_index:
+            return action_index[candidate]
     return action_index[()]
 
 

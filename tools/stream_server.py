@@ -29,16 +29,16 @@ from typing import Any
 import torch
 
 from gradoom import GraDoomVecEnv
-from gradoom.actions import DEATHMATCH_ACTIONS
+from gradoom.actions import DEATHMATCH_HUMAN_ACTIONS
 from gradoom.engine import DEVICE_SIGNAL_NAMES
 
 _REQUEST = struct.Struct("!BBB")
 _FLAG_RESET = 0x01
 _FLAG_QUIT = 0x02
 
-_NOOP = DEATHMATCH_ACTIONS.index(())
-_NEXT_WEAPON = DEATHMATCH_ACTIONS.index(("SELECT_NEXT_WEAPON",))
-_PREVIOUS_WEAPON = DEATHMATCH_ACTIONS.index(("SELECT_PREV_WEAPON",))
+_NOOP = DEATHMATCH_HUMAN_ACTIONS.index(())
+_NEXT_WEAPON = DEATHMATCH_HUMAN_ACTIONS.index(("SELECT_NEXT_WEAPON",))
+_PREVIOUS_WEAPON = DEATHMATCH_HUMAN_ACTIONS.index(("SELECT_PREV_WEAPON",))
 
 _WEAPON_SLOTS = 6
 _MAX_WEAPON_PRESSES = _WEAPON_SLOTS * 8
@@ -389,7 +389,7 @@ def _create_env(args: argparse.Namespace) -> GraDoomVecEnv:
         num_envs=1,
         device=device,
         transport="torch",
-        use_restricted_actions=DEATHMATCH_ACTIONS,
+        use_restricted_actions=DEATHMATCH_HUMAN_ACTIONS,
         render_mode="rgb_array",
         obs_copy="unsafe_view",
         obs_resize=(84, 84),
@@ -495,7 +495,7 @@ def _serve_connection(
                 "protocol": 3,
                 "fps": env.metadata["render_fps"] / env.frame_skip,
                 "signals": list(DEVICE_SIGNAL_NAMES),
-                "actions": [list(buttons) for buttons in DEATHMATCH_ACTIONS],
+                "actions": [list(buttons) for buttons in DEATHMATCH_HUMAN_ACTIONS],
             }
         )
     )

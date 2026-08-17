@@ -50,6 +50,25 @@ DEATHMATCH_ACTIONS = (
     ("SELECT_PREV_WEAPON",),
 )
 
+# Superset for human play (e.g. the remote stream server): adds movement/turn
+# chords a keyboard player expects. Training parity keeps the pinned table
+# above; this table is tooling-only and must not be used for certified runs.
+DEATHMATCH_HUMAN_ACTIONS = (
+    *DEATHMATCH_ACTIONS,
+    ("MOVE_FORWARD", "TURN_LEFT"),
+    ("MOVE_FORWARD", "TURN_RIGHT"),
+    ("SPEED", "MOVE_FORWARD", "TURN_LEFT"),
+    ("SPEED", "MOVE_FORWARD", "TURN_RIGHT"),
+    ("MOVE_BACKWARD", "TURN_LEFT"),
+    ("MOVE_BACKWARD", "TURN_RIGHT"),
+    ("MOVE_LEFT", "TURN_LEFT"),
+    ("MOVE_LEFT", "TURN_RIGHT"),
+    ("MOVE_RIGHT", "TURN_LEFT"),
+    ("MOVE_RIGHT", "TURN_RIGHT"),
+    ("ATTACK", "MOVE_FORWARD", "TURN_LEFT"),
+    ("ATTACK", "MOVE_FORWARD", "TURN_RIGHT"),
+)
+
 
 def normalize_action_table(
     actions: Any,
@@ -95,4 +114,7 @@ def normalize_action_table(
 
 DEATHMATCH_ACTIONS, DEATHMATCH_ACTION_MEANINGS, DEATHMATCH_ACTION_TABLE_SHA256 = (
     normalize_action_table(DEATHMATCH_ACTIONS)
+)
+DEATHMATCH_HUMAN_ACTIONS, DEATHMATCH_HUMAN_ACTION_MEANINGS, DEATHMATCH_HUMAN_ACTION_TABLE_SHA256 = (
+    normalize_action_table(DEATHMATCH_HUMAN_ACTIONS)
 )

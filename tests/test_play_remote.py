@@ -9,13 +9,14 @@ from pathlib import Path
 
 import pytest
 
-from gradoom.actions import DEATHMATCH_ACTIONS
+from gradoom.actions import DEATHMATCH_ACTIONS, DEATHMATCH_HUMAN_ACTIONS
 
 _ROOT = Path(__file__).parents[1]
 _SERVER = runpy.run_path(str(_ROOT / "tools" / "stream_server.py"))
 _CLIENT = runpy.run_path(str(_ROOT / "play_remote.py"))
 
 _ACTION_INDEX = {buttons: index for index, buttons in enumerate(DEATHMATCH_ACTIONS)}
+_HUMAN_ACTION_INDEX = {buttons: index for index, buttons in enumerate(DEATHMATCH_HUMAN_ACTIONS)}
 ControlState = _CLIENT["ControlState"]
 _select_action = _CLIENT["_select_action"]
 
@@ -60,6 +61,62 @@ def test_select_action_matches_pinned_deathmatch_actions(
     expected: int,
 ) -> None:
     assert _select_action(controls, _ACTION_INDEX) == expected
+
+
+def _human_action(*buttons: str) -> int:
+    return DEATHMATCH_HUMAN_ACTIONS.index(buttons)
+
+
+@pytest.mark.parametrize(
+    ("controls", "expected"),
+    [
+        # movement/turn chords the pinned training table lacks
+        (ControlState(forward=True, turn_right=True), _human_action("MOVE_FORWARD", "TURN_RIGHT")),
+        (ControlState(forward=True, turn_left=True), _human_action("MOVE_FORWARD", "TURN_LEFT")),
+        (
+            ControlState(forward=True, turn_left=True, run=True),
+            _human_action("SPEED", "MOVE_FORWARD", "TURN_LEFT"),
+        ),
+        (
+            ControlState(backward=True, turn_right=True),
+            _human_action("MOVE_BACKWARD", "TURN_RIGHT"),
+        ),
+        (ControlState(strafe_left=True, turn_right=True), _human_action("MOVE_LEFT", "TURN_RIGHT")),
+        (ControlState(strafe_right=True, turn_left=True), _human_action("MOVE_RIGHT", "TURN_LEFT")),
+        (
+            ControlState(attack=True, forward=True, turn_right=True),
+            _human_action("ATTACK", "MOVE_FORWARD", "TURN_RIGHT"),
+        ),
+        # run is sacrificed before firing when the full chord is unavailable
+        (
+            ControlState(attack=True, forward=True, turn_right=True, run=True),
+            _human_action("ATTACK", "MOVE_FORWARD", "TURN_RIGHT"),
+        ),
+        # firing is sacrificed before maneuvering for strafe+turn chords
+        (
+            ControlState(attack=True, strafe_left=True, turn_left=True),
+            _human_action("MOVE_LEFT", "TURN_LEFT"),
+        ),
+    ],
+)
+def test_select_action_uses_human_table_chords(
+    controls: ControlState,
+    expected: int,
+) -> None:
+    assert _select_action(controls, _HUMAN_ACTION_INDEX) == expected
+
+
+def test_select_action_pinned_table_still_drops_turn() -> None:
+    # Certified training table has no move+turn chord; the turn is dropped.
+    assert _select_action(ControlState(forward=True, turn_right=True), _ACTION_INDEX) == _action(
+        "MOVE_FORWARD"
+    )
+
+
+def test_server_uses_human_action_table() -> None:
+    assert _SERVER["_NOOP"] == DEATHMATCH_HUMAN_ACTIONS.index(())
+    assert len(DEATHMATCH_HUMAN_ACTIONS) == len(DEATHMATCH_ACTIONS) + 12
+    assert DEATHMATCH_HUMAN_ACTIONS[: len(DEATHMATCH_ACTIONS)] == DEATHMATCH_ACTIONS
 
 
 @pytest.mark.parametrize(
