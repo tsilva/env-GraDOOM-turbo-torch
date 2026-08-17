@@ -1,16 +1,22 @@
 """Stream one GraDOOM deathmatch lane to a remote keyboard player.
 
-The server steps the environment on its own real-time clock and pushes
-zlib-compressed frames; the client sends input only when it changes. This
-keeps the frame rate independent of the connection's round-trip latency.
+The server steps the environment on its own real-time clock, replaying one
+CUDA-graphed step+reset transaction per Doom tic, and pushes zlib-compressed
+frames; the client sends input only when it changes. This keeps the frame
+rate independent of the connection's round-trip latency. Compression and
+sending run on a worker thread that keeps only the latest frame, so a slow
+connection drops frames instead of slowing the game clock. Per-tic phase
+timings and stream throughput are logged every --metrics-interval seconds.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import socket
 import struct
+import threading
 import time
 import zlib
 from dataclasses import dataclass
@@ -116,6 +122,140 @@ def _encode_step_reply(
     return header.pack(done, *signals) + struct.pack("!I", len(payload)) + payload
 
 
+class _StreamSender:
+    """Compresses and sends replies on a worker thread, keeping only the latest.
+
+    The tic loop never waits on zlib or the network: when the sender falls
+    behind, pending frames are coalesced (dropped) so the game keeps real time.
+    """
+
+    def __init__(self, connection: socket.socket, header: struct.Struct) -> None:
+        self._connection = connection
+        self._header = header
+        self._lock = threading.Lock()
+        self._wakeup = threading.Event()
+        self._latest: tuple[bool, list[float], bytes] | None = None
+        self._stop = False
+        self._dead: OSError | None = None
+        self.sent = 0
+        self.drops = 0
+        self.compress_s = 0.0
+        self.send_s = 0.0
+        self.bytes_sent = 0
+        self._thread = threading.Thread(target=self._run, daemon=True, name="stream-sender")
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def submit(self, done: bool, signals: list[float], frame: bytes) -> None:
+        with self._lock:
+            if self._latest is not None:
+                self.drops += 1
+            self._latest = (done, signals, frame)
+        self._wakeup.set()
+
+    @property
+    def dead(self) -> OSError | None:
+        with self._lock:
+            return self._dead
+
+    def snapshot(self) -> tuple[int, int, float, float, int]:
+        """Return and reset the window counters: sent, drops, compress_s, send_s, bytes."""
+        with self._lock:
+            stats = (self.sent, self.drops, self.compress_s, self.send_s, self.bytes_sent)
+            self.sent = self.drops = 0
+            self.compress_s = self.send_s = 0.0
+            self.bytes_sent = 0
+        return stats
+
+    def stop(self) -> None:
+        with self._lock:
+            self._stop = True
+        self._wakeup.set()
+        self._thread.join(timeout=2)
+
+    def _run(self) -> None:
+        while True:
+            self._wakeup.wait()
+            self._wakeup.clear()
+            with self._lock:
+                item = self._latest
+                self._latest = None
+                stop = self._stop
+            if item is not None:
+                done, signals, frame = item
+                compress_start = time.perf_counter()
+                reply = _encode_step_reply(self._header, done, signals, frame)
+                compress_end = time.perf_counter()
+                try:
+                    self._connection.sendall(reply)
+                except OSError as exc:
+                    with self._lock:
+                        self._dead = exc
+                    return
+                send_end = time.perf_counter()
+                with self._lock:
+                    self.compress_s += compress_end - compress_start
+                    self.send_s += send_end - compress_end
+                    self.sent += 1
+                    self.bytes_sent += len(reply)
+            if stop:
+                return
+
+
+class _TicMetrics:
+    """Windowed accumulator that logs where each Doom tic's time goes."""
+
+    def __init__(self, interval: float) -> None:
+        self.interval = interval
+        self._reset(time.monotonic())
+
+    def _reset(self, now: float) -> None:
+        self._window_start = now
+        self.tics = 0
+        self.step_s = 0.0
+        self.render_s = 0.0
+        self.submit_s = 0.0
+        self.sleep_s = 0.0
+        self.late = 0
+
+    def record(
+        self, step_s: float, render_s: float, submit_s: float, sleep_s: float, late: bool
+    ) -> None:
+        self.tics += 1
+        self.step_s += step_s
+        self.render_s += render_s
+        self.submit_s += submit_s
+        self.sleep_s += sleep_s
+        self.late += int(late)
+
+    def maybe_report(self, sender: _StreamSender) -> None:
+        now = time.monotonic()
+        if self.interval <= 0 or now - self._window_start < self.interval:
+            return
+        self._report(now, sender.snapshot())
+
+    def _report(self, now: float, sender_stats: tuple[int, int, float, float, int]) -> None:
+        elapsed = now - self._window_start
+        sent, drops, compress_s, send_s, bytes_sent = sender_stats
+        tics = max(self.tics, 1)
+        sent_denom = max(sent, 1)
+        print(
+            f"[stream] {self.tics / elapsed:.1f} tics/s (target ~17.5) "
+            f"step {1e3 * self.step_s / tics:.2f}ms "
+            f"render {1e3 * self.render_s / tics:.2f}ms "
+            f"submit {1e3 * self.submit_s / tics:.2f}ms "
+            f"sleep {1e3 * self.sleep_s / tics:.2f}ms "
+            f"late {self.late} | "
+            f"sent {sent / elapsed:.1f}/s drops {drops / elapsed:.1f}/s "
+            f"compress {1e3 * compress_s / sent_denom:.2f}ms "
+            f"send {1e3 * send_s / sent_denom:.2f}ms "
+            f"{bytes_sent / elapsed / 1024:.0f} KiB/s",
+            flush=True,
+        )
+        self._reset(now)
+
+
 def _slot_presses(current: int, target: int, owned: list[bool], direction: int) -> int:
     """Count cycle presses needed to reach a target slot, skipping unowned slots."""
 
@@ -168,6 +308,13 @@ def _positive_int(value: str) -> int:
     return result
 
 
+def _nonnegative_float(value: str) -> float:
+    result = float(value)
+    if result < 0:
+        raise argparse.ArgumentTypeError("must be non-negative")
+    return result
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Stream GraDOOM's deathmatch-p1-v1 environment to a remote player.",
@@ -189,24 +336,38 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=_positive_int, default=6666, help="TCP port to listen on")
     parser.add_argument(
         "--compile-engine",
-        action="store_true",
-        help="compile the engine with torch.compile (CUDA only)",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="compile engine phases and replay the CUDA-graphed step transaction; "
+        "roughly 25x faster single-lane stepping, at the cost of a one-time warmup "
+        "(CUDA only; automatically disabled otherwise)",
     )
     parser.add_argument(
         "--allow-unpinned-scenario",
         action="store_true",
         help="allow a non-certified deathmatch scenario WAD",
     )
+    parser.add_argument(
+        "--metrics-interval",
+        type=_nonnegative_float,
+        default=5.0,
+        help="seconds between [stream] timing/throughput log lines; 0 disables",
+    )
     return parser
 
 
 def _create_env(args: argparse.Namespace) -> GraDoomVecEnv:
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    compile_engine = args.compile_engine
+    if compile_engine and not device.startswith("cuda"):
+        print("CUDA unavailable; --no-compile-engine is implied", flush=True)
+        compile_engine = False
     return GraDoomVecEnv(
         game="VizdoomDeathmatch-v1",
         scenario=args.scenario,
         rom_path=None if args.iwad is None else str(args.iwad),
         num_envs=1,
-        device=args.device,
+        device=device,
         transport="torch",
         use_restricted_actions=DEATHMATCH_ACTIONS,
         render_mode="rgb_array",
@@ -225,9 +386,28 @@ def _create_env(args: argparse.Namespace) -> GraDoomVecEnv:
         use_fire_reset=False,
         sticky_action_prob=0.0,
         reward_clip=False,
-        compile_engine=args.compile_engine,
+        compile_engine=compile_engine,
         require_pinned_scenario=not args.allow_unpinned_scenario,
     )
+
+
+def _warm_up(env: GraDoomVecEnv) -> None:
+    """Pay the one-time compile/capture cost before the first client connects."""
+
+    if env.engine_backend != "torch-compiled-cudagraph":
+        return
+    print(
+        "compiling engine phases and capturing the CUDA graph (one-time warmup)...",
+        flush=True,
+    )
+    start = time.monotonic()
+    mask = torch.ones(1, device=env.device, dtype=torch.bool)
+    seeds = torch.zeros(1, device=env.device, dtype=torch.int64)
+    env.reset_device(mask, seeds)
+    actions = torch.zeros(1, device=env.device, dtype=torch.int64)  # noop
+    env.step_and_reset_device(actions, seeds)
+    torch.cuda.synchronize(env.device)
+    print(f"warmup done in {time.monotonic() - start:.0f}s", flush=True)
 
 
 def _reset_lane(env: GraDoomVecEnv, seed: int) -> list[float]:
@@ -248,6 +428,7 @@ def _serve_connection(
     env: GraDoomVecEnv,
     connection: socket.socket,
     seed: int,
+    metrics_interval: float,
 ) -> int:
     """Play one client until quit or disconnect; return the next episode seed."""
 
@@ -272,47 +453,78 @@ def _serve_connection(
     connection.sendall(_encode_step_reply(header, False, signals, frame.tobytes()))
 
     action = torch.zeros(1, dtype=torch.int64, device=env.device)
+    reset_seeds = torch.zeros(1, dtype=torch.int64, device=env.device)
     state = _ClientInput()
     weapon_select = _WeaponSelect()
     pending = bytearray()
     done = False
+    last_seed = seed
+    next_episode_seed = seed + 1
     tic_period = env.frame_skip / env.metadata["render_fps"]
     next_tic = time.monotonic()
-    while not state.quit:
-        connection.setblocking(False)
-        pending = _drain_requests(connection, state, pending)
-        connection.setblocking(True)
+    sender = _StreamSender(connection, header)
+    sender.start()
+    metrics = _TicMetrics(metrics_interval)
+    try:
+        while not state.quit:
+            dead_error = sender.dead
+            if dead_error is not None:
+                raise ConnectionError(f"stream sender failed: {dead_error}")
+            tic_start = time.perf_counter()
+            connection.setblocking(False)
+            pending = _drain_requests(connection, state, pending)
+            connection.setblocking(True)
 
-        if state.reset or done:
-            seed += 1
-            signals = _reset_lane(env, seed)
-            weapon_select = _WeaponSelect()
-            state.reset = False
-            done = False
-        else:
-            if state.weapon_key:
-                weapon_select = _WeaponSelect(target=state.weapon_key)
-                state.weapon_key = 0
-            override = _weapon_select_action(weapon_select, signals)
-            action.fill_(override if override is not None else state.action)
-            transition = env.step_device(action)
-            signals = transition.signals[0].detach().to("cpu").tolist()
-            done = bool((transition.terminated | transition.truncated)[0].item())
+            if state.reset:
+                signals = _reset_lane(env, next_episode_seed)
+                last_seed = next_episode_seed
+                next_episode_seed += 1
+                weapon_select = _WeaponSelect()
+                state.reset = False
+                done = False
+            else:
+                if state.weapon_key:
+                    weapon_select = _WeaponSelect(target=state.weapon_key)
+                    state.weapon_key = 0
+                override = _weapon_select_action(weapon_select, signals)
+                action.fill_(override if override is not None else state.action)
+                reset_seeds.fill_(next_episode_seed)
+                # One CUDA graph replay: step plus atomic reset of terminal lanes.
+                transition = env.step_and_reset_device(action, reset_seeds)
+                signals = transition.signals[0].detach().to("cpu").tolist()
+                done = bool((transition.terminated | transition.truncated)[0].item())
+                if done:
+                    last_seed = next_episode_seed
+                    next_episode_seed += 1
 
-        reply = _encode_step_reply(header, done, signals, _render_frame(env).tobytes())
-        connection.sendall(reply)
-        next_tic += tic_period
-        delay = next_tic - time.monotonic()
-        if delay > 0:
-            time.sleep(delay)
-        else:
-            next_tic = time.monotonic()
-    return seed
+            step_end = time.perf_counter()
+            reply_frame = _render_frame(env)
+            render_end = time.perf_counter()
+            sender.submit(done, signals, reply_frame.tobytes())
+            submit_end = time.perf_counter()
+            next_tic += tic_period
+            delay = next_tic - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+            else:
+                next_tic = time.monotonic()
+            metrics.record(
+                step_end - tic_start,
+                render_end - step_end,
+                submit_end - render_end,
+                max(delay, 0.0),
+                delay <= 0,
+            )
+            metrics.maybe_report(sender)
+    finally:
+        sender.stop()
+    return last_seed
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     env = _create_env(args)
+    _warm_up(env)
     try:
         with socket.socket() as listener:
             listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -325,7 +537,9 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"player connected from {address[0]}:{address[1]}", flush=True)
                 try:
                     connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                    seed = _serve_connection(env, connection, seed)
+                    with contextlib.suppress(OSError):  # best effort; OS may cap the buffer
+                        connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1 << 22)
+                    seed = _serve_connection(env, connection, seed, args.metrics_interval)
                 except (ConnectionError, OSError) as exc:
                     print(f"player connection dropped: {exc}", flush=True)
                 finally:

@@ -172,6 +172,81 @@ def test_parse_requests_latches_quit_and_ignores_partial() -> None:
     assert state.quit is False
 
 
+def test_stream_sender_passthrough() -> None:
+    server, client = socket.socketpair()
+    try:
+        header = _SERVER["_step_reply_header"](_SIGNAL_COUNT)
+        sender = _SERVER["_StreamSender"](server, header)
+        sender.start()
+        signals = [float(index) for index in range(_SIGNAL_COUNT)]
+        sender.submit(True, signals, bytes(range(12)))
+        done, received_signals, received_frame = _CLIENT["_recv_reply"](
+            client,
+            _CLIENT["_step_reply_header"](_SIGNAL_COUNT),
+            12,
+            compressed=True,
+        )
+        sender.stop()
+        assert done is True
+        assert received_signals == signals
+        assert received_frame == bytes(range(12))
+        assert sender.sent == 1
+        assert sender.drops == 0
+    finally:
+        server.close()
+        client.close()
+
+
+def test_stream_sender_coalesces_to_latest_frame() -> None:
+    server, client = socket.socketpair()
+    try:
+        header = _SERVER["_step_reply_header"](_SIGNAL_COUNT)
+        sender = _SERVER["_StreamSender"](server, header)
+        first = [1.0] * _SIGNAL_COUNT
+        latest = [2.0] * _SIGNAL_COUNT
+        sender.submit(False, first, b"\x00" * 12)
+        sender.submit(False, latest, b"\x01" * 12)
+        sender.start()  # the worker only wakes now, so the first frame is stale
+        _, received_signals, received_frame = _CLIENT["_recv_reply"](
+            client,
+            _CLIENT["_step_reply_header"](_SIGNAL_COUNT),
+            12,
+            compressed=True,
+        )
+        sender.stop()
+        assert received_signals == latest
+        assert received_frame == b"\x01" * 12
+        assert sender.drops == 1
+    finally:
+        server.close()
+        client.close()
+
+
+def test_tic_metrics_report(capsys: pytest.CaptureFixture[str]) -> None:
+    metrics = _SERVER["_TicMetrics"](interval=5.0)
+    for _ in range(3):
+        metrics.record(0.002, 0.004, 0.0001, 0.05, False)
+    metrics._report(metrics._window_start + 5.0, (50, 2, 0.1, 0.4, 50 * 30_000))
+    out = capsys.readouterr().out
+    assert "tics/s" in out
+    assert "render 4.00ms" in out
+    assert "compress 2.00ms" in out
+    assert metrics.tics == 0  # the window reset after reporting
+
+
+def test_tic_metrics_disabled(capsys: pytest.CaptureFixture[str]) -> None:
+    server, client = socket.socketpair()
+    try:
+        sender = _SERVER["_StreamSender"](server, _SERVER["_step_reply_header"](_SIGNAL_COUNT))
+        metrics = _SERVER["_TicMetrics"](interval=0.0)
+        metrics.record(0.002, 0.004, 0.0001, 0.05, False)
+        metrics.maybe_report(sender)
+        assert capsys.readouterr().out == ""
+    finally:
+        server.close()
+        client.close()
+
+
 def test_step_reply_round_trip() -> None:
     server, client = socket.socketpair()
     try:
@@ -248,3 +323,13 @@ def test_client_parser_rejects_non_positive_port() -> None:
 def test_server_parser_rejects_non_positive_port() -> None:
     with pytest.raises(SystemExit):
         _SERVER["_parser"]().parse_args(["--port", "0"])
+
+
+def test_client_parser_rejects_negative_metrics_interval() -> None:
+    with pytest.raises(SystemExit):
+        _CLIENT["_parser"]().parse_args(["--metrics-interval", "-1"])
+
+
+def test_server_parser_rejects_negative_metrics_interval() -> None:
+    with pytest.raises(SystemExit):
+        _SERVER["_parser"]().parse_args(["--metrics-interval", "-1"])

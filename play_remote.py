@@ -2,12 +2,14 @@
 
 This client runs where the gradoom package itself cannot be imported (the
 engine's Triton dependency is Linux-only); the stream server sends the pinned
-action table in its hello message.
+action table in its hello message. Receive throughput and display timings are
+logged every --metrics-interval seconds.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import socket
 import struct
@@ -111,6 +113,13 @@ def _positive_float(value: str) -> float:
     return result
 
 
+def _nonnegative_float(value: str) -> float:
+    result = float(value)
+    if result < 0:
+        raise argparse.ArgumentTypeError("must be non-negative")
+    return result
+
+
 def _recv_exact(connection: socket.socket, size: int) -> bytes:
     chunks = bytearray()
     while len(chunks) < size:
@@ -198,6 +207,12 @@ def _parser() -> argparse.ArgumentParser:
         default=60.0,
         help="input/display poll rate; the server streams at real-time Doom tics",
     )
+    parser.add_argument(
+        "--metrics-interval",
+        type=_nonnegative_float,
+        default=5.0,
+        help="seconds between [play] timing/throughput log lines; 0 disables",
+    )
     return parser
 
 
@@ -212,6 +227,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         with socket.create_connection((args.host, args.port)) as connection:
             connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            with contextlib.suppress(OSError):  # best effort; the OS may cap the buffer
+                connection.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 22)
             hello = _recv_hello(connection)
             width, height = hello["width"], hello["height"]
             action_index = {tuple(buttons): index for index, buttons in enumerate(hello["actions"])}
@@ -223,6 +240,7 @@ def main(argv: list[str] | None = None) -> int:
             pygame.display.set_caption("GraDOOM")
 
             latest: dict[str, Any] = {"frame": None, "signals": None, "dead": None}
+            stats = {"frames": 0, "bytes": 0, "draws": 0, "draw_s": 0.0, "inputs": 0}
             lock = threading.Lock()
 
             def receive() -> None:
@@ -234,6 +252,8 @@ def main(argv: list[str] | None = None) -> int:
                         with lock:
                             latest["signals"] = signals
                             latest["frame"] = frame
+                            stats["frames"] += 1
+                            stats["bytes"] += len(frame)
                 except (ConnectionError, OSError) as exc:
                     with lock:
                         latest["dead"] = exc
@@ -252,6 +272,7 @@ def main(argv: list[str] | None = None) -> int:
             print(_CONTROLS)
             clock = pygame.time.Clock()
             last_sent: tuple[int, int, int] | None = None
+            metrics_start = time.monotonic()
             running = True
             while running:
                 flags = 0
@@ -280,6 +301,8 @@ def main(argv: list[str] | None = None) -> int:
                 if message != last_sent:
                     connection.sendall(_encode_request(*message))
                     last_sent = message
+                    with lock:
+                        stats["inputs"] += 1
                 if not running:
                     break
 
@@ -290,10 +313,34 @@ def main(argv: list[str] | None = None) -> int:
                 if dead is not None:
                     raise dead
                 if frame is not None:
+                    draw_start = time.perf_counter()
                     _draw_frame(pygame, screen, frame, width, height)
+                    draw_end = time.perf_counter()
+                    with lock:
+                        stats["draws"] += 1
+                        stats["draw_s"] += draw_end - draw_start
                 if signals is not None:
                     pygame.display.set_caption(_caption(hello["signals"], signals))
                 clock.tick(args.fps)
+
+                now = time.monotonic()
+                elapsed = now - metrics_start
+                if args.metrics_interval > 0 and elapsed >= args.metrics_interval:
+                    with lock:
+                        frames, nbytes = stats["frames"], stats["bytes"]
+                        draws, draw_s, inputs = stats["draws"], stats["draw_s"], stats["inputs"]
+                        stats["frames"] = stats["bytes"] = stats["inputs"] = 0
+                        stats["draws"] = 0
+                        stats["draw_s"] = 0.0
+                    print(
+                        f"[play] recv {frames / elapsed:.1f} fps "
+                        f"{nbytes / elapsed / 1024:.0f} KiB/s | "
+                        f"draw {1e3 * draw_s / max(draws, 1):.2f}ms "
+                        f"{draws / elapsed:.1f} presents/s | "
+                        f"inputs {inputs / elapsed:.1f}/s",
+                        flush=True,
+                    )
+                    metrics_start = now
     except (ConnectionError, OSError) as exc:
         print(f"connection to {args.host}:{args.port} failed: {exc}")
         return 1
