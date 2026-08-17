@@ -3,10 +3,13 @@
 The server steps the environment on its own real-time clock, replaying one
 CUDA-graphed step+reset transaction per Doom tic, and pushes zlib-compressed
 frames; the client sends input only when it changes. This keeps the frame
-rate independent of the connection's round-trip latency. Compression and
-sending run on a worker thread that keeps only the latest frame, so a slow
-connection drops frames instead of slowing the game clock. Per-tic phase
-timings and stream throughput are logged every --metrics-interval seconds.
+rate independent of the connection's round-trip latency. Frames stream as
+Doom's native 8-bit palette indices (lossless, one third of RGB's bandwidth)
+unless screen flashes are enabled. Compression and sending run on a worker
+thread that keeps only the latest frame and drops frames older than
+--stale-budget-ms, so a slow connection degrades to fresh low-FPS video
+instead of accumulating lag. Per-tic phase timings and stream throughput are
+logged every --metrics-interval seconds.
 """
 
 from __future__ import annotations
@@ -109,7 +112,9 @@ def _encode_hello(metadata: dict[str, Any]) -> bytes:
 
 
 def _step_reply_header(signal_count: int) -> struct.Struct:
-    return struct.Struct(f"!B{signal_count}f")
+    # done byte, signal floats, and a send timestamp the client uses to
+    # measure stream lag despite the machines' unrelated monotonic clocks.
+    return struct.Struct(f"!B{signal_count}fd")
 
 
 def _encode_step_reply(
@@ -119,7 +124,8 @@ def _encode_step_reply(
     frame: bytes,
 ) -> bytes:
     payload = zlib.compress(frame, 1)
-    return header.pack(done, *signals) + struct.pack("!I", len(payload)) + payload
+    header_bytes = header.pack(done, *signals, time.monotonic())
+    return header_bytes + struct.pack("!I", len(payload)) + payload
 
 
 class _StreamSender:
@@ -129,12 +135,15 @@ class _StreamSender:
     behind, pending frames are coalesced (dropped) so the game keeps real time.
     """
 
-    def __init__(self, connection: socket.socket, header: struct.Struct) -> None:
+    def __init__(
+        self, connection: socket.socket, header: struct.Struct, stale_budget_s: float
+    ) -> None:
         self._connection = connection
         self._header = header
+        self._stale_budget_s = stale_budget_s
         self._lock = threading.Lock()
         self._wakeup = threading.Event()
-        self._latest: tuple[bool, list[float], bytes] | None = None
+        self._latest: tuple[float, bool, list[float], bytes] | None = None
         self._stop = False
         self._dead: OSError | None = None
         self.sent = 0
@@ -151,7 +160,7 @@ class _StreamSender:
         with self._lock:
             if self._latest is not None:
                 self.drops += 1
-            self._latest = (done, signals, frame)
+            self._latest = (time.monotonic(), done, signals, frame)
         self._wakeup.set()
 
     @property
@@ -183,22 +192,27 @@ class _StreamSender:
                 self._latest = None
                 stop = self._stop
             if item is not None:
-                done, signals, frame = item
-                compress_start = time.perf_counter()
-                reply = _encode_step_reply(self._header, done, signals, frame)
-                compress_end = time.perf_counter()
-                try:
-                    self._connection.sendall(reply)
-                except OSError as exc:
+                submitted_at, done, signals, frame = item
+                if time.monotonic() - submitted_at > self._stale_budget_s:
+                    # The pipe is behind; show the player a fresher frame instead.
                     with self._lock:
-                        self._dead = exc
-                    return
-                send_end = time.perf_counter()
-                with self._lock:
-                    self.compress_s += compress_end - compress_start
-                    self.send_s += send_end - compress_end
-                    self.sent += 1
-                    self.bytes_sent += len(reply)
+                        self.drops += 1
+                else:
+                    compress_start = time.perf_counter()
+                    reply = _encode_step_reply(self._header, done, signals, frame)
+                    compress_end = time.perf_counter()
+                    try:
+                        self._connection.sendall(reply)
+                    except OSError as exc:
+                        with self._lock:
+                            self._dead = exc
+                        return
+                    send_end = time.perf_counter()
+                    with self._lock:
+                        self.compress_s += compress_end - compress_start
+                        self.send_s += send_end - compress_end
+                        self.sent += 1
+                        self.bytes_sent += len(reply)
             if stop:
                 return
 
@@ -353,6 +367,12 @@ def _parser() -> argparse.ArgumentParser:
         default=5.0,
         help="seconds between [stream] timing/throughput log lines; 0 disables",
     )
+    parser.add_argument(
+        "--stale-budget-ms",
+        type=_positive_int,
+        default=250,
+        help="drop unsent frames older than this; keeps the video fresh on slow links",
+    )
     return parser
 
 
@@ -424,33 +444,62 @@ def _render_frame(env: GraDoomVecEnv) -> Any:
     return frame
 
 
+def _stream_encoding(env: GraDoomVecEnv) -> tuple[str, list[int] | None]:
+    """Pick the frame encoding: palette-indexed unless screen flashes are on.
+
+    Doom renders to an 8-bit PLAYPAL-indexed framebuffer; streaming those
+    indices losslessly uses one third of RGB's bandwidth before compression.
+    Screen flashes are continuous RGB blends, so they require RGB transport.
+    """
+
+    if getattr(env._engine, "render_screen_flashes", False):
+        return "zlib", None
+    palette = env._engine.map.playpal.detach().to("cpu").numpy().reshape(-1).tolist()
+    return "zlib-indexed", palette
+
+
+def _render_frame_bytes(env: GraDoomVecEnv, indexed: bool) -> tuple[bytes, int, int, int]:
+    """Render the current frame; return (pixels, width, height, channels)."""
+
+    if indexed:
+        frame = env._engine._render_native_indexed_frame(include_hud=True)[0]
+        data = frame.detach().to("cpu").numpy().tobytes()
+        return data, int(frame.shape[1]), int(frame.shape[0]), 1
+    frame = _render_frame(env)
+    return frame.tobytes(), int(frame.shape[1]), int(frame.shape[0]), 3
+
+
 def _serve_connection(
     env: GraDoomVecEnv,
     connection: socket.socket,
     seed: int,
     metrics_interval: float,
+    stale_budget_s: float,
 ) -> int:
     """Play one client until quit or disconnect; return the next episode seed."""
 
+    encoding, palette = _stream_encoding(env)
+    indexed = encoding == "zlib-indexed"
     signals = _reset_lane(env, seed)
-    frame = _render_frame(env)
+    first_frame, width, height, channels = _render_frame_bytes(env, indexed)
     header = _step_reply_header(_SIGNAL_COUNT)
     connection.sendall(
         _encode_hello(
             {
-                "width": frame.shape[1],
-                "height": frame.shape[0],
-                "channels": frame.shape[2],
-                "frame_bytes": frame.nbytes,
-                "encoding": "zlib",
-                "protocol": 2,
+                "width": width,
+                "height": height,
+                "channels": channels,
+                "frame_bytes": len(first_frame),
+                "encoding": encoding,
+                "palette": palette,
+                "protocol": 3,
                 "fps": env.metadata["render_fps"] / env.frame_skip,
                 "signals": list(DEVICE_SIGNAL_NAMES),
                 "actions": [list(buttons) for buttons in DEATHMATCH_ACTIONS],
             }
         )
     )
-    connection.sendall(_encode_step_reply(header, False, signals, frame.tobytes()))
+    connection.sendall(_encode_step_reply(header, False, signals, first_frame))
 
     action = torch.zeros(1, dtype=torch.int64, device=env.device)
     reset_seeds = torch.zeros(1, dtype=torch.int64, device=env.device)
@@ -462,7 +511,7 @@ def _serve_connection(
     next_episode_seed = seed + 1
     tic_period = env.frame_skip / env.metadata["render_fps"]
     next_tic = time.monotonic()
-    sender = _StreamSender(connection, header)
+    sender = _StreamSender(connection, header, stale_budget_s)
     sender.start()
     metrics = _TicMetrics(metrics_interval)
     try:
@@ -498,9 +547,9 @@ def _serve_connection(
                     next_episode_seed += 1
 
             step_end = time.perf_counter()
-            reply_frame = _render_frame(env)
+            reply_frame, _, _, _ = _render_frame_bytes(env, indexed)
             render_end = time.perf_counter()
-            sender.submit(done, signals, reply_frame.tobytes())
+            sender.submit(done, signals, reply_frame)
             submit_end = time.perf_counter()
             next_tic += tic_period
             delay = next_tic - time.monotonic()
@@ -537,9 +586,19 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"player connected from {address[0]}:{address[1]}", flush=True)
                 try:
                     connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                    with contextlib.suppress(OSError):  # best effort; OS may cap the buffer
-                        connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1 << 22)
-                    seed = _serve_connection(env, connection, seed, args.metrics_interval)
+                    # Bound kernel-side queueing so backpressure reaches the sender
+                    # thread quickly and stale frames are dropped, not queued.
+                    with contextlib.suppress(OSError, AttributeError):  # Linux-only
+                        connection.setsockopt(
+                            socket.IPPROTO_TCP, socket.TCP_NOTSENT_LOWAT, 256 * 1024
+                        )
+                    seed = _serve_connection(
+                        env,
+                        connection,
+                        seed,
+                        args.metrics_interval,
+                        args.stale_budget_ms / 1000,
+                    )
                 except (ConnectionError, OSError) as exc:
                     print(f"player connection dropped: {exc}", flush=True)
                 finally:

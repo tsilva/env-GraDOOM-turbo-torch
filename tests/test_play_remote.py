@@ -3,6 +3,7 @@ from __future__ import annotations
 import runpy
 import socket
 import struct
+import time
 import zlib
 from pathlib import Path
 
@@ -123,8 +124,11 @@ def test_hello_round_trip() -> None:
         metadata = {
             "width": 320,
             "height": 240,
-            "channels": 3,
-            "frame_bytes": 320 * 240 * 3,
+            "channels": 1,
+            "frame_bytes": 320 * 240,
+            "encoding": "zlib-indexed",
+            "palette": [0, 1, 2] * 256,
+            "protocol": 3,
             "fps": 17.5,
             "signals": ["a"],
             "actions": [[], ["ATTACK"]],
@@ -176,11 +180,11 @@ def test_stream_sender_passthrough() -> None:
     server, client = socket.socketpair()
     try:
         header = _SERVER["_step_reply_header"](_SIGNAL_COUNT)
-        sender = _SERVER["_StreamSender"](server, header)
+        sender = _SERVER["_StreamSender"](server, header, stale_budget_s=60.0)
         sender.start()
         signals = [float(index) for index in range(_SIGNAL_COUNT)]
         sender.submit(True, signals, bytes(range(12)))
-        done, received_signals, received_frame = _CLIENT["_recv_reply"](
+        done, received_signals, received_frame, sent_at = _CLIENT["_recv_reply"](
             client,
             _CLIENT["_step_reply_header"](_SIGNAL_COUNT),
             12,
@@ -190,6 +194,7 @@ def test_stream_sender_passthrough() -> None:
         assert done is True
         assert received_signals == signals
         assert received_frame == bytes(range(12))
+        assert sent_at > 0
         assert sender.sent == 1
         assert sender.drops == 0
     finally:
@@ -201,13 +206,13 @@ def test_stream_sender_coalesces_to_latest_frame() -> None:
     server, client = socket.socketpair()
     try:
         header = _SERVER["_step_reply_header"](_SIGNAL_COUNT)
-        sender = _SERVER["_StreamSender"](server, header)
+        sender = _SERVER["_StreamSender"](server, header, stale_budget_s=60.0)
         first = [1.0] * _SIGNAL_COUNT
         latest = [2.0] * _SIGNAL_COUNT
         sender.submit(False, first, b"\x00" * 12)
         sender.submit(False, latest, b"\x01" * 12)
         sender.start()  # the worker only wakes now, so the first frame is stale
-        _, received_signals, received_frame = _CLIENT["_recv_reply"](
+        _, received_signals, received_frame, _ = _CLIENT["_recv_reply"](
             client,
             _CLIENT["_step_reply_header"](_SIGNAL_COUNT),
             12,
@@ -220,6 +225,33 @@ def test_stream_sender_coalesces_to_latest_frame() -> None:
     finally:
         server.close()
         client.close()
+
+
+def test_stream_sender_drops_stale_frames() -> None:
+    server, client = socket.socketpair()
+    try:
+        header = _SERVER["_step_reply_header"](_SIGNAL_COUNT)
+        # A zero budget marks every frame stale by the time the worker wakes.
+        sender = _SERVER["_StreamSender"](server, header, stale_budget_s=0.0)
+        sender.start()
+        sender.submit(False, [0.0] * _SIGNAL_COUNT, b"\x00" * 12)
+        deadline = time.monotonic() + 5
+        while sender.drops < 1 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        sender.stop()
+        assert sender.drops == 1
+        assert sender.sent == 0
+    finally:
+        server.close()
+        client.close()
+
+
+def test_stream_clock_measures_lag_above_best_delay() -> None:
+    clock = _CLIENT["_StreamClock"]()
+    now = time.monotonic()
+    assert clock.lag(now) < 0.001  # first sample anchors the clock
+    assert 0.04 < clock.lag(now - 0.05) < 0.2
+    assert clock.lag(now) < 0.001  # a fresher frame resets the floor
 
 
 def test_tic_metrics_report(capsys: pytest.CaptureFixture[str]) -> None:
@@ -237,7 +269,9 @@ def test_tic_metrics_report(capsys: pytest.CaptureFixture[str]) -> None:
 def test_tic_metrics_disabled(capsys: pytest.CaptureFixture[str]) -> None:
     server, client = socket.socketpair()
     try:
-        sender = _SERVER["_StreamSender"](server, _SERVER["_step_reply_header"](_SIGNAL_COUNT))
+        sender = _SERVER["_StreamSender"](
+            server, _SERVER["_step_reply_header"](_SIGNAL_COUNT), stale_budget_s=60.0
+        )
         metrics = _SERVER["_TicMetrics"](interval=0.0)
         metrics.record(0.002, 0.004, 0.0001, 0.05, False)
         metrics.maybe_report(sender)
@@ -254,7 +288,7 @@ def test_step_reply_round_trip() -> None:
         signals = [float(index) for index in range(_SIGNAL_COUNT)]
         frame = bytes(range(12))
         server.sendall(_SERVER["_encode_step_reply"](header, True, signals, frame))
-        done, received_signals, received_frame = _CLIENT["_recv_reply"](
+        done, received_signals, received_frame, sent_at = _CLIENT["_recv_reply"](
             client,
             _CLIENT["_step_reply_header"](_SIGNAL_COUNT),
             len(frame),
@@ -263,6 +297,7 @@ def test_step_reply_round_trip() -> None:
         assert done is True
         assert received_signals == signals
         assert received_frame == frame
+        assert sent_at > 0
     finally:
         server.close()
         client.close()

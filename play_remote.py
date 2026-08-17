@@ -2,14 +2,13 @@
 
 This client runs where the gradoom package itself cannot be imported (the
 engine's Triton dependency is Linux-only); the stream server sends the pinned
-action table in its hello message. Receive throughput and display timings are
-logged every --metrics-interval seconds.
+action table in its hello message. Receive throughput, stream lag, and display
+timings are logged every --metrics-interval seconds.
 """
 
 from __future__ import annotations
 
 import argparse
-import contextlib
 import json
 import socket
 import struct
@@ -140,7 +139,25 @@ def _encode_request(action: int, flags: int, weapon_key: int) -> bytes:
 
 
 def _step_reply_header(signal_count: int) -> struct.Struct:
-    return struct.Struct(f"!B{signal_count}f")
+    # done byte, signal floats, and the server's send timestamp (protocol 3).
+    return struct.Struct(f"!B{signal_count}fd")
+
+
+class _StreamClock:
+    """Estimates stream lag from server send timestamps.
+
+    The machines' monotonic clocks are unrelated, so anchor on the best
+    observed delay: lag above that floor is queueing backlog on the wire.
+    """
+
+    def __init__(self) -> None:
+        self._best_delay: float | None = None
+
+    def lag(self, sent_at: float) -> float:
+        delay = time.monotonic() - sent_at
+        if self._best_delay is None or delay < self._best_delay:
+            self._best_delay = delay
+        return delay - self._best_delay
 
 
 def _recv_reply(
@@ -149,7 +166,7 @@ def _recv_reply(
     frame_bytes: int,
     *,
     compressed: bool = False,
-) -> tuple[bool, list[float], bytes]:
+) -> tuple[bool, list[float], bytes, float]:
     head = _recv_exact(connection, header.size + 4)
     values = header.unpack(head[: header.size])
     (payload_length,) = struct.unpack("!I", head[header.size :])
@@ -158,7 +175,7 @@ def _recv_reply(
         payload = zlib.decompress(payload)
     if len(payload) != frame_bytes:
         raise ConnectionError(f"bad frame payload: {len(payload)} != {frame_bytes}")
-    return bool(values[0]), list(values[1:]), payload
+    return bool(values[0]), list(values[1:-1]), payload, float(values[-1])
 
 
 def _pressed_controls(keys: Any, pygame: Any) -> ControlState:
@@ -175,8 +192,20 @@ def _pressed_controls(keys: Any, pygame: Any) -> ControlState:
     )
 
 
-def _draw_frame(pygame: Any, screen: Any, frame: bytes, width: int, height: int) -> None:
-    native = pygame.image.frombuffer(frame, (width, height), "RGB")
+def _draw_frame(
+    pygame: Any,
+    screen: Any,
+    frame: bytes,
+    width: int,
+    height: int,
+    palette: list[tuple[int, int, int]] | None,
+) -> None:
+    if palette is None:
+        native = pygame.image.frombuffer(frame, (width, height), "RGB")
+    else:
+        indexed = pygame.image.frombuffer(frame, (width, height), "P")
+        indexed.set_palette(palette)
+        native = indexed.convert()
     scaled = pygame.transform.scale(native, screen.get_size())
     screen.blit(scaled, (0, 0))
     pygame.display.flip()
@@ -227,33 +256,54 @@ def main(argv: list[str] | None = None) -> int:
     try:
         with socket.create_connection((args.host, args.port)) as connection:
             connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            with contextlib.suppress(OSError):  # best effort; the OS may cap the buffer
-                connection.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 22)
             hello = _recv_hello(connection)
+            if hello.get("protocol") != 3:
+                raise SystemExit(
+                    f"server speaks protocol {hello.get('protocol')}, expected 3; "
+                    "update play_remote.py and tools/stream_server.py together"
+                )
             width, height = hello["width"], hello["height"]
             action_index = {tuple(buttons): index for index, buttons in enumerate(hello["actions"])}
             next_weapon = action_index[("SELECT_NEXT_WEAPON",)]
             previous_weapon = action_index[("SELECT_PREV_WEAPON",)]
             header = _step_reply_header(len(hello["signals"]))
-            compressed = hello.get("encoding") == "zlib"
+            compressed = hello.get("encoding", "").startswith("zlib")
+            palette_list = hello.get("palette")
+            palette = (
+                [tuple(palette_list[i : i + 3]) for i in range(0, len(palette_list), 3)]
+                if palette_list is not None
+                else None
+            )
             screen = pygame.display.set_mode((width * args.scale, height * args.scale))
             pygame.display.set_caption("GraDOOM")
 
             latest: dict[str, Any] = {"frame": None, "signals": None, "dead": None}
-            stats = {"frames": 0, "bytes": 0, "draws": 0, "draw_s": 0.0, "inputs": 0}
+            stats = {
+                "frames": 0,
+                "bytes": 0,
+                "lag_s": 0.0,
+                "lag_max": 0.0,
+                "draws": 0,
+                "draw_s": 0.0,
+                "inputs": 0,
+            }
             lock = threading.Lock()
+            stream_clock = _StreamClock()
 
             def receive() -> None:
                 try:
                     while True:
-                        _, signals, frame = _recv_reply(
+                        _, signals, frame, sent_at = _recv_reply(
                             connection, header, hello["frame_bytes"], compressed=compressed
                         )
+                        lag = stream_clock.lag(sent_at)
                         with lock:
                             latest["signals"] = signals
                             latest["frame"] = frame
                             stats["frames"] += 1
                             stats["bytes"] += len(frame)
+                            stats["lag_s"] += lag
+                            stats["lag_max"] = max(stats["lag_max"], lag)
                 except (ConnectionError, OSError) as exc:
                     with lock:
                         latest["dead"] = exc
@@ -314,7 +364,7 @@ def main(argv: list[str] | None = None) -> int:
                     raise dead
                 if frame is not None:
                     draw_start = time.perf_counter()
-                    _draw_frame(pygame, screen, frame, width, height)
+                    _draw_frame(pygame, screen, frame, width, height, palette)
                     draw_end = time.perf_counter()
                     with lock:
                         stats["draws"] += 1
@@ -328,13 +378,17 @@ def main(argv: list[str] | None = None) -> int:
                 if args.metrics_interval > 0 and elapsed >= args.metrics_interval:
                     with lock:
                         frames, nbytes = stats["frames"], stats["bytes"]
+                        lag_s, lag_max = stats["lag_s"], stats["lag_max"]
                         draws, draw_s, inputs = stats["draws"], stats["draw_s"], stats["inputs"]
                         stats["frames"] = stats["bytes"] = stats["inputs"] = 0
+                        stats["lag_s"] = stats["lag_max"] = 0.0
                         stats["draws"] = 0
                         stats["draw_s"] = 0.0
                     print(
                         f"[play] recv {frames / elapsed:.1f} fps "
                         f"{nbytes / elapsed / 1024:.0f} KiB/s | "
+                        f"lag {1e3 * lag_s / max(frames, 1):.0f}ms avg "
+                        f"{1e3 * lag_max:.0f}ms max | "
                         f"draw {1e3 * draw_s / max(draws, 1):.2f}ms "
                         f"{draws / elapsed:.1f} presents/s | "
                         f"inputs {inputs / elapsed:.1f}/s",
