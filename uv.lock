@@ -374,7 +374,7 @@ wheels = [
 
 [[package]]
 name = "env-doom-turbo-torch"
-version = "0.1.0a4"
+version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "gymnasium" },
