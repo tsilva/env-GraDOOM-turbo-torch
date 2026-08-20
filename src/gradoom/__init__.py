@@ -1,4 +1,4 @@
-"""GPU-native Doom reinforcement-learning environments."""
+"""Torch-native Doom reinforcement-learning environments."""
 
 from typing import Any
 
@@ -53,4 +53,4 @@ __all__ = [
     "scenario_buttons",
 ]
 
-__version__ = "0.1.0a3"
+__version__ = "0.1.0a4"

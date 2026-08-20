@@ -178,7 +178,7 @@ def scenario_buttons(
 
 @dataclass(frozen=True)
 class DeviceTransition:
-    """Allocation-light transition consumed directly by GPU-native learners."""
+    """Allocation-light transition consumed directly by Torch-native learners."""
 
     observations: torch.Tensor
     rewards: torch.Tensor

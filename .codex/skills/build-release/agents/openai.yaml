@@ -1,4 +1,4 @@
 interface:
   display_name: "Build Release"
-  short_description: "Publish and verify GraDOOM releases on PyPI"
-  default_prompt: "Use $build-release to publish the next GraDOOM version and verify it on PyPI."
+  short_description: "Publish env-doom-turbo-torch releases"
+  default_prompt: "Use $build-release to publish the next env-doom-turbo-torch version and verify it on PyPI."

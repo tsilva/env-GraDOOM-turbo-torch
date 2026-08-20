@@ -73,6 +73,21 @@ jobs:
           .venv/bin/python .codex/skills/build-release/scripts/release_build.py
           check-pypi --version "${{ steps.version.outputs.version }}"
 
+      - name: Validate migration package source
+        if: steps.version.outputs.version == '0.1.0a4'
+        run: >-
+          .venv/bin/python scripts/redirect_release.py check-source
+          --version "${{ steps.version.outputs.version }}"
+
+      - name: Check migration package version is unused
+        if: >-
+          github.event_name == 'push' && github.ref_type == 'tag' &&
+          steps.version.outputs.version == '0.1.0a4'
+        run: >-
+          .venv/bin/python .codex/skills/build-release/scripts/release_build.py
+          check-pypi --package gradoom
+          --version "${{ steps.version.outputs.version }}"
+
       - name: Run source checks
         run: |
           .venv/bin/ruff check .
@@ -82,13 +97,20 @@ jobs:
         run: >-
           .venv/bin/python .codex/skills/build-release/scripts/release_build.py
           build --version "${{ steps.version.outputs.version }}"
-          --out-dir "dist/release-v${{ steps.version.outputs.version }}"
+          --out-dir dist/primary
+
+      - name: Build and audit migration distributions
+        if: steps.version.outputs.version == '0.1.0a4'
+        run: >-
+          .venv/bin/python scripts/redirect_release.py build
+          --version "${{ steps.version.outputs.version }}"
+          --out-dir dist/redirect
 
       - name: Upload audited distributions
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-v${{ steps.version.outputs.version }}
-          path: dist/release-v${{ steps.version.outputs.version }}/*
+          path: dist/**
           if-no-files-found: error
 
   publish:
@@ -98,7 +120,7 @@ jobs:
     runs-on: ubuntu-24.04
     environment:
       name: pypi
-      url: https://pypi.org/p/gradoom
+      url: https://pypi.org/p/env-doom-turbo-torch
     permissions:
       id-token: write
     steps:
@@ -108,10 +130,16 @@ jobs:
           name: release-v${{ needs.build.outputs.version }}
           path: dist
 
-      - name: Publish package distributions to PyPI
+      - name: Publish primary package distributions to PyPI
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
         with:
-          packages-dir: dist
+          packages-dir: dist/primary
+
+      - name: Publish migration package distributions to PyPI
+        if: needs.build.outputs.version == '0.1.0a4'
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          packages-dir: dist/redirect
 
   github-release:
     name: Publish GitHub release
@@ -132,10 +160,12 @@ jobs:
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: >-
-          gh release create "${GITHUB_REF_NAME}"
-          dist/*
-          --repo "${GITHUB_REPOSITORY}"
-          --verify-tag
-          --generate-notes
-          --title "${GITHUB_REF_NAME}"
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          find dist -type f -exec cp {} release-assets/ \;
+          gh release create "${GITHUB_REF_NAME}" release-assets/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --verify-tag \
+            --generate-notes \
+            --title "${GITHUB_REF_NAME}"

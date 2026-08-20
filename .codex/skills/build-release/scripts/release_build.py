@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and audit GraDOOM release distributions."""
+"""Build and audit env-doom-turbo-torch release distributions."""
 
 from __future__ import annotations
 
@@ -19,8 +19,9 @@ from email.parser import BytesParser
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
-PACKAGE_NAME = "gradoom"
+PACKAGE_NAME = "env-doom-turbo-torch"
 IMPORT_NAME = "gradoom"
+DIST_FILE_PREFIX = "env_doom_turbo_torch"
 VERSION_PATTERN = re.compile(
     r"^(?P<major>[0-9]+)\.(?P<minor>[0-9]+)\.(?P<patch>[0-9]+)"
     r"(?:(?P<pre>a|b|rc)(?P<pre_number>[0-9]+)"
@@ -124,8 +125,8 @@ def check_version(args: argparse.Namespace) -> None:
     print(json.dumps({"package": PACKAGE_NAME, "version": expected}, indent=2))
 
 
-def fetch_pypi() -> dict[str, object]:
-    url = f"https://pypi.org/pypi/{PACKAGE_NAME}/json"
+def fetch_pypi(package: str = PACKAGE_NAME) -> dict[str, object]:
+    url = f"https://pypi.org/pypi/{package}/json"
     try:
         with urllib.request.urlopen(url, timeout=20) as response:
             data = json.load(response)
@@ -138,8 +139,8 @@ def fetch_pypi() -> dict[str, object]:
     return data
 
 
-def pypi_releases() -> dict[str, object]:
-    releases = fetch_pypi().get("releases", {})
+def pypi_releases(package: str = PACKAGE_NAME) -> dict[str, object]:
+    releases = fetch_pypi(package).get("releases", {})
     if not isinstance(releases, dict):
         raise SystemExit("unexpected PyPI releases payload")
     return releases
@@ -258,10 +259,11 @@ def prepare_version(args: argparse.Namespace) -> None:
 
 def check_pypi(args: argparse.Namespace) -> None:
     validate_version(args.version)
-    releases = pypi_releases()
+    package = args.package or PACKAGE_NAME
+    releases = pypi_releases(package)
     if releases.get(args.version):
-        raise SystemExit(f"{PACKAGE_NAME}=={args.version} already exists on PyPI")
-    print(f"{PACKAGE_NAME}=={args.version} is unused on PyPI")
+        raise SystemExit(f"{package}=={args.version} already exists on PyPI")
+    print(f"{package}=={args.version} is unused on PyPI")
 
 
 def sha256(path: Path) -> str:
@@ -288,7 +290,7 @@ def wheel_audit(wheel: Path, version: str) -> dict[str, object]:
             else None
         )
     checks = {
-        "expected_filename": wheel.name == f"{PACKAGE_NAME}-{version}-py3-none-any.whl",
+        "expected_filename": wheel.name == f"{DIST_FILE_PREFIX}-{version}-py3-none-any.whl",
         "one_metadata_file": len(metadata_names) == 1,
         "one_wheel_file": len(wheel_names) == 1,
         "metadata_name": metadata is not None and metadata.get("Name") == PACKAGE_NAME,
@@ -316,7 +318,7 @@ def wheel_audit(wheel: Path, version: str) -> dict[str, object]:
 def sdist_audit(sdist: Path, version: str) -> dict[str, object]:
     with tarfile.open(sdist, "r:gz") as archive:
         names = archive.getnames()
-    root = f"{PACKAGE_NAME}-{version}"
+    root = f"{DIST_FILE_PREFIX}-{version}"
     checks = {
         "expected_filename": sdist.name == f"{root}.tar.gz",
         "has_pyproject": f"{root}/pyproject.toml" in names,
@@ -356,7 +358,7 @@ assert gradoom.__version__ == sys.argv[2]
 assert len(gradoom.DEATHMATCH_ACTIONS) == 17
 assert gradoom.scenario_buttons() == gradoom.DEATHMATCH_BUTTONS
 distribution = next(PathDistribution.discover(path=[str(wheel)]))
-assert distribution.metadata["Name"] == "gradoom"
+assert distribution.metadata["Name"] == "env-doom-turbo-torch"
 assert distribution.version == sys.argv[2]
 print("wheel import smoke passed")
 """
@@ -401,6 +403,8 @@ def build(args: argparse.Namespace) -> None:
             "build",
             "--no-sources",
             "--no-create-gitignore",
+            "--config-file",
+            str(REPO_ROOT / "uv.toml"),
             "--out-dir",
             str(output),
         ],
@@ -430,6 +434,7 @@ def main() -> None:
 
     pypi = commands.add_parser("check-pypi")
     pypi.add_argument("--version", required=True)
+    pypi.add_argument("--package")
     pypi.set_defaults(func=check_pypi)
 
     candidate = commands.add_parser("build")

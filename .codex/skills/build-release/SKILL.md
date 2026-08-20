@@ -1,6 +1,6 @@
 ---
 name: build-release
-description: Automatically version, build, audit, publish, monitor, and verify a GraDOOM Python release through PyPI availability. Use when the user asks to build release artifacts, cut/tag/publish a release, requests a specific GraDOOM version, invokes $build-release, diagnoses release packaging, or asks whether a version is live on PyPI.
+description: Automatically version, build, audit, publish, monitor, and verify an env-doom-turbo-torch Python release through PyPI availability. Use when the user asks to build release artifacts, cut/tag/publish a release, requests a specific env-doom-turbo-torch version, invokes $build-release, diagnoses release packaging, or asks whether a version is live on PyPI.
 ---
 
 # Build Release
@@ -19,16 +19,19 @@ validation-only run, or no publication.
 The repository publication path is `.github/workflows/release.yml`. A pushed
 `v<version>` tag runs the locked source checks, builds and audits one universal
 wheel and one source distribution, publishes them with PyPI trusted publishing,
-and creates a GitHub Release. A `workflow_dispatch` run validates the same
-source and artifacts but never publishes. Do not manually upload, substitute
-artifacts, or replay only part of the workflow.
+and creates a GitHub Release. Version `0.1.0a4` additionally publishes the
+metadata-only `gradoom` migration wheel and source distribution after the
+primary package. A `workflow_dispatch` run validates the same source and
+artifacts but never publishes. Do not manually upload, substitute artifacts, or
+replay only part of the workflow.
 
 Use normal PEP 440 project versions from `pyproject.toml`. Keep that version
-identical to `src/gradoom/__init__.py` and the root `gradoom` entry in `uv.lock`.
+identical to `src/gradoom/__init__.py` and the root `env-doom-turbo-torch` entry
+in `uv.lock`.
 Treat an untagged, unused checked-in version as pending. Otherwise select the
 next unused, untagged version automatically: increment the numeric suffix for
 `aN`, `bN`, `rcN`, or `.devN` versions, and increment the patch component for a
-final or `.postN` version. GraDOOM has no upstream-derived `.postN` release
+final or `.postN` version. `env-doom-turbo-torch` has no upstream-derived `.postN` release
 scheme. Honor an exact user-selected version instead of auto-selection.
 
 ## Build an explicitly requested local candidate
@@ -55,7 +58,7 @@ python3 .codex/skills/build-release/scripts/release_build.py \
 
 For an exact version explicitly requested by the user, add `--to <version>`.
 The helper checks local tags and PyPI, skips occupied versions, and transactionally
-updates `pyproject.toml`, `src/gradoom/__init__.py`, and the root `gradoom`
+updates `pyproject.toml`, `src/gradoom/__init__.py`, and the root `env-doom-turbo-torch`
 entry in `uv.lock`. If the worktree was dirty, run without `--write`; proceed
 only when the reported pending version requires no bump. Never layer an
 automatic version edit onto existing user changes.
@@ -152,7 +155,7 @@ If the workflow fails, inspect only failed logs with
 Confirm the exact PyPI version at:
 
 ```text
-https://pypi.org/project/gradoom/<version>/
+https://pypi.org/project/env-doom-turbo-torch/<version>/
 ```
 
 ## Final response

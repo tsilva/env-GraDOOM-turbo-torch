@@ -51,8 +51,8 @@ def test_select_release_version_skips_published_and_tagged_versions(
     release_build: ModuleType,
 ) -> None:
     releases = {
-        "0.1.0a0": [{"filename": "gradoom-0.1.0a0.tar.gz"}],
-        "0.1.0a1": [{"filename": "gradoom-0.1.0a1.tar.gz"}],
+        "0.1.0a0": [{"filename": "env_doom_turbo_torch-0.1.0a0.tar.gz"}],
+        "0.1.0a1": [{"filename": "env_doom_turbo_torch-0.1.0a1.tar.gz"}],
     }
     tags = {"0.1.0a2"}
     assert (
@@ -72,12 +72,12 @@ def test_write_version_updates_all_release_metadata(
     init = package / "__init__.py"
     lock = tmp_path / "uv.lock"
     pyproject.write_text(
-        '[project]\nname = "gradoom"\nversion = "0.1.0a0"\n',
+        '[project]\nname = "env-doom-turbo-torch"\nversion = "0.1.0a0"\n',
         encoding="utf-8",
     )
     init.write_text('__version__ = "0.1.0a0"\n', encoding="utf-8")
     lock.write_text(
-        'version = 1\n\n[[package]]\nname = "gradoom"\nversion = "0.1.0a0"\n',
+        'version = 1\n\n[[package]]\nname = "env-doom-turbo-torch"\nversion = "0.1.0a0"\n',
         encoding="utf-8",
     )
     monkeypatch.setattr(release_build, "REPO_ROOT", tmp_path)
@@ -88,6 +88,6 @@ def test_write_version_updates_all_release_metadata(
     assert 'version = "0.1.0a1"' in pyproject.read_text(encoding="utf-8")
     assert init.read_text(encoding="utf-8") == '__version__ = "0.1.0a1"\n'
     assert 'version = "0.1.0a1"' in lock.read_text(encoding="utf-8")
-    assert release_build.project_metadata() == ("gradoom", "0.1.0a1")
+    assert release_build.project_metadata() == ("env-doom-turbo-torch", "0.1.0a1")
     assert release_build.init_version() == "0.1.0a1"
     assert release_build.lock_version() == "0.1.0a1"

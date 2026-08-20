@@ -1,20 +1,26 @@
 <div align="center">
-  <img src="./logo.png" alt="GraDOOM" width="560" />
+  <img src="./logo.png" alt="env-Doom-turbo-torch" width="560" />
 
   **🔥 Rip and Tear Until It Is Done—at GPU speed. 🔥**
 </div>
 
-GraDOOM is a Python library for reinforcement-learning researchers and engineers who need to train Doom policies at high throughput. It runs batched deathmatch simulation, rendering, rewards, and resets in PyTorch on the same device as the learner, then targets zero-shot evaluation in comparable ViZDoom environments.
+`env-Doom-turbo-torch` is a Python library for reinforcement-learning researchers and engineers who need to train Doom policies at high throughput. It runs batched deathmatch simulation, rendering, rewards, and resets in PyTorch on the same device as the learner, then targets zero-shot evaluation in comparable ViZDoom environments. The distribution retains the public `gradoom` import package and Gymnasium IDs.
 
 Use `GraDoomVecEnv` with an operator-supplied Doom II or Freedoom IWAD and the pinned ViZDoom deathmatch scenario. The current alpha implements Turbo Vector API v2 with Torch-only transition tensors, alongside a synchronization-free device API, scenario compiler, and vectorized Torch execution model.
 
 ## Install
 
-GraDOOM requires Python 3.11 or newer and [uv](https://docs.astral.sh/uv/).
+`env-Doom-turbo-torch` requires Python 3.11 or newer and [uv](https://docs.astral.sh/uv/).
 
 ```bash
-git clone https://github.com/tsilva/GraDOOM.git
-cd GraDOOM
+uv add env-doom-turbo-torch
+```
+
+For source development:
+
+```bash
+git clone https://github.com/tsilva/env-Doom-turbo-torch.git
+cd env-Doom-turbo-torch
 uv sync --group dev
 ```
 
@@ -84,7 +90,7 @@ python tools/evaluate_vizdoom_checkpoint.py \
 
 ## Notes
 
-- GraDOOM is under active construction and is not yet parity-certified. No current release supports a public fastest-training claim.
+- `env-Doom-turbo-torch` is under active construction and is not yet parity-certified. No current release supports a public fastest-training claim.
 - The first certification candidate is single-player `deathmatch-p1-v1`: 17 actions, frame skip 2, and 84×84 grayscale CHW observations with four-frame stacking.
 - `render()` and `render_lane()` expose the unprocessed 320×240 RGB24 comparison view with the full Doom HUD; observation preprocessing remains separate from this diagnostic render path.
 - The initial certification hardware target is one NVIDIA RTX 4090 integrated with GradLab.
@@ -96,10 +102,10 @@ python tools/evaluate_vizdoom_checkpoint.py \
 
 ## Architecture
 
-![GraDOOM architecture](./architecture.png)
+![env-Doom-turbo-torch architecture](./architecture.png)
 
 ## License
 
-GraDOOM's original source code is [MIT-licensed](./LICENSE). Bundled ZDoom BulletChip
+The project's original source code is [MIT-licensed](./LICENSE). Bundled ZDoom BulletChip
 resources retain their separate [GPL-3.0-only license](./LICENSES/GPL-3.0-only.txt); see
 the [third-party notices](./THIRD_PARTY_NOTICES.md) for exact provenance and redistribution terms.

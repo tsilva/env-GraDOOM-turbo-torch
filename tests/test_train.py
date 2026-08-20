@@ -122,7 +122,7 @@ def test_reference_observations_allow_compiled_gameplay_phases() -> None:
     assert train._audit_config(args)["environment"]["observation_renderer"] == "reference"
 
 
-def test_wandb_uses_gradlab_project_metrics_and_gradoom_provider_tag(
+def test_wandb_uses_gradlab_project_metrics_and_doom_turbo_torch_provider_tag(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class FakeRun:
@@ -149,7 +149,7 @@ def test_wandb_uses_gradlab_project_metrics_and_gradoom_provider_tag(
         "--wandb-mode",
         "disabled",
         "--wandb-tags",
-        "experiment:throughput,env_provider:gradoom",
+        "experiment:throughput,env_provider:env-doom-turbo-torch",
     )
     audit = train._audit_config(args)
 
@@ -174,7 +174,7 @@ def test_wandb_uses_gradlab_project_metrics_and_gradoom_provider_tag(
         "goal_id:VizdoomDeathmatch-v1",
         "recipe_id:ppo",
         "env_id:VizdoomDeathmatch-v1",
-        "env_provider:gradoom",
+        "env_provider:env-doom-turbo-torch",
         "experiment:throughput",
     ]
     assert audit["tracking"]["wandb_metrics"] == list(train.GRADLAB_WANDB_METRICS)

@@ -3,9 +3,9 @@ requires = ["setuptools>=83,<84", "wheel>=0.45,<1"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "gradoom"
-version = "0.1.0a3"
-description = "GPU-native Doom reinforcement-learning environments"
+name = "env-doom-turbo-torch"
+version = "0.1.0a4"
+description = "Torch-native Doom reinforcement-learning environments"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT AND GPL-3.0-only"
@@ -18,12 +18,19 @@ dependencies = [
   "wandb>=0.18,<0.23",
 ]
 
+[project.urls]
+Homepage = "https://github.com/tsilva/env-Doom-turbo-torch"
+Repository = "https://github.com/tsilva/env-Doom-turbo-torch.git"
+Issues = "https://github.com/tsilva/env-Doom-turbo-torch/issues"
+Changelog = "https://github.com/tsilva/env-Doom-turbo-torch/blob/main/CHANGES.md"
+
 [dependency-groups]
 dev = [
   "pip-audit>=2.9,<3",
   "pygame-ce>=2.5,<3",
   "pytest>=8,<10",
   "ruff>=0.12,<1",
+  "twine>=6.2,<8",
 ]
 
 [tool.setuptools.packages.find]

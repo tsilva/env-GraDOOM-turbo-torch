@@ -1,6 +1,6 @@
 {
-  "name": "GraDOOM",
-  "short_name": "GraDOOM",
+  "name": "env-Doom-turbo-torch",
+  "short_name": "Doom turbo",
   "icons": [
     {
       "src": "android-chrome-192.png",

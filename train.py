@@ -66,7 +66,7 @@ GRADLAB_WANDB_METRICS = (
     PLAYER_KILLS_METRIC,
     *GRADLAB_PPO_DIAGNOSTIC_METRICS,
 )
-GRADOOM_WANDB_TAG = "env_provider:gradoom"
+GRADOOM_WANDB_TAG = "env_provider:env-doom-turbo-torch"
 UINT32_MASK = (1 << 32) - 1
 SEED_TABLE_INITIAL_EPISODES = 64
 NATIVE_MONSTER_KILL_REWARDS = (1.0, 3.0, 3.0, 4.0, 3.0, 10.0)
@@ -235,7 +235,7 @@ SAMPLE_FACTORY_REWARD = SampleFactoryRewardConfig()
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Train standalone PPO on GraDOOM's GPU-native Deathmatch runtime.",
+        description="Train standalone PPO on env-Doom-turbo-torch's Deathmatch runtime.",
     )
     parser.add_argument(
         "--iwad",
@@ -459,7 +459,8 @@ def _parser() -> argparse.ArgumentParser:
         "--wandb-tags",
         default="",
         help=(
-            "Comma-separated additional W&B tags. The env_provider:gradoom tag is always included."
+            "Comma-separated additional W&B tags. The "
+            "env_provider:env-doom-turbo-torch tag is always included."
         ),
     )
     parser.add_argument(
@@ -821,7 +822,7 @@ def _audit_config(args: argparse.Namespace) -> dict[str, Any]:
             },
         },
         "environment": {
-            "provider": "gradoom",
+            "provider": "env-doom-turbo-torch",
             "game": "VizdoomDeathmatch-v1",
             "doom_skill": REFERENCE_RECIPE.doom_skill,
             "wall_contact_damage_scale": float(args.wall_contact_damage_scale),

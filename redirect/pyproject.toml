@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=83,<84", "wheel>=0.45,<1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gradoom"
+version = "0.1.0a4"
+description = "Migration package for env-doom-turbo-torch"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "Tiago Silva" }]
+dependencies = ["env-doom-turbo-torch==0.1.0a4"]
+classifiers = [
+  "Development Status :: 7 - Inactive",
+  "Intended Audience :: Science/Research",
+  "Programming Language :: Python :: 3",
+]
+
+[project.urls]
+Migration = "https://github.com/tsilva/env-Doom-turbo-torch"
+
+[tool.setuptools]
+packages = []
+
+[tool.uv]
+exclude-newer = "7 days"
+constraint-dependencies = [
+  "mistralai!=2.4.6",
+  "guardrails-ai!=0.10.1",
+]
