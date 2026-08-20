@@ -1,6 +1,6 @@
-"""Evaluate a standalone GraDOOM checkpoint unchanged in reference ViZDoom.
+"""Evaluate a standalone env-Doom-turbo-torch checkpoint unchanged in reference ViZDoom.
 
-This optional transfer gate depends on ``vizdoom-turbo``. The root trainer does
+This optional transfer gate depends on ``env-vizdoom-turbo``. The root trainer does
 not import it and remains independent of ViZDoom, GradLab, and Stable-Baselines3.
 """
 
@@ -36,20 +36,20 @@ TRACE_GAME_VARIABLES = (
 TRACE_INFO_NAMES = tuple(name.casefold() for name in TRACE_GAME_VARIABLES)
 SURVIVAL_GAME_VARIABLES = ("HITS_TAKEN", "DAMAGE_TAKEN")
 SURVIVAL_INFO_NAMES = tuple(name.casefold() for name in SURVIVAL_GAME_VARIABLES)
-GRADOOM_ONLY_SIGNAL_NAMES = frozenset({"player_killcount"})
+ENV_DOOM_TURBO_TORCH_ONLY_SIGNAL_NAMES = frozenset({"player_killcount"})
 
 
 def _reference_signal_names(names: Sequence[str]) -> tuple[str, ...]:
-    """Remove GraDOOM-only diagnostics from a ViZDoom provider contract."""
+    """Remove env-Doom-turbo-torch-only diagnostics from a ViZDoom provider contract."""
 
     return tuple(
-        name for name in names if str(name).casefold() not in GRADOOM_ONLY_SIGNAL_NAMES
+        name for name in names if str(name).casefold() not in ENV_DOOM_TURBO_TORCH_ONLY_SIGNAL_NAMES
     )
 
 
 def _load_standalone_train() -> ModuleType:
     path = Path(__file__).parents[1] / "train.py"
-    spec = importlib.util.spec_from_file_location("gradoom_standalone_train", path)
+    spec = importlib.util.spec_from_file_location("env_doom_turbo_torch_standalone_train", path)
     if spec is None or spec.loader is None:  # pragma: no cover - import invariant
         raise RuntimeError(f"cannot load standalone trainer: {path}")
     module = importlib.util.module_from_spec(spec)
@@ -68,7 +68,7 @@ def _provider_seed(run_seed: int, lane: int, episode_index: int) -> int:
 
 
 def _game_seed(provider_seed: int) -> int:
-    """Reproduce vizdoom-turbo's provider-seed to game-seed conversion."""
+    """Reproduce env-vizdoom-turbo's provider-seed to game-seed conversion."""
 
     generator = np.random.default_rng(int(provider_seed))
     return int(generator.integers(0, UINT32_MASK + 1, dtype=np.uint32))
@@ -213,7 +213,7 @@ def _evaluate(args: argparse.Namespace, train: ModuleType) -> dict[str, Any]:
         from vizdoom_turbo import VizdoomTurboVecEnv
     except ImportError as exc:
         raise RuntimeError(
-            "zero-shot evaluation requires vizdoom-turbo in the selected Python runtime"
+            "zero-shot evaluation requires env-vizdoom-turbo in the selected Python runtime"
         ) from exc
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for standalone checkpoint policy inference")
@@ -229,13 +229,11 @@ def _evaluate(args: argparse.Namespace, train: ModuleType) -> dict[str, Any]:
     if not scenario_wad.is_file():
         raise FileNotFoundError(f"scenario WAD does not exist beside config: {scenario_wad}")
 
-    extra_game_variables = (
-        (TRACE_GAME_VARIABLES if args.include_action_traces else ())
-        + (SURVIVAL_GAME_VARIABLES if args.include_survival_diagnostics else ())
+    extra_game_variables = (TRACE_GAME_VARIABLES if args.include_action_traces else ()) + (
+        SURVIVAL_GAME_VARIABLES if args.include_survival_diagnostics else ()
     )
-    extra_info_names = (
-        (TRACE_INFO_NAMES if args.include_action_traces else ())
-        + (SURVIVAL_INFO_NAMES if args.include_survival_diagnostics else ())
+    extra_info_names = (TRACE_INFO_NAMES if args.include_action_traces else ()) + (
+        SURVIVAL_INFO_NAMES if args.include_survival_diagnostics else ()
     )
     game_variables = (
         *_reference_signal_names(train.GAME_VARIABLES),
@@ -280,7 +278,10 @@ def _evaluate(args: argparse.Namespace, train: ModuleType) -> dict[str, Any]:
         if tuple(env.action_table or ()) != train.RESTRICTED_ACTIONS:
             raise RuntimeError("reference action table differs from checkpoint contract")
         loaded = torch.load(args.checkpoint, map_location=device, weights_only=False)
-        if not isinstance(loaded, Mapping) or loaded.get("format") != "standalone-gradoom-ppo-v1":
+        if (
+            not isinstance(loaded, Mapping)
+            or loaded.get("format") != "standalone-env_doom_turbo_torch-ppo-v1"
+        ):
             raise ValueError(f"unsupported standalone checkpoint: {args.checkpoint}")
         checkpoint_config = loaded.get("config", {})
         effective_recipe = (
@@ -299,9 +300,7 @@ def _evaluate(args: argparse.Namespace, train: ModuleType) -> dict[str, Any]:
                 observation_invariance.get("observation_blur_kernel", 1),
             )
         )
-        policy = train.NatureActorCritic(
-            observation_blur_kernel=observation_blur_kernel
-        ).to(device)
+        policy = train.NatureActorCritic(observation_blur_kernel=observation_blur_kernel).to(device)
         policy.load_state_dict(loaded["policy_state_dict"])
         policy.eval()
         calls = train.PolicyCalls(policy, compile_policy=bool(args.compile_policy))

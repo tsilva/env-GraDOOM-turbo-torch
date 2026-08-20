@@ -2,7 +2,7 @@
 
 This document records the internal Beast-3 experiment captured on 2026-08-12. It
 is a reproducibility note, not a public fastest-training or ViZDoom-parity claim.
-The fixed evaluation uses GraDOOM's current environment, so environment parity
+The fixed evaluation uses env-Doom-turbo-torch's current environment, so environment parity
 and zero-shot policy transfer must be certified separately.
 
 Unless a result is explicitly labeled player-attributed, historical "kills" in
@@ -23,7 +23,7 @@ not player-only policy-quality measurements.
   `0.21 R + 0.72 G + 0.07 B`.
 - Evaluation: 100 stochastic episodes, 16 balanced lanes, evaluation seed 123,
   using protocol
-  `standalone-gradoom-deathmatch-checkpoint-eval-v3-balanced-seed-grid`.
+  `standalone-env_doom_turbo_torch-deathmatch-checkpoint-eval-v3-balanced-seed-grid`.
 - Quality gates over from-scratch training seeds 123, 456, and 789: every mean at
   least 10 kills, three-seed median at least 12.59, and best mean at least 15.41.
 - Throughput gate: at least 134,184 workload-equivalent steady-state
@@ -101,7 +101,7 @@ The measured quality-producing common recipe is approximately 6.8x the baseline,
 while the selected frozen quality phase is 9.83x.
 
 The retained JSONL and checkpoint evidence is under
-`/home/tsilva/gradoom-opt.LlmBqk/throughput-v1` on Beast-3. Summary metrics use
+`/home/tsilva/env_doom_turbo_torch-opt.LlmBqk/throughput-v1` on Beast-3. Summary metrics use
 `steady_state_after_rollouts=2`; compile and initialization time are excluded from
 that steady-state statistic and remain present separately in emitted records.
 The complete lineage and acceptance audit is
@@ -159,7 +159,7 @@ end-to-end time-to-quality.
 
 Parity remains the blocking issue for a certified result. The converted
 GradLab reference policy scores 35.11 mean kills over 100 episodes in ViZDoom.
-It originally scored only 3.59 with GraDOOM's approximate policy renderer, but
+It originally scored only 3.59 with env-Doom-turbo-torch's approximate policy renderer, but
 the fast native renderer now recovers 28.09 mean kills, median 26, and maximum
 62 without changing gameplay mechanics. This is substantial useful one-way
 transfer, but it is only 80.0% of the ViZDoom source mean and remains below the
@@ -169,14 +169,14 @@ The localized observation defect is quantified. At identical static
 poses, the raw native RGB renderer averages 0.999998 correlation with ViZDoom,
 but the compiled direct-84 policy renderer averages only 0.528 correlation and
 20.34/255 MAE across four pinned seeds. Passing the native indexed frame
-through the exact ViZDoom-turbo area/grayscale transform restores 0.999998
+through the exact env-ViZDoom-turbo area/grayscale transform restores 0.999998
 policy-frame correlation and 0.00266/255 MAE. The retained `native-fused` path
 renders native indexed flats, portal walls, actors, and the exact weapon layer
 with compact Triton kernels before the reference 84x84 policy transform.
 
 Isolated statistical oracles now cover all six scenario monster classes and a
 two-monster infighting setup. Across 128 aligned Zombieman/ShotgunGuy trials,
-GraDOOM's kill-observed rate is 44.53% versus 45.31% in ViZDoom, with first-kill
+env-Doom-turbo-torch's kill-observed rate is 44.53% versus 45.31% in ViZDoom, with first-kill
 means of 26.82 and 27.71 decisions. These results, together with the matching
 pre-spawn deterministic prefix and early ACS spawn distribution, rule out
 several broad mechanics hypotheses. Long-horizon stochastic amplification and
@@ -184,7 +184,7 @@ remaining observation sensitivity are still plausible.
 
 ## Unmodified kill-count continuation milestone
 
-The strongest unmodified GraDOOM checkpoint in this milestone initializes from
+The strongest unmodified env-Doom-turbo-torch checkpoint in this milestone initializes from
 the converted reference policy, freezes its visual encoder, and trains the
 policy/value head with uniform kill-count reward. It uses 2,048 environments x
 16 steps, batch size 4,096, two epochs, learning rate 1e-6, entropy coefficient
@@ -204,16 +204,16 @@ not improve the 25.93 parent, and the required unmodified >=30 result remains
 unmet. The continuation checkpoint SHA-256 is
 `67989a0ca18c38602cacb5c955bcc68b91c25f433739a6b45fa603e1dcefaae2`.
 W&B run `11p5nezd` in `tsilva/VizdoomDeathmatch-v1` carries the mandatory
-`env_provider:gradoom` tag and the comparable return, rolling-kill, throughput,
+`env_provider:env_doom_turbo_torch` tag and the comparable return, rolling-kill, throughput,
 and PPO diagnostics.
 
 The retained evidence is under
-`/home/tsilva/gradoom-runs/20260813-native-wall025-mature-seed789-goal30` and
-`/home/tsilva/gradoom-runs/20260813-wall025-goal30-throughput10x` for the
+`/home/tsilva/env_doom_turbo_torch-runs/20260813-native-wall025-mature-seed789-goal30` and
+`/home/tsilva/env_doom_turbo_torch-runs/20260813-wall025-goal30-throughput10x` for the
 experimental result, and under
-`/home/tsilva/gradoom-runs/20260813-depth-vizinit-killcount-standardconv-lr1e6-4m`
+`/home/tsilva/env_doom_turbo_torch-runs/20260813-depth-vizinit-killcount-standardconv-lr1e6-4m`
 and
-`/home/tsilva/gradoom-runs/20260813-parity-killcount-standardconv-lr1e6-resume8m`
+`/home/tsilva/env_doom_turbo_torch-runs/20260813-parity-killcount-standardconv-lr1e6-resume8m`
 for the unmodified milestone on Beast-3.
 
 ## Actor-slide and damage-diagnostic parity follow-up
@@ -221,17 +221,17 @@ for the unmodified milestone on Beast-3.
 A 2026-08-14 mechanics follow-up matched Doom's actor-blocked player movement
 fallback: when diagonal movement is blocked, the engine now attempts the y-only
 move before the x-only move. In a controlled Chaingunner-forward oracle this
-raised GraDOOM player displacement from 314.71 to 406.22 map units versus
+raised env-Doom-turbo-torch player displacement from 314.71 to 406.22 map units versus
 410.08 in ViZDoom, while mean health damage fell from 23.875 to 15.844 versus
 14.641. The fixed 100-episode seed-10000 evaluation of the retained unmodified
 checkpoint then scored 25.67 mean kills, 19.5 median, and 63 maximum in
-GraDOOM.
+env-Doom-turbo-torch.
 
 The same investigation found a diagnostics-only mismatch around voodoo dolls.
 ViZDoom records incoming `HITS_TAKEN` and `DAMAGE_TAKEN` only when the damaged
 actor is the real player body. Damage to a health-sharing voodoo doll is not
 incoming damage; if the real player caused it, it is instead outgoing
-`HITCOUNT` and `DAMAGECOUNT`. GraDOOM now follows those categories while
+`HITCOUNT` and `DAMAGECOUNT`. env-Doom-turbo-torch now follows those categories while
 preserving the existing shared health, armor, thrust, and gameplay effects.
 Replaying the same 100 open-loop ViZDoom action traces before and after the
 change reproduced kills, returns, episode lengths, and termination rates
@@ -246,25 +246,25 @@ skill 1, and wall damage scale 1.0. It executed 8,028,160 samples in 450.95
 seconds end to end and sustained a median 21,412 steady-state transitions/s.
 The GradLab-compatible rolling-100 metric peaked at 43.64 kills at step
 4,325,376 but ended at 21.93. A fixed balanced 100-episode seed-10000 gate
-scored only **24.69 mean kills** in GraDOOM (median 19.5, maximum 63), versus
+scored only **24.69 mean kills** in env-Doom-turbo-torch (median 19.5, maximum 63), versus
 **36.40 mean kills** in zero-shot ViZDoom (median 36, maximum 75). The apparent
 greater-than-30 training peak was therefore a synchronized-completion cohort,
 not a fixed-grid quality breakthrough; this checkpoint is not selected over
 the 25.67-mean parent.
 
 The run and comparable PPO diagnostics are in W&B run `jxga8pbb` under
-`tsilva/VizdoomDeathmatch-v1` with the `env_provider:gradoom` tag. Its final
+`tsilva/VizdoomDeathmatch-v1` with the `env_provider:env_doom_turbo_torch` tag. Its final
 checkpoint SHA-256 is
 `1fbd6885a516ff2a3afebde5c42e914b65cc7d115b65419893077e66b4b793ba`,
 and the retained local evidence is under
-`/home/tsilva/gradoom-runs/20260814-actor-slide-refine-killcount-lr1e6-8m-seed1597`.
+`/home/tsilva/env_doom_turbo_torch-runs/20260814-actor-slide-refine-killcount-lr1e6-8m-seed1597`.
 The unmodified fixed-grid greater-than-30 and bidirectional transfer goals
 remain unmet.
 
 The current production-renderer transfer baseline was remeasured after the
 death-state rendering and actor-slide parity fixes. On the fixed 100-episode
 seed-10000 grid, the untouched converted ViZDoom reference policy scores
-**23.36 mean kills** in GraDOOM (median 16.5, maximum 63, mean episode length
+**23.36 mean kills** in env-Doom-turbo-torch (median 16.5, maximum 63, mean episode length
 1,043.57), versus its existing **35.11 mean kills** in ViZDoom (median 38.5,
 maximum 68). Current zero-shot transfer is therefore 66.5% of the source mean.
 The earlier 28.09/35.11, or 80.0%, comparison remains useful historical
@@ -302,7 +302,7 @@ completion cohorts are length biased.
 ## Player-attributed kill optimization
 
 The 2026-08-20 follow-up separates policy quality from monster infighting.
-GraDOOM now exposes the GPU-resident `player_killcount` signal, which increments
+env-Doom-turbo-torch now exposes the GPU-resident `player_killcount` signal, which increments
 only when player melee, hitscan, or projectile damage delivers the enemy death.
 The ViZDoom-compatible `killcount` signal is unchanged for parity. Standalone
 training and evaluation use the new signal for their rolling and headline kill
@@ -340,6 +340,6 @@ samples are 26,745, 23,142, 23,959, 22,964, and 23,960, 4.35% above the prior
 22,961 median under the same protocol.
 
 Player-only evaluation evidence is retained at
-`/home/tsilva/gradoom-runs/20260814-negative-movecount-projection-killcount-fullbatch-lr8e6-4m-seed6841/eval-player-kills-final100-native-fused-seed10000.jsonl`;
+`/home/tsilva/env_doom_turbo_torch-runs/20260814-negative-movecount-projection-killcount-fullbatch-lr8e6-4m-seed6841/eval-player-kills-final100-native-fused-seed10000.jsonl`;
 the baseline and next-best evidence use the same filename in their respective
 run directories.

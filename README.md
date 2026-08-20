@@ -4,9 +4,9 @@
   **🔥 Rip and Tear Until It Is Done—at GPU speed. 🔥**
 </div>
 
-`env-Doom-turbo-torch` is a Python library for reinforcement-learning researchers and engineers who need to train Doom policies at high throughput. It runs batched deathmatch simulation, rendering, rewards, and resets in PyTorch on the same device as the learner, then targets zero-shot evaluation in comparable ViZDoom environments. The distribution retains the public `gradoom` import package and Gymnasium IDs.
+`env-Doom-turbo-torch` is a Python library for reinforcement-learning researchers and engineers who need to train Doom policies at high throughput. It runs batched deathmatch simulation, rendering, rewards, and resets in PyTorch on the same device as the learner, then targets zero-shot evaluation in comparable ViZDoom environments. The distribution retains the public `env_doom_turbo_torch` import package and Gymnasium IDs.
 
-Use `GraDoomVecEnv` with an operator-supplied Doom II or Freedoom IWAD and the pinned ViZDoom deathmatch scenario. The current alpha implements Turbo Vector API v2 with Torch-only transition tensors, alongside a synchronization-free device API, scenario compiler, and vectorized Torch execution model.
+Use `EnvDoomTurboTorchVecEnv` with an operator-supplied Doom II or Freedoom IWAD and the pinned ViZDoom deathmatch scenario. The current alpha implements Turbo Vector API v2 with Torch-only transition tensors, alongside a synchronization-free device API, scenario compiler, and vectorized Torch execution model.
 
 ## Install
 
@@ -33,7 +33,7 @@ import torch
 num_envs = 128
 device = torch.device("cuda")
 env = gym.make_vec(
-    "gradoom:GraDOOM-v0",
+    "env_doom_turbo_torch:EnvDoomTurboTorch-v0",
     game="VizdoomDeathmatch-v1",
     scenario="/path/to/vizdoom/scenarios/deathmatch.wad",
     rom_path="/path/to/doom2.wad",
@@ -56,10 +56,10 @@ env.close()
 
 The module-qualified ID imports the package and registers the factory. This ID
 is vector-only, requires an explicit `game`, and returns the native
-Torch-only `GraDoomVecEnv`; the class also remains available for direct use.
+Torch-only `EnvDoomTurboTorchVecEnv`; the class also remains available for direct use.
 
 `observations`, rewards, episode flags, and signals remain Torch tensors on the selected device.
-Request the GraDOOM-specific `player_killcount` game variable when policy quality
+Request the env-Doom-turbo-torch-specific `player_killcount` game variable when policy quality
 must count only enemy deaths delivered by the player. ViZDoom-compatible
 `killcount` remains available and also includes countable monsters killed by
 infighting in this single-player scenario.
@@ -69,7 +69,7 @@ infighting in this single-player scenario.
 ```bash
 uv run pytest                                             # run the test suite
 uv run ruff check .                                      # lint the repository
-uv run python -m gradoom.inspect_scenario \
+uv run python -m env_doom_turbo_torch.inspect_scenario \
   --scenario /path/to/deathmatch.wad --iwad /path/to/doom2.wad  # inspect assets
 uv run python play.py --scenario /path/to/deathmatch.wad \
   --iwad /path/to/doom2.wad                              # play with keyboard controls
@@ -94,7 +94,7 @@ python tools/evaluate_vizdoom_checkpoint.py \
 - The first certification candidate is single-player `deathmatch-p1-v1`: 17 actions, frame skip 2, and 84×84 grayscale CHW observations with four-frame stacking.
 - `render()` and `render_lane()` expose the unprocessed 320×240 RGB24 comparison view with the full Doom HUD; observation preprocessing remains separate from this diagnostic render path.
 - The initial certification hardware target is one NVIDIA RTX 4090 integrated with GradLab.
-- Pass asset paths directly or set `GRADOOM_IWAD` and `GRADOOM_DEATHMATCH_WAD`. WADs and other game data are not distributed with this repository.
+- Pass asset paths directly or set `ENV_DOOM_TURBO_TORCH_IWAD` and `ENV_DOOM_TURBO_TORCH_DEATHMATCH_WAD`. WADs and other game data are not distributed with this repository.
 - Torch tensors are the only reset/step transition transport, including reset selectors and read-only state indices. Only diagnostic RGB arrays cross into NumPy.
 - Operator-run benchmarks require a controlled quiet window and matched reference evidence; see [deathmatch parity](./docs/deathmatch-parity.md).
 - The current internal RTX 4090 training optimization recipe and its three-seed evidence are recorded in [training optimization](./docs/training-optimization.md). These results are experimental and do not supersede the parity-certification requirement.

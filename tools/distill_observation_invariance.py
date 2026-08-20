@@ -1,4 +1,4 @@
-"""Adapt a policy encoder to paired exact and fast GraDOOM observations.
+"""Adapt a policy encoder to paired exact and fast env-Doom-turbo-torch observations.
 
 The downstream policy is frozen.  The visual encoder learns to reproduce the
 reference encoder features from the selected fast renderer while rehearsing the
@@ -28,7 +28,7 @@ import torch.nn.functional as F
 
 def _load_train() -> ModuleType:
     path = Path(__file__).parents[1] / "train.py"
-    spec = importlib.util.spec_from_file_location("gradoom_distill_train", path)
+    spec = importlib.util.spec_from_file_location("env_doom_turbo_torch_distill_train", path)
     if spec is None or spec.loader is None:  # pragma: no cover - import invariant
         raise RuntimeError(f"cannot load standalone trainer: {path}")
     module = importlib.util.module_from_spec(spec)
@@ -232,7 +232,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     device = torch.device("cuda")
 
     loaded = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    if not isinstance(loaded, Mapping) or loaded.get("format") != "standalone-gradoom-ppo-v1":
+    if (
+        not isinstance(loaded, Mapping)
+        or loaded.get("format") != "standalone-env_doom_turbo_torch-ppo-v1"
+    ):
         raise ValueError(f"unsupported checkpoint: {args.checkpoint}")
     config = loaded.get("config", {})
     policy_config = config.get("policy_model", {}) if isinstance(config, Mapping) else {}
@@ -256,9 +259,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         source_blur_kernel,
     ).to(device)
     student = train.NatureActorCritic(
-        architecture,
-        memory_format,
-        observation_blur_kernel=args.observation_blur_kernel
+        architecture, memory_format, observation_blur_kernel=args.observation_blur_kernel
     ).to(device)
     teacher.load_state_dict(loaded["policy_state_dict"])
     student.load_state_dict(loaded["policy_state_dict"])
@@ -354,11 +355,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             with torch.no_grad():
                 teacher_actions = torch.argmax(teacher_logits, dim=1)
                 approximate_agreement = (
-                    torch.argmax(approximate_logits, dim=1) == teacher_actions
-                ).float().mean()
+                    (torch.argmax(approximate_logits, dim=1) == teacher_actions).float().mean()
+                )
                 reference_agreement = (
-                    torch.argmax(retained_logits, dim=1) == teacher_actions
-                ).float().mean()
+                    (torch.argmax(retained_logits, dim=1) == teacher_actions).float().mean()
+                )
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(student.observation_encoder.parameters(), 1.0)

@@ -39,13 +39,13 @@ def test_distribution_comparison_uses_independent_provider_uncertainty() -> None
         }
 
     reference = [record(1.0, False), record(3.0, True)]
-    gradoom = [record(3.0, True), record(5.0, True)]
+    env_doom_turbo_torch = [record(3.0, True), record(5.0, True)]
 
-    comparison = tool._distribution_comparison(reference, gradoom)
+    comparison = tool._distribution_comparison(reference, env_doom_turbo_torch)
     damage = comparison["damage_taken"]
-    assert damage["gradoom_minus_reference"] == 2.0
-    assert damage["gradoom_minus_reference_standard_error"] == math.sqrt(2.0)
+    assert damage["env_doom_turbo_torch_minus_reference"] == 2.0
+    assert damage["env_doom_turbo_torch_minus_reference_standard_error"] == math.sqrt(2.0)
     observed = comparison["first_damage_observed"]
-    assert observed["gradoom_minus_reference"] == 0.5
+    assert observed["env_doom_turbo_torch_minus_reference"] == 0.5
     assert observed["reference"]["count"] == 2
-    assert observed["gradoom"]["count"] == 2
+    assert observed["env_doom_turbo_torch"]["count"] == 2

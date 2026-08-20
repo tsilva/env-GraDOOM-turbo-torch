@@ -7,14 +7,14 @@ from types import ModuleType
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-RELEASE_BUILD = (
-    REPO_ROOT / ".codex" / "skills" / "build-release" / "scripts" / "release_build.py"
-)
+RELEASE_BUILD = REPO_ROOT / ".codex" / "skills" / "build-release" / "scripts" / "release_build.py"
 
 
 @pytest.fixture(scope="module")
 def release_build() -> ModuleType:
-    spec = importlib.util.spec_from_file_location("gradoom_release_build", RELEASE_BUILD)
+    spec = importlib.util.spec_from_file_location(
+        "env_doom_turbo_torch_release_build", RELEASE_BUILD
+    )
     assert spec is not None
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -65,10 +65,7 @@ def test_select_release_version_skips_published_and_tagged_versions(
         "0.1.1": [{"filename": "env_doom_turbo_torch-0.1.1.tar.gz"}],
     }
     tags = {"0.1.2"}
-    assert (
-        release_build.select_release_version("0.1.0a4", releases, tags)
-        == "0.1.3"
-    )
+    assert release_build.select_release_version("0.1.0a4", releases, tags) == "0.1.3"
 
 
 def test_write_version_updates_all_release_metadata(
@@ -76,7 +73,7 @@ def test_write_version_updates_all_release_metadata(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    package = tmp_path / "src" / "gradoom"
+    package = tmp_path / "src" / "env_doom_turbo_torch"
     package.mkdir(parents=True)
     pyproject = tmp_path / "pyproject.toml"
     init = package / "__init__.py"

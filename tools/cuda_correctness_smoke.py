@@ -9,8 +9,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from gradoom import GraDoomVecEnv
-from gradoom.scenario import CompiledScenario
+from env_doom_turbo_torch import EnvDoomTurboTorchVecEnv
+from env_doom_turbo_torch.scenario import CompiledScenario
 
 
 def _square_scenario() -> CompiledScenario:
@@ -92,7 +92,7 @@ def main() -> int:
         if args.iwad is None
         else {"rom_path": str(args.iwad), "scenario": args.scenario}
     )
-    env = GraDoomVecEnv(
+    env = EnvDoomTurboTorchVecEnv(
         game="VizdoomDeathmatch-v1",
         **env_kwargs,
         num_envs=args.num_envs,
@@ -119,7 +119,7 @@ def main() -> int:
         checks = {
             "cuda": torch.version.cuda,
             "device": torch.cuda.get_device_name(device),
-            "device_api_version": env.metadata["gradoom_device_api_version"],
+            "device_api_version": env.metadata["env_doom_turbo_torch_device_api_version"],
             "engine_backend": env.engine_backend,
             "episode_time": int(signals[0, 17].item()),
             "finite_signals": bool(torch.isfinite(signals).all().item()),

@@ -3,13 +3,13 @@ from __future__ import annotations
 import pytest
 import torch
 
-from gradoom import GraDoomVecEnv
-from gradoom.actions import DEATHMATCH_ACTION_TABLE_SHA256
+from env_doom_turbo_torch import EnvDoomTurboTorchVecEnv
+from env_doom_turbo_torch.actions import DEATHMATCH_ACTION_TABLE_SHA256
 
 
-def _env(square_scenario, **kwargs) -> GraDoomVecEnv:
+def _env(square_scenario, **kwargs) -> EnvDoomTurboTorchVecEnv:
     device = kwargs.pop("device", "cpu")
-    return GraDoomVecEnv(
+    return EnvDoomTurboTorchVecEnv(
         game="VizdoomDeathmatch-v1",
         compiled_scenario=square_scenario,
         num_envs=2,
@@ -115,7 +115,7 @@ def test_turbo_api_contract_and_torch_transport(square_scenario) -> None:
         assert observations.device.type == "cpu"
         assert env.action_table_hash == DEATHMATCH_ACTION_TABLE_SHA256
         assert env.metadata["turbo_api_version"] == 2
-        assert env.metadata["gradoom_device_api_version"] == 1
+        assert env.metadata["env_doom_turbo_torch_device_api_version"] == 1
         assert env.engine_backend == "torch-eager"
         assert "engine_backend" not in env.capabilities
         assert env.capabilities["supports_enemy_variants"] is False

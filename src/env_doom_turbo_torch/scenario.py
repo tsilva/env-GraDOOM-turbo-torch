@@ -280,7 +280,7 @@ def _compile_sprite_blend_luts(
 def _load_bullet_decal_assets() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Load the separately licensed ZDoom BulletChip grayscale resources."""
 
-    resource = files("gradoom").joinpath("assets/zdoom_bullet_chips.json")
+    resource = files("env_doom_turbo_torch").joinpath("assets/zdoom_bullet_chips.json")
     document = json.loads(resource.read_text(encoding="utf-8"))
     chips = document["chips"]
     atlas = np.zeros((len(chips), 9, 7), dtype=np.uint8)
@@ -423,9 +423,7 @@ def _compile_wall_projection_fragments_fixed(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return the software renderer's fixed-point BSP fragments by linedef."""
 
-    walls_fixed = np.rint(
-        wall_segments.astype(np.float64) * 65536.0
-    ).astype(np.int64)
+    walls_fixed = np.rint(wall_segments.astype(np.float64) * 65536.0).astype(np.int64)
     split_vertices = (
         _PINNED_DEATHMATCH_BSP_SPLIT_VERTICES_FIXED
         if scenario_sha256 == PINNED_DEATHMATCH_WAD_SHA256
@@ -663,17 +661,13 @@ def compile_deathmatch_scenario(
         raw_projectile_flight_sprite_ids[2, 1, rotation - 1] = request_raw_sprite(
             f"BAL7B{rotation}"
         )
-    max_explosion_frames = max(
-        len(frames) for frames in DEATHMATCH_PROJECTILE_EXPLOSION_FRAMES
-    )
+    max_explosion_frames = max(len(frames) for frames in DEATHMATCH_PROJECTILE_EXPLOSION_FRAMES)
     raw_projectile_explosion_sprite_ids = np.empty((3, max_explosion_frames), dtype=np.int32)
     projectile_explosion_frame_counts = np.asarray(
         [len(frames) for frames in DEATHMATCH_PROJECTILE_EXPLOSION_FRAMES],
         dtype=np.int32,
     )
-    projectile_explosion_frame_durations = np.zeros(
-        (3, max_explosion_frames), dtype=np.int32
-    )
+    projectile_explosion_frame_durations = np.zeros((3, max_explosion_frames), dtype=np.int32)
     for projectile_type, (frames, durations) in enumerate(
         zip(
             DEATHMATCH_PROJECTILE_EXPLOSION_FRAMES,
@@ -684,8 +678,8 @@ def compile_deathmatch_scenario(
         projectile_explosion_frame_durations[projectile_type, : len(durations)] = durations
         for frame_index in range(max_explosion_frames):
             frame = frames[min(frame_index, len(frames) - 1)]
-            raw_projectile_explosion_sprite_ids[projectile_type, frame_index] = (
-                request_raw_sprite(frame)
+            raw_projectile_explosion_sprite_ids[projectile_type, frame_index] = request_raw_sprite(
+                frame
             )
     projectile_explosion_total_tics = projectile_explosion_frame_durations.sum(
         axis=1, dtype=np.int32

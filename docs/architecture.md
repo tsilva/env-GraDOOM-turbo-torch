@@ -8,7 +8,7 @@ The certified training path is a device-resident state machine. Host code may co
 
 1. The scenario compiler reads an external IWAD/PWAD and produces immutable structure-of-arrays geometry and actor metadata.
 2. The device engine owns batched match state, deterministic counter-based random state, mechanics, collision, combat, rewards, resets, and observations.
-3. `GraDoomVecEnv` exposes the supported `vizdoom-turbo` surface plus a device-tensor contract.
+3. `EnvDoomTurboTorchVecEnv` exposes the supported `env-vizdoom-turbo` surface plus a device-tensor contract.
 4. GradLab consumes device tensors directly and evaluates checkpoints in unmodified ViZDoom.
 
 The first implementation uses vectorized Torch operations so the same code is testable on CPU and CUDA. Profiling determines which operations become fused C++/CUDA kernels. The public contract and scenario representation do not depend on the kernel implementation.

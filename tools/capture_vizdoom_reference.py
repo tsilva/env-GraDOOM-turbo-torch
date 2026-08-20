@@ -1,7 +1,7 @@
 """Capture a deterministic ViZDoom oracle trace as JSON Lines.
 
 Run this with the reference ViZDoom environment available on PYTHONPATH. The
-tool is intentionally outside the GraDOOM runtime dependency graph.
+tool is intentionally outside the env-Doom-turbo-torch runtime dependency graph.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from typing import Any
 
 import numpy as np
 
-from gradoom.actions import DEATHMATCH_ACTIONS, DEATHMATCH_BUTTONS
+from env_doom_turbo_torch.actions import DEATHMATCH_ACTIONS, DEATHMATCH_BUTTONS
 
 VARIABLES = (
     "KILLCOUNT",
@@ -116,7 +116,7 @@ def main() -> int:
     import vizdoom as vzd
 
     game = vzd.DoomGame()
-    config_directory = tempfile.TemporaryDirectory(prefix="gradoom-vizdoom-trace-")
+    config_directory = tempfile.TemporaryDirectory(prefix="env_doom_turbo_torch-vizdoom-trace-")
     game.load_config(str(Path(args.config).expanduser().resolve()))
     game.set_doom_config_path(str(Path(config_directory.name) / "engine.ini"))
     game.set_window_visible(False)
@@ -153,7 +153,7 @@ def main() -> int:
                     "frame_skip": args.frame_skip,
                     "iwad_sha256": hashlib.sha256(Path(args.iwad).read_bytes()).hexdigest(),
                     "program": args.program,
-                    "schema": "gradoom.vizdoom-reference-trace.v1",
+                    "schema": "env_doom_turbo_torch.vizdoom-reference-trace.v1",
                     "seed": args.seed,
                     "type": "header",
                 },

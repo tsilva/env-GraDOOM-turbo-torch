@@ -37,7 +37,7 @@ dev = [
 where = ["src"]
 
 [tool.setuptools.package-data]
-gradoom = ["assets/*.json"]
+env_doom_turbo_torch = ["assets/*.json"]
 
 [tool.pytest.ini_options]
 addopts = "-ra"

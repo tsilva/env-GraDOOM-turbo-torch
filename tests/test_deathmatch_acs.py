@@ -6,7 +6,7 @@ from dataclasses import replace
 import numpy as np
 import torch
 
-from gradoom.engine import TorchDeathmatchEngine
+from env_doom_turbo_torch.engine import TorchDeathmatchEngine
 
 
 def _engine(square_scenario) -> TorchDeathmatchEngine:
@@ -151,9 +151,7 @@ def test_player_damage_taken_counters_match_post_armor_health_damage(square_scen
     assert engine.player_hits_taken.tolist() == [1, 2]
     assert engine.player_damage_taken.tolist() == [5.0, 12.0]
     engine._update_signal_buffer()
-    signal_indices = {
-        name: index for index, name in enumerate(engine.signals())
-    }
+    signal_indices = {name: index for index, name in enumerate(engine.signals())}
     assert engine.signal_buffer[:, signal_indices["hits_taken"]].tolist() == [1.0, 2.0]
     assert engine.signal_buffer[:, signal_indices["damage_taken"]].tolist() == [5.0, 12.0]
 
@@ -223,9 +221,7 @@ def test_spawn_check_attempts_each_acs_actor_class(square_scenario) -> None:
     )
     assert torch.all(engine.enemy_target_slot[engine.enemy_alive] == -2)
     spawned_type = engine.enemy_type[engine.enemy_alive]
-    spawned_angle_byte = (
-        engine.enemy_angle[engine.enemy_alive] * (256.0 / (2.0 * math.pi))
-    )
+    spawned_angle_byte = engine.enemy_angle[engine.enemy_alive] * (256.0 / (2.0 * math.pi))
     assert torch.allclose(spawned_angle_byte, torch.round(spawned_angle_byte))
     assert torch.all(engine.enemy_animation_tics[engine.enemy_alive] == 1)
     assert torch.all(engine.enemy_cooldown[engine.enemy_alive] == 0)
@@ -618,9 +614,7 @@ def test_monster_damage_switches_targets_until_retaliation_threshold_expires(
     engine.enemy_alive[:, :3] = True
     engine._enemy_pain_chance.zero_()
 
-    first_hit = torch.zeros(
-        (engine.num_envs, engine.enemy_slots, engine.enemy_slots)
-    )
+    first_hit = torch.zeros((engine.num_envs, engine.enemy_slots, engine.enemy_slots))
     first_hit[:, 0, 2] = 1
     engine._apply_enemy_damage(
         torch.sum(first_hit, dim=1),
@@ -1352,9 +1346,7 @@ def test_player_wall_collision_uses_doom_square_corner(square_scenario) -> None:
     engine = _engine(scenario)
 
     assert torch.all(engine._points_collide(torch.full((2,), 16.1), torch.full((2,), 8.0)))
-    assert not torch.any(
-        engine._points_collide(torch.full((2,), 16.1), torch.full((2,), 16.0))
-    )
+    assert not torch.any(engine._points_collide(torch.full((2,), 16.1), torch.full((2,), 16.0)))
 
 
 def test_player_actor_collision_uses_doom_square_corner(square_scenario) -> None:
@@ -1714,12 +1706,8 @@ def test_corner_slide_retries_with_unclipped_reference_motion(square_scenario) -
     fixed_unit = 1 << 16
     # Translate two certified-map oracle contacts onto the fixture's matching
     # bottom-right and top-right corners without changing their fixed geometry.
-    engine._x_fixed[:] = torch.tensor(
-        [65741189 - 768 * fixed_unit, 66018892 - 768 * fixed_unit]
-    )
-    engine._y_fixed[:] = torch.tensor(
-        [1048970 - 256 * fixed_unit, 66058833 - 768 * fixed_unit]
-    )
+    engine._x_fixed[:] = torch.tensor([65741189 - 768 * fixed_unit, 66018892 - 768 * fixed_unit])
+    engine._y_fixed[:] = torch.tensor([1048970 - 256 * fixed_unit, 66058833 - 768 * fixed_unit])
     engine._momentum_x_fixed[:] = torch.tensor([397773, 99394])
     engine._momentum_y_fixed[:] = torch.tensor([-12631, 46551])
     engine.x.copy_(engine._x_fixed.to(torch.float32) / fixed_unit)
@@ -2035,9 +2023,7 @@ def test_spawn_reaction_time_counts_chase_actions_and_only_blocks_missiles(
     engine.enemy_alive.zero_()
     engine.enemy_x[:, 0] = torch.tensor([100.0, 32.0])
     engine.enemy_y[:, 0].zero_()
-    engine._enemy_x_fixed[:, 0] = torch.round(
-        engine.enemy_x[:, 0] * 65536
-    ).to(torch.int64)
+    engine._enemy_x_fixed[:, 0] = torch.round(engine.enemy_x[:, 0] * 65536).to(torch.int64)
     engine._enemy_y_fixed[:, 0].zero_()
     engine.enemy_type[:, 0] = torch.tensor([0, 4])
     engine.enemy_health[:, 0] = torch.tensor([20.0, 150.0])
@@ -2383,12 +2369,8 @@ def test_monster_melee_range_uses_target_radius_and_approximate_distance(
     engine.enemy_alive.zero_()
     engine.enemy_x[:, 0] = torch.tensor([42.0, 70.0])
     engine.enemy_y[:, 0] = torch.tensor([42.0, 0.0])
-    engine._enemy_x_fixed[:, 0] = torch.round(
-        engine.enemy_x[:, 0] * 65536
-    ).to(torch.int64)
-    engine._enemy_y_fixed[:, 0] = torch.round(
-        engine.enemy_y[:, 0] * 65536
-    ).to(torch.int64)
+    engine._enemy_x_fixed[:, 0] = torch.round(engine.enemy_x[:, 0] * 65536).to(torch.int64)
+    engine._enemy_y_fixed[:, 0] = torch.round(engine.enemy_y[:, 0] * 65536).to(torch.int64)
     engine.enemy_type[:, 0] = 2
     engine.enemy_health[:, 0] = 100
     engine.enemy_alive[:, 0] = True
@@ -2555,8 +2537,7 @@ def test_monster_hitscan_uses_independent_reference_pellets(square_scenario) -> 
     fires = torch.zeros_like(engine.enemy_alive)
     fires[:, 0] = True
     distance = torch.sqrt(
-        (engine.x[:, None] - engine.enemy_x) ** 2
-        + (engine.y[:, None] - engine.enemy_y) ** 2
+        (engine.x[:, None] - engine.enemy_x) ** 2 + (engine.y[:, None] - engine.enemy_y) ** 2
     ).clamp_min(1e-4)
 
     damage, _actual_player_damage, _enemy_damage = engine._enemy_hitscan_damage(
@@ -2610,8 +2591,7 @@ def test_monster_spread_pellet_traces_its_own_blocking_linedef(
         fires = torch.zeros_like(engine.enemy_alive)
         fires[:, 0] = True
         distance = torch.sqrt(
-            (engine.x[:, None] - engine.enemy_x) ** 2
-            + (engine.y[:, None] - engine.enemy_y) ** 2
+            (engine.x[:, None] - engine.enemy_x) ** 2 + (engine.y[:, None] - engine.enemy_y) ** 2
         ).clamp_min(1e-4)
         visible = ~engine._sight_blocked(
             engine.enemy_x,

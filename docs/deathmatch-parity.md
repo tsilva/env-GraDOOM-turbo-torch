@@ -26,12 +26,12 @@ Tick/action timing, movement, collision, weapon selection and state, ammo, hitsc
 ## Policy observation reference
 
 The release gate applies to the frame consumed by the policy, not only to the
-raw renderer. The pinned ViZDoom-turbo transform masks the bottom 32 rows in
+raw renderer. The pinned env-ViZDoom-turbo transform masks the bottom 32 rows in
 the 320x240 RGB frame, performs rational RGB area pooling to 84x84, rounds each
 RGB channel, then computes grayscale with integer coefficients 77/150/29.
 
 `tools/compare_renderer.py` reports raw and policy-facing metrics together. On
-the four pinned static seeds 123, 456, 789, and 1337, GraDOOM's native renderer
+the four pinned static seeds 123, 456, 789, and 1337, env-Doom-turbo-torch's native renderer
 plus reference preprocessing reaches 0.999998 mean policy-frame correlation
 and 0.00266/255 mean absolute error. The legacy direct-84 renderer reaches only
 0.528 correlation and 20.34/255 error on the same cases, so it is explicitly
@@ -39,7 +39,7 @@ reported as `approximate` and is not parity evidence.
 
 ## Deterministic prefix oracle
 
-`tools/compare_behavior.py` aligns GraDOOM to ViZDoom's randomized initial
+`tools/compare_behavior.py` aligns env-Doom-turbo-torch to ViZDoom's randomized initial
 pose, then compares player state, motion, weapons, ammo, rewards, and episode
 timing over scripted actions. It deliberately stops before episode time 106,
 where the first permitted stochastic ACS monster spawn occurs.
@@ -59,21 +59,21 @@ progress, not release certification:
 - The early ACS spawn distribution matches across providers.
 - `tools/compare_summoned_monsters.py` compares 64 aligned trials for each of
   the six scenario actor classes. Attack onset, damage, death rate, and motion
-  are close; for example, Zombieman mean damage is 4.17 in GraDOOM versus 3.17
+  are close; for example, Zombieman mean damage is 4.17 in env-Doom-turbo-torch versus 3.17
   in ViZDoom, ShotgunGuy is 12.94 versus 11.22, and Demon is 9.41 versus 10.53.
 - `tools/compare_infighting.py` compares 128 aligned Zombieman/ShotgunGuy
-  trials. GraDOOM observes a monster kill in 44.53% of trials at mean decision
+  trials. env-Doom-turbo-torch observes a monster kill in 44.53% of trials at mean decision
   26.82; ViZDoom observes 45.31% at mean decision 27.71. This covers targeting,
   hitscan interception, retaliation, and kill credit in the isolated setup.
 - The converted reference policy scores 35.11 mean kills over 100 ViZDoom
-  episodes and 28.09 over 100 GraDOOM episodes with the fast native renderer.
-  This is useful one-way zero-shot transfer, but GraDOOM retains only 80.0% of
+  episodes and 28.09 over 100 env-Doom-turbo-torch episodes with the fast native renderer.
+  This is useful one-way zero-shot transfer, but env-Doom-turbo-torch retains only 80.0% of
   the source mean and therefore does not yet satisfy the release gate.
-- A GraDOOM-adapted checkpoint scores 20.96 in GraDOOM and 34.95 zero-shot in
+- A env-Doom-turbo-torch-adapted checkpoint scores 20.96 in env-Doom-turbo-torch and 34.95 zero-shot in
   ViZDoom over 100 episodes. Both directions retain useful behavior, but their
   performance is not yet similar enough to claim parity.
 
-The retained aggregate evidence is under `/home/tsilva/gradoom-runs` in
+The retained aggregate evidence is under `/home/tsilva/env_doom_turbo_torch-runs` in
 `20260813-summoned-monster-parity64-seed10000.json`,
 `20260813-infighting-zombie-shotgun128-aligned-seed10000.json`,
 `20260813-source-layer16-sprite1-depth-eval100-n100-seed10000`, and
@@ -96,14 +96,14 @@ damage scales, rewards, episode rules, or policy inputs:
   vertical interval clipped through portal openings. The corrected CUDA path
   returns the clipped aim interval and preserves ViZDoom attack/chase target
   state timing. Across 1,024 aligned Zombieman/ChaingunGuy infighting trials,
-  GraDOOM versus ViZDoom records 4.650 versus 4.558 mean damage, 1.082 versus
+  env-Doom-turbo-torch versus ViZDoom records 4.650 versus 4.558 mean damage, 1.082 versus
   1.104 mean hits, 61.82% versus 62.01% kill observation, and 32.06 versus
   32.21 mean first-kill decision. Post-kill damage, previously exactly zero in
-  GraDOOM, is now 6.250 versus 5.872.
+  env-Doom-turbo-torch, is now 6.250 versus 5.872.
 
 The untouched converted reference policy now scores 25.23 mean kills over 100
-fixed-seed GraDOOM episodes, up from 23.36 immediately before these fixes. The
-same policy scores 35.11 in ViZDoom, so GraDOOM retains 71.9% of the source
+fixed-seed env-Doom-turbo-torch episodes, up from 23.36 immediately before these fixes. The
+same policy scores 35.11 in ViZDoom, so env-Doom-turbo-torch retains 71.9% of the source
 mean. This confirms that the fixes improve real policy transfer, but it remains
 below both the 30-kill training target and the 90% release gate and is not
 certification. The combined corrections sustain 22,639 median environment
@@ -112,17 +112,17 @@ benchmark, within 1.7% of the effects-disabled implementation.
 
 Reproducible evidence is retained in:
 
-- `/home/tsilva/gradoom-runs/20260814-effect-ablation-u300-n32-seed10000.json`
-- `/home/tsilva/gradoom-runs/20260814-optimized-correct-effect-styles-exact-weapon-u300-n32-seed10000.json`
-- `/home/tsilva/gradoom-runs/20260814-raw-plasma-fire-hide-weapon-seed1337/`
-- `/home/tsilva/gradoom-runs/20260814-infighting-zombie-chaingun1024-portal-autoaim-target-state-fix-seed10000.json`
-- `/home/tsilva/gradoom-runs/20260814-summoned-zombieman1024-noop-d44-autoaim-state-fix-seed10000.json`
-- `/home/tsilva/gradoom-runs/20260814-render-effects-autoaim-state-reference-eval100-seed10000.jsonl`
+- `/home/tsilva/env_doom_turbo_torch-runs/20260814-effect-ablation-u300-n32-seed10000.json`
+- `/home/tsilva/env_doom_turbo_torch-runs/20260814-optimized-correct-effect-styles-exact-weapon-u300-n32-seed10000.json`
+- `/home/tsilva/env_doom_turbo_torch-runs/20260814-raw-plasma-fire-hide-weapon-seed1337/`
+- `/home/tsilva/env_doom_turbo_torch-runs/20260814-infighting-zombie-chaingun1024-portal-autoaim-target-state-fix-seed10000.json`
+- `/home/tsilva/env_doom_turbo_torch-runs/20260814-summoned-zombieman1024-noop-d44-autoaim-state-fix-seed10000.json`
+- `/home/tsilva/env_doom_turbo_torch-runs/20260814-render-effects-autoaim-state-reference-eval100-seed10000.jsonl`
 
 ## 2026-08-14 missile-spawn and no-autofire follow-up
 
 Synchronized raw-RGB/state traces exposed two additional deterministic
-mechanics defects. GraDOOM now performs Doom's `P_CheckMissileSpawn` collision
+mechanics defects. env-Doom-turbo-torch now performs Doom's `P_CheckMissileSpawn` collision
 test at the already-advanced half-step spawn position, including the missile
 radius when deriving a two-sided portal's floor and ceiling opening. It also
 implements the Rocket Launcher's `WEAPON.NOAUTOFIRE` flag: attack starts held,
@@ -132,7 +132,7 @@ Neither correction changes rewards, damage, observations, episode rules, or
 the policy action space.
 
 In the seed-789 plasma oracle, ViZDoom's first impact is at
-`(581.610916, 513.577087, -32)` and GraDOOM's corrected CUDA impact is within
+`(581.610916, 513.577087, -32)` and env-Doom-turbo-torch's corrected CUDA impact is within
 1.5e-5 map units; the first impact scene is pixel exact. In the Rocket Launcher
 oracle, both providers retain 100 rockets and zero player damage while attack
 is held before Ready. Screen-flash on/off/default ablations are pixel identical
@@ -147,9 +147,9 @@ shows no fast-path regression.
 
 Fixed seed-10000 stochastic evaluation does not establish a policy-quality
 gain. The untouched converted ViZDoom policy scores **23.20 mean kills** over
-100 GraDOOM episodes (median 18, standard deviation 17.21), versus its prior
-25.23 GraDOOM measurement and existing 35.11 ViZDoom result. The 4.03M-sample
-GraDOOM-adapted checkpoint scores **26.75 mean kills** (median 23, standard
+100 env-Doom-turbo-torch episodes (median 18, standard deviation 17.21), versus its prior
+25.23 env-Doom-turbo-torch measurement and existing 35.11 ViZDoom result. The 4.03M-sample
+env-Doom-turbo-torch-adapted checkpoint scores **26.75 mean kills** (median 23, standard
 deviation 17.51), versus 27.39 before the corrections and 39.38 in ViZDoom.
 The changes are retained because the raw causal behavior is reference-correct
 and the fixed-grid shifts are small relative to episode variance, but the
@@ -157,12 +157,12 @@ greater-than-or-equal-to-30 and similar-transfer gates remain unmet.
 
 Reproducible evidence is retained in:
 
-- `/home/tsilva/gradoom-runs/20260814-plasma-seed789-spawn-opening-cuda.json`
-- `/home/tsilva/gradoom-runs/20260814-rocket-seed789-noautofire-parity.json`
-- `/home/tsilva/gradoom-runs/20260814-projectile-spawn-opening-cuda-4seeds.json`
-- `/home/tsilva/gradoom-runs/20260814-projectile-spawn-noautofire-throughput-2048.json`
-- `/home/tsilva/gradoom-runs/20260814-projectile-spawn-noautofire-source-eval100-seed10000.jsonl`
-- `/home/tsilva/gradoom-runs/20260814-projectile-spawn-noautofire-adapted-eval100-seed10000.jsonl`
+- `/home/tsilva/env_doom_turbo_torch-runs/20260814-plasma-seed789-spawn-opening-cuda.json`
+- `/home/tsilva/env_doom_turbo_torch-runs/20260814-rocket-seed789-noautofire-parity.json`
+- `/home/tsilva/env_doom_turbo_torch-runs/20260814-projectile-spawn-opening-cuda-4seeds.json`
+- `/home/tsilva/env_doom_turbo_torch-runs/20260814-projectile-spawn-noautofire-throughput-2048.json`
+- `/home/tsilva/env_doom_turbo_torch-runs/20260814-projectile-spawn-noautofire-source-eval100-seed10000.jsonl`
+- `/home/tsilva/env_doom_turbo_torch-runs/20260814-projectile-spawn-noautofire-adapted-eval100-seed10000.jsonl`
 
 ## 2026-08-14 blocked-chase missile parity follow-up
 
@@ -172,22 +172,22 @@ not bug evidence. Deterministic predicates use pre-stochastic oracles;
 stochastic mechanics use isolated high-sample outcome distributions.
 
 Direct ViZDoom probes of both `P_CheckSight` and the complete initial `A_Look`
-target-acquisition decision match GraDOOM in all 512 captured ChaingunGuy
+target-acquisition decision match env-Doom-turbo-torch in all 512 captured ChaingunGuy
 initial states. A separate zero-tic `A_CPosAttack` counter preserved the
 original map `BEHAVIOR` and matched all 512 initial player/monster states
 exactly. Before the fix, 2,048 trials showed that hit and damage yield per
-attack already matched, but GraDOOM executed 0.321 more attacks per trial, with
+attack already matched, but env-Doom-turbo-torch executed 0.321 more attacks per trial, with
 a normal 95% interval of 0.122 to 0.520.
 
 The causal defect was Doom's failed `P_NewChaseDir` state. ViZDoom retains the
 pre-decremented negative `movecount` when every direction is blocked and only
-permits missile selection when `movecount == 0`. GraDOOM instead reset a failed
+permits missile selection when `movecount == 0`. env-Doom-turbo-torch instead reset a failed
 count to zero and accepted every non-positive count, making stuck monsters
-immediately missile-eligible. GraDOOM now preserves the negative count and
+immediately missile-eligible. env-Doom-turbo-torch now preserves the negative count and
 uses the exact equality guard. This changes no damage, reward, observation,
 episode, or policy parameters.
 
-Across 4,096 unmodified-scenario trials after the correction, GraDOOM versus
+Across 4,096 unmodified-scenario trials after the correction, env-Doom-turbo-torch versus
 ViZDoom records 29.314 versus 29.065 mean ChaingunGuy damage (difference 0.250,
 95% interval -0.423 to 0.922), 6.978 versus 6.969 mean hits (difference 0.009,
 interval -0.143 to 0.160), and 94.263% versus 93.359% any-damage observation
@@ -198,19 +198,19 @@ skipped.
 
 Reproducible evidence is retained in:
 
-- `/home/tsilva/gradoom-runs/20260814-chaingunguy512-direct-initial-sight-oracle-seed10000.json`
-- `/home/tsilva/gradoom-runs/20260814-chaingunguy512-direct-initial-look-oracle-seed10000.json`
-- `/home/tsilva/gradoom-runs/20260814-chaingun-attack-probe-final-initial-state-validation512.json`
-- `/home/tsilva/gradoom-runs/20260814-chaingunguy2048-attack-count-parity-validated-seed10000.json`
-- `/home/tsilva/gradoom-runs/20260814-summoned-chaingunguy4096-noop-parity-uncertainty-seed10000.json`
-- `/home/tsilva/gradoom-runs/20260814-summoned-chaingunguy4096-post-negative-movecount-fix-seed10000.json`
+- `/home/tsilva/env_doom_turbo_torch-runs/20260814-chaingunguy512-direct-initial-sight-oracle-seed10000.json`
+- `/home/tsilva/env_doom_turbo_torch-runs/20260814-chaingunguy512-direct-initial-look-oracle-seed10000.json`
+- `/home/tsilva/env_doom_turbo_torch-runs/20260814-chaingun-attack-probe-final-initial-state-validation512.json`
+- `/home/tsilva/env_doom_turbo_torch-runs/20260814-chaingunguy2048-attack-count-parity-validated-seed10000.json`
+- `/home/tsilva/env_doom_turbo_torch-runs/20260814-summoned-chaingunguy4096-noop-parity-uncertainty-seed10000.json`
+- `/home/tsilva/env_doom_turbo_torch-runs/20260814-summoned-chaingunguy4096-post-negative-movecount-fix-seed10000.json`
 
 ## 2026-08-14 corrected-engine training and transfer milestone
 
 Fresh on-policy adaptation after the blocked-chase correction clears the
 project's 30-kill training milestone without gameplay scaling. The promoted
 checkpoint was initialized from the converted GradLab policy lineage and
-trained for 4,030,464 GraDOOM transitions with 2,048 environments, 16-step
+trained for 4,030,464 env-Doom-turbo-torch transitions with 2,048 environments, 16-step
 rollouts, 4,096-sample minibatches, two PPO epochs, learning rate `1e-6`,
 zero entropy coefficient, `killcount-v1`, projection-only visual adaptation,
 the native-fused renderer, frame skip 2, and
@@ -218,22 +218,22 @@ the native-fused renderer, frame skip 2, and
 the RTX 4090, reached 20,144 median steady-state transitions/s, and logged the
 GradLab-compatible return, rolling-kill, throughput, and PPO diagnostics to
 W&B run `tsilva/VizdoomDeathmatch-v1/tvoqahok` with the
-`env_provider:gradoom` tag.
+`env_provider:env_doom_turbo_torch` tag.
 
 On the balanced seed-10000 stochastic acceptance grid, the checkpoint scores
-**30.47 mean kills over 100 GraDOOM episodes** (median 33, standard deviation
+**30.47 mean kills over 100 env-Doom-turbo-torch episodes** (median 33, standard deviation
 17.84), up from 28.99 for the pre-correction-trained incumbent evaluated on
 the same corrected engine. The unchanged checkpoint scores **38.73 mean kills
-over 100 ViZDoom-turbo episodes** (median 47, standard deviation 19.07). The
+over 100 env-ViZDoom-turbo episodes** (median 47, standard deviation 19.07). The
 checkpoint SHA-256 is
 `554eba0f53b0351f844faeb9733bae6dbcc3277147a160f215a3292983347ee0`.
 This clears the explicit greater-than-or-equal-to-30 milestone and provides
-strong GraDOOM-to-ViZDoom zero-shot transfer, but remains below the stricter
-31.78 historical reference target in GraDOOM.
+strong env-Doom-turbo-torch-to-ViZDoom zero-shot transfer, but remains below the stricter
+31.78 historical reference target in env-Doom-turbo-torch.
 
 Reverse transfer remains useful but asymmetric. The untouched converted
 GradLab/ViZDoom checkpoint at step 463,970,304 scores **25.80 mean kills over
-100 corrected GraDOOM episodes** (median 18.5, standard deviation 18.35), up
+100 corrected env-Doom-turbo-torch episodes** (median 18.5, standard deviation 18.35), up
 from 23.20 before the blocked-chase correction. Its SHA-256 is
 `ecf8927d13c4ebc72f9f16e130c8e500578dfdf349f819c24c1875f29c6a72dd`.
 The remaining reverse-transfer and five-seed release gates are therefore not
@@ -329,39 +329,39 @@ spending a fixed-100 evaluation. W&B run
 
 Reproducible evidence is retained in:
 
-- `/home/tsilva/gradoom-runs/20260814-negative-movecount-projection-killcount-n2048-lr1e6-4m-seed4127/train.jsonl`
-- `/home/tsilva/gradoom-runs/20260814-negative-movecount-projection-killcount-n2048-lr1e6-4m-seed4127/eval-final100-seed10000.jsonl`
-- `/home/tsilva/gradoom-runs/20260814-negative-movecount-projection-killcount-n2048-lr1e6-4m-seed4127/eval-vizdoom-final100-seed10000-pythonpath.jsonl`
-- `/home/tsilva/gradoom-runs/20260814-reference-gradlab-source-post-negative-movecount-fix-eval100-seed10000.jsonl`
-- `/home/tsilva/gradoom-runs/20260814-negative-movecount-projection-killcount-n4096-lr1e6-4m-seed6841/train.jsonl`
-- `/home/tsilva/gradoom-runs/20260814-negative-movecount-projection-killcount-n4096-lr1e6-4m-seed6841/eval-final32-seed10000.jsonl`
-- `/home/tsilva/gradoom-runs/20260814-negative-movecount-best-sample-factory-projection-lr5e7-2m-seed7717/train.jsonl`
-- `/home/tsilva/gradoom-runs/20260814-negative-movecount-best-sample-factory-projection-lr5e7-2m-seed7717/eval-final32-seed10000.jsonl`
-- `/home/tsilva/gradoom-runs/20260814-negative-movecount-projection-killcount-n2048-lr2e6-2m-seed4127/train.jsonl`
-- `/home/tsilva/gradoom-runs/20260814-negative-movecount-projection-killcount-n2048-lr2e6-2m-seed4127/eval-final32-seed10000.jsonl`
-- `/home/tsilva/gradoom-runs/20260814-negative-movecount-projection-killcount-n2048-lr1e6-4m-seed6841/train.jsonl`
-- `/home/tsilva/gradoom-runs/20260814-negative-movecount-projection-killcount-n2048-lr1e6-4m-seed6841/eval-final32-seed10000.jsonl`
-- `/home/tsilva/gradoom-runs/20260814-negative-movecount-projection-killcount-n2048-lr1e6-4m-seed6841/eval-final100-seed10000.jsonl`
-- `/home/tsilva/gradoom-runs/20260814-negative-movecount-projection-killcount-n2048-lr5e7-8m-seed6841/train.jsonl`
-- `/home/tsilva/gradoom-runs/20260814-negative-movecount-projection-killcount-n2048-lr5e7-8m-seed6841/eval-final32-seed10000.jsonl`
-- `/home/tsilva/gradoom-runs/20260814-negative-movecount-projection-killcount-n2048-lr5e7-8m-seed6841/eval-step7208960-32-seed10000.jsonl`
-- `/home/tsilva/gradoom-runs/20260814-accepted-negative-movecount-frozen-head-killcount-lr1e6-4m-seed6841/train.jsonl`
-- `/home/tsilva/gradoom-runs/20260814-accepted-negative-movecount-frozen-head-killcount-lr1e6-4m-seed6841/eval-final32-seed10000.jsonl`
-- `/home/tsilva/gradoom-runs/20260814-negative-movecount-projection-killcount-n2048-lr1e6-4m-seed4127/eval-step3276800-32-seed10000.jsonl`
-- `/home/tsilva/gradoom-runs/20260814-negative-movecount-projection-killcount-n2048-lr1e6-4m-seed4127/eval-step3276800-100-seed10000.jsonl`
-- `/home/tsilva/gradoom-runs/20260814-negative-movecount-projection-killcount-fullbatch-lr8e6-4m-seed6841/train.jsonl`
-- `/home/tsilva/gradoom-runs/20260814-negative-movecount-projection-killcount-fullbatch-lr8e6-4m-seed6841/eval-final32-seed10000.jsonl`
-- `/home/tsilva/gradoom-runs/20260814-negative-movecount-projection-killcount-n2048-lr1e6-4m-seed4127/eval-final32-seed10000-deterministic-actions.jsonl`
-- `/home/tsilva/gradoom-runs/20260814-negative-movecount-projection-killcount-ent001-4m-seed6841/train.jsonl`
-- `/home/tsilva/gradoom-runs/20260814-negative-movecount-projection-killcount-ent001-4m-seed6841/eval-final32-seed10000.jsonl`
+- `/home/tsilva/env_doom_turbo_torch-runs/20260814-negative-movecount-projection-killcount-n2048-lr1e6-4m-seed4127/train.jsonl`
+- `/home/tsilva/env_doom_turbo_torch-runs/20260814-negative-movecount-projection-killcount-n2048-lr1e6-4m-seed4127/eval-final100-seed10000.jsonl`
+- `/home/tsilva/env_doom_turbo_torch-runs/20260814-negative-movecount-projection-killcount-n2048-lr1e6-4m-seed4127/eval-vizdoom-final100-seed10000-pythonpath.jsonl`
+- `/home/tsilva/env_doom_turbo_torch-runs/20260814-reference-gradlab-source-post-negative-movecount-fix-eval100-seed10000.jsonl`
+- `/home/tsilva/env_doom_turbo_torch-runs/20260814-negative-movecount-projection-killcount-n4096-lr1e6-4m-seed6841/train.jsonl`
+- `/home/tsilva/env_doom_turbo_torch-runs/20260814-negative-movecount-projection-killcount-n4096-lr1e6-4m-seed6841/eval-final32-seed10000.jsonl`
+- `/home/tsilva/env_doom_turbo_torch-runs/20260814-negative-movecount-best-sample-factory-projection-lr5e7-2m-seed7717/train.jsonl`
+- `/home/tsilva/env_doom_turbo_torch-runs/20260814-negative-movecount-best-sample-factory-projection-lr5e7-2m-seed7717/eval-final32-seed10000.jsonl`
+- `/home/tsilva/env_doom_turbo_torch-runs/20260814-negative-movecount-projection-killcount-n2048-lr2e6-2m-seed4127/train.jsonl`
+- `/home/tsilva/env_doom_turbo_torch-runs/20260814-negative-movecount-projection-killcount-n2048-lr2e6-2m-seed4127/eval-final32-seed10000.jsonl`
+- `/home/tsilva/env_doom_turbo_torch-runs/20260814-negative-movecount-projection-killcount-n2048-lr1e6-4m-seed6841/train.jsonl`
+- `/home/tsilva/env_doom_turbo_torch-runs/20260814-negative-movecount-projection-killcount-n2048-lr1e6-4m-seed6841/eval-final32-seed10000.jsonl`
+- `/home/tsilva/env_doom_turbo_torch-runs/20260814-negative-movecount-projection-killcount-n2048-lr1e6-4m-seed6841/eval-final100-seed10000.jsonl`
+- `/home/tsilva/env_doom_turbo_torch-runs/20260814-negative-movecount-projection-killcount-n2048-lr5e7-8m-seed6841/train.jsonl`
+- `/home/tsilva/env_doom_turbo_torch-runs/20260814-negative-movecount-projection-killcount-n2048-lr5e7-8m-seed6841/eval-final32-seed10000.jsonl`
+- `/home/tsilva/env_doom_turbo_torch-runs/20260814-negative-movecount-projection-killcount-n2048-lr5e7-8m-seed6841/eval-step7208960-32-seed10000.jsonl`
+- `/home/tsilva/env_doom_turbo_torch-runs/20260814-accepted-negative-movecount-frozen-head-killcount-lr1e6-4m-seed6841/train.jsonl`
+- `/home/tsilva/env_doom_turbo_torch-runs/20260814-accepted-negative-movecount-frozen-head-killcount-lr1e6-4m-seed6841/eval-final32-seed10000.jsonl`
+- `/home/tsilva/env_doom_turbo_torch-runs/20260814-negative-movecount-projection-killcount-n2048-lr1e6-4m-seed4127/eval-step3276800-32-seed10000.jsonl`
+- `/home/tsilva/env_doom_turbo_torch-runs/20260814-negative-movecount-projection-killcount-n2048-lr1e6-4m-seed4127/eval-step3276800-100-seed10000.jsonl`
+- `/home/tsilva/env_doom_turbo_torch-runs/20260814-negative-movecount-projection-killcount-fullbatch-lr8e6-4m-seed6841/train.jsonl`
+- `/home/tsilva/env_doom_turbo_torch-runs/20260814-negative-movecount-projection-killcount-fullbatch-lr8e6-4m-seed6841/eval-final32-seed10000.jsonl`
+- `/home/tsilva/env_doom_turbo_torch-runs/20260814-negative-movecount-projection-killcount-n2048-lr1e6-4m-seed4127/eval-final32-seed10000-deterministic-actions.jsonl`
+- `/home/tsilva/env_doom_turbo_torch-runs/20260814-negative-movecount-projection-killcount-ent001-4m-seed6841/train.jsonl`
+- `/home/tsilva/env_doom_turbo_torch-runs/20260814-negative-movecount-projection-killcount-ent001-4m-seed6841/eval-final32-seed10000.jsonl`
 
 ## 2026-08-14 overlapping-sprite renderer parity correction
 
 A wider matched acceptance cohort exposed a remaining closed-loop transfer
 gap without being used to localize its cause. The promoted checkpoint scores
-24.49 mean kills (standard deviation 17.33) in one GraDOOM episode on each of
-100 seed streams, versus 39.20 (standard deviation 19.36) in ViZDoom-turbo on
-the same provider/game seed grid. The first 16 GraDOOM records are bit-for-bit
+24.49 mean kills (standard deviation 17.33) in one env-Doom-turbo-torch episode on each of
+100 seed streams, versus 39.20 (standard deviation 19.36) in env-ViZDoom-turbo on
+the same provider/game seed grid. The first 16 env-Doom-turbo-torch records are bit-for-bit
 identical to the corresponding records from the normal 16-lane evaluator, so
 the lower broad-cohort result is not a batch-width simulation defect. The
 100-lane protocol is retained as a matched secondary screen; it does not
@@ -369,15 +369,15 @@ replace the registered 16-lane GradLab-compatible acceptance protocol.
 
 The gap was not attributed to downstream trajectory divergence. In 256
 independent episodes for each of four fixed open-loop action programs, normal
-95% intervals for GraDOOM-minus-ViZDoom incoming damage, hit count, episode
+95% intervals for env-Doom-turbo-torch-minus-ViZDoom incoming damage, hit count, episode
 length, and their per-decision rates all include zero. Mean-kill intervals
 exclude zero only for `noop` (0.332, interval 0.006 to 0.658) and
-`forward-fire` (0.656, interval 0.103 to 1.210), where GraDOOM obtains more
-kills. This does not support a general claim that GraDOOM combat is harsher;
+`forward-fire` (0.656, interval 0.103 to 1.210), where env-Doom-turbo-torch obtains more
+kills. This does not support a general claim that env-Doom-turbo-torch combat is harsher;
 it moves localization to the controlled observation-policy loop.
 
 Rendering the exact and native-fused observations from each of 9,600
-identical GraDOOM states, then passing both through the same promoted policy,
+identical env-Doom-turbo-torch states, then passing both through the same promoted policy,
 found that the fused renderer retained only the nearest horizontally
 overlapping actor for each screen column. A transparent or vertically short
 pickup, corpse, or projectile could therefore erase a live enemy behind it.
@@ -398,7 +398,7 @@ the former one-layer implementation's 22,961 and 38.1% faster than the
 correct but launch-bound two-pass prototype's 18,385.
 
 The unchanged promoted policy improves from 24.49 to **27.60 mean kills** on
-the identical broad 100-seed GraDOOM cohort (+3.11, +12.7%) after only the
+the identical broad 100-seed env-Doom-turbo-torch cohort (+3.11, +12.7%) after only the
 renderer correction. This is direct end-to-end evidence that the defect was
 material, although the result remains below both the 30-kill goal and the
 matched ViZDoom mean. A fresh 4,030,464-transition projection-only adaptation
@@ -437,23 +437,23 @@ The complete Doom-II-backed suite passes 335 tests after the correction, with
 the three optional Freedoom/alternate-IWAD tests skipped. Reproducible
 evidence is retained in:
 
-- `/home/tsilva/gradoom-runs/20260814-outcome-distributions-all256-post-negative-movecount-uncertainty-seed10000.json`
-- `/home/tsilva/gradoom-runs/20260814-accepted-policy-current-render-death-ablation-u300-n32-seed10000.json`
-- `/home/tsilva/gradoom-runs/20260814-accepted-policy-current-render-live-enemy-ablation-u300-n32-seed10000.json`
-- `/home/tsilva/gradoom-runs/20260814-accepted-policy-current-render-fused-two-sprite-layers-u300-n32-seed10000.json`
-- `/home/tsilva/gradoom-runs/20260814-negative-movecount-projection-killcount-n2048-lr1e6-4m-seed4127/eval-final100-env100-seed10000.jsonl`
-- `/home/tsilva/gradoom-runs/20260814-negative-movecount-projection-killcount-n2048-lr1e6-4m-seed4127/eval-final100-env100-seed10000-two-sprite-layers.jsonl`
-- `/home/tsilva/gradoom-runs/20260814-negative-movecount-projection-killcount-n2048-lr1e6-4m-seed4127/eval-vizdoom-final100-env100-seed10000-pythonpath.jsonl`
-- `/home/tsilva/gradoom-runs/20260814-fused-two-sprite-layers-projection-killcount-n2048-lr1e6-4m-seed4127/train.jsonl`
-- `/home/tsilva/gradoom-runs/20260814-fused-two-sprite-layers-projection-killcount-n2048-lr1e6-4m-seed4127/eval-final100-env100-seed10000.jsonl`
-- `/home/tsilva/gradoom-runs/20260814-negative-movecount-projection-killcount-n2048-lr1e6-4m-seed4127/eval-final100-seed10000-fused-two-sprite-layers.jsonl`
-- `/home/tsilva/gradoom-runs/20260814-accepted-policy-fused-two-sprite-layers-effect-decal-ablation-u300-n32-seed10000.json`
-- `/home/tsilva/gradoom-runs/20260814-accepted-policy-fused-two-sprite-layers-decal-ablation-u300-n32-seed10000.json`
+- `/home/tsilva/env_doom_turbo_torch-runs/20260814-outcome-distributions-all256-post-negative-movecount-uncertainty-seed10000.json`
+- `/home/tsilva/env_doom_turbo_torch-runs/20260814-accepted-policy-current-render-death-ablation-u300-n32-seed10000.json`
+- `/home/tsilva/env_doom_turbo_torch-runs/20260814-accepted-policy-current-render-live-enemy-ablation-u300-n32-seed10000.json`
+- `/home/tsilva/env_doom_turbo_torch-runs/20260814-accepted-policy-current-render-fused-two-sprite-layers-u300-n32-seed10000.json`
+- `/home/tsilva/env_doom_turbo_torch-runs/20260814-negative-movecount-projection-killcount-n2048-lr1e6-4m-seed4127/eval-final100-env100-seed10000.jsonl`
+- `/home/tsilva/env_doom_turbo_torch-runs/20260814-negative-movecount-projection-killcount-n2048-lr1e6-4m-seed4127/eval-final100-env100-seed10000-two-sprite-layers.jsonl`
+- `/home/tsilva/env_doom_turbo_torch-runs/20260814-negative-movecount-projection-killcount-n2048-lr1e6-4m-seed4127/eval-vizdoom-final100-env100-seed10000-pythonpath.jsonl`
+- `/home/tsilva/env_doom_turbo_torch-runs/20260814-fused-two-sprite-layers-projection-killcount-n2048-lr1e6-4m-seed4127/train.jsonl`
+- `/home/tsilva/env_doom_turbo_torch-runs/20260814-fused-two-sprite-layers-projection-killcount-n2048-lr1e6-4m-seed4127/eval-final100-env100-seed10000.jsonl`
+- `/home/tsilva/env_doom_turbo_torch-runs/20260814-negative-movecount-projection-killcount-n2048-lr1e6-4m-seed4127/eval-final100-seed10000-fused-two-sprite-layers.jsonl`
+- `/home/tsilva/env_doom_turbo_torch-runs/20260814-accepted-policy-fused-two-sprite-layers-effect-decal-ablation-u300-n32-seed10000.json`
+- `/home/tsilva/env_doom_turbo_torch-runs/20260814-accepted-policy-fused-two-sprite-layers-decal-ablation-u300-n32-seed10000.json`
 
 ## Release gates
 
 1. Differential micro-scenarios pass for all deterministic mechanics.
 2. Stochastic outcome distributions stay within declared bounds.
-3. At least five GraDOOM training seeds are evaluated unchanged over 100 ViZDoom episodes each.
+3. At least five env-Doom-turbo-torch training seeds are evaluated unchanged over 100 ViZDoom episodes each.
 4. Mean ViZDoom kills is at least 10 and at least 90% of the matched ViZDoom-trained reference.
 5. Median wall-clock time to the first passing checkpoint beats the strongest matched baseline by a statistically meaningful margin.

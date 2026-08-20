@@ -4,7 +4,7 @@ import struct
 
 import pytest
 
-from gradoom.wad import WadArchive, parse_udmf
+from env_doom_turbo_torch.wad import WadArchive, parse_udmf
 
 
 def _wad(*lumps: tuple[str, bytes], identity: bytes = b"PWAD") -> bytes:

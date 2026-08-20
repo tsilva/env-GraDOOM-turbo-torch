@@ -1,4 +1,4 @@
-"""Play one GraDOOM deathmatch lane with a keyboard."""
+"""Play one env-Doom-turbo-torch deathmatch lane with a keyboard."""
 
 from __future__ import annotations
 
@@ -10,8 +10,8 @@ from typing import Any
 
 import torch
 
-from gradoom import GraDoomVecEnv
-from gradoom.actions import DEATHMATCH_ACTIONS
+from env_doom_turbo_torch import EnvDoomTurboTorchVecEnv
+from env_doom_turbo_torch.actions import DEATHMATCH_ACTIONS
 
 _ACTION_INDEX = {buttons: index for index, buttons in enumerate(DEATHMATCH_ACTIONS)}
 _NEXT_WEAPON = _ACTION_INDEX[("SELECT_NEXT_WEAPON",)]
@@ -103,18 +103,18 @@ def _positive_float(value: str) -> float:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Play GraDOOM's deathmatch-p1-v1 environment as a human.",
+        description="Play env-Doom-turbo-torch's deathmatch-p1-v1 environment as a human.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
         "--iwad",
         type=Path,
-        help="Doom II or Freedoom IWAD (or set GRADOOM_IWAD)",
+        help="Doom II or Freedoom IWAD (or set ENV_DOOM_TURBO_TORCH_IWAD)",
     )
     parser.add_argument(
         "--scenario",
         type=Path,
-        help="ViZDoom deathmatch.wad (or set GRADOOM_DEATHMATCH_WAD)",
+        help="ViZDoom deathmatch.wad (or set ENV_DOOM_TURBO_TORCH_DEATHMATCH_WAD)",
     )
     parser.add_argument("--device", help="Torch device; defaults to CUDA when available")
     parser.add_argument("--seed", type=int, default=0, help="initial episode seed")
@@ -164,7 +164,7 @@ def _caption(signal_names: tuple[str, ...], signals: torch.Tensor) -> str:
     values = signals[0].detach().to("cpu").tolist()
     by_name = dict(zip(signal_names, values, strict=True))
     return (
-        "GraDOOM | "
+        "env-Doom-turbo-torch | "
         f"kills {int(by_name['killcount'])}  "
         f"health {int(by_name['health'])}  "
         f"armor {int(by_name['armor'])}  "
@@ -180,9 +180,9 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("play.py requires pygame-ce; run `uv sync --group dev`") from exc
 
     pygame.init()
-    env: GraDoomVecEnv | None = None
+    env: EnvDoomTurboTorchVecEnv | None = None
     try:
-        env = GraDoomVecEnv(
+        env = EnvDoomTurboTorchVecEnv(
             game="VizdoomDeathmatch-v1",
             scenario=args.scenario,
             rom_path=None if args.iwad is None else str(args.iwad),
@@ -216,7 +216,7 @@ def main(argv: list[str] | None = None) -> int:
             raise RuntimeError("rgb_array rendering did not produce a frame")
         native_height, native_width, _ = initial_frame.shape
         screen = pygame.display.set_mode((native_width * args.scale, native_height * args.scale))
-        pygame.display.set_caption("GraDOOM")
+        pygame.display.set_caption("env-Doom-turbo-torch")
         step_fps = args.fps or env.metadata["render_fps"] / env.frame_skip
         frame_period = 1.0 / step_fps
         next_frame_at = time.perf_counter()

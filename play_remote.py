@@ -1,6 +1,6 @@
-"""Play GraDOOM hosted on a remote stream server with original Doom keybindings.
+"""Play env-Doom-turbo-torch hosted on a remote stream server with original Doom keybindings.
 
-This client runs where the gradoom package itself cannot be imported (the
+This client runs where the env_doom_turbo_torch package itself cannot be imported (the
 engine's Triton dependency is Linux-only); the stream server sends the pinned
 action table in its hello message. Receive throughput, stream lag, and display
 timings are logged every --metrics-interval seconds.
@@ -222,7 +222,7 @@ def _draw_frame(
 def _caption(signal_names: list[str], signals: list[float]) -> str:
     by_name = dict(zip(signal_names, signals, strict=True))
     return (
-        "GraDOOM | "
+        "env-Doom-turbo-torch | "
         f"kills {int(by_name['killcount'])}  "
         f"health {int(by_name['health'])}  "
         f"armor {int(by_name['armor'])}  "
@@ -232,7 +232,10 @@ def _caption(signal_names: list[str], signals: list[float]) -> str:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Play GraDOOM hosted on a remote stream server (tools/stream_server.py).",
+        description=(
+            "Play env-Doom-turbo-torch hosted on a remote stream server "
+            "(tools/stream_server.py)."
+        ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--host", default="beast-3.local", help="stream server host")
@@ -283,7 +286,7 @@ def main(argv: list[str] | None = None) -> int:
                 else None
             )
             screen = pygame.display.set_mode((width * args.scale, height * args.scale))
-            pygame.display.set_caption("GraDOOM")
+            pygame.display.set_caption("env-Doom-turbo-torch")
 
             latest: dict[str, Any] = {"frame": None, "signals": None, "dead": None}
             stats = {

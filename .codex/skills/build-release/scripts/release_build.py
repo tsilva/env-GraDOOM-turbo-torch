@@ -20,7 +20,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 PACKAGE_NAME = "env-doom-turbo-torch"
-IMPORT_NAME = "gradoom"
+IMPORT_NAME = "env_doom_turbo_torch"
 DIST_FILE_PREFIX = "env_doom_turbo_torch"
 VERSION_PATTERN = re.compile(
     r"^(?P<major>[0-9]+)\.(?P<minor>[0-9]+)\.(?P<patch>[0-9]+)"
@@ -108,22 +108,19 @@ def check_version(args: argparse.Namespace) -> None:
     actual = {
         "project.name": project_name,
         "pyproject.toml": project_version,
-        "src/gradoom/__init__.py": init_version(),
+        "src/env_doom_turbo_torch/__init__.py": init_version(),
         "uv.lock": lock_version(),
     }
     wanted = {
         "project.name": PACKAGE_NAME,
         "pyproject.toml": expected,
-        "src/gradoom/__init__.py": expected,
+        "src/env_doom_turbo_torch/__init__.py": expected,
         "uv.lock": expected,
     }
-    failures = {
-        key: value for key, value in actual.items() if value != wanted[key]
-    }
+    failures = {key: value for key, value in actual.items() if value != wanted[key]}
     if failures:
         details = ", ".join(
-            f"{key}={value!r}, expected {wanted[key]!r}"
-            for key, value in failures.items()
+            f"{key}={value!r}, expected {wanted[key]!r}" for key, value in failures.items()
         )
         raise SystemExit(f"release metadata mismatch for {expected}: {details}")
     print(json.dumps({"package": PACKAGE_NAME, "version": expected}, indent=2))
@@ -158,11 +155,7 @@ def tagged_versions() -> set[str]:
         capture_output=True,
         text=True,
     )
-    return {
-        tag.removeprefix("v")
-        for tag in result.stdout.splitlines()
-        if tag.startswith("v")
-    }
+    return {tag.removeprefix("v") for tag in result.stdout.splitlines() if tag.startswith("v")}
 
 
 def select_release_version(
@@ -179,9 +172,7 @@ def select_release_version(
 
 def replace_project_version(path: Path, current: str, target: str) -> None:
     text = path.read_text(encoding="utf-8")
-    pattern = re.compile(
-        rf'(?ms)(^\[project\]\n.*?^version\s*=\s*"){re.escape(current)}(")'
-    )
+    pattern = re.compile(rf'(?ms)(^\[project\]\n.*?^version\s*=\s*"){re.escape(current)}(")')
     updated, count = pattern.subn(rf"\g<1>{target}\g<2>", text, count=1)
     if count != 1:
         raise SystemExit(f"could not update [project] version in {path}")
@@ -331,9 +322,7 @@ def sdist_audit(sdist: Path, version: str) -> dict[str, object]:
         "has_gpl_license": f"{root}/LICENSES/GPL-3.0-only.txt" in names,
         "has_notices": f"{root}/THIRD_PARTY_NOTICES.md" in names,
         "has_package": f"{root}/src/{IMPORT_NAME}/__init__.py" in names,
-        "has_package_data": (
-            f"{root}/src/{IMPORT_NAME}/assets/zdoom_bullet_chips.json" in names
-        ),
+        "has_package_data": (f"{root}/src/{IMPORT_NAME}/assets/zdoom_bullet_chips.json" in names),
         "no_build_outputs": not any(
             part in {".git", ".venv", "__pycache__", "build", "dist"}
             for name in names
@@ -356,17 +345,17 @@ from pathlib import Path
 
 wheel = Path(sys.argv[1]).resolve()
 sys.path.insert(0, str(wheel))
-import gradoom
+import env_doom_turbo_torch
 
-assert gradoom.__version__ == sys.argv[2]
-assert len(gradoom.DEATHMATCH_ACTIONS) == 17
-assert gradoom.scenario_buttons() == gradoom.DEATHMATCH_BUTTONS
+assert env_doom_turbo_torch.__version__ == sys.argv[2]
+assert len(env_doom_turbo_torch.DEATHMATCH_ACTIONS) == 17
+assert env_doom_turbo_torch.scenario_buttons() == env_doom_turbo_torch.DEATHMATCH_BUTTONS
 distribution = next(PathDistribution.discover(path=[str(wheel)]))
 assert distribution.metadata["Name"] == "env-doom-turbo-torch"
 assert distribution.version == sys.argv[2]
 print("wheel import smoke passed")
 """
-    with tempfile.TemporaryDirectory(prefix="gradoom-wheel-smoke-") as directory:
+    with tempfile.TemporaryDirectory(prefix="env_doom_turbo_torch-wheel-smoke-") as directory:
         subprocess.run(
             [sys.executable, "-c", code, str(wheel), version],
             cwd=directory,

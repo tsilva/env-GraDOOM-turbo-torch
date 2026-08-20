@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from gradoom.actions import DEATHMATCH_ACTIONS
+from env_doom_turbo_torch.actions import DEATHMATCH_ACTIONS
 
 _PLAY = runpy.run_path(str(Path(__file__).parents[1] / "play.py"))
 ControlState = _PLAY["ControlState"]

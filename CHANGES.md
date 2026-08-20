@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Migrate `GraDoomVecEnv` to the breaking Turbo Vector API v2 shared
+- Migrate `EnvDoomTurboTorchVecEnv` to the breaking Turbo Vector API v2 shared
   constructor and defaults while keeping reset and step transitions Torch-only
   on `env.device`.
 - Add immutable exact capabilities, portable signal schemas, numeric reset
@@ -12,3 +12,6 @@
   pool.
 - Preserve the certified deathmatch training, playback, CUDA smoke, and CUDA
   benchmark profiles through explicit construction settings.
+- Point reference-provider documentation, diagnostics, and local asset defaults
+  at the standardized `env-ViZDoom-turbo` project and `env-vizdoom-turbo`
+  distribution names.

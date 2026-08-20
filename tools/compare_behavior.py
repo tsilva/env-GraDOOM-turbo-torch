@@ -1,8 +1,8 @@
-"""Compare deterministic GraDOOM transitions with an aligned ViZDoom oracle.
+"""Compare deterministic env-Doom-turbo-torch transitions with an aligned ViZDoom oracle.
 
 The certified scenario randomizes its initial pose through a stochastic stream
-that GraDOOM is not required to reproduce. This diagnostic copies ViZDoom's
-initial pose into GraDOOM, then compares deterministic player-facing state up
+that env-Doom-turbo-torch is not required to reproduce. This diagnostic copies ViZDoom's
+initial pose into env-Doom-turbo-torch, then compares deterministic player-facing state up
 to (but not including) the first ACS monster spawn.
 """
 
@@ -18,9 +18,9 @@ from typing import Any
 
 import torch
 
-from gradoom.actions import DEATHMATCH_ACTIONS, DEATHMATCH_BUTTONS
-from gradoom.engine import TorchDeathmatchEngine
-from gradoom.scenario import CompiledScenario, compile_deathmatch_scenario
+from env_doom_turbo_torch.actions import DEATHMATCH_ACTIONS, DEATHMATCH_BUTTONS
+from env_doom_turbo_torch.engine import TorchDeathmatchEngine
+from env_doom_turbo_torch.scenario import CompiledScenario, compile_deathmatch_scenario
 
 VARIABLES = (
     "KILLCOUNT",
@@ -197,7 +197,7 @@ def _run_case(
         raise RuntimeError("compare_behavior.py requires the reference vizdoom package") from exc
 
     game = vzd.DoomGame()
-    config_directory = tempfile.TemporaryDirectory(prefix="gradoom-vizdoom-parity-")
+    config_directory = tempfile.TemporaryDirectory(prefix="env_doom_turbo_torch-vizdoom-parity-")
     game.load_config(str(config))
     game.set_doom_config_path(str(Path(config_directory.name) / "engine.ini"))
     game.set_window_visible(False)
@@ -282,9 +282,7 @@ def _run_case(
             if step == steps:
                 break
             action_index = _action_index(program, step)
-            previous_reference_reward = float(
-                game.make_action(actions[action_index], frame_skip)
-            )
+            previous_reference_reward = float(game.make_action(actions[action_index], frame_skip))
             _frames, reward, _terminated, _truncated = engine.step(
                 torch.tensor(actions[action_index], dtype=torch.bool, device=device)
             )
@@ -324,8 +322,7 @@ def main() -> int:
         parser.error("--frame-skip must be positive")
     if args.steps * args.frame_skip >= 106:
         parser.error(
-            "comparison must stop before the first stochastic ACS monster spawn "
-            "at episode time 106"
+            "comparison must stop before the first stochastic ACS monster spawn at episode time 106"
         )
     config = args.config.expanduser().resolve()
     scenario_path = args.scenario.expanduser().resolve()
@@ -351,7 +348,7 @@ def main() -> int:
         "iwad_sha256": _sha256(iwad),
         "records": records,
         "scenario_sha256": _sha256(scenario_path),
-        "schema": "gradoom.behavior-parity.aligned-prefix.v1",
+        "schema": "env_doom_turbo_torch.behavior-parity.aligned-prefix.v1",
     }
     print(json.dumps(result, sort_keys=True))
     return int(any(record["status"] != "matched" for record in records))

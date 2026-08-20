@@ -1,4 +1,4 @@
-"""Measure policy drift between paired exact and fast GraDOOM observations.
+"""Measure policy drift between paired exact and fast env-Doom-turbo-torch observations.
 
 Both observations are rendered from the same device-resident engine state.  The
 exact path matches ViZDoom's native RGB/area/grayscale pipeline; the fast path
@@ -50,7 +50,7 @@ _COMBAT_VISIBILITY_STATE = (
 
 def _load_train() -> ModuleType:
     path = Path(__file__).parents[1] / "train.py"
-    spec = importlib.util.spec_from_file_location("gradoom_domain_compare_train", path)
+    spec = importlib.util.spec_from_file_location("env_doom_turbo_torch_domain_compare_train", path)
     if spec is None or spec.loader is None:  # pragma: no cover - import invariant
         raise RuntimeError(f"cannot load standalone trainer: {path}")
     module = importlib.util.module_from_spec(spec)
@@ -266,7 +266,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     device = torch.device("cuda")
 
     loaded = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    if not isinstance(loaded, Mapping) or loaded.get("format") != "standalone-gradoom-ppo-v1":
+    if (
+        not isinstance(loaded, Mapping)
+        or loaded.get("format") != "standalone-env_doom_turbo_torch-ppo-v1"
+    ):
         raise ValueError(f"unsupported standalone checkpoint: {args.checkpoint}")
     config = loaded.get("config", {})
     policy_config = config.get("policy_model", {}) if isinstance(config, Mapping) else {}
@@ -564,7 +567,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             }
         )
     result: dict[str, Any] = {
-        "schema": "gradoom.policy-observation-domain-comparison.v4",
+        "schema": "env_doom_turbo_torch.policy-observation-domain-comparison.v4",
         "checkpoint": str(args.checkpoint),
         "checkpoint_sha256": train._file_sha256(args.checkpoint),
         "state_source": args.state_source,

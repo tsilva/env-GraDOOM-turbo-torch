@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from gradoom.scenario import (
+from env_doom_turbo_torch.scenario import (
     KNOWN_DOOM2_WAD_SHA256,
     PINNED_DEATHMATCH_WAD_SHA256,
     compile_deathmatch_scenario,
@@ -13,15 +13,16 @@ from gradoom.scenario import (
 
 SCENARIO = Path(
     os.environ.get(
-        "GRADOOM_DEATHMATCH_WAD",
-        "/Users/tsilva/repos/tsilva/ViZDoom-turbo/scenarios/deathmatch.wad",
+        "ENV_DOOM_TURBO_TORCH_DEATHMATCH_WAD",
+        Path(__file__).resolve().parents[2] / "env-ViZDoom-turbo/scenarios/deathmatch.wad",
     )
 )
-DOOM2 = Path(os.environ.get("GRADOOM_IWAD", "/Users/tsilva/roms/vizdoom/doom2.wad"))
+DOOM2 = Path(os.environ.get("ENV_DOOM_TURBO_TORCH_IWAD", "/Users/tsilva/roms/vizdoom/doom2.wad"))
 FREEDOOM2 = Path(
     os.environ.get(
-        "GRADOOM_FREEDOOM_IWAD",
-        "/Users/tsilva/repos/tsilva/ViZDoom-turbo/bin/python3.14/vizdoom/freedoom2.wad",
+        "ENV_DOOM_TURBO_TORCH_FREEDOOM_IWAD",
+        Path(__file__).resolve().parents[2]
+        / "env-ViZDoom-turbo/bin/python3.14/vizdoom/freedoom2.wad",
     )
 )
 
@@ -166,12 +167,8 @@ def test_pinned_deathmatch_compiles_external_doom2_data() -> None:
     assert scenario.enemy_xdeath_frame_durations.shape == (6, 9)
     assert scenario.enemy_xdeath_total_tics is not None
     assert scenario.enemy_xdeath_total_tics.tolist() == [41, 41, 41, 26, 29, 49]
-    assert scenario.raw_sprite_names[
-        scenario.enemy_xdeath_sprite_ids[0, 0]
-    ].startswith("POSSM0")
-    assert scenario.raw_sprite_names[
-        scenario.enemy_xdeath_sprite_ids[2, -1]
-    ].startswith("PLAYW0")
+    assert scenario.raw_sprite_names[scenario.enemy_xdeath_sprite_ids[0, 0]].startswith("POSSM0")
+    assert scenario.raw_sprite_names[scenario.enemy_xdeath_sprite_ids[2, -1]].startswith("PLAYW0")
     assert scenario.enemy_pain_sprite_ids is not None
     assert scenario.enemy_pain_sprite_ids.shape == (6, 8)
     assert scenario.raw_projectile_flight_sprite_ids is not None
@@ -183,8 +180,7 @@ def test_pinned_deathmatch_compiles_external_doom2_data() -> None:
     assert scenario.raw_bullet_puff_sprite_ids is not None
     assert scenario.raw_bullet_puff_sprite_ids.shape == (4,)
     assert tuple(
-        scenario.raw_sprite_names[index]
-        for index in scenario.raw_bullet_puff_sprite_ids
+        scenario.raw_sprite_names[index] for index in scenario.raw_bullet_puff_sprite_ids
     ) == ("PUFFA0", "PUFFB0", "PUFFC0", "PUFFD0")
     assert scenario.bullet_decal_atlas is not None
     assert scenario.bullet_decal_atlas.shape == (5, 9, 7)
@@ -221,9 +217,7 @@ def test_pinned_deathmatch_compiles_external_doom2_data() -> None:
     assert scenario.sprite_translucent_lut[0, 3] == 111
     assert scenario.sprite_translucent_lut[71, 73] == 72
     assert scenario.hud_patch_names[0:2] == ("STBAR", "STARMS")
-    assert scenario.hud_patch_names[44:49] == tuple(
-        f"STFTR{pain}0" for pain in range(5)
-    )
+    assert scenario.hud_patch_names[44:49] == tuple(f"STFTR{pain}0" for pain in range(5))
     assert scenario.hud_patch_names[69] == "STFDEAD0"
     assert scenario.hud_patch_atlas is not None
     assert scenario.hud_patch_atlas.shape == (70, 32, 320)

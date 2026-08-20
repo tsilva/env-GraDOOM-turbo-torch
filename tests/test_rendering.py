@@ -9,16 +9,16 @@ import numpy as np
 import pytest
 import torch
 
-from gradoom.engine import TorchDeathmatchEngine
-from gradoom.scenario import compile_deathmatch_scenario
+from env_doom_turbo_torch.engine import TorchDeathmatchEngine
+from env_doom_turbo_torch.scenario import compile_deathmatch_scenario
 
 SCENARIO = Path(
     os.environ.get(
-        "GRADOOM_DEATHMATCH_WAD",
-        "/Users/tsilva/repos/tsilva/ViZDoom-turbo/scenarios/deathmatch.wad",
+        "ENV_DOOM_TURBO_TORCH_DEATHMATCH_WAD",
+        Path(__file__).resolve().parents[2] / "env-ViZDoom-turbo/scenarios/deathmatch.wad",
     )
 )
-DOOM2 = Path(os.environ.get("GRADOOM_IWAD", "/Users/tsilva/roms/vizdoom/doom2.wad"))
+DOOM2 = Path(os.environ.get("ENV_DOOM_TURBO_TORCH_IWAD", "/Users/tsilva/roms/vizdoom/doom2.wad"))
 
 
 @pytest.fixture(scope="module")
@@ -111,7 +111,7 @@ def test_approximate_renderer_draws_front_side_of_one_sided_wall(square_scenario
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 def test_cuda_policy_preprocessing_matches_cpu_reference_arithmetic() -> None:
-    from gradoom._triton_kernels import policy_area_grayscale
+    from env_doom_turbo_torch._triton_kernels import policy_area_grayscale
 
     generator = torch.Generator().manual_seed(20260813)
     indexed = torch.randint(0, 256, (2, 208, 320), generator=generator, dtype=torch.uint8)
@@ -131,12 +131,7 @@ def test_cuda_policy_preprocessing_matches_cpu_reference_arithmetic() -> None:
     pooled = torch.matmul(y_weights, rgb.float().permute(0, 3, 1, 2))
     pooled = torch.matmul(pooled, x_weights)
     rounded = torch.floor(pooled + 0.5).to(torch.int32)
-    expected = (
-        rounded[:, 0] * 77
-        + rounded[:, 1] * 150
-        + rounded[:, 2] * 29
-        + 128
-    ) >> 8
+    expected = (rounded[:, 0] * 77 + rounded[:, 1] * 150 + rounded[:, 2] * 29 + 128) >> 8
 
     actual = policy_area_grayscale(indexed.cuda(), palette.cuda()).cpu().to(torch.int32)
 
@@ -172,8 +167,7 @@ def test_reference_background_cuda_graph_tracks_mutable_pose(square_scenario) ->
     eager = engine._render_native_background()
 
     assert all(
-        torch.equal(actual, expected)
-        for actual, expected in zip(captured, eager, strict=True)
+        torch.equal(actual, expected) for actual, expected in zip(captured, eager, strict=True)
     )
 
 
@@ -269,8 +263,7 @@ def test_native_hitscan_puff_renders_all_translucent_animation_frames(
 
     assert all(not torch.equal(frame, baseline) for frame in frames)
     assert all(
-        not torch.equal(frames[index], frames[index + 1])
-        for index in range(len(frames) - 1)
+        not torch.equal(frames[index], frames[index + 1]) for index in range(len(frames) - 1)
     )
     engine.hitscan_puff_tics.zero_()
     assert torch.equal(engine.render_native_frame(include_hud=False), baseline)
@@ -681,13 +674,11 @@ def test_native_two_sided_wall_top_edges_own_flat_boundary(
         engine._current_sector(),
         engine.view_z,
     )
-    frame, _scene_depth, _sprite_clip_depth, _sprite_clip_wall = (
-        engine._native_render_portal_walls(
-            flat_frame.clone(),
-            engine.view_z,
-            surface_depth,
-            scene_surface_depth,
-        )
+    frame, _scene_depth, _sprite_clip_depth, _sprite_clip_wall = engine._native_render_portal_walls(
+        flat_frame.clone(),
+        engine.view_z,
+        surface_depth,
+        scene_surface_depth,
     )
     flat_rgb = engine.map.playpal[flat_frame.to(torch.int64)]
     rgb = engine.map.playpal[frame.to(torch.int64)]
@@ -1116,13 +1107,11 @@ def test_native_walls_use_reference_fixed_horizontal_sampling(
         engine._current_sector(),
         engine.view_z,
     )
-    frame, _scene_depth, _sprite_clip_depth, _sprite_clip_wall = (
-        engine._native_render_portal_walls(
-            frame,
-            engine.view_z,
-            surface_depth,
-            scene_surface_depth,
-        )
+    frame, _scene_depth, _sprite_clip_depth, _sprite_clip_wall = engine._native_render_portal_walls(
+        frame,
+        engine.view_z,
+        surface_depth,
+        scene_surface_depth,
     )
     rgb = engine.map.playpal[frame.to(torch.int64)]
 
@@ -1251,13 +1240,11 @@ def test_native_projected_endpoint_owner_selects_nested_pit_texture_columns(
         engine._current_sector(),
         engine.view_z,
     )
-    frame, _scene_depth, _sprite_clip_depth, _sprite_clip_wall = (
-        engine._native_render_portal_walls(
-            frame,
-            engine.view_z,
-            surface_depth,
-            scene_surface_depth,
-        )
+    frame, _scene_depth, _sprite_clip_depth, _sprite_clip_wall = engine._native_render_portal_walls(
+        frame,
+        engine.view_z,
+        surface_depth,
+        scene_surface_depth,
     )
     rgb = engine.map.playpal[frame.to(torch.int64)]
 
@@ -1280,8 +1267,7 @@ def test_native_projected_endpoint_owner_selects_nested_pit_texture_columns(
         assert projected_intersections[0, column, projected_owner]
         assert projected_left_edges[0, column, projected_owner]
         assert (
-            wall_distance[0, column, projected_owner]
-            - wall_distance[0, column, ray_wall]
+            wall_distance[0, column, projected_owner] - wall_distance[0, column, ray_wall]
             > 1.0 / 16.0
         )
     for x, y, expected in (
@@ -1327,13 +1313,11 @@ def test_native_projected_endpoint_owner_preserves_geometric_portal_path(
         engine._current_sector(),
         engine.view_z,
     )
-    frame, _scene_depth, _sprite_clip_depth, _sprite_clip_wall = (
-        engine._native_render_portal_walls(
-            frame,
-            engine.view_z,
-            surface_depth,
-            scene_surface_depth,
-        )
+    frame, _scene_depth, _sprite_clip_depth, _sprite_clip_wall = engine._native_render_portal_walls(
+        frame,
+        engine.view_z,
+        surface_depth,
+        scene_surface_depth,
     )
     rgb = engine.map.playpal[frame.to(torch.int64)]
 
@@ -1380,22 +1364,18 @@ def test_native_projected_owner_resolves_short_opposite_endpoint_hit(
         engine._current_sector(),
         engine.view_z,
     )
-    frame, _scene_depth, _sprite_clip_depth, _sprite_clip_wall = (
-        engine._native_render_portal_walls(
-            frame,
-            engine.view_z,
-            surface_depth,
-            scene_surface_depth,
-        )
+    frame, _scene_depth, _sprite_clip_depth, _sprite_clip_wall = engine._native_render_portal_walls(
+        frame,
+        engine.view_z,
+        surface_depth,
+        scene_surface_depth,
     )
     direct_frame = frame
     assert engine._native_direct_endpoint_neighbors is not None
     engine._native_direct_endpoint_neighbors = None
-    generic_frame, generic_surface_depth, generic_scene_surface_depth = (
-        engine._native_render_flats(
-            engine._current_sector(),
-            engine.view_z,
-        )
+    generic_frame, generic_surface_depth, generic_scene_surface_depth = engine._native_render_flats(
+        engine._current_sector(),
+        engine.view_z,
     )
     generic_frame, *_generic_depths = engine._native_render_portal_walls(
         generic_frame,
@@ -1517,9 +1497,7 @@ def test_native_same_sector_fragments_own_projected_interior_and_opposing_strip(
     assert not projected_left_edges[0, 66, 132]
     assert engine._native_same_portal_sector_pairs[98, 132]
     assert rgb[0, 145:165, 66].tolist() == (
-        [[103, 0, 0]] * 5
-        + [[79, 0, 0]] * 5
-        + [[103, 0, 0]] * 10
+        [[103, 0, 0]] * 5 + [[79, 0, 0]] * 5 + [[103, 0, 0]] * 10
     )
 
     # Projected-only portals 149 and 151 are the near and far sides of one
@@ -1562,21 +1540,17 @@ def test_native_pit_boundary_separates_wallscan_owner_from_portal_path(
         projected_intersections,
         projected_left_edges,
         _wall_visibility,
-    ) = engine._native_portal_intersections(
-        engine._native_wall_projection_geometry()
-    )
+    ) = engine._native_portal_intersections(engine._native_wall_projection_geometry())
     horizontal_offset_fixed, _vertical_step = engine._native_wall_texture_mapping()
     frame, surface_depth, scene_surface_depth = engine._native_render_flats(
         engine._current_sector(),
         engine.view_z,
     )
-    frame, _scene_depth, _sprite_clip_depth, _sprite_clip_wall = (
-        engine._native_render_portal_walls(
-            frame,
-            engine.view_z,
-            surface_depth,
-            scene_surface_depth,
-        )
+    frame, _scene_depth, _sprite_clip_depth, _sprite_clip_wall = engine._native_render_portal_walls(
+        frame,
+        engine.view_z,
+        surface_depth,
+        scene_surface_depth,
     )
     rgb = engine.map.playpal[frame.to(torch.int64)]
 
@@ -1596,18 +1570,14 @@ def test_native_pit_boundary_separates_wallscan_owner_from_portal_path(
     # emitting a drawseg leaks BFALL1 over the visible floor.
     assert geometric_intersections[0, 12, 98]
     assert not projected_intersections[0, 12, 98]
-    assert not torch.any(
-        projected_left_edges[0, 12] & torch.isfinite(wall_distance[0, 12])
-    )
+    assert not torch.any(projected_left_edges[0, 12] & torch.isfinite(wall_distance[0, 12]))
     assert rgb[0, 124, 12].tolist() == [83, 63, 47]
 
     # PrepWallRoundFix intentionally preserves leading texture-coordinate
     # spill when a clipped drawseg begins at screen x == 0. Wall 192 reverses
     # this value to -17440 before applying its sidedef offset; clamping it
     # selects the adjacent BFALL1 column and produces [79, 0, 0] instead.
-    wall_repeat_fixed = torch.round(
-        engine.map.portal_wall_lengths[192] * (1 << 16)
-    ).to(torch.int64)
+    wall_repeat_fixed = torch.round(engine.map.portal_wall_lengths[192] * (1 << 16)).to(torch.int64)
     assert horizontal_offset_fixed[0, 0, 192] - wall_repeat_fixed == 17440
     assert rgb[0, 124, 0].tolist() == [67, 0, 0]
     assert rgb[0, 125, 0].tolist() == [67, 0, 0]
@@ -1751,9 +1721,7 @@ def test_native_excluded_wide_portal_does_not_clip_next_drawseg(
         projected_intersections,
         _projected_left_edges,
         _wall_visibility,
-    ) = engine._native_portal_intersections(
-        engine._native_wall_projection_geometry()
-    )
+    ) = engine._native_portal_intersections(engine._native_wall_projection_geometry())
     rgb = engine.render_native_frame(include_hud=False)
 
     # The ray traverses portal 181 exactly at its excluded screen-right edge.
@@ -1836,20 +1804,16 @@ def test_native_walls_reject_collapsed_screen_edge_span(
     engine.episode_time.fill_(41)
 
     wall_distance, *_rest = engine._native_portal_intersections()
-    screen_left, screen_right, _depth_left, _depth_right = (
-        engine._native_wall_projection_geometry()
-    )
+    screen_left, screen_right, _depth_left, _depth_right = engine._native_wall_projection_geometry()
     frame, surface_depth, scene_surface_depth = engine._native_render_flats(
         engine._current_sector(),
         engine.view_z,
     )
-    frame, _scene_depth, _sprite_clip_depth, _sprite_clip_wall = (
-        engine._native_render_portal_walls(
-            frame,
-            engine.view_z,
-            surface_depth,
-            scene_surface_depth,
-        )
+    frame, _scene_depth, _sprite_clip_depth, _sprite_clip_wall = engine._native_render_portal_walls(
+        frame,
+        engine.view_z,
+        surface_depth,
+        scene_surface_depth,
     )
     rgb = engine.map.playpal[frame.to(torch.int64)]
 
@@ -1941,13 +1905,11 @@ def test_native_partially_clipped_solid_owns_left_frustum_column(
         engine._current_sector(),
         engine.view_z,
     )
-    frame, _scene_depth, _sprite_clip_depth, sprite_clip_wall = (
-        engine._native_render_portal_walls(
-            frame,
-            engine.view_z,
-            surface_depth,
-            scene_surface_depth,
-        )
+    frame, _scene_depth, _sprite_clip_depth, sprite_clip_wall = engine._native_render_portal_walls(
+        frame,
+        engine.view_z,
+        surface_depth,
+        scene_surface_depth,
     )
     rgb = engine.map.playpal[frame.to(torch.int64)]
 
@@ -1994,13 +1956,11 @@ def test_native_deferred_masked_middle_texture_owns_shared_endpoint_column(
         engine._current_sector(),
         engine.view_z,
     )
-    frame, scene_depth, _sprite_clip_depth, _sprite_clip_wall = (
-        engine._native_render_portal_walls(
-            frame,
-            engine.view_z,
-            surface_depth,
-            scene_surface_depth,
-        )
+    frame, scene_depth, _sprite_clip_depth, _sprite_clip_wall = engine._native_render_portal_walls(
+        frame,
+        engine.view_z,
+        surface_depth,
+        scene_surface_depth,
     )
     rgb = engine.map.playpal[frame.to(torch.int64)]
 
@@ -2040,13 +2000,11 @@ def test_native_same_column_portal_layers_retain_nested_wall(
         engine._current_sector(),
         engine.view_z,
     )
-    frame, _scene_depth, _sprite_clip_depth, _sprite_clip_wall = (
-        engine._native_render_portal_walls(
-            frame,
-            engine.view_z,
-            surface_depth,
-            scene_surface_depth,
-        )
+    frame, _scene_depth, _sprite_clip_depth, _sprite_clip_wall = engine._native_render_portal_walls(
+        frame,
+        engine.view_z,
+        surface_depth,
+        scene_surface_depth,
     )
     rgb = engine.map.playpal[frame.to(torch.int64)]
 
@@ -2138,13 +2096,11 @@ def test_native_projected_portal_enters_non_touching_tied_sector_strip(
         engine._current_sector(),
         engine.view_z,
     )
-    frame, scene_depth, _sprite_clip_depth, _sprite_clip_wall = (
-        engine._native_render_portal_walls(
-            frame,
-            engine.view_z,
-            surface_depth,
-            scene_surface_depth,
-        )
+    frame, scene_depth, _sprite_clip_depth, _sprite_clip_wall = engine._native_render_portal_walls(
+        frame,
+        engine.view_z,
+        surface_depth,
+        scene_surface_depth,
     )
     rgb = engine.map.playpal[frame.to(torch.int64)]
 
@@ -2197,13 +2153,11 @@ def test_native_projected_portal_tie_retains_same_direction_boundary_chain(
         engine._current_sector(),
         engine.view_z,
     )
-    frame, _scene_depth, _sprite_clip_depth, _sprite_clip_wall = (
-        engine._native_render_portal_walls(
-            frame,
-            engine.view_z,
-            surface_depth,
-            scene_surface_depth,
-        )
+    frame, _scene_depth, _sprite_clip_depth, _sprite_clip_wall = engine._native_render_portal_walls(
+        frame,
+        engine.view_z,
+        surface_depth,
+        scene_surface_depth,
     )
     rgb = engine.map.playpal[frame.to(torch.int64)]
 
@@ -2459,13 +2413,11 @@ def test_native_projected_solid_chain_clips_geometric_endpoint_portal(
         engine._current_sector(),
         engine.view_z,
     )
-    frame, _scene_depth, _sprite_clip_depth, _sprite_clip_wall = (
-        engine._native_render_portal_walls(
-            frame,
-            engine.view_z,
-            surface_depth,
-            scene_surface_depth,
-        )
+    frame, _scene_depth, _sprite_clip_depth, _sprite_clip_wall = engine._native_render_portal_walls(
+        frame,
+        engine.view_z,
+        surface_depth,
+        scene_surface_depth,
     )
     rgb = engine.map.playpal[frame.to(torch.int64)]
 
@@ -2486,8 +2438,7 @@ def test_native_projected_solid_chain_clips_geometric_endpoint_portal(
     assert 170 in bridge_indices[bridge_mask].tolist()
     assert not torch.any(
         torch.all(
-            engine.map.portal_walls[208, 2:]
-            == engine.map.portal_walls[170].reshape(2, 2),
+            engine.map.portal_walls[208, 2:] == engine.map.portal_walls[170].reshape(2, 2),
             dim=1,
         )
     )
@@ -2541,12 +2492,8 @@ def test_native_weapon_preserves_fractional_bob_during_sampling(
     frame_id, _flash_id, _flash_light = engine._native_weapon_frame_selection()
     assert frame_id.item() == 38  # PLSGA0
 
-    black = engine._native_render_weapon(
-        torch.zeros((1, 208, 320), dtype=torch.uint8)
-    )
-    white = engine._native_render_weapon(
-        torch.full((1, 208, 320), 255, dtype=torch.uint8)
-    )
+    black = engine._native_render_weapon(torch.zeros((1, 208, 320), dtype=torch.uint8))
+    white = engine._native_render_weapon(torch.full((1, 208, 320), 255, dtype=torch.uint8))
     opaque = black == white
     coordinates = torch.nonzero(opaque[0])
 
@@ -2749,7 +2696,7 @@ def test_native_transparent_sprites_reveal_fifth_farther_actor(square_scenario) 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 def test_fast_native_sprite_respects_portal_surface_depth() -> None:
-    from gradoom._triton_kernels import render_fast_native_sprites_
+    from env_doom_turbo_torch._triton_kernels import render_fast_native_sprites_
 
     device = torch.device("cuda")
     frame = torch.full((1, 208, 320), 7, dtype=torch.uint8, device=device)
@@ -2796,7 +2743,7 @@ def test_fast_native_sprite_respects_portal_surface_depth() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 def test_fast_native_transparent_foreground_reveals_farther_actor() -> None:
-    from gradoom._triton_kernels import render_fast_native_sprites_
+    from env_doom_turbo_torch._triton_kernels import render_fast_native_sprites_
 
     device = torch.device("cuda")
     frame = torch.full((1, 208, 320), 7, dtype=torch.uint8, device=device)
@@ -2846,7 +2793,7 @@ def test_fast_native_transparent_foreground_reveals_farther_actor() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 def test_fast_native_sprite_applies_reference_render_styles() -> None:
-    from gradoom._triton_kernels import render_fast_native_sprites_
+    from env_doom_turbo_torch._triton_kernels import render_fast_native_sprites_
 
     device = torch.device("cuda")
     lanes = 4
@@ -2895,9 +2842,7 @@ def test_fast_native_sprite_applies_reference_render_styles() -> None:
 
 
 def test_native_teleport_fog_uses_reference_animation_and_lifetime(square_scenario) -> None:
-    atlas = np.stack(
-        [np.full((3, 3), 10 + frame, dtype=np.uint8) for frame in range(12)]
-    )
+    atlas = np.stack([np.full((3, 3), 10 + frame, dtype=np.uint8) for frame in range(12)])
     scenario = replace(
         square_scenario,
         raw_sprite_atlas=atlas,
@@ -3006,11 +2951,12 @@ def test_fast_native_actor_state_includes_combat_effects(square_scenario) -> Non
     assert actor_visible[0, effect_indices].tolist() == [True, True, True, True]
     assert actor_fullbright[0, effect_indices].tolist() == [True, True, True, True]
     assert actor_additive_style[0, effect_indices].tolist() == [0, 1, 1, -2]
-    assert actor_sprites[0, player_projectile] == (
-        engine.map.raw_projectile_flight_sprite_ids[1, 1, 4]
+    assert (
+        actor_sprites[0, player_projectile]
+        == (engine.map.raw_projectile_flight_sprite_ids[1, 1, 4])
     )
-    assert actor_sprites[0, enemy_projectile] == (
-        engine.map.raw_projectile_flight_sprite_ids[2, 1, 4]
+    assert (
+        actor_sprites[0, enemy_projectile] == (engine.map.raw_projectile_flight_sprite_ids[2, 1, 4])
     )
     assert actor_sprites[0, fog] == engine.map.raw_teleport_fog_sprite_ids[1]
     assert actor_sprites[0, puff] == engine.map.raw_bullet_puff_sprite_ids[0]
@@ -3027,9 +2973,7 @@ def test_acs_reposition_preserves_start_z_and_idle_pit_floor(
     )
     spawn_x = 569.3474273681641
     spawn_y = 515.9971313476562
-    engine.map.spawn_bounds.copy_(
-        torch.tensor((spawn_x, spawn_x, spawn_y, spawn_y))
-    )
+    engine.map.spawn_bounds.copy_(torch.tensor((spawn_x, spawn_x, spawn_y, spawn_y)))
     engine.reset(torch.ones(2, dtype=torch.bool), torch.tensor([789, 790]))
 
     # SetActorPosition keeps the map-start Z while SetOrigin derives floorz
@@ -3087,9 +3031,7 @@ def test_acs_monster_spawn_falls_from_absolute_zero_into_center_pit(
     engine.reset(torch.ones(1, dtype=torch.bool), torch.tensor([2]))
     spawn_x = 560.7010192871094
     spawn_y = 481.3784484863281
-    engine.map.spawn_bounds.copy_(
-        torch.tensor((spawn_x, spawn_x, spawn_y, spawn_y))
-    )
+    engine.map.spawn_bounds.copy_(torch.tensor((spawn_x, spawn_x, spawn_y, spawn_y)))
     # The player occupies the same XY in the pit but ends below the spawned
     # monster. ACS Spawn temporarily enables PASSMOBJ, so this vertical gap is
     # legal even though their 2D boxes overlap.
@@ -3116,9 +3058,7 @@ def test_acs_monster_spawn_falls_from_absolute_zero_into_center_pit(
     for _ in range(11):
         engine._move_enemy_thrust(torch.ones(1, dtype=torch.bool))
         z_trace.append(float(engine.enemy_z[0, 0]))
-        velocity_trace.append(
-            float(engine._enemy_velocity_z_fixed[0, 0]) / 65536.0
-        )
+        velocity_trace.append(float(engine._enemy_velocity_z_fixed[0, 0]) / 65536.0)
 
     # ViZDoom seed 2, object 196 (ShotgunGuy), episode times 117..127.
     assert z_trace == [-1.0, -3.0, -6.0, -10.0, -15.0, -21.0, -28.0, -36.0, -45.0, -55.0, -64.0]
@@ -3926,16 +3866,13 @@ def test_native_item_uses_fixed_point_sprite_projection(
     engine.player_dead.fill_(True)
 
     item_index = torch.where(
-        (engine.map.item_spawns[:, 0] == 1248)
-        & (engine.map.item_spawns[:, 1] == 832)
+        (engine.map.item_spawns[:, 0] == 1248) & (engine.map.item_spawns[:, 1] == 832)
     )[0].item()
     sprite = engine.map.item_raw_visual_types[item_index].reshape(1, 1)
-    sprite_left, sprite_right, texture_step = (
-        engine._native_sprite_horizontal_projection(
-            engine.map.item_spawns[item_index : item_index + 1, 0].reshape(1, 1),
-            engine.map.item_spawns[item_index : item_index + 1, 1].reshape(1, 1),
-            sprite,
-        )
+    sprite_left, sprite_right, texture_step = engine._native_sprite_horizontal_projection(
+        engine.map.item_spawns[item_index : item_index + 1, 0].reshape(1, 1),
+        engine.map.item_spawns[item_index : item_index + 1, 1].reshape(1, 1),
+        sprite,
     )
     assert sprite_left.item() == 85
     assert sprite_right.item() == 119
@@ -4000,9 +3937,7 @@ def test_native_drawseg_side_keeps_sprite_edges_past_nearest_ray(
     # Each mathematical column ray reaches a nearby wall just before the
     # sprite center depth. Doom does not reject the sprite here: R_DrawSprite
     # resolves the owning drawseg endpoint and wall side per pixel.
-    assert torch.all(
-        ray_distance[0, edge_columns] * 4096 < actor_depth_fixed[0]
-    )
+    assert torch.all(ray_distance[0, edge_columns] * 4096 < actor_depth_fixed[0])
     assert with_items[0, 113, 262].tolist() == [119, 119, 119]
     assert with_items[0, 114, 274].tolist() == [119, 119, 119]
     assert with_items[0, 115, 290].tolist() == [119, 119, 119]
@@ -4044,12 +3979,10 @@ def test_native_blocking_drawseg_excludes_right_endpoint_from_sprite_clip(
     item_index = 28
     assert engine.map.item_spawns[item_index].tolist() == [-228.0, 950.0, 0.0]
     sprite = engine.map.item_raw_visual_types[item_index].reshape(1, 1)
-    sprite_left, sprite_right, _texture_step = (
-        engine._native_sprite_horizontal_projection(
-            engine.map.item_spawns[None, item_index, 0].reshape(1, 1),
-            engine.map.item_spawns[None, item_index, 1].reshape(1, 1),
-            sprite,
-        )
+    sprite_left, sprite_right, _texture_step = engine._native_sprite_horizontal_projection(
+        engine.map.item_spawns[None, item_index, 0].reshape(1, 1),
+        engine.map.item_spawns[None, item_index, 1].reshape(1, 1),
+        sprite,
     )
     assert (sprite_left.item(), sprite_right.item()) == (34, 45)
     _blocking_distance, blocking_wall = engine._native_blocking_raycast()
@@ -4106,12 +4039,10 @@ def test_native_blocking_drawseg_rejects_occluded_offscreen_item(
     item_index = 38
     assert engine.map.item_spawns[item_index].tolist() == [-99.0, 277.0, 0.0]
     sprite = engine.map.item_raw_visual_types[item_index].reshape(1, 1)
-    sprite_left, sprite_right, _texture_step = (
-        engine._native_sprite_horizontal_projection(
-            engine.map.item_spawns[None, item_index, 0].reshape(1, 1),
-            engine.map.item_spawns[None, item_index, 1].reshape(1, 1),
-            sprite,
-        )
+    sprite_left, sprite_right, _texture_step = engine._native_sprite_horizontal_projection(
+        engine.map.item_spawns[None, item_index, 0].reshape(1, 1),
+        engine.map.item_spawns[None, item_index, 1].reshape(1, 1),
+        sprite,
     )
     assert sprite_left.item() <= 0 < sprite_right.item()
     _blocking_distance, blocking_wall = engine._native_blocking_raycast()
@@ -4169,8 +4100,7 @@ def test_native_sprites_keep_offcenter_spans_that_cross_view(
         (1248, 873, (0, 15)),
     ):
         item_index = torch.where(
-            (engine.map.item_spawns[:, 0] == spawn_x)
-            & (engine.map.item_spawns[:, 1] == spawn_y)
+            (engine.map.item_spawns[:, 0] == spawn_x) & (engine.map.item_spawns[:, 1] == spawn_y)
         )[0].item()
         engine.item_available.zero_()
         engine.item_available[0, item_index] = True
@@ -4214,9 +4144,7 @@ def test_native_renderer_includes_voodoo_dolls(pinned_deathmatch_scenario) -> No
         _scene_depth,
         sprite_clip_depth,
         sprite_clip_wall,
-    ) = engine._native_render_portal_walls(
-        flat_frame, view_z, surface_depth, scene_surface_depth
-    )
+    ) = engine._native_render_portal_walls(flat_frame, view_z, surface_depth, scene_surface_depth)
     with_dolls = engine._native_render_sprites(
         portal_frame.clone(),
         wall_distance,

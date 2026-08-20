@@ -1,4 +1,4 @@
-"""Record the unprocessed 320x240 RGB24 GraDOOM deathmatch renderer."""
+"""Record the unprocessed 320x240 RGB24 env-Doom-turbo-torch deathmatch renderer."""
 
 from __future__ import annotations
 
@@ -9,9 +9,9 @@ from pathlib import Path
 
 import torch
 
-from gradoom.actions import DEATHMATCH_BUTTONS
-from gradoom.engine import TorchDeathmatchEngine
-from gradoom.scenario import compile_deathmatch_scenario
+from env_doom_turbo_torch.actions import DEATHMATCH_BUTTONS
+from env_doom_turbo_torch.engine import TorchDeathmatchEngine
+from env_doom_turbo_torch.scenario import compile_deathmatch_scenario
 
 
 def _buttons(frame: int, frame_count: int) -> torch.Tensor:

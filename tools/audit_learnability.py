@@ -12,7 +12,9 @@ from typing import Any
 
 import torch
 
-EVALUATION_PROTOCOL = "standalone-gradoom-deathmatch-checkpoint-eval-v3-balanced-seed-grid"
+EVALUATION_PROTOCOL = (
+    "standalone-env_doom_turbo_torch-deathmatch-checkpoint-eval-v3-balanced-seed-grid"
+)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -116,9 +118,7 @@ def _training_metrics(path: Path) -> dict[str, Any]:
     if len(resumed_events) > 1:
         raise ValueError(f"{path}: expected at most one resumed event")
     external_initialization_events = [
-        record
-        for record in events
-        if record.get("event") in {"initialized", "policy_initialized"}
+        record for record in events if record.get("event") in {"initialized", "policy_initialized"}
     ]
     checks = {
         "initialization_declared_random": initialization["mode"] == "random"
@@ -137,22 +137,16 @@ def _training_metrics(path: Path) -> dict[str, Any]:
         if record.get("event") == "checkpoint_saved"
     ]
     if summaries:
-        produced_checkpoints.append(
-            str(Path(str(summaries[-1]["checkpoint"])).resolve())
-        )
+        produced_checkpoints.append(str(Path(str(summaries[-1]["checkpoint"])).resolve()))
     return {
         "end_step": int(rollouts[-1]["train/global_step"]),
         "measured_loop_seconds": loop_seconds,
         "metrics": str(path),
-        "process_seconds": (
-            float(summaries[-1]["process_elapsed_seconds"]) if summaries else None
-        ),
+        "process_seconds": (float(summaries[-1]["process_elapsed_seconds"]) if summaries else None),
         "reported_learning_rate": float(recipe["learning_rate"]),
         "rollout_shape": [int(recipe["num_envs"]), int(recipe["n_steps"])],
         "seed": int(recipe["seed"]),
-        "start_step": (
-            int(resumed_event["train/global_step"]) if resumed_event is not None else 0
-        ),
+        "start_step": (int(resumed_event["train/global_step"]) if resumed_event is not None else 0),
         "resumed_from_checkpoint": (
             str(Path(str(resumed_event["checkpoint"])).resolve())
             if resumed_event is not None
@@ -228,8 +222,7 @@ def main() -> int:
         "every_seed_mean_at_or_above_minimum_threshold": all(
             mean >= args.minimum_mean_kills for mean in means
         ),
-        "at_least_one_seed_mean_at_or_above_best_threshold": max(means)
-        >= args.best_mean_kills,
+        "at_least_one_seed_mean_at_or_above_best_threshold": max(means) >= args.best_mean_kills,
         "median_seed_mean_at_or_above_threshold": statistics.median(means)
         >= args.median_mean_kills,
         "all_checkpoints_trace_to_random_training_roots": all(

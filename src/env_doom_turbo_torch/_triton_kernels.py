@@ -64,7 +64,7 @@ def _bounded_observation_augment_kernel(
     tl.store(output_ptr + output_offset, adjusted, mask=output_valid)
 
 
-@torch.library.custom_op("gradoom::bounded_observation_augment", mutates_args=())
+@torch.library.custom_op("env_doom_turbo_torch::bounded_observation_augment", mutates_args=())
 def bounded_observation_augment(
     observations: torch.Tensor,
     randoms: torch.Tensor,
@@ -126,7 +126,7 @@ def _policy_area_grayscale_kernel(
     OUTPUT_BLOCK: tl.constexpr,
     SAMPLE_BLOCK: tl.constexpr,
 ):
-    """Exact 320x240 -> 84x84 ViZDoom-turbo indexed-area conversion."""
+    """Exact 320x240 -> 84x84 env-ViZDoom-turbo indexed-area conversion."""
 
     output_pixels = 84 * 84
     program = tl.program_id(0)
@@ -177,9 +177,9 @@ def _policy_area_grayscale_kernel(
     )
 
 
-@torch.library.custom_op("gradoom::policy_area_grayscale", mutates_args=())
+@torch.library.custom_op("env_doom_turbo_torch::policy_area_grayscale", mutates_args=())
 def policy_area_grayscale(indexed: torch.Tensor, palette: torch.Tensor) -> torch.Tensor:
-    """Apply the pinned ViZDoom-turbo area/grayscale transform on CUDA."""
+    """Apply the pinned env-ViZDoom-turbo area/grayscale transform on CUDA."""
 
     if indexed.ndim != 3 or indexed.shape[1:] not in ((208, 320), (240, 320)):
         raise ValueError("indexed must have shape (N, 208, 320) or (N, 240, 320)")
@@ -411,7 +411,7 @@ def _render_fast_native_flats_kernel(
 
 
 @torch.library.custom_op(
-    "gradoom::render_fast_native_flats",
+    "env_doom_turbo_torch::render_fast_native_flats",
     mutates_args=(),
     device_types="cuda",
 )
@@ -633,7 +633,7 @@ def _frozen_nature_conv1_kernel(
 
 
 @torch.library.custom_op(
-    "gradoom::frozen_nature_conv1",
+    "env_doom_turbo_torch::frozen_nature_conv1",
     mutates_args=(),
     device_types="cuda",
 )
@@ -785,7 +785,7 @@ def _portal_intersections_kernel(
 
 
 @torch.library.custom_op(
-    "gradoom::portal_intersections",
+    "env_doom_turbo_torch::portal_intersections",
     mutates_args=(),
     device_types="cuda",
 )
@@ -843,7 +843,7 @@ def portal_intersections(
 
 
 @torch.library.custom_op(
-    "gradoom::masked_portal_intersections",
+    "env_doom_turbo_torch::masked_portal_intersections",
     mutates_args=(),
     device_types="cuda",
 )
@@ -1241,7 +1241,7 @@ def _move_drops_kernel(
 
 
 @torch.library.custom_op(
-    "gradoom::move_drops_",
+    "env_doom_turbo_torch::move_drops_",
     mutates_args=(
         "drop_x_fixed",
         "drop_y_fixed",
@@ -1554,7 +1554,7 @@ def _render_portal_walls_kernel(
 
 
 @torch.library.custom_op(
-    "gradoom::render_portal_walls_",
+    "env_doom_turbo_torch::render_portal_walls_",
     mutates_args=("frame",),
     device_types="cuda",
 )
@@ -1631,7 +1631,7 @@ def render_portal_walls_(
 
 
 @torch.library.custom_op(
-    "gradoom::masked_render_portal_walls_",
+    "env_doom_turbo_torch::masked_render_portal_walls_",
     mutates_args=("frame",),
     device_types="cuda",
 )
@@ -1709,7 +1709,7 @@ def masked_render_portal_walls_(
 
 
 @torch.library.custom_op(
-    "gradoom::render_fast_native_portal_walls_",
+    "env_doom_turbo_torch::render_fast_native_portal_walls_",
     mutates_args=("frame", "surface_depth"),
     device_types="cuda",
 )
@@ -2060,7 +2060,7 @@ def _render_sprites_kernel(
 
 
 @torch.library.custom_op(
-    "gradoom::render_sprites_",
+    "env_doom_turbo_torch::render_sprites_",
     mutates_args=("frame",),
     device_types="cuda",
 )
@@ -2318,8 +2318,7 @@ def _render_fast_native_sprites_kernel(
         selected_left = tl.load(projected_left + selected_index)
         selected_top = (
             tl.load(center + env_index)
-            + (tl.load(view_z + env_index) - tl.load(actor_z + selected_index))
-            * selected_scale_y
+            + (tl.load(view_z + env_index) - tl.load(actor_z + selected_index)) * selected_scale_y
             - tl.load(sprite_top_offsets + selected_sprite) * selected_scale_y
         )
         sprite_u = tl.floor((column.to(tl.float32) - selected_left) / selected_scale_x).to(tl.int64)
@@ -2335,9 +2334,7 @@ def _render_fast_native_sprites_kernel(
         safe_u = tl.maximum(0, tl.minimum(sprite_u, selected_width - 1))
         safe_v = tl.maximum(0, tl.minimum(sprite_v, selected_height - 1))
         atlas_index = (
-            selected_sprite * atlas_stride_type
-            + safe_v * atlas_stride_y
-            + safe_u * atlas_stride_x
+            selected_sprite * atlas_stride_type + safe_v * atlas_stride_y + safe_u * atlas_stride_x
         )
         opaque = tl.load(sprite_opaque + atlas_index, mask=inside, other=0).to(tl.int1)
         palette_index = tl.load(sprite_atlas + atlas_index, mask=inside, other=0).to(tl.int64)
@@ -2373,9 +2370,7 @@ def _render_fast_native_sprites_kernel(
         additive_style = tl.load(actor_additive_style + selected_index).to(tl.int64)
         clamped_additive_style = tl.maximum(0, tl.minimum(additive_style, 1))
         effect_mask = inside & opaque & visible_against_scene
-        additive_index = (
-            clamped_additive_style * 256 * 256 + prior.to(tl.int64) * 256 + lit_index
-        )
+        additive_index = clamped_additive_style * 256 * 256 + prior.to(tl.int64) * 256 + lit_index
         additive_pixel = tl.load(
             projectile_additive_luts + additive_index,
             mask=effect_mask & (additive_style >= 0),
@@ -2397,7 +2392,7 @@ def _render_fast_native_sprites_kernel(
 
 
 @torch.library.custom_op(
-    "gradoom::render_fast_native_sprites_",
+    "env_doom_turbo_torch::render_fast_native_sprites_",
     mutates_args=("frame",),
     device_types="cuda",
 )
@@ -2465,49 +2460,49 @@ def render_fast_native_sprites_(
     torch.library.wrap_triton(_render_fast_native_sprites_kernel)[
         (frame.shape[0] * observation_width,)
     ](
-            frame,
-            blocking_distance,
-            surface_depth,
-            actor_x,
-            actor_y,
-            actor_z,
-            actor_alive,
-            actor_sprite,
-            actor_fullbright,
-            actor_additive_style,
-            player_x,
-            player_y,
-            player_angle,
-            projected_depth,
-            projected_left,
-            projected_right,
-            view_z,
-            center,
-            sprite_widths,
-            sprite_heights,
-            sprite_left_offsets,
-            sprite_top_offsets,
-            sprite_atlas,
-            sprite_opaque,
-            sector_lookup,
-            lookup_metadata,
-            sector_lights,
-            flash_light,
-            colormap,
-            projectile_additive_luts,
-            sprite_translucent_lut,
-            observation_height,
-            observation_width,
-            actor_count,
-            sprite_atlas.stride(0),
-            sprite_atlas.stride(1),
-            sprite_atlas.stride(2),
-            sector_lookup.shape[0],
-            sector_lookup.shape[1],
-            triton.next_power_of_2(actor_count),
-            block_height,
-            num_warps=4,
-        )
+        frame,
+        blocking_distance,
+        surface_depth,
+        actor_x,
+        actor_y,
+        actor_z,
+        actor_alive,
+        actor_sprite,
+        actor_fullbright,
+        actor_additive_style,
+        player_x,
+        player_y,
+        player_angle,
+        projected_depth,
+        projected_left,
+        projected_right,
+        view_z,
+        center,
+        sprite_widths,
+        sprite_heights,
+        sprite_left_offsets,
+        sprite_top_offsets,
+        sprite_atlas,
+        sprite_opaque,
+        sector_lookup,
+        lookup_metadata,
+        sector_lights,
+        flash_light,
+        colormap,
+        projectile_additive_luts,
+        sprite_translucent_lut,
+        observation_height,
+        observation_width,
+        actor_count,
+        sprite_atlas.stride(0),
+        sprite_atlas.stride(1),
+        sprite_atlas.stride(2),
+        sector_lookup.shape[0],
+        sector_lookup.shape[1],
+        triton.next_power_of_2(actor_count),
+        block_height,
+        num_warps=4,
+    )
 
 
 @render_fast_native_sprites_.register_fake
@@ -2677,7 +2672,7 @@ def _render_native_weapon_kernel(
 
 
 @torch.library.custom_op(
-    "gradoom::render_native_weapon",
+    "env_doom_turbo_torch::render_native_weapon",
     mutates_args=(),
     device_types="cuda",
 )
@@ -3095,7 +3090,7 @@ def _normalize_enemy_xy_kernel(
 
 
 @torch.library.custom_op(
-    "gradoom::try_enemy_chase_step",
+    "env_doom_turbo_torch::try_enemy_chase_step",
     mutates_args=(
         "enemy_x_fixed",
         "enemy_y_fixed",
@@ -3508,7 +3503,7 @@ def _enemy_hitscan_trace_kernel(
 
 
 @torch.library.custom_op(
-    "gradoom::enemy_hitscan_trace",
+    "env_doom_turbo_torch::enemy_hitscan_trace",
     mutates_args=(),
     device_types="cuda",
 )
@@ -3913,7 +3908,7 @@ def _select_enemy_spawn_position_kernel(
 
 
 @torch.library.custom_op(
-    "gradoom::select_enemy_spawn_position",
+    "env_doom_turbo_torch::select_enemy_spawn_position",
     mutates_args=(),
     device_types="cuda",
 )
@@ -4446,7 +4441,7 @@ def _enemy_projectile_move_kernel(
 
 
 @torch.library.custom_op(
-    "gradoom::enemy_projectile_move",
+    "env_doom_turbo_torch::enemy_projectile_move",
     mutates_args=(),
     device_types="cuda",
 )
@@ -5019,7 +5014,7 @@ def _player_projectile_move_kernel(
 
 
 @torch.library.custom_op(
-    "gradoom::player_projectile_move",
+    "env_doom_turbo_torch::player_projectile_move",
     mutates_args=(),
     device_types="cuda",
 )
@@ -5280,7 +5275,7 @@ def _random_spawn_candidates_kernel(
 
 
 @torch.library.custom_op(
-    "gradoom::random_spawn_candidates",
+    "env_doom_turbo_torch::random_spawn_candidates",
     mutates_args=("rng_state",),
     device_types="cuda",
 )
@@ -5601,7 +5596,7 @@ def _move_enemy_thrust_kernel(
 
 
 @torch.library.custom_op(
-    "gradoom::move_enemy_thrust",
+    "env_doom_turbo_torch::move_enemy_thrust",
     mutates_args=("enemy_x_fixed", "enemy_y_fixed", "enemy_x", "enemy_y"),
     device_types="cuda",
 )
@@ -5991,7 +5986,7 @@ def _rocket_splash_blocked_kernel(
 
 
 @torch.library.custom_op(
-    "gradoom::rocket_splash_blocked",
+    "env_doom_turbo_torch::rocket_splash_blocked",
     mutates_args=(),
     device_types="cuda",
 )
@@ -6336,7 +6331,7 @@ def _enemy_sight_opening_kernel(
 
 
 @torch.library.custom_op(
-    "gradoom::enemy_sight_blocked",
+    "env_doom_turbo_torch::enemy_sight_blocked",
     mutates_args=(),
     device_types="cuda",
 )
@@ -6416,7 +6411,7 @@ def _enemy_sight_blocked_fake(
 
 
 @torch.library.custom_op(
-    "gradoom::enemy_sight_opening",
+    "env_doom_turbo_torch::enemy_sight_opening",
     mutates_args=(),
     device_types="cuda",
 )
@@ -6697,7 +6692,7 @@ _SPAWN_MUTATED_ARGUMENTS = (
 
 
 @torch.library.custom_op(
-    "gradoom::initialize_enemy_spawn",
+    "env_doom_turbo_torch::initialize_enemy_spawn",
     mutates_args=_SPAWN_MUTATED_ARGUMENTS,
     device_types="cuda",
 )
@@ -6979,7 +6974,7 @@ def _enemy_spawn_requests_kernel(
 
 
 @torch.library.custom_op(
-    "gradoom::enemy_spawn_requests",
+    "env_doom_turbo_torch::enemy_spawn_requests",
     mutates_args=("next_spawn_check", "rng_state"),
     device_types="cuda",
 )
@@ -7054,7 +7049,7 @@ def _first_free_enemy_slot_kernel(
 
 
 @torch.library.custom_op(
-    "gradoom::first_free_enemy_slot",
+    "env_doom_turbo_torch::first_free_enemy_slot",
     mutates_args=(),
     device_types="cuda",
 )
@@ -7497,7 +7492,7 @@ def _enemy_spawn_plan_kernel(
 
 
 @torch.library.custom_op(
-    "gradoom::enemy_spawn_plan",
+    "env_doom_turbo_torch::enemy_spawn_plan",
     mutates_args=("next_spawn_check", "rng_state"),
     device_types="cuda",
 )

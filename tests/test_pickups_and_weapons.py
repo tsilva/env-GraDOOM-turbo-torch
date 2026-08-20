@@ -5,7 +5,7 @@ from dataclasses import replace
 import numpy as np
 import torch
 
-from gradoom.engine import TorchDeathmatchEngine
+from env_doom_turbo_torch.engine import TorchDeathmatchEngine
 
 
 def _item_scenario(square_scenario, *type_ids: int):

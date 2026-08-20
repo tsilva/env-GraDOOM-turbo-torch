@@ -1,9 +1,10 @@
-"""Replay fixed ViZDoom policy action traces in GraDOOM.
+"""Replay fixed ViZDoom policy action traces in env-Doom-turbo-torch.
 
 The reference evaluator can record each episode's initial pose and restricted
 action sequence.  This diagnostic applies those controls unchanged to
-GraDOOM, stopping each lane at the earlier of its GraDOOM termination or the
-reference episode horizon.  Rendering and policy inference are therefore
+env-Doom-turbo-torch, stopping each lane at the earlier of its
+env-Doom-turbo-torch termination or the reference episode horizon. Rendering
+and policy inference are therefore
 removed from the comparison, leaving post-spawn simulation behavior.
 """
 
@@ -19,9 +20,9 @@ from typing import Any
 
 import torch
 
-from gradoom.actions import DEATHMATCH_ACTIONS, DEATHMATCH_BUTTONS
-from gradoom.engine import TorchDeathmatchEngine
-from gradoom.scenario import compile_deathmatch_scenario
+from env_doom_turbo_torch.actions import DEATHMATCH_ACTIONS, DEATHMATCH_BUTTONS
+from env_doom_turbo_torch.engine import TorchDeathmatchEngine
+from env_doom_turbo_torch.scenario import compile_deathmatch_scenario
 
 UINT32_MASK = (1 << 32) - 1
 FIXED_UNIT = 1 << 16
@@ -220,7 +221,7 @@ def main() -> int:
     if not bool(torch.all(recorded)):
         raise RuntimeError("not every action trace produced a result")
 
-    gradoom_records = [
+    env_doom_turbo_torch_records = [
         {
             "damage_taken": float(result_damage_taken[lane]),
             "hits_taken": float(result_hits_taken[lane]),
@@ -243,26 +244,26 @@ def main() -> int:
         for record in episodes
     ]
     kill_deltas = [
-        gradoom_records[index]["kills"] - reference_records[index]["kills"]
+        env_doom_turbo_torch_records[index]["kills"] - reference_records[index]["kills"]
         for index in range(num_envs)
     ]
     result = {
-        "schema": "gradoom.vizdoom-action-trace-replay.v1",
+        "schema": "env_doom_turbo_torch.vizdoom-action-trace-replay.v1",
         "source_trace": str(args.trace_jsonl.expanduser().resolve()),
         "frame_skip": frame_skip,
         "doom_skill": doom_skill,
         "episode_timeout": episode_timeout,
         "initial_pose_alignment": True,
         "reference": _summary(reference_records),
-        "gradoom": _summary(gradoom_records),
+        "env_doom_turbo_torch": _summary(env_doom_turbo_torch_records),
         "paired": {
             "kills_delta_mean": statistics.fmean(kill_deltas),
             "kills_delta_median": statistics.median(kill_deltas),
             "kills_at_least_reference_rate": statistics.fmean(
                 float(delta >= 0) for delta in kill_deltas
             ),
-            "gradoom_survived_reference_horizon_rate": statistics.fmean(
-                float(not record["terminated"]) for record in gradoom_records
+            "env_doom_turbo_torch_survived_reference_horizon_rate": statistics.fmean(
+                float(not record["terminated"]) for record in env_doom_turbo_torch_records
             ),
         },
     }

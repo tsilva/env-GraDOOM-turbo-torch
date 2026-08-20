@@ -21,9 +21,9 @@ from typing import Any
 import numpy as np
 import torch
 
-from gradoom.actions import DEATHMATCH_BUTTONS
-from gradoom.engine import TorchDeathmatchEngine
-from gradoom.scenario import compile_deathmatch_scenario
+from env_doom_turbo_torch.actions import DEATHMATCH_BUTTONS
+from env_doom_turbo_torch.engine import TorchDeathmatchEngine
+from env_doom_turbo_torch.scenario import compile_deathmatch_scenario
 
 UINT32_MASK = (1 << 32) - 1
 FIXED_UNIT = 1 << 16
@@ -66,7 +66,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--rear-class", choices=MONSTER_NAMES, default="ShotgunGuy")
     parser.add_argument("--front-distance", type=float, default=100.0)
     parser.add_argument("--rear-distance", type=float, default=200.0)
-    parser.add_argument("--trace-gradoom-lane", type=int)
+    parser.add_argument("--trace-env_doom_turbo_torch-lane", type=int)
     parser.add_argument("--output", type=Path)
     return parser
 
@@ -133,7 +133,7 @@ def _run_vizdoom_episode(
         raise RuntimeError("infighting comparison requires vizdoom") from exc
 
     game = vzd.DoomGame()
-    config_directory = tempfile.TemporaryDirectory(prefix="gradoom-vizdoom-infight-")
+    config_directory = tempfile.TemporaryDirectory(prefix="env_doom_turbo_torch-vizdoom-infight-")
     game.load_config(str(config))
     game.set_doom_config_path(str(Path(config_directory.name) / "engine.ini"))
     game.set_window_visible(False)
@@ -225,15 +225,12 @@ def _run_vizdoom_episode(
             if first_kill is None and kills > 0:
                 first_kill = decision
                 damage_at_first_kill = (
-                    float(game.get_game_variable(vzd.GameVariable.DAMAGE_TAKEN))
-                    - initial_damage
+                    float(game.get_game_variable(vzd.GameVariable.DAMAGE_TAKEN)) - initial_damage
                 )
                 hits_at_first_kill = (
                     float(game.get_game_variable(vzd.GameVariable.HITS_TAKEN)) - initial_hits
                 )
-        final_damage = (
-            float(game.get_game_variable(vzd.GameVariable.DAMAGE_TAKEN)) - initial_damage
-        )
+        final_damage = float(game.get_game_variable(vzd.GameVariable.DAMAGE_TAKEN)) - initial_damage
         final_hits = float(game.get_game_variable(vzd.GameVariable.HITS_TAKEN)) - initial_hits
         return {
             "damage_taken": final_damage,
@@ -339,7 +336,7 @@ def _initialize_monster(
     )
 
 
-def _run_gradoom(
+def _run_env_doom_turbo_torch(
     *,
     scenario_path: Path,
     iwad: Path,
@@ -394,24 +391,14 @@ def _run_gradoom(
     first_kill = torch.full((num_envs,), -1, device=device, dtype=torch.int32)
     damage_at_first_kill = torch.full((num_envs,), -1.0, device=device)
     hits_at_first_kill = torch.full((num_envs,), -1.0, device=device)
-    survivor_slot_at_first_kill = torch.full(
-        (num_envs,), -1, device=device, dtype=torch.int64
-    )
-    survivor_target_at_first_kill = torch.full(
-        (num_envs,), -3, device=device, dtype=torch.int64
-    )
-    survivor_phase_at_first_kill = torch.full(
-        (num_envs,), -1, device=device, dtype=torch.int32
-    )
-    survivor_cooldown_at_first_kill = torch.full(
-        (num_envs,), -1, device=device, dtype=torch.int32
-    )
+    survivor_slot_at_first_kill = torch.full((num_envs,), -1, device=device, dtype=torch.int64)
+    survivor_target_at_first_kill = torch.full((num_envs,), -3, device=device, dtype=torch.int64)
+    survivor_phase_at_first_kill = torch.full((num_envs,), -1, device=device, dtype=torch.int32)
+    survivor_cooldown_at_first_kill = torch.full((num_envs,), -1, device=device, dtype=torch.int32)
     survivor_move_cooldown_at_first_kill = torch.full(
         (num_envs,), -1, device=device, dtype=torch.int32
     )
-    survivor_just_attacked_at_first_kill = torch.zeros(
-        num_envs, device=device, dtype=torch.bool
-    )
+    survivor_just_attacked_at_first_kill = torch.zeros(num_envs, device=device, dtype=torch.bool)
     survivor_selected_player_attack_after_kill = torch.zeros(
         num_envs, device=device, dtype=torch.bool
     )
@@ -446,12 +433,8 @@ def _run_gradoom(
         current_survivor_target = engine.enemy_target_slot[rows, current_survivor_slot]
         current_survivor_phase = engine.enemy_attack_phase[rows, current_survivor_slot]
         current_survivor_cooldown = engine.enemy_cooldown[rows, current_survivor_slot]
-        current_survivor_move_cooldown = engine.enemy_move_cooldown[
-            rows, current_survivor_slot
-        ]
-        current_survivor_just_attacked = engine.enemy_just_attacked[
-            rows, current_survivor_slot
-        ]
+        current_survivor_move_cooldown = engine.enemy_move_cooldown[rows, current_survivor_slot]
+        current_survivor_just_attacked = engine.enemy_just_attacked[rows, current_survivor_slot]
         survivor_slot_at_first_kill.copy_(
             torch.where(new_kill, current_survivor_slot, survivor_slot_at_first_kill)
         )
@@ -480,9 +463,7 @@ def _run_gradoom(
         )
         after_kill = first_kill >= 0
         survivor_selected_player_attack_after_kill |= (
-            after_kill
-            & (current_survivor_target == -1)
-            & (current_survivor_phase > 0)
+            after_kill & (current_survivor_target == -1) & (current_survivor_phase > 0)
         )
         if trace_lane is not None:
             trace.append(
@@ -496,9 +477,7 @@ def _run_gradoom(
                     "enemy_death_type": engine.enemy_death_type[trace_lane, :2].tolist(),
                     "enemy_health": engine.enemy_health[trace_lane, :2].tolist(),
                     "enemy_just_attacked": engine.enemy_just_attacked[trace_lane, :2].tolist(),
-                    "enemy_move_cooldown": engine.enemy_move_cooldown[
-                        trace_lane, :2
-                    ].tolist(),
+                    "enemy_move_cooldown": engine.enemy_move_cooldown[trace_lane, :2].tolist(),
                     "enemy_target_slot": engine.enemy_target_slot[trace_lane, :2].tolist(),
                     "enemy_x": engine.enemy_x[trace_lane, :2].tolist(),
                     "enemy_y": engine.enemy_y[trace_lane, :2].tolist(),
@@ -533,9 +512,7 @@ def _run_gradoom(
                 else float(engine.player_hits_taken[lane] - hits_at_first_kill[lane])
             ),
             "survivor_cooldown_at_first_kill": (
-                None
-                if int(first_kill[lane]) < 0
-                else int(survivor_cooldown_at_first_kill[lane])
+                None if int(first_kill[lane]) < 0 else int(survivor_cooldown_at_first_kill[lane])
             ),
             "survivor_just_attacked_at_first_kill": (
                 None
@@ -548,9 +525,7 @@ def _run_gradoom(
                 else int(survivor_move_cooldown_at_first_kill[lane])
             ),
             "survivor_phase_at_first_kill": (
-                None
-                if int(first_kill[lane]) < 0
-                else int(survivor_phase_at_first_kill[lane])
+                None if int(first_kill[lane]) < 0 else int(survivor_phase_at_first_kill[lane])
             ),
             "survivor_selected_player_attack_after_kill": (
                 None
@@ -558,21 +533,15 @@ def _run_gradoom(
                 else bool(survivor_selected_player_attack_after_kill[lane])
             ),
             "survivor_slot_at_first_kill": (
-                None
-                if int(first_kill[lane]) < 0
-                else int(survivor_slot_at_first_kill[lane])
+                None if int(first_kill[lane]) < 0 else int(survivor_slot_at_first_kill[lane])
             ),
             "survivor_target_at_first_kill": (
-                None
-                if int(first_kill[lane]) < 0
-                else int(survivor_target_at_first_kill[lane])
+                None if int(first_kill[lane]) < 0 else int(survivor_target_at_first_kill[lane])
             ),
             "survivor_target_final": (
                 None
                 if int(first_kill[lane]) < 0
-                else int(
-                    engine.enemy_target_slot[lane, survivor_slot_at_first_kill[lane]]
-                )
+                else int(engine.enemy_target_slot[lane, survivor_slot_at_first_kill[lane]])
             ),
         }
         for lane in range(num_envs)
@@ -662,8 +631,11 @@ def main() -> int:
         raise ValueError("front and rear classes must differ for object-pose alignment")
     if args.front_distance >= args.rear_distance:
         raise ValueError("front-distance must be less than rear-distance")
-    if args.trace_gradoom_lane is not None and not 0 <= args.trace_gradoom_lane < args.episodes:
-        raise ValueError("trace-gradoom-lane must select an episode lane")
+    if (
+        args.trace_env_doom_turbo_torch_lane is not None
+        and not 0 <= args.trace_env_doom_turbo_torch_lane < args.episodes
+    ):
+        raise ValueError("trace-env_doom_turbo_torch-lane must select an episode lane")
     config = args.config.expanduser().resolve()
     scenario = args.scenario.expanduser().resolve()
     iwad = args.iwad.expanduser().resolve()
@@ -685,7 +657,7 @@ def main() -> int:
                 game_seeds,
             )
         )
-    gradoom, gradoom_trace = _run_gradoom(
+    env_doom_turbo_torch, env_doom_turbo_torch_trace = _run_env_doom_turbo_torch(
         scenario_path=scenario,
         iwad=iwad,
         reference=reference,
@@ -693,18 +665,18 @@ def main() -> int:
         rear_type=MONSTER_NAMES.index(args.rear_class),
         decisions=args.decisions,
         frame_skip=args.frame_skip,
-        trace_lane=args.trace_gradoom_lane,
+        trace_lane=args.trace_env_doom_turbo_torch_lane,
     )
     result = {
         "decisions": args.decisions,
         "episodes": args.episodes,
         "frame_skip": args.frame_skip,
         "front_class": args.front_class,
-        "gradoom": _summary(gradoom),
-        "gradoom_trace": gradoom_trace,
+        "env_doom_turbo_torch": _summary(env_doom_turbo_torch),
+        "env_doom_turbo_torch_trace": env_doom_turbo_torch_trace,
         "rear_class": args.rear_class,
         "reference": _summary(reference),
-        "schema": "gradoom.infighting-outcomes.v3",
+        "schema": "env_doom_turbo_torch.infighting-outcomes.v3",
         "seed": args.seed,
     }
     serialized = json.dumps(result, indent=2, sort_keys=True)

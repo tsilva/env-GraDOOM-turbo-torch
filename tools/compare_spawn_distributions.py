@@ -3,7 +3,7 @@
 Short runs isolate the first spawn checks before policy feedback can amplify
 the intentionally independent random streams.  Long runs expose population
 pressure over a full combat trajectory.  ViZDoom object IDs provide cumulative
-successful spawns by class; GraDOOM records the corresponding inactive-to-alive
+successful spawns by class; env-Doom-turbo-torch records the corresponding inactive-to-alive
 slot transitions.
 """
 
@@ -22,9 +22,9 @@ from typing import Any
 import numpy as np
 import torch
 
-from gradoom.actions import DEATHMATCH_ACTIONS, DEATHMATCH_BUTTONS
-from gradoom.engine import TorchDeathmatchEngine
-from gradoom.scenario import compile_deathmatch_scenario
+from env_doom_turbo_torch.actions import DEATHMATCH_ACTIONS, DEATHMATCH_BUTTONS
+from env_doom_turbo_torch.engine import TorchDeathmatchEngine
+from env_doom_turbo_torch.scenario import compile_deathmatch_scenario
 
 UINT32_MASK = (1 << 32) - 1
 FIXED_UNIT = 1 << 16
@@ -96,7 +96,7 @@ def _run_vizdoom_episode(
         raise RuntimeError("spawn comparison requires vizdoom") from exc
 
     game = vzd.DoomGame()
-    config_directory = tempfile.TemporaryDirectory(prefix="gradoom-vizdoom-spawns-")
+    config_directory = tempfile.TemporaryDirectory(prefix="env_doom_turbo_torch-vizdoom-spawns-")
     game.load_config(str(config))
     game.set_doom_config_path(str(Path(config_directory.name) / "engine.ini"))
     game.set_window_visible(False)
@@ -181,7 +181,7 @@ def _align_poses(engine: TorchDeathmatchEngine, records: Sequence[Mapping[str, A
     engine.player_ceiling_z.copy_(engine.map.sector_heights[sector, 1])
 
 
-def _run_gradoom(
+def _run_env_doom_turbo_torch(
     *,
     scenario_path: Path,
     iwad: Path,
@@ -335,7 +335,7 @@ def main() -> int:
                 game_seeds,
             )
         )
-    gradoom = _run_gradoom(
+    env_doom_turbo_torch = _run_env_doom_turbo_torch(
         scenario_path=scenario,
         iwad=iwad,
         reference=reference,
@@ -344,14 +344,14 @@ def main() -> int:
         action_index=action_index,
     )
     result = {
-        "schema": "gradoom.spawn-distribution-comparison.v1",
+        "schema": "env_doom_turbo_torch.spawn-distribution-comparison.v1",
         "seed": args.seed,
         "decisions": args.decisions,
         "frame_skip": args.frame_skip,
         "program": args.program,
         "initial_pose_alignment": True,
         "vizdoom": _summary(reference),
-        "gradoom": _summary(gradoom),
+        "env_doom_turbo_torch": _summary(env_doom_turbo_torch),
     }
     serialized = json.dumps(result, sort_keys=True)
     if args.output is not None:

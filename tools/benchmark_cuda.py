@@ -1,4 +1,4 @@
-"""Measure steady-state GraDOOM device throughput after an untimed warmup.
+"""Measure steady-state env-Doom-turbo-torch device throughput after an untimed warmup.
 
 This is an operator-run benchmark, not a correctness test. Beast-3 runs require
 an explicitly confirmed quiet window before launching this tool.
@@ -14,7 +14,7 @@ from pathlib import Path
 
 import torch
 
-from gradoom import GraDoomVecEnv
+from env_doom_turbo_torch import EnvDoomTurboTorchVecEnv
 
 
 def main() -> int:
@@ -38,7 +38,7 @@ def main() -> int:
         raise ValueError("all count arguments must be positive")
 
     device = torch.device("cuda")
-    env = GraDoomVecEnv(
+    env = EnvDoomTurboTorchVecEnv(
         game="VizdoomDeathmatch-v1",
         scenario=args.scenario,
         rom_path=str(args.iwad),

@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from gradoom.actions import DEATHMATCH_ACTIONS, DEATHMATCH_HUMAN_ACTIONS
+from env_doom_turbo_torch.actions import DEATHMATCH_ACTIONS, DEATHMATCH_HUMAN_ACTIONS
 
 _ROOT = Path(__file__).parents[1]
 _SERVER = runpy.run_path(str(_ROOT / "tools" / "stream_server.py"))

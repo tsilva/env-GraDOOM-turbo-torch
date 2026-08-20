@@ -19,15 +19,13 @@ from typing import Any
 
 import torch
 
-PUBLISHED_CHECKPOINT_SHA256 = (
-    "e5596d939cef0b6d34e75874b4d917660e7b6efab672ad8d7bea85445a7bb100"
-)
+PUBLISHED_CHECKPOINT_SHA256 = "e5596d939cef0b6d34e75874b4d917660e7b6efab672ad8d7bea85445a7bb100"
 PUBLISHED_CHECKPOINT_STEP = 463_970_304
 
 
 def _load_standalone_train() -> ModuleType:
     path = Path(__file__).parents[1] / "train.py"
-    spec = importlib.util.spec_from_file_location("gradoom_standalone_train", path)
+    spec = importlib.util.spec_from_file_location("env_doom_turbo_torch_standalone_train", path)
     if spec is None or spec.loader is None:  # pragma: no cover - import invariant
         raise RuntimeError(f"cannot load standalone trainer: {path}")
     module = importlib.util.module_from_spec(spec)
@@ -54,8 +52,7 @@ def _source_policy(path: Path) -> Mapping[str, torch.Tensor]:
     if not isinstance(loaded, Mapping):
         raise TypeError("GradLab policy.pth is not a state dictionary")
     valid_items = all(
-        isinstance(key, str) and isinstance(value, torch.Tensor)
-        for key, value in loaded.items()
+        isinstance(key, str) and isinstance(value, torch.Tensor) for key, value in loaded.items()
     )
     if not valid_items:
         raise TypeError("GradLab policy.pth contains non-tensor state")

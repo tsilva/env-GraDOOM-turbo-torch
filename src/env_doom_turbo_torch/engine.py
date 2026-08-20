@@ -533,7 +533,7 @@ DEVICE_SIGNAL_NAMES = (
     "damagecount",
     "hits_taken",
     "damage_taken",
-    # GraDOOM diagnostic: unlike ViZDoom's single-player KILLCOUNT, this
+    # env-Doom-turbo-torch diagnostic: unlike ViZDoom's single-player KILLCOUNT, this
     # excludes countable monsters killed by monster infighting.
     "player_killcount",
 )
@@ -10281,7 +10281,7 @@ class TorchDeathmatchEngine:
 
         This path remains useful for renderer development and performance
         comparisons, but it does not yet reproduce the RGB area resize used by
-        the pinned ViZDoom-turbo observation pipeline.  It remains the policy
+        the pinned env-ViZDoom-turbo observation pipeline.  It remains the policy
         hot path while the reference renderer is being fused.
         """
         distances, wall_indices, wall_along, distance = self._portal_intersections(active)
@@ -10394,7 +10394,7 @@ class TorchDeathmatchEngine:
     def render_approximate_frame(self, active: torch.Tensor | None = None) -> torch.Tensor:
         """Explicit alias for the current compiled policy hot path."""
 
-        # ``GraDoomVecEnv`` selects the reference renderer by rebinding the
+        # ``EnvDoomTurboTorchVecEnv`` selects the reference renderer by rebinding the
         # instance's ``render_frame`` method. Keep this diagnostic entry point
         # pinned to the class implementation so paired-render comparisons do
         # not silently compare the reference renderer with itself.
@@ -15404,7 +15404,7 @@ class TorchDeathmatchEngine:
         *,
         device: torch.device,
     ) -> torch.Tensor:
-        """Return ViZDoom-turbo's rational area weights, normalized per row."""
+        """Return env-ViZDoom-turbo's rational area weights, normalized per row."""
 
         weights = torch.zeros((output, source), device=device, dtype=torch.float32)
         for coordinate in range(output):
@@ -15420,7 +15420,7 @@ class TorchDeathmatchEngine:
         return weights
 
     def _preprocess_policy_rgb(self, rgb: torch.Tensor) -> torch.Tensor:
-        """Match the pinned ViZDoom-turbo 320x240 -> 84x84 area pipeline."""
+        """Match the pinned env-ViZDoom-turbo 320x240 -> 84x84 area pipeline."""
 
         # The Rust reference pools RGB independently, rounds each channel, and
         # only then converts to grayscale with its 77/150/29 coefficients.
@@ -15434,7 +15434,7 @@ class TorchDeathmatchEngine:
         return grayscale.clamp(0, 255).to(torch.uint8)
 
     def render_reference_frame(self, active: torch.Tensor | None = None) -> torch.Tensor:
-        """Render the reference-equivalent ViZDoom-turbo policy observation."""
+        """Render the reference-equivalent env-ViZDoom-turbo policy observation."""
 
         del active  # Native rendering currently evaluates all fixed batch lanes.
         indexed = self._render_native_indexed_frame(include_hud=not self.mask_hud)

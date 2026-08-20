@@ -26,8 +26,8 @@ from compare_behavior import (
 )
 from compare_renderer import _match_reference_mugshot
 
-from gradoom.engine import TorchDeathmatchEngine
-from gradoom.scenario import compile_deathmatch_scenario
+from env_doom_turbo_torch.engine import TorchDeathmatchEngine
+from env_doom_turbo_torch.scenario import compile_deathmatch_scenario
 
 NON_FIRING_PROGRAMS = (
     "noop",
@@ -124,7 +124,7 @@ def _run_case(
         ) from exc
 
     game = vzd.DoomGame()
-    config_directory = tempfile.TemporaryDirectory(prefix="gradoom-vizdoom-renderer-")
+    config_directory = tempfile.TemporaryDirectory(prefix="env_doom_turbo_torch-vizdoom-renderer-")
     game.load_config(str(config))
     game.set_doom_config_path(str(Path(config_directory.name) / "engine.ini"))
     game.set_window_visible(False)
@@ -196,7 +196,7 @@ def _run_case(
                 reference_state = {
                     variable.name: float(game.get_game_variable(variable)) for variable in variables
                 }
-                gradoom_state = {
+                env_doom_turbo_torch_state = {
                     "ANGLE": float(engine.angle[0]) * 180.0 / np.pi % 360.0,
                     "ARMOR": float(engine.armor[0]),
                     "BONUS_BLEND_COUNT": int(engine.bonus_count[0]),
@@ -224,7 +224,7 @@ def _run_case(
                     "camera_z": reference_state["CAMERA_POSITION_Z"],
                     "correlation": float(torch.corrcoef(flattened)[0, 1]),
                     "episode_time": int(game.get_episode_time()),
-                    "gradoom_state": gradoom_state,
+                    "env_doom_turbo_torch_state": env_doom_turbo_torch_state,
                     "mae": float(absolute_error.mean()),
                     "mae_hud": float(absolute_error[208:].mean()),
                     "mae_scene": float(absolute_error[:208].mean()),
@@ -306,7 +306,7 @@ def _run_case(
                     ]
                     projectile_alive = engine.projectile_alive[0]
                     projectile_slots = torch.nonzero(projectile_alive).flatten().tolist()
-                    record["gradoom_player_projectiles"] = [
+                    record["env_doom_turbo_torch_player_projectiles"] = [
                         {
                             "age": int(engine.projectile_age[0, slot]),
                             "position": [
@@ -327,7 +327,7 @@ def _run_case(
                     impact_slots = (
                         torch.nonzero(engine.projectile_impact_tics[0] > 0).flatten().tolist()
                     )
-                    record["gradoom_player_projectile_impacts"] = [
+                    record["env_doom_turbo_torch_player_projectile_impacts"] = [
                         {
                             "position": [
                                 float(engine.projectile_x[0, slot]),
@@ -453,7 +453,7 @@ def main() -> int:
     parser.add_argument(
         "--compare-item-occlusion",
         action="store_true",
-        help="compare isolated GraDOOM item pixels with ViZDoom's label buffer",
+        help="compare isolated env-Doom-turbo-torch item pixels with ViZDoom's label buffer",
     )
     parser.add_argument(
         "--effect-timing-offsets",
@@ -474,7 +474,7 @@ def main() -> int:
         "--record-object-labels",
         action="store_true",
         help=(
-            "record ViZDoom object labels and matched GraDOOM player-projectile "
+            "record ViZDoom object labels and matched env-Doom-turbo-torch player-projectile "
             "state for simulation/render timing diagnostics"
         ),
     )
@@ -569,7 +569,7 @@ def main() -> int:
         "programs": args.programs,
         "records": records,
         "sample_steps": sample_steps,
-        "schema": "gradoom.renderer-parity.dynamic-raw-rgb-hud.v3",
+        "schema": "env_doom_turbo_torch.renderer-parity.dynamic-raw-rgb-hud.v3",
         "screen_flashes": args.screen_flashes,
         "stochastic_phase_included": sample_steps[-1] * args.frame_skip >= 106,
         "stochastic_state_alignment": ["mugshot_face_index"],

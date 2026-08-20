@@ -48,13 +48,13 @@ def test_normal_summary_reports_sample_uncertainty() -> None:
 
 def test_distribution_comparison_uses_independent_provider_uncertainty() -> None:
     reference = [_record(1.0), _record(3.0)]
-    gradoom = [_record(3.0), _record(5.0)]
+    env_doom_turbo_torch = [_record(3.0), _record(5.0)]
 
-    comparison = tool._distribution_comparison(reference, gradoom)
+    comparison = tool._distribution_comparison(reference, env_doom_turbo_torch)
     damage = comparison["damage_taken"]
-    assert damage["gradoom_minus_vizdoom"] == 2.0
-    assert damage["gradoom_minus_vizdoom_standard_error"] == math.sqrt(2.0)
+    assert damage["env_doom_turbo_torch_minus_vizdoom"] == 2.0
+    assert damage["env_doom_turbo_torch_minus_vizdoom_standard_error"] == math.sqrt(2.0)
     rate = comparison["damage_taken_per_1000_decisions"]
-    assert rate["gradoom_minus_vizdoom"] == 20.0
+    assert rate["env_doom_turbo_torch_minus_vizdoom"] == 20.0
     assert rate["vizdoom"]["count"] == 2
-    assert rate["gradoom"]["count"] == 2
+    assert rate["env_doom_turbo_torch"]["count"] == 2

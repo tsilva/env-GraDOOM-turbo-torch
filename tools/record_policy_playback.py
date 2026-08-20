@@ -1,4 +1,4 @@
-"""Record a standalone GraDOOM policy through the raw 320x240 HUD renderer."""
+"""Record a standalone env-Doom-turbo-torch policy through the raw 320x240 HUD renderer."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ TRAIN_SPEC.loader.exec_module(train)
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Record a trained standalone policy using GraDOOM's raw renderer.",
+        description="Record a trained standalone policy using env-Doom-turbo-torch's raw renderer.",
     )
     parser.add_argument("--checkpoint", required=True, type=Path)
     parser.add_argument("--iwad", required=True, type=Path)
@@ -93,7 +93,10 @@ def main() -> int:
     torch.manual_seed(args.policy_seed)
     torch.cuda.manual_seed_all(args.policy_seed)
     loaded = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    if not isinstance(loaded, Mapping) or loaded.get("format") != "standalone-gradoom-ppo-v1":
+    if (
+        not isinstance(loaded, Mapping)
+        or loaded.get("format") != "standalone-env_doom_turbo_torch-ppo-v1"
+    ):
         raise ValueError(f"unsupported standalone checkpoint: {args.checkpoint}")
 
     env_args = argparse.Namespace(

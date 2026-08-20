@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from gradoom.textures import (
+from env_doom_turbo_torch.textures import (
     TextureCatalog,
     compile_grayscale_atlas,
     compile_indexed_sprite_atlas,
@@ -16,13 +16,14 @@ from gradoom.textures import (
     grayscale_palette,
     policy_grayscale_palette,
 )
-from gradoom.wad import WadArchive
+from env_doom_turbo_torch.wad import WadArchive
 
-DOOM2 = Path(os.environ.get("GRADOOM_IWAD", "/Users/tsilva/roms/vizdoom/doom2.wad"))
+DOOM2 = Path(os.environ.get("ENV_DOOM_TURBO_TORCH_IWAD", "/Users/tsilva/roms/vizdoom/doom2.wad"))
 FREEDOOM2 = Path(
     os.environ.get(
-        "GRADOOM_FREEDOOM_IWAD",
-        "/Users/tsilva/repos/tsilva/ViZDoom-turbo/bin/python3.14/vizdoom/freedoom2.wad",
+        "ENV_DOOM_TURBO_TORCH_FREEDOOM_IWAD",
+        Path(__file__).resolve().parents[2]
+        / "env-ViZDoom-turbo/bin/python3.14/vizdoom/freedoom2.wad",
     )
 )
 DEATHMATCH_TEXTURES = ("BIGBRIK1", "BRICK12", "BFALL1", "FLAT5_3", "COMPBLUE")
