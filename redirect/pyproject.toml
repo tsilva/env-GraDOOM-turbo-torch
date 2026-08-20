@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gradoom"
-version = "0.1.0a4"
+version = "0.1.0"
 description = "Migration package for env-doom-turbo-torch"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
 authors = [{ name = "Tiago Silva" }]
-dependencies = ["env-doom-turbo-torch==0.1.0a4"]
+dependencies = ["env-doom-turbo-torch==0.1.0"]
 classifiers = [
   "Development Status :: 7 - Inactive",
   "Intended Audience :: Science/Research",

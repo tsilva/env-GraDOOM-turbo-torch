@@ -25,39 +25,49 @@ def release_build() -> ModuleType:
 @pytest.mark.parametrize(
     ("current", "expected"),
     [
-        ("0.1.0a0", "0.1.0a1"),
-        ("0.1.0b4", "0.1.0b5"),
-        ("0.1.0rc2", "0.1.0rc3"),
-        ("0.1.0.dev7", "0.1.0.dev8"),
-        ("1.2.3", "1.2.4"),
+        ("0.1.0a0", "0.1.0"),
+        ("0.1.0b4", "0.1.0"),
+        ("0.1.0rc2", "0.1.0"),
+        ("0.1.0.dev7", "0.1.0"),
+        ("1.2.3", "1.2.3"),
         ("1.2.3.post1", "1.2.4"),
     ],
 )
-def test_next_version_preserves_the_current_release_channel(
+def test_default_release_version_selects_a_final_release(
     release_build: ModuleType,
     current: str,
     expected: str,
 ) -> None:
-    assert release_build.next_version(current) == expected
+    assert release_build.default_release_version(current) == expected
 
 
 def test_select_release_version_keeps_an_unused_pending_version(
     release_build: ModuleType,
 ) -> None:
-    assert release_build.select_release_version("0.1.0a0", {}, set()) == "0.1.0a0"
+    assert release_build.select_release_version("1.2.3", {}, set()) == "1.2.3"
+
+
+def test_select_release_version_promotes_a_prerelease_to_final(
+    release_build: ModuleType,
+) -> None:
+    releases = {
+        "0.1.0a4": [{"filename": "env_doom_turbo_torch-0.1.0a4.tar.gz"}],
+    }
+    tags = {"0.1.0a4"}
+    assert release_build.select_release_version("0.1.0a4", releases, tags) == "0.1.0"
 
 
 def test_select_release_version_skips_published_and_tagged_versions(
     release_build: ModuleType,
 ) -> None:
     releases = {
-        "0.1.0a0": [{"filename": "env_doom_turbo_torch-0.1.0a0.tar.gz"}],
-        "0.1.0a1": [{"filename": "env_doom_turbo_torch-0.1.0a1.tar.gz"}],
+        "0.1.0": [{"filename": "env_doom_turbo_torch-0.1.0.tar.gz"}],
+        "0.1.1": [{"filename": "env_doom_turbo_torch-0.1.1.tar.gz"}],
     }
-    tags = {"0.1.0a2"}
+    tags = {"0.1.2"}
     assert (
-        release_build.select_release_version("0.1.0a0", releases, tags)
-        == "0.1.0a3"
+        release_build.select_release_version("0.1.0a4", releases, tags)
+        == "0.1.3"
     )
 
 

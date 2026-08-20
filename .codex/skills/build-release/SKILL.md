@@ -19,7 +19,7 @@ validation-only run, or no publication.
 The repository publication path is `.github/workflows/release.yml`. A pushed
 `v<version>` tag runs the locked source checks, builds and audits one universal
 wheel and one source distribution, publishes them with PyPI trusted publishing,
-and creates a GitHub Release. Version `0.1.0a4` additionally publishes the
+and creates a GitHub Release. Version `0.1.0` additionally publishes the
 metadata-only `gradoom` migration wheel and source distribution after the
 primary package. A `workflow_dispatch` run validates the same source and
 artifacts but never publishes. Do not manually upload, substitute artifacts, or
@@ -28,11 +28,14 @@ replay only part of the workflow.
 Use normal PEP 440 project versions from `pyproject.toml`. Keep that version
 identical to `src/gradoom/__init__.py` and the root `env-doom-turbo-torch` entry
 in `uv.lock`.
-Treat an untagged, unused checked-in version as pending. Otherwise select the
-next unused, untagged version automatically: increment the numeric suffix for
-`aN`, `bN`, `rcN`, or `.devN` versions, and increment the patch component for a
-final or `.postN` version. `env-doom-turbo-torch` has no upstream-derived `.postN` release
-scheme. Honor an exact user-selected version instead of auto-selection.
+Automatic version selection always targets a final release. Promote an `aN`,
+`bN`, `rcN`, or `.devN` checked-in version to its final base version; keep an
+unused, untagged final version; otherwise increment the patch component until a
+final version is unused on PyPI and untagged locally. Do not automatically
+continue a prerelease series. A prerelease may be built or published only when
+the user explicitly requests its exact version. `env-doom-turbo-torch` has no
+upstream-derived `.postN` release scheme, so advance a `.postN` version to the
+next final patch. Honor any exact user-selected final version as well.
 
 ## Build an explicitly requested local candidate
 
@@ -48,8 +51,8 @@ python3 .codex/skills/build-release/scripts/release_build.py check-version
 Dirty files do not prevent an explicitly requested local candidate, but report
 that it is not eligible for publication and preserve every existing change.
 
-3. Select the release version. On a clean worktree, write an automatic bump when
-the checked-in version is already tagged or published:
+3. Select the release version. On a clean worktree, write the automatically
+selected final version when it differs from the checked-in version:
 
 ```bash
 python3 .codex/skills/build-release/scripts/release_build.py \
@@ -57,11 +60,12 @@ python3 .codex/skills/build-release/scripts/release_build.py \
 ```
 
 For an exact version explicitly requested by the user, add `--to <version>`.
-The helper checks local tags and PyPI, skips occupied versions, and transactionally
-updates `pyproject.toml`, `src/gradoom/__init__.py`, and the root `env-doom-turbo-torch`
-entry in `uv.lock`. If the worktree was dirty, run without `--write`; proceed
-only when the reported pending version requires no bump. Never layer an
-automatic version edit onto existing user changes.
+This is the only path that permits a prerelease. The helper checks local tags
+and PyPI, skips occupied automatic versions, and transactionally updates
+`pyproject.toml`, `src/gradoom/__init__.py`, and the root
+`env-doom-turbo-torch` entry in `uv.lock`. If the worktree was dirty, run
+without `--write`; proceed only when the reported pending version requires no
+bump. Never layer an automatic version edit onto existing user changes.
 
 4. Run the locked source gates after version preparation:
 

@@ -82,19 +82,23 @@ def validate_version(version: str) -> None:
         raise SystemExit(f"unsupported PEP 440 release version: {version!r}")
 
 
-def next_version(version: str) -> str:
+def default_release_version(version: str) -> str:
     match = VERSION_PATTERN.fullmatch(version)
     if match is None:
         raise SystemExit(f"unsupported PEP 440 release version: {version!r}")
     base = ".".join(match.group(name) for name in ("major", "minor", "patch"))
-    if pre := match.group("pre"):
-        return f"{base}{pre}{int(match.group('pre_number')) + 1}"
-    if dev := match.group("dev_number"):
-        return f"{base}.dev{int(dev) + 1}"
-    return (
-        f"{match.group('major')}.{match.group('minor')}."
-        f"{int(match.group('patch')) + 1}"
-    )
+    if match.group("pre") or match.group("dev_number"):
+        return base
+    if match.group("post_number"):
+        return next_final_version(version)
+    return version
+
+
+def next_final_version(version: str) -> str:
+    match = VERSION_PATTERN.fullmatch(version)
+    if match is None:
+        raise SystemExit(f"unsupported PEP 440 release version: {version!r}")
+    return f"{match.group('major')}.{match.group('minor')}.{int(match.group('patch')) + 1}"
 
 
 def check_version(args: argparse.Namespace) -> None:
@@ -167,9 +171,9 @@ def select_release_version(
     tags: set[str],
 ) -> str:
     validate_version(current)
-    candidate = current
+    candidate = default_release_version(current)
     while releases.get(candidate) or candidate in tags:
-        candidate = next_version(candidate)
+        candidate = next_final_version(candidate)
     return candidate
 
 
