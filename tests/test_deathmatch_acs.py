@@ -100,6 +100,7 @@ def test_player_combat_counters_match_vizdoom_game_variables(square_scenario) ->
     assert torch.equal(player_reward, torch.zeros(2))
     assert torch.equal(infighting_reward, torch.ones(2))
     assert engine.killcount.tolist() == [1, 1]
+    assert engine.player_killcount.tolist() == [0, 0]
 
     engine.health[0] = -1
     engine.step(torch.zeros((2, 20), dtype=torch.bool))
@@ -110,6 +111,33 @@ def test_player_combat_counters_match_vizdoom_game_variables(square_scenario) ->
     assert engine.player_deathcount.tolist() == [0, 0]
     assert engine.player_hitcount.tolist() == [0, 1]
     assert engine.player_damagecount.tolist() == [0.0, 5.0]
+    assert engine.player_killcount.tolist() == [0, 0]
+
+
+def test_player_killcount_excludes_infighting_and_resets_per_lane(square_scenario) -> None:
+    engine = _engine(square_scenario)
+    engine.enemy_alive[:, :2] = True
+    engine.enemy_type[:, :2] = 0
+    engine.enemy_health[:, :2] = 1
+    damage = torch.zeros_like(engine.enemy_health)
+    damage[:, 0] = 1
+
+    engine._apply_enemy_damage(damage)
+    damage.zero_()
+    damage[:, 1] = 1
+    engine._apply_enemy_damage(
+        damage,
+        credit_player=False,
+        attacker_is_player=False,
+    )
+    engine._update_signal_buffer()
+
+    assert engine.killcount.tolist() == [2, 2]
+    assert engine.player_killcount.tolist() == [1, 1]
+    assert engine.signal_buffer[:, 26].tolist() == [1.0, 1.0]
+
+    engine.reset(torch.tensor([True, False]), torch.tensor([789, 0]))
+    assert engine.player_killcount.tolist() == [0, 1]
 
 
 def test_player_damage_taken_counters_match_post_armor_health_damage(square_scenario) -> None:

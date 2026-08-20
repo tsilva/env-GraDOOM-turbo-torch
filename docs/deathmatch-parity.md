@@ -8,6 +8,11 @@
 
 Hashes identify operator-supplied inputs; the files are not distributed here.
 
+Unless explicitly labeled player-attributed, historical "kills" below use
+ViZDoom-compatible `KILLCOUNT`. In this single-player scenario that counter also
+includes countable monsters killed by monster infighting; it is retained for
+provider parity but is not a player-only policy-quality signal.
+
 ## Required deterministic mechanics
 
 Tick/action timing, movement, collision, weapon selection and state, ammo, hitscan/projectile behavior, damage, armor, pickups, monster state machines, kills, player death, episode boundaries, and task signals must match deterministic reference fixtures or have an explicitly accepted deviation.

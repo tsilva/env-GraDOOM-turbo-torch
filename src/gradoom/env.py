@@ -44,7 +44,12 @@ _DEFAULT_SIGNALS = (
     "ammo5",
     "ammo6",
 )
-_SUPPORTED_GAME_VARIABLES = (*_DEFAULT_SIGNALS, "hits_taken", "damage_taken")
+_SUPPORTED_GAME_VARIABLES = (
+    *_DEFAULT_SIGNALS,
+    "hits_taken",
+    "damage_taken",
+    "player_killcount",
+)
 _DERIVED_SIGNALS = ("episode_time", "episode_return", "player_dead", "pending_reset")
 _COMPILED_ENGINE_PHASES = (
     "_begin_decision",

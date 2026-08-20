@@ -46,6 +46,23 @@ def test_device_api_is_deterministic_and_resident(square_scenario) -> None:
         second.close()
 
 
+def test_player_killcount_is_an_explicit_device_and_info_signal(square_scenario) -> None:
+    env = _env(
+        square_scenario,
+        game_variables=("killcount", "player_killcount"),
+    )
+    try:
+        _observations, infos = env.reset(seed=[1, 2])
+        player_index = env.device_signal_names.index("player_killcount")
+
+        assert player_index == len(env.device_signal_names) - 1
+        assert infos["killcount"].tolist() == [0.0, 0.0]
+        assert infos["player_killcount"].tolist() == [0.0, 0.0]
+        assert env.device_signals()[:, player_index].tolist() == [0.0, 0.0]
+    finally:
+        env.close()
+
+
 def test_device_api_validates_concrete_resident_device(square_scenario) -> None:
     env = _env(square_scenario, device="cpu:0")
     resident_device = torch.empty((), device="cpu:0").device

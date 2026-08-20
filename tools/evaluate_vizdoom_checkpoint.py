@@ -36,6 +36,15 @@ TRACE_GAME_VARIABLES = (
 TRACE_INFO_NAMES = tuple(name.casefold() for name in TRACE_GAME_VARIABLES)
 SURVIVAL_GAME_VARIABLES = ("HITS_TAKEN", "DAMAGE_TAKEN")
 SURVIVAL_INFO_NAMES = tuple(name.casefold() for name in SURVIVAL_GAME_VARIABLES)
+GRADOOM_ONLY_SIGNAL_NAMES = frozenset({"player_killcount"})
+
+
+def _reference_signal_names(names: Sequence[str]) -> tuple[str, ...]:
+    """Remove GraDOOM-only diagnostics from a ViZDoom provider contract."""
+
+    return tuple(
+        name for name in names if str(name).casefold() not in GRADOOM_ONLY_SIGNAL_NAMES
+    )
 
 
 def _load_standalone_train() -> ModuleType:
@@ -228,8 +237,14 @@ def _evaluate(args: argparse.Namespace, train: ModuleType) -> dict[str, Any]:
         (TRACE_INFO_NAMES if args.include_action_traces else ())
         + (SURVIVAL_INFO_NAMES if args.include_survival_diagnostics else ())
     )
-    game_variables = (*train.GAME_VARIABLES, *extra_game_variables)
-    info_keys = (*train.INFO_SIGNALS, *extra_info_names)
+    game_variables = (
+        *_reference_signal_names(train.GAME_VARIABLES),
+        *extra_game_variables,
+    )
+    info_keys = (
+        *_reference_signal_names(train.INFO_SIGNALS),
+        *extra_info_names,
+    )
     env = VizdoomTurboVecEnv(
         str(args.scenario_config),
         use_restricted_actions=train.RESTRICTED_ACTIONS,

@@ -53,6 +53,10 @@ is vector-only, requires an explicit `game`, and returns the native
 Torch-only `GraDoomVecEnv`; the class also remains available for direct use.
 
 `observations`, rewards, episode flags, and signals remain Torch tensors on the selected device.
+Request the GraDOOM-specific `player_killcount` game variable when policy quality
+must count only enemy deaths delivered by the player. ViZDoom-compatible
+`killcount` remains available and also includes countable monsters killed by
+infighting in this single-player scenario.
 
 ## Commands
 

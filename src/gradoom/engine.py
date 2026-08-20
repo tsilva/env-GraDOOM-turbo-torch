@@ -533,6 +533,9 @@ DEVICE_SIGNAL_NAMES = (
     "damagecount",
     "hits_taken",
     "damage_taken",
+    # GraDOOM diagnostic: unlike ViZDoom's single-player KILLCOUNT, this
+    # excludes countable monsters killed by monster infighting.
+    "player_killcount",
 )
 
 
@@ -1691,6 +1694,7 @@ class TorchDeathmatchEngine:
         self.armor = torch.zeros(n, device=device)
         self.armor_save_fraction = torch.zeros(n, device=device)
         self.killcount = torch.zeros(n, device=device, dtype=torch.int32)
+        self.player_killcount = torch.zeros(n, device=device, dtype=torch.int32)
         self.player_deathcount = torch.zeros(n, device=device, dtype=torch.int32)
         self.player_hitcount = torch.zeros(n, device=device, dtype=torch.int32)
         self.player_damagecount = torch.zeros(n, device=device)
@@ -2357,6 +2361,7 @@ class TorchDeathmatchEngine:
         self._player_bob_fixed.masked_fill_(mask, 0)
         self.health.masked_fill_(mask, 100)
         self.killcount.masked_fill_(mask, 0)
+        self.player_killcount.masked_fill_(mask, 0)
         self.player_deathcount.masked_fill_(mask, 0)
         self.player_hitcount.masked_fill_(mask, 0)
         self.player_damagecount.masked_fill_(mask, 0)
@@ -5134,7 +5139,10 @@ class TorchDeathmatchEngine:
         self.enemy_type.copy_(
             torch.where(killed, torch.full_like(self.enemy_type, -1), self.enemy_type)
         )
-        self.killcount.add_(torch.sum(killed.to(torch.int32), dim=1))
+        killed_count = torch.sum(killed.to(torch.int32), dim=1)
+        self.killcount.add_(killed_count)
+        if credit_player:
+            self.player_killcount.add_(killed_count)
         return reward
 
     def _spawn_player_projectile(
@@ -15467,6 +15475,7 @@ class TorchDeathmatchEngine:
         self.signal_buffer[:, 23].copy_(self.player_damagecount)
         self.signal_buffer[:, 24].copy_(self.player_hits_taken)
         self.signal_buffer[:, 25].copy_(self.player_damage_taken)
+        self.signal_buffer[:, 26].copy_(self.player_killcount)
 
     def signals(self) -> dict[str, torch.Tensor]:
         return {

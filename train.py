@@ -45,6 +45,7 @@ REFERENCE_KILLS_TARGET = 31.78
 GRADLAB_WANDB_PROJECT = "VizdoomDeathmatch-v1"
 GRADLAB_RETURN_METRIC = "train/episode/return/shaped/origin/target/rolling/mean"
 GRADLAB_KILLS_METRIC = "train/progress/kills/origin/target/rolling/mean"
+PLAYER_KILLS_METRIC = "train/progress/player_enemy_kills/origin/target/rolling/mean"
 GRADLAB_PPO_DIAGNOSTIC_METRICS = (
     "train/algorithm/ppo/policy/dominant/action/rate",
     "train/algorithm/ppo/policy/entropy",
@@ -62,6 +63,7 @@ GRADLAB_PPO_DIAGNOSTIC_METRICS = (
 GRADLAB_WANDB_METRICS = (
     GRADLAB_RETURN_METRIC,
     GRADLAB_KILLS_METRIC,
+    PLAYER_KILLS_METRIC,
     *GRADLAB_PPO_DIAGNOSTIC_METRICS,
 )
 GRADOOM_WANDB_TAG = "env_provider:gradoom"
@@ -90,6 +92,7 @@ GAME_VARIABLES = (
     "ammo4",
     "ammo5",
     "ammo6",
+    "player_killcount",
 )
 INFO_SIGNALS = (*GAME_VARIABLES, "player_dead")
 RESTRICTED_ACTIONS = (
@@ -287,12 +290,15 @@ def _parser() -> argparse.ArgumentParser:
             "native-v1",
             "native-death-v1",
             "killcount-v1",
+            "player-killcount-v1",
+            "player-combat-v1",
             "sample-factory-v0",
         ),
         default="native-v1",
         help=(
             "Use scenario-native rewards, native rewards plus an explicit death cost, "
-            "uniform kill-count deltas, or the registered GradLab Sample Factory "
+            "uniform ViZDoom kill-count deltas, player-attributed enemy-kill deltas, "
+            "player kill/hit/damage shaping, or the registered GradLab Sample Factory "
             "shaping contract."
         ),
     )
@@ -727,6 +733,14 @@ def _audit_config(args: argparse.Namespace) -> dict[str, Any]:
                 "terminal_death_penalty": float(args.death_penalty),
             },
             "killcount-v1": {"killcount_delta_reward": 1.0},
+            "player-killcount-v1": {"player_killcount_delta_reward": 1.0},
+            "player-combat-v1": {
+                "player_killcount_delta_reward": 1.0,
+                "hitcount_delta_reward": SAMPLE_FACTORY_REWARD.hit_reward,
+                "hitcount_delta_cap": SAMPLE_FACTORY_REWARD.hit_delta_cap,
+                "damagecount_delta_reward": SAMPLE_FACTORY_REWARD.damage_reward,
+                "damagecount_delta_cap": SAMPLE_FACTORY_REWARD.damage_delta_cap,
+            },
             "sample-factory-v0": asdict(SAMPLE_FACTORY_REWARD),
         }[str(args.reward_shape)],
         "return_comparability": (
@@ -734,6 +748,12 @@ def _audit_config(args: argparse.Namespace) -> dict[str, Any]:
                 "native-v1": "scenario-native return and kills",
                 "native-death-v1": "native-plus-death-cost return and kills",
                 "killcount-v1": "uniform kill-count return and kills",
+                "player-killcount-v1": (
+                    "uniform player-attributed enemy-kill return and player kills"
+                ),
+                "player-combat-v1": (
+                    "player-attributed enemy-kill plus hit/damage shaped return and player kills"
+                ),
                 "sample-factory-v0": "exact sample-factory-v0 shaped return and kills",
             }[str(args.reward_shape)]
         ),
@@ -755,7 +775,10 @@ def _audit_config(args: argparse.Namespace) -> dict[str, Any]:
             "stochastic_actions": bool(args.evaluation_stochastic),
             "survival_diagnostics": bool(args.evaluation_survival_diagnostics),
             "action_diagnostics": bool(args.evaluation_action_diagnostics),
+            "kills_signal": "player_killcount",
+            "vizdoom_compatibility_kills_signal": "killcount",
             "kills_target": REFERENCE_KILLS_TARGET,
+            "kills_target_signal": "killcount",
         },
         "effective_recipe": effective,
         "policy_model": {
@@ -1195,7 +1218,7 @@ class SampleFactoryDeathmatchReward:
 
 
 class KillcountReward:
-    """GPU-resident uniform reward for each KILLCOUNT increment."""
+    """GPU-resident uniform reward for each selected kill-signal increment."""
 
     def __init__(
         self,
@@ -1204,11 +1227,12 @@ class KillcountReward:
         device: torch.device,
         *,
         compile_reward: bool,
+        signal_name: str = "killcount",
     ) -> None:
         try:
-            self.kill_index = tuple(signal_names).index("killcount")
+            self.kill_index = tuple(signal_names).index(signal_name)
         except ValueError as exc:
-            raise ValueError("killcount-v1 signals are missing: ['killcount']") from exc
+            raise ValueError(f"kill reward signals are missing: [{signal_name!r}]") from exc
         self.previous_kills = torch.zeros(num_envs, dtype=torch.float32, device=device)
         process = self._process
         self.process = (
@@ -1225,6 +1249,58 @@ class KillcountReward:
         reward = torch.clamp_min(current_kills - self.previous_kills, 0.0).to(torch.float32)
         done = terminated | truncated
         self.previous_kills.copy_(torch.where(done, torch.zeros_like(current_kills), current_kills))
+        return reward
+
+
+class PlayerCombatReward:
+    """Player-only kills plus bounded outgoing hit and damage progress."""
+
+    _SIGNAL_NAMES = ("player_killcount", "hitcount", "damagecount")
+
+    def __init__(
+        self,
+        signal_names: Sequence[str],
+        num_envs: int,
+        device: torch.device,
+        *,
+        compile_reward: bool,
+    ) -> None:
+        indices = {name: index for index, name in enumerate(signal_names)}
+        missing = [name for name in self._SIGNAL_NAMES if name not in indices]
+        if missing:
+            raise ValueError(f"player-combat-v1 signals are missing: {missing}")
+        self.signal_indices = torch.tensor(
+            [indices[name] for name in self._SIGNAL_NAMES],
+            dtype=torch.int64,
+            device=device,
+        )
+        self.previous = torch.zeros(
+            (num_envs, len(self._SIGNAL_NAMES)),
+            dtype=torch.float32,
+            device=device,
+        )
+        process = self._process
+        self.process = (
+            torch.compile(process, dynamic=False, fullgraph=True) if compile_reward else process
+        )
+
+    def _process(
+        self,
+        final_signals: torch.Tensor,
+        terminated: torch.Tensor,
+        truncated: torch.Tensor,
+    ) -> torch.Tensor:
+        current = final_signals.index_select(1, self.signal_indices)
+        delta = torch.clamp_min(current - self.previous, 0.0)
+        reward = (
+            delta[:, 0]
+            + SAMPLE_FACTORY_REWARD.hit_reward
+            * delta[:, 1].clamp_max(SAMPLE_FACTORY_REWARD.hit_delta_cap)
+            + SAMPLE_FACTORY_REWARD.damage_reward
+            * delta[:, 2].clamp_max(SAMPLE_FACTORY_REWARD.damage_delta_cap)
+        ).to(torch.float32)
+        done = terminated | truncated
+        self.previous.copy_(torch.where(done[:, None], torch.zeros_like(current), current))
         return reward
 
 
@@ -2125,6 +2201,10 @@ def _evaluation_aggregate(records: Sequence[Mapping[str, Any]]) -> dict[str, Any
     returns = [float(record["return"]) for record in records]
     lengths = [float(record["length"]) for record in records]
     mean_kills = statistics.fmean(kills)
+    vizdoom_killcounts = [
+        float(record.get("vizdoom_killcount", record["kills"])) for record in records
+    ]
+    mean_vizdoom_killcount = statistics.fmean(vizdoom_killcounts)
     aggregate = {
         "evaluation/episode/count": len(records),
         "evaluation/kills/mean": mean_kills,
@@ -2132,10 +2212,16 @@ def _evaluation_aggregate(records: Sequence[Mapping[str, Any]]) -> dict[str, Any
         "evaluation/kills/std": statistics.pstdev(kills),
         "evaluation/kills/min": min(kills),
         "evaluation/kills/max": max(kills),
+        "evaluation/kills/signal": "player_killcount",
+        "evaluation/vizdoom_killcount/mean": mean_vizdoom_killcount,
+        "evaluation/vizdoom_killcount/median": statistics.median(vizdoom_killcounts),
+        "evaluation/vizdoom_killcount/min": min(vizdoom_killcounts),
+        "evaluation/vizdoom_killcount/max": max(vizdoom_killcounts),
         "evaluation/return/native/mean": statistics.fmean(returns),
         "evaluation/episode/length/mean": statistics.fmean(lengths),
         "evaluation/target/kills/mean": REFERENCE_KILLS_TARGET,
-        "evaluation/target/passed": mean_kills >= REFERENCE_KILLS_TARGET,
+        "evaluation/target/kills/signal": "killcount",
+        "evaluation/target/passed": mean_vizdoom_killcount >= REFERENCE_KILLS_TARGET,
     }
     if all("damage_taken" in record and "hits_taken" in record for record in records):
         damage_taken = [float(record["damage_taken"]) for record in records]
@@ -2249,7 +2335,8 @@ def _evaluate(
         episode_returns = torch.zeros(evaluation_envs, dtype=torch.float32, device=device)
         episode_lengths = torch.zeros(evaluation_envs, dtype=torch.int32, device=device)
         signal_indices = {name: index for index, name in enumerate(env.device_signal_names)}
-        kill_index = signal_indices["killcount"]
+        kill_index = signal_indices["player_killcount"]
+        vizdoom_killcount_index = signal_indices["killcount"]
         hits_taken_index = signal_indices["hits_taken"]
         damage_taken_index = signal_indices["damage_taken"]
         health_index = signal_indices["health"]
@@ -2287,6 +2374,7 @@ def _evaluate(
             dtype=torch.float32,
             device=device,
         )
+        completed_vizdoom_killcounts = torch.empty_like(completed_kills)
         completed_returns = torch.empty_like(completed_kills)
         completed_hits_taken = torch.empty_like(completed_kills)
         completed_damage_taken = torch.empty_like(completed_kills)
@@ -2324,6 +2412,7 @@ def _evaluate(
                 "episode_quotas": list(episode_quotas),
                 "seed_grid": "gradlab-vizdoom-turbo-v1 lanes x episode-index",
                 "deterministic_actions": not bool(args.evaluation_stochastic),
+                "kills_signal": "player_killcount",
             }
         )
         executed_decisions = maximum_decisions
@@ -2354,6 +2443,9 @@ def _evaluate(
             done = transition.terminated | transition.truncated
             completed[decision].copy_(done)
             completed_kills[decision].copy_(transition.final_signals[:, kill_index])
+            completed_vizdoom_killcounts[decision].copy_(
+                transition.final_signals[:, vizdoom_killcount_index]
+            )
             completed_hits_taken[decision].copy_(
                 transition.final_signals[:, hits_taken_index]
             )
@@ -2394,6 +2486,7 @@ def _evaluate(
         evaluation_seconds = time.perf_counter() - evaluation_started
         completed_cpu = completed[:executed_decisions].cpu().numpy()
         kills_cpu = completed_kills[:executed_decisions].cpu().numpy()
+        vizdoom_killcounts_cpu = completed_vizdoom_killcounts[:executed_decisions].cpu().numpy()
         returns_cpu = completed_returns[:executed_decisions].cpu().numpy()
         hits_taken_cpu = completed_hits_taken[:executed_decisions].cpu().numpy()
         damage_taken_cpu = completed_damage_taken[:executed_decisions].cpu().numpy()
@@ -2425,6 +2518,9 @@ def _evaluate(
                     "lane_episode": lane_episode,
                     "game_seed": int(seeds_cpu[completion_decision, lane]),
                     "kills": float(kills_cpu[completion_decision, lane]),
+                    "vizdoom_killcount": float(
+                        vizdoom_killcounts_cpu[completion_decision, lane]
+                    ),
                     "return": float(returns_cpu[completion_decision, lane]),
                     "length": int(lengths_cpu[completion_decision, lane]),
                     "terminated": bool(terminated_cpu[completion_decision, lane]),
@@ -2629,11 +2725,24 @@ def _train(
         episode_returns = torch.zeros(int(args.num_envs), dtype=torch.float32, device=device)
         episode_lengths = torch.zeros(int(args.num_envs), dtype=torch.int32, device=device)
         signal_indices = {name: index for index, name in enumerate(env.device_signal_names)}
-        kill_index = signal_indices["killcount"]
+        kill_index = signal_indices["player_killcount"]
         reward_shaper = {
             "native-v1": None,
             "native-death-v1": None,
             "killcount-v1": KillcountReward(
+                env.device_signal_names,
+                int(args.num_envs),
+                device,
+                compile_reward=bool(args.compile_engine),
+            ),
+            "player-killcount-v1": KillcountReward(
+                env.device_signal_names,
+                int(args.num_envs),
+                device,
+                compile_reward=bool(args.compile_engine),
+                signal_name="player_killcount",
+            ),
+            "player-combat-v1": PlayerCombatReward(
                 env.device_signal_names,
                 int(args.num_envs),
                 device,
@@ -2907,6 +3016,7 @@ def _train(
                     rolling_returns
                 ),
                 "train/progress/kills/origin/target/rolling/mean": _rolling_mean(rolling_kills),
+                PLAYER_KILLS_METRIC: _rolling_mean(rolling_kills),
                 "train/episode/length/origin/all/rolling/mean": _rolling_mean(rolling_lengths),
                 "train/outcome/success/starts/all/rolling/rate/min": _rolling_mean(rolling_success),
                 **update_metrics,
@@ -2981,6 +3091,7 @@ def _train(
                     rolling_returns
                 ),
                 "train/progress/kills/origin/target/rolling/mean": _rolling_mean(rolling_kills),
+                PLAYER_KILLS_METRIC: _rolling_mean(rolling_kills),
                 "cuda_peak_memory_allocated_bytes": torch.cuda.max_memory_allocated(device),
                 "cuda_peak_memory_reserved_bytes": torch.cuda.max_memory_reserved(device),
                 "checkpoint": None if checkpoint_path is None else str(checkpoint_path),

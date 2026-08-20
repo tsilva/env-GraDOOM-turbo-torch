@@ -5,6 +5,11 @@ is a reproducibility note, not a public fastest-training or ViZDoom-parity claim
 The fixed evaluation uses GraDOOM's current environment, so environment parity
 and zero-shot policy transfer must be certified separately.
 
+Unless a result is explicitly labeled player-attributed, historical "kills" in
+this document are ViZDoom-compatible `KILLCOUNT`: in single-player deathmatch it
+also counts countable monsters killed by monster infighting. Those values are
+not player-only policy-quality measurements.
+
 ## Acceptance protocol
 
 - Hardware: one NVIDIA GeForce RTX 4090.
@@ -293,3 +298,48 @@ respectively. The next optimization stage must therefore adapt or train on the
 corrected environment and pass a fresh fixed-grid gate; a GradLab-compatible
 rolling-100 peak alone remains insufficient because synchronized 2,048-lane
 completion cohorts are length biased.
+
+## Player-attributed kill optimization
+
+The 2026-08-20 follow-up separates policy quality from monster infighting.
+GraDOOM now exposes the GPU-resident `player_killcount` signal, which increments
+only when player melee, hitscan, or projectile damage delivers the enemy death.
+The ViZDoom-compatible `killcount` signal is unchanged for parity. Standalone
+training and evaluation use the new signal for their rolling and headline kill
+metrics, while evaluation also emits compatibility `KILLCOUNT` summaries. The
+historical 31.78 reference target remains explicitly attached to compatibility
+`KILLCOUNT` because the source evidence used that counter.
+
+The fixed comparison uses 100 stochastic episodes over 16 balanced lanes with
+seed 10000 and the native-fused renderer. The original retained checkpoint
+scores **20.77 player-attributed kills** (median 17.5, maximum 56), versus 23.65
+compatibility kills. Thus 2.88 deaths per episode, or 13.9% of the player-only
+mean, were hidden by the old metric's infighting credit.
+
+Short 32-episode prefix screens were used only to prune candidates. Direct
+player-kill head tuning peaked at 24.03, player kill/hit/damage head tuning at
+24.09, and full-batch player-combat refinement at 26.13; none beat its parent on
+the identical prefix. The strongest retained full-batch checkpoint scored 29.53
+on that screen and advanced to the authoritative gate. Its recipe uses 2,048 x
+16 rollouts, one 32,768-sample full-rollout batch, two PPO epochs, learning rate
+`8e-6`, zero entropy coefficient, projection-only adaptation, and 4,030,464
+transitions.
+
+The selected full-batch checkpoint scores **25.51 player-attributed kills over
+100 episodes** (median 26, standard deviation 16.67, maximum 57), a gain of 4.74
+kills or **22.8%** over the 20.77 baseline. Its compatibility result is 28.93,
+so another 3.42 deaths per episode are correctly excluded as infighting. The
+next-best post-missile checkpoint scores 23.47 player kills on the same full
+grid. The selected checkpoint SHA-256 is
+`f4430d2ff5e08a651c6a52c22e426373c49dd5d55c93b6d6e0caf2906e0baddf`.
+
+The added counter does not introduce a measured throughput regression. A quiet
+2,048-environment native-fused benchmark with 20 excluded warmup batches and
+five 100-step samples records **23,959 median environment transitions/s**. The
+samples are 26,745, 23,142, 23,959, 22,964, and 23,960, 4.35% above the prior
+22,961 median under the same protocol.
+
+Player-only evaluation evidence is retained at
+`/home/tsilva/gradoom-runs/20260814-negative-movecount-projection-killcount-fullbatch-lr8e6-4m-seed6841/eval-player-kills-final100-native-fused-seed10000.jsonl`;
+the baseline and next-best evidence use the same filename in their respective
+run directories.

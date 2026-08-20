@@ -42,3 +42,14 @@ def test_zero_shot_summary_uses_reference_kill_target() -> None:
 
 def test_zero_shot_contract_keeps_the_training_hud_enabled() -> None:
     assert tool.REFERENCE_RENDER_HUD is True
+
+
+def test_reference_contract_excludes_gradoom_only_player_kill_signal() -> None:
+    train = tool._load_standalone_train()
+
+    game_variables = tool._reference_signal_names(train.GAME_VARIABLES)
+    info_signals = tool._reference_signal_names(train.INFO_SIGNALS)
+
+    assert "killcount" in game_variables
+    assert "player_killcount" not in game_variables
+    assert "player_killcount" not in info_signals

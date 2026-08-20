@@ -460,8 +460,8 @@ def test_weights_only_initialization_is_audited_and_mutually_exclusive(
 
 def test_evaluation_aggregate_uses_exact_records_and_reference_target() -> None:
     records = [
-        {"kills": 30.0, "return": 30.0, "length": 2100},
-        {"kills": 34.0, "return": 34.0, "length": 2100},
+        {"kills": 30.0, "vizdoom_killcount": 30.0, "return": 30.0, "length": 2100},
+        {"kills": 34.0, "vizdoom_killcount": 32.0, "return": 34.0, "length": 2100},
     ]
 
     result = train._evaluation_aggregate(records)
@@ -470,8 +470,11 @@ def test_evaluation_aggregate_uses_exact_records_and_reference_target() -> None:
     assert result["evaluation/kills/mean"] == 32.0
     assert result["evaluation/kills/median"] == 32.0
     assert result["evaluation/kills/std"] == 2.0
+    assert result["evaluation/kills/signal"] == "player_killcount"
+    assert result["evaluation/vizdoom_killcount/mean"] == 31.0
     assert result["evaluation/target/kills/mean"] == 31.78
-    assert result["evaluation/target/passed"] is True
+    assert result["evaluation/target/kills/signal"] == "killcount"
+    assert result["evaluation/target/passed"] is False
 
 
 def test_evaluation_aggregate_rejects_no_completed_episodes() -> None:
@@ -518,6 +521,47 @@ def test_killcount_reward_is_uniform_and_resets_at_episode_boundaries() -> None:
 
     assert first.tolist() == [1.0, 3.0]
     assert second.tolist() == [3.0, 0.0]
+
+
+def test_player_killcount_reward_ignores_vizdoom_compatibility_kills() -> None:
+    reward = train.KillcountReward(
+        ("killcount", "player_killcount"),
+        2,
+        torch.device("cpu"),
+        compile_reward=False,
+        signal_name="player_killcount",
+    )
+
+    actual = reward.process(
+        torch.tensor(((3.0, 1.0), (4.0, 0.0))),
+        torch.tensor((False, False)),
+        torch.tensor((False, False)),
+    )
+
+    assert actual.tolist() == [1.0, 0.0]
+
+
+def test_player_combat_reward_adds_bounded_outgoing_progress() -> None:
+    reward = train.PlayerCombatReward(
+        ("damagecount", "player_killcount", "hitcount"),
+        2,
+        torch.device("cpu"),
+        compile_reward=False,
+    )
+
+    first = reward.process(
+        torch.tensor(((250.0, 1.0, 7.0), (6.0, 0.0, 1.0))),
+        torch.tensor((False, True)),
+        torch.tensor((False, False)),
+    )
+    second = reward.process(
+        torch.tensor(((260.0, 2.0, 9.0), (0.0, 0.0, 0.0))),
+        torch.tensor((False, False)),
+        torch.tensor((False, False)),
+    )
+
+    assert first.tolist() == pytest.approx([1.65, 0.028])
+    assert second.tolist() == pytest.approx([1.05, 0.0])
 
 
 def test_native_reward_audit_preserves_class_weights() -> None:
