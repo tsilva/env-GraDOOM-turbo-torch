@@ -1,12 +1,12 @@
-<div align="center">
-  <img src="./logo.png" alt="env-Doom-turbo-torch" width="560" />
+<p align="center">
+  <img src="https://raw.githubusercontent.com/tsilva/env-Doom-turbo-torch/main/logo.png" alt="env-Doom-turbo-torch" width="560" />
+  <br />
+  <strong>🔥 Train Stronger Doom Policies, Faster 🔥</strong>
+</p>
 
-  **🔥 Rip and Tear Until It Is Done—at GPU speed. 🔥**
-</div>
+`env-Doom-turbo-torch` is a Python library and integrated training system for expert reinforcement-learning researchers who want to train strong Doom deathmatch policies from fresh initialization on NVIDIA GPUs. A certified result counts only when the unchanged stochastic policy transfers to `env-ViZDoom-turbo`; certification ranks policy quality by systematic player-attributed kills, with reusable-run wall-clock time and raw simulated Doom tics breaking close ties.
 
-`env-Doom-turbo-torch` is a Python library for reinforcement-learning researchers and engineers who need to train Doom policies at high throughput. It runs batched deathmatch simulation, rendering, rewards, and resets in PyTorch on the same device as the learner, then targets zero-shot evaluation in comparable ViZDoom environments. The distribution retains the public `env_doom_turbo_torch` import package and Gymnasium IDs.
-
-Use `EnvDoomTurboTorchVecEnv` with an operator-supplied Doom II or Freedoom IWAD and the pinned ViZDoom deathmatch scenario. The current alpha implements Turbo Vector API v2 with Torch-only transition tensors, alongside a synchronization-free device API, scenario compiler, and vectorized Torch execution model.
+Its batched simulation, rendering, rewards, resets, rollouts, policy inference, and learning remain in Torch on the GPU during steady-state training. Use `EnvDoomTurboTorchVecEnv` with an operator-supplied Doom II or Freedoom IWAD and the pinned ViZDoom deathmatch scenario.
 
 ## Install
 
@@ -74,23 +74,26 @@ uv run python -m env_doom_turbo_torch.inspect_scenario \
 uv run python play.py --scenario /path/to/deathmatch.wad \
   --iwad /path/to/doom2.wad                              # play with keyboard controls
 uv run python tools/cuda_correctness_smoke.py --compile-engine   # check CUDA residency
-python train.py --iwad /path/to/doom2.wad \
+uv run python train.py --iwad /path/to/doom2.wad \
   --scenario /path/to/deathmatch.wad                    # standalone 256x16 PPO
-python train.py --iwad /path/to/doom2.wad \
+uv run python train.py --iwad /path/to/doom2.wad \
   --scenario /path/to/deathmatch.wad --wandb            # log to GradLab's W&B project
-python train.py --initialize-from /path/to/policy.pt \
-  --iwad /path/to/doom2.wad --scenario /path/to/deathmatch.wad  # weights-only start
-python tools/convert_gradlab_checkpoint.py \
+uv run python train.py --initialize-from /path/to/policy.pt \
+  --iwad /path/to/doom2.wad --scenario /path/to/deathmatch.wad  # warm-start lane only
+uv run python tools/convert_gradlab_checkpoint.py \
   --source /path/to/published/model.zip \
   --output /path/to/standalone-policy.pt                # no GradLab/SB3 imports
-python tools/evaluate_vizdoom_checkpoint.py \
+uv run python tools/evaluate_vizdoom_checkpoint.py \
   --checkpoint /path/to/policy.pt --iwad /path/to/doom2.wad \
   --scenario-config /path/to/deathmatch.cfg                      # zero-shot transfer gate
 ```
 
 ## Notes
 
-- `env-Doom-turbo-torch` is under active construction and is not yet parity-certified. No current release supports a public fastest-training claim.
+- `env-Doom-turbo-torch` is under active construction and is not yet parity-certified. No current release supports a public quality- or speed-leadership claim.
+- Certification ranks results in this order: zero-shot transfer eligibility, systematic `player_kills`, reusable-run wall-clock time among practically equivalent policies, then raw simulated Doom tics.
+- Certified results start from freshly initialized policy and optimizer state. Pretrained, adapted, fine-tuned, and warm-start runs are reported separately.
+- Final certification uses five predeclared cold-start seeds, reports every outcome without replacement, and requires at least four unchanged stochastic policies to transfer equivalently to `env-ViZDoom-turbo`.
 - The first certification candidate is single-player `deathmatch-p1-v1`: 17 actions, frame skip 2, and 84×84 grayscale CHW observations with four-frame stacking.
 - `render()` and `render_lane()` expose the unprocessed 320×240 RGB24 comparison view with the full Doom HUD; observation preprocessing remains separate from this diagnostic render path.
 - The initial certification hardware target is one NVIDIA RTX 4090 integrated with GradLab.
@@ -102,7 +105,7 @@ python tools/evaluate_vizdoom_checkpoint.py \
 
 ## Architecture
 
-![env-Doom-turbo-torch architecture](./architecture.png)
+![env-Doom-turbo-torch architecture](https://raw.githubusercontent.com/tsilva/env-Doom-turbo-torch/main/architecture.png)
 
 ## License
 
