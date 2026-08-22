@@ -34,6 +34,7 @@
 - Public releases must be open, installable, documented, and accompanied by independently reproducible benchmark recipes and evidence.
 - Use `env-Doom-turbo-torch` as the project and GitHub repository name, `env-doom-turbo-torch` as the Python distribution name, and `env_doom_turbo_torch` as the public Python import package; current project content must not use any former project name or import identifier.
 - `env-Doom-turbo-torch` must provide the supported deathmatch API exposed by `env-ViZDoom-turbo`.
+- Future releases must provide policy-facing semantic parity with ViZDoom across supported environments, maps, actions, observations, signals, rewards, resets, episode semantics, save-state initialization, and multiplayer while retaining Torch-only transition transport and without slowing certified fast paths.
 - Its Turbo-compatible reset and step data plane must accept and return Torch tensors; it must not provide a NumPy transition transport.
 - The first certified environment is the ViZDoom deathmatch scenario.
 - Certified environments must support user-supplied Doom II and Freedoom WADs.

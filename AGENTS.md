@@ -21,3 +21,7 @@ Use the canonical `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-hu
 ### Domain docs
 
 Use a single-context layout with `CONTEXT.md` at the repository root and system-wide ADRs under `docs/adr/`. See `docs/agents/domain.md`.
+
+### ViZDoom parity plan
+
+For work that adds an environment, expands ViZDoom compatibility, or changes the generic Doom runtime, read `PLAN.md` and execute one eligible active environment milestone at a time. Wishlist milestones require explicit stakeholder promotion before implementation.
