@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from env_doom_turbo_torch.scenario import CompiledScenario
+from gradoom.scenario import CompiledScenario
 
 
 @pytest.fixture

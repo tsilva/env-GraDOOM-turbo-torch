@@ -149,7 +149,7 @@ def test_wandb_uses_gradlab_project_metrics_and_doom_turbo_torch_provider_tag(
         "--wandb-mode",
         "disabled",
         "--wandb-tags",
-        "experiment:throughput,env_provider:env-doom-turbo-torch",
+        "experiment:throughput,env_provider:env-gradoom-turbo-torch",
     )
     audit = train._audit_config(args)
 
@@ -174,7 +174,7 @@ def test_wandb_uses_gradlab_project_metrics_and_doom_turbo_torch_provider_tag(
         "goal_id:VizdoomDeathmatch-v1",
         "recipe_id:ppo",
         "env_id:VizdoomDeathmatch-v1",
-        "env_provider:env-doom-turbo-torch",
+        "env_provider:env-gradoom-turbo-torch",
         "experiment:throughput",
     ]
     assert audit["tracking"]["wandb_metrics"] == list(train.GRADLAB_WANDB_METRICS)

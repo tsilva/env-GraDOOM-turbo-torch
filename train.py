@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Standalone PPO trainer for env-Doom-turbo-torch's certified Deathmatch fast path.
+"""Standalone PPO trainer for env-GraDOOM-turbo-torch's certified Deathmatch fast path.
 
 The defaults reproduce the successful GradLab VizdoomDeathmatch-v1 PPO recipe,
 but this script has no GradLab or Stable-Baselines3 runtime dependency. It uses
-only env-Doom-turbo-torch, PyTorch, NumPy, and the Python standard library so GradLab and
-env-Doom-turbo-torch can be optimized independently against a fixed learning baseline.
+only env-GraDOOM-turbo-torch, PyTorch, NumPy, and the Python standard library so GradLab and
+env-GraDOOM-turbo-torch can be optimized independently against a fixed learning baseline.
 
 Run training with::
 
@@ -36,7 +36,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from env_doom_turbo_torch._triton_kernels import bounded_observation_augment, frozen_nature_conv1
+from gradoom._kernels import bounded_observation_augment, frozen_nature_conv1
 
 REFERENCE_NAME = "GradLab VizdoomDeathmatch-v1/ppo"
 REFERENCE_CAPTURED_AT = "2026-08-11"
@@ -66,7 +66,7 @@ GRADLAB_WANDB_METRICS = (
     PLAYER_KILLS_METRIC,
     *GRADLAB_PPO_DIAGNOSTIC_METRICS,
 )
-ENV_DOOM_TURBO_TORCH_WANDB_TAG = "env_provider:env-doom-turbo-torch"
+GRADOOM_WANDB_TAG = "env_provider:env-gradoom-turbo-torch"
 UINT32_MASK = (1 << 32) - 1
 SEED_TABLE_INITIAL_EPISODES = 64
 NATIVE_MONSTER_KILL_REWARDS = (1.0, 3.0, 3.0, 4.0, 3.0, 10.0)
@@ -235,20 +235,20 @@ SAMPLE_FACTORY_REWARD = SampleFactoryRewardConfig()
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Train standalone PPO on env-Doom-turbo-torch's Deathmatch runtime.",
+        description="Train standalone PPO on env-GraDOOM-turbo-torch's Deathmatch runtime.",
     )
     parser.add_argument(
         "--iwad",
         type=Path,
-        default=os.environ.get("ENV_DOOM_TURBO_TORCH_IWAD"),
-        help="Doom II or Freedoom IWAD (default: ENV_DOOM_TURBO_TORCH_IWAD).",
+        default=os.environ.get("GRADOOM_IWAD"),
+        help="Doom II or Freedoom IWAD (default: GRADOOM_IWAD).",
     )
     parser.add_argument(
         "--scenario",
         type=Path,
-        default=os.environ.get("ENV_DOOM_TURBO_TORCH_DEATHMATCH_WAD"),
+        default=os.environ.get("GRADOOM_DEATHMATCH_WAD"),
         help=(
-            "Pinned ViZDoom deathmatch WAD (default: ENV_DOOM_TURBO_TORCH_DEATHMATCH_WAD or the "
+            "Pinned ViZDoom deathmatch WAD (default: GRADOOM_DEATHMATCH_WAD or the "
             "installed ViZDoom scenario)."
         ),
     )
@@ -313,7 +313,7 @@ def _parser() -> argparse.ArgumentParser:
         type=float,
         default=0.0,
         help=(
-            "Training-only cross-entropy coefficient for env-Doom-turbo-torch's visible-enemy "
+            "Training-only cross-entropy coefficient for env-GraDOOM-turbo-torch's visible-enemy "
             "combat teacher (default: 0, disabled). The saved policy remains "
             "pixels/context-only."
         ),
@@ -460,7 +460,7 @@ def _parser() -> argparse.ArgumentParser:
         default="",
         help=(
             "Comma-separated additional W&B tags. The "
-            "env_provider:env-doom-turbo-torch tag is always included."
+            "env_provider:env-gradoom-turbo-torch tag is always included."
         ),
     )
     parser.add_argument(
@@ -655,7 +655,7 @@ def _validate_args(args: argparse.Namespace) -> None:
 
 def _runtime_paths(args: argparse.Namespace) -> None:
     if args.iwad is None:
-        raise FileNotFoundError("pass --iwad or set ENV_DOOM_TURBO_TORCH_IWAD")
+        raise FileNotFoundError("pass --iwad or set GRADOOM_IWAD")
     args.iwad = args.iwad.expanduser().resolve()
     if not args.iwad.is_file():
         raise FileNotFoundError(f"IWAD does not exist: {args.iwad}")
@@ -710,11 +710,11 @@ def _audit_config(args: argparse.Namespace) -> dict[str, Any]:
     canonical = json.dumps(effective, sort_keys=True, separators=(",", ":"))
     return {
         "type": "config",
-        "contract": "standalone-env_doom_turbo_torch-deathmatch-ppo-v2",
+        "contract": "standalone-gradoom-deathmatch-ppo-v2",
         "operation": "evaluate" if args.evaluate_checkpoint is not None else "train",
         "standalone": True,
         "runtime_dependencies": [
-            "env_doom_turbo_torch",
+            "gradoom",
             "torch",
             "numpy",
             *(["wandb"] if bool(args.wandb) else []),
@@ -822,7 +822,7 @@ def _audit_config(args: argparse.Namespace) -> dict[str, Any]:
             },
         },
         "environment": {
-            "provider": "env-doom-turbo-torch",
+            "provider": "env-gradoom-turbo-torch",
             "game": "VizdoomDeathmatch-v1",
             "doom_skill": REFERENCE_RECIPE.doom_skill,
             "wall_contact_damage_scale": float(args.wall_contact_damage_scale),
@@ -845,7 +845,7 @@ def _audit_config(args: argparse.Namespace) -> dict[str, Any]:
             "wandb_entity": args.wandb_entity,
             "wandb_group": args.wandb_group,
             "wandb_mode": str(args.wandb_mode),
-            "wandb_provider_tag": ENV_DOOM_TURBO_TORCH_WANDB_TAG,
+            "wandb_provider_tag": GRADOOM_WANDB_TAG,
             "wandb_metrics": list(GRADLAB_WANDB_METRICS),
         },
     }
@@ -883,7 +883,7 @@ def _wandb_tags(additional: str) -> list[str]:
         "goal_id:VizdoomDeathmatch-v1",
         "recipe_id:ppo",
         "env_id:VizdoomDeathmatch-v1",
-        ENV_DOOM_TURBO_TORCH_WANDB_TAG,
+        GRADOOM_WANDB_TAG,
     ]
     return list(dict.fromkeys([*standard, *requested]))
 
@@ -924,7 +924,7 @@ class CombatContextEncoder:
         indices = {name: index for index, name in enumerate(history_names)}
         missing = sorted(set(MODEL_HISTORY_SIGNALS) - set(indices))
         if missing:
-            raise ValueError(f"env-Doom-turbo-torch context histories are missing: {missing}")
+            raise ValueError(f"env-GraDOOM-turbo-torch context histories are missing: {missing}")
         self.armor = indices["armor"]
         self.health = indices["health"]
         self.selected_weapon = indices["selected_weapon"]
@@ -2037,9 +2037,9 @@ def _make_env(
     *,
     num_envs: int | None = None,
 ):
-    from env_doom_turbo_torch import EnvDoomTurboTorchVecEnv
+    from gradoom import GraDoomVecEnv
 
-    return EnvDoomTurboTorchVecEnv(
+    return GraDoomVecEnv(
         game="VizdoomDeathmatch-v1",
         scenario=None if args.scenario is None else str(args.scenario),
         use_restricted_actions=RESTRICTED_ACTIONS,
@@ -2170,7 +2170,7 @@ def _save_checkpoint(
     destination.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
-            "format": "standalone-env_doom_turbo_torch-ppo-v1",
+            "format": "standalone-gradoom-ppo-v1",
             "step": int(step),
             "policy_state_dict": policy.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
@@ -2287,7 +2287,7 @@ def _evaluate(
     process_started: float,
 ) -> int:
     if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is required for env-Doom-turbo-torch checkpoint evaluation")
+        raise RuntimeError("CUDA is required for env-GraDOOM-turbo-torch checkpoint evaluation")
     if args.evaluate_checkpoint is None:  # pragma: no cover - caller invariant
         raise ValueError("evaluate-checkpoint is required")
     random.seed(int(args.evaluation_seed))
@@ -2301,7 +2301,7 @@ def _evaluate(
         loaded = torch.load(args.evaluate_checkpoint, map_location=device, weights_only=False)
         if (
             not isinstance(loaded, Mapping)
-            or loaded.get("format") != "standalone-env_doom_turbo_torch-ppo-v1"
+            or loaded.get("format") != "standalone-gradoom-ppo-v1"
         ):
             raise ValueError(f"unsupported evaluation checkpoint: {args.evaluate_checkpoint}")
         policy = NatureActorCritic(
@@ -2561,7 +2561,7 @@ def _evaluate(
                 "type": "evaluation",
                 "status": "completed",
                 "protocol": (
-                    "standalone-env_doom_turbo_torch-deathmatch-checkpoint-eval-"
+                    "standalone-gradoom-deathmatch-checkpoint-eval-"
                     "v3-balanced-seed-grid"
                 ),
                 "checkpoint": str(args.evaluate_checkpoint),
@@ -2597,7 +2597,7 @@ def _train(
     process_started: float,
 ) -> int:
     if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is required for the env-Doom-turbo-torch training fast path")
+        raise RuntimeError("CUDA is required for the env-GraDOOM-turbo-torch training fast path")
     random.seed(int(args.seed))
     np.random.seed(int(args.seed))
     torch.manual_seed(int(args.seed))
@@ -2665,7 +2665,7 @@ def _train(
             loaded = torch.load(args.initialize_from, map_location=device, weights_only=False)
             if (
                 not isinstance(loaded, Mapping)
-                or loaded.get("format") != "standalone-env_doom_turbo_torch-ppo-v1"
+                or loaded.get("format") != "standalone-gradoom-ppo-v1"
             ):
                 raise ValueError(f"unsupported initialization checkpoint: {args.initialize_from}")
             policy.load_state_dict(loaded["policy_state_dict"])
@@ -2683,7 +2683,7 @@ def _train(
             loaded = torch.load(args.resume, map_location=device, weights_only=False)
             if (
                 not isinstance(loaded, Mapping)
-                or loaded.get("format") != "standalone-env_doom_turbo_torch-ppo-v1"
+                or loaded.get("format") != "standalone-gradoom-ppo-v1"
             ):
                 raise ValueError(f"unsupported resume checkpoint: {args.resume}")
             policy.load_state_dict(loaded["policy_state_dict"])

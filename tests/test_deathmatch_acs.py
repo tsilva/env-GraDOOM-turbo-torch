@@ -6,7 +6,7 @@ from dataclasses import replace
 import numpy as np
 import torch
 
-from env_doom_turbo_torch.engine import TorchDeathmatchEngine
+from gradoom.engine import TorchDeathmatchEngine
 
 
 def _engine(square_scenario) -> TorchDeathmatchEngine:

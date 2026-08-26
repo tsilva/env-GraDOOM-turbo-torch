@@ -1,5 +1,5 @@
 {
-  "project_name": "env-Doom-turbo-torch",
+  "project_name": "env-GraDOOM-turbo-torch",
   "assets": [
     {
       "key": "logo-1024",
@@ -16,8 +16,8 @@
     {
       "key": "root-logo",
       "path": "../logo.png",
-      "width": 1330,
-      "height": 971
+      "width": 1726,
+      "height": 907
     },
     {
       "key": "favicon-16",

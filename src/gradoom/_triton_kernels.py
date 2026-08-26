@@ -64,7 +64,7 @@ def _bounded_observation_augment_kernel(
     tl.store(output_ptr + output_offset, adjusted, mask=output_valid)
 
 
-@torch.library.custom_op("env_doom_turbo_torch::bounded_observation_augment", mutates_args=())
+@torch.library.custom_op("gradoom::bounded_observation_augment", mutates_args=())
 def bounded_observation_augment(
     observations: torch.Tensor,
     randoms: torch.Tensor,
@@ -177,7 +177,7 @@ def _policy_area_grayscale_kernel(
     )
 
 
-@torch.library.custom_op("env_doom_turbo_torch::policy_area_grayscale", mutates_args=())
+@torch.library.custom_op("gradoom::policy_area_grayscale", mutates_args=())
 def policy_area_grayscale(indexed: torch.Tensor, palette: torch.Tensor) -> torch.Tensor:
     """Apply the pinned env-ViZDoom-turbo area/grayscale transform on CUDA."""
 
@@ -411,7 +411,7 @@ def _render_fast_native_flats_kernel(
 
 
 @torch.library.custom_op(
-    "env_doom_turbo_torch::render_fast_native_flats",
+    "gradoom::render_fast_native_flats",
     mutates_args=(),
     device_types="cuda",
 )
@@ -633,7 +633,7 @@ def _frozen_nature_conv1_kernel(
 
 
 @torch.library.custom_op(
-    "env_doom_turbo_torch::frozen_nature_conv1",
+    "gradoom::frozen_nature_conv1",
     mutates_args=(),
     device_types="cuda",
 )
@@ -785,7 +785,7 @@ def _portal_intersections_kernel(
 
 
 @torch.library.custom_op(
-    "env_doom_turbo_torch::portal_intersections",
+    "gradoom::portal_intersections",
     mutates_args=(),
     device_types="cuda",
 )
@@ -843,7 +843,7 @@ def portal_intersections(
 
 
 @torch.library.custom_op(
-    "env_doom_turbo_torch::masked_portal_intersections",
+    "gradoom::masked_portal_intersections",
     mutates_args=(),
     device_types="cuda",
 )
@@ -1241,7 +1241,7 @@ def _move_drops_kernel(
 
 
 @torch.library.custom_op(
-    "env_doom_turbo_torch::move_drops_",
+    "gradoom::move_drops_",
     mutates_args=(
         "drop_x_fixed",
         "drop_y_fixed",
@@ -1554,7 +1554,7 @@ def _render_portal_walls_kernel(
 
 
 @torch.library.custom_op(
-    "env_doom_turbo_torch::render_portal_walls_",
+    "gradoom::render_portal_walls_",
     mutates_args=("frame",),
     device_types="cuda",
 )
@@ -1631,7 +1631,7 @@ def render_portal_walls_(
 
 
 @torch.library.custom_op(
-    "env_doom_turbo_torch::masked_render_portal_walls_",
+    "gradoom::masked_render_portal_walls_",
     mutates_args=("frame",),
     device_types="cuda",
 )
@@ -1709,7 +1709,7 @@ def masked_render_portal_walls_(
 
 
 @torch.library.custom_op(
-    "env_doom_turbo_torch::render_fast_native_portal_walls_",
+    "gradoom::render_fast_native_portal_walls_",
     mutates_args=("frame", "surface_depth"),
     device_types="cuda",
 )
@@ -2060,7 +2060,7 @@ def _render_sprites_kernel(
 
 
 @torch.library.custom_op(
-    "env_doom_turbo_torch::render_sprites_",
+    "gradoom::render_sprites_",
     mutates_args=("frame",),
     device_types="cuda",
 )
@@ -2392,7 +2392,7 @@ def _render_fast_native_sprites_kernel(
 
 
 @torch.library.custom_op(
-    "env_doom_turbo_torch::render_fast_native_sprites_",
+    "gradoom::render_fast_native_sprites_",
     mutates_args=("frame",),
     device_types="cuda",
 )
@@ -2672,7 +2672,7 @@ def _render_native_weapon_kernel(
 
 
 @torch.library.custom_op(
-    "env_doom_turbo_torch::render_native_weapon",
+    "gradoom::render_native_weapon",
     mutates_args=(),
     device_types="cuda",
 )
@@ -3090,7 +3090,7 @@ def _normalize_enemy_xy_kernel(
 
 
 @torch.library.custom_op(
-    "env_doom_turbo_torch::try_enemy_chase_step",
+    "gradoom::try_enemy_chase_step",
     mutates_args=(
         "enemy_x_fixed",
         "enemy_y_fixed",
@@ -3503,7 +3503,7 @@ def _enemy_hitscan_trace_kernel(
 
 
 @torch.library.custom_op(
-    "env_doom_turbo_torch::enemy_hitscan_trace",
+    "gradoom::enemy_hitscan_trace",
     mutates_args=(),
     device_types="cuda",
 )
@@ -3908,7 +3908,7 @@ def _select_enemy_spawn_position_kernel(
 
 
 @torch.library.custom_op(
-    "env_doom_turbo_torch::select_enemy_spawn_position",
+    "gradoom::select_enemy_spawn_position",
     mutates_args=(),
     device_types="cuda",
 )
@@ -4441,7 +4441,7 @@ def _enemy_projectile_move_kernel(
 
 
 @torch.library.custom_op(
-    "env_doom_turbo_torch::enemy_projectile_move",
+    "gradoom::enemy_projectile_move",
     mutates_args=(),
     device_types="cuda",
 )
@@ -5014,7 +5014,7 @@ def _player_projectile_move_kernel(
 
 
 @torch.library.custom_op(
-    "env_doom_turbo_torch::player_projectile_move",
+    "gradoom::player_projectile_move",
     mutates_args=(),
     device_types="cuda",
 )
@@ -5275,7 +5275,7 @@ def _random_spawn_candidates_kernel(
 
 
 @torch.library.custom_op(
-    "env_doom_turbo_torch::random_spawn_candidates",
+    "gradoom::random_spawn_candidates",
     mutates_args=("rng_state",),
     device_types="cuda",
 )
@@ -5596,7 +5596,7 @@ def _move_enemy_thrust_kernel(
 
 
 @torch.library.custom_op(
-    "env_doom_turbo_torch::move_enemy_thrust",
+    "gradoom::move_enemy_thrust",
     mutates_args=("enemy_x_fixed", "enemy_y_fixed", "enemy_x", "enemy_y"),
     device_types="cuda",
 )
@@ -5986,7 +5986,7 @@ def _rocket_splash_blocked_kernel(
 
 
 @torch.library.custom_op(
-    "env_doom_turbo_torch::rocket_splash_blocked",
+    "gradoom::rocket_splash_blocked",
     mutates_args=(),
     device_types="cuda",
 )
@@ -6331,7 +6331,7 @@ def _enemy_sight_opening_kernel(
 
 
 @torch.library.custom_op(
-    "env_doom_turbo_torch::enemy_sight_blocked",
+    "gradoom::enemy_sight_blocked",
     mutates_args=(),
     device_types="cuda",
 )
@@ -6411,7 +6411,7 @@ def _enemy_sight_blocked_fake(
 
 
 @torch.library.custom_op(
-    "env_doom_turbo_torch::enemy_sight_opening",
+    "gradoom::enemy_sight_opening",
     mutates_args=(),
     device_types="cuda",
 )
@@ -6692,7 +6692,7 @@ _SPAWN_MUTATED_ARGUMENTS = (
 
 
 @torch.library.custom_op(
-    "env_doom_turbo_torch::initialize_enemy_spawn",
+    "gradoom::initialize_enemy_spawn",
     mutates_args=_SPAWN_MUTATED_ARGUMENTS,
     device_types="cuda",
 )
@@ -6974,7 +6974,7 @@ def _enemy_spawn_requests_kernel(
 
 
 @torch.library.custom_op(
-    "env_doom_turbo_torch::enemy_spawn_requests",
+    "gradoom::enemy_spawn_requests",
     mutates_args=("next_spawn_check", "rng_state"),
     device_types="cuda",
 )
@@ -7049,7 +7049,7 @@ def _first_free_enemy_slot_kernel(
 
 
 @torch.library.custom_op(
-    "env_doom_turbo_torch::first_free_enemy_slot",
+    "gradoom::first_free_enemy_slot",
     mutates_args=(),
     device_types="cuda",
 )
@@ -7492,7 +7492,7 @@ def _enemy_spawn_plan_kernel(
 
 
 @torch.library.custom_op(
-    "env_doom_turbo_torch::enemy_spawn_plan",
+    "gradoom::enemy_spawn_plan",
     mutates_args=("next_spawn_check", "rng_state"),
     device_types="cuda",
 )

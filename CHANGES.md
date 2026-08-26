@@ -2,7 +2,12 @@
 
 ## Unreleased
 
-- Migrate `EnvDoomTurboTorchVecEnv` to the breaking Turbo Vector API v2 shared
+- Rename the project and distribution to `env-GraDOOM-turbo-torch` and
+  `env-gradoom-turbo-torch` while restoring the published `gradoom`,
+  `GraDoomVecEnv`, and `GraDOOM-v0` public API names.
+- Keep package imports and CPU execution available when the CUDA-only Triton
+  runtime is not installed.
+- Migrate `GraDoomVecEnv` to the breaking Turbo Vector API v2 shared
   constructor and defaults while keeping reset and step transitions Torch-only
   on `env.device`.
 - Add immutable exact capabilities, portable signal schemas, numeric reset

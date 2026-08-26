@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from env_doom_turbo_torch.actions import (
+from gradoom.actions import (
     DEATHMATCH_ACTION_MEANINGS,
     DEATHMATCH_ACTION_TABLE_SHA256,
     DEATHMATCH_ACTIONS,

@@ -1,6 +1,6 @@
 # Issue tracker: GitHub
 
-Issues and specs for this repository live as GitHub issues in `tsilva/env-Doom-turbo-torch`. Use the `gh` CLI for all operations.
+Issues and specs for this repository live as GitHub issues in `tsilva/env-GraDOOM-turbo-torch`. Use the `gh` CLI for all operations.
 
 ## Conventions
 

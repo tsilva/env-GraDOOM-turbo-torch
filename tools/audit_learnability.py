@@ -13,7 +13,7 @@ from typing import Any
 import torch
 
 EVALUATION_PROTOCOL = (
-    "standalone-env_doom_turbo_torch-deathmatch-checkpoint-eval-v3-balanced-seed-grid"
+    "standalone-gradoom-deathmatch-checkpoint-eval-v3-balanced-seed-grid"
 )
 
 

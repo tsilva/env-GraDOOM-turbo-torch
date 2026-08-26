@@ -280,7 +280,7 @@ def _compile_sprite_blend_luts(
 def _load_bullet_decal_assets() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Load the separately licensed ZDoom BulletChip grayscale resources."""
 
-    resource = files("env_doom_turbo_torch").joinpath("assets/zdoom_bullet_chips.json")
+    resource = files("gradoom").joinpath("assets/zdoom_bullet_chips.json")
     document = json.loads(resource.read_text(encoding="utf-8"))
     chips = document["chips"]
     atlas = np.zeros((len(chips), 9, 7), dtype=np.uint8)

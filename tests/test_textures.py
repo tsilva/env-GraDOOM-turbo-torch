@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from env_doom_turbo_torch.textures import (
+from gradoom.textures import (
     TextureCatalog,
     compile_grayscale_atlas,
     compile_indexed_sprite_atlas,
@@ -16,12 +16,12 @@ from env_doom_turbo_torch.textures import (
     grayscale_palette,
     policy_grayscale_palette,
 )
-from env_doom_turbo_torch.wad import WadArchive
+from gradoom.wad import WadArchive
 
-DOOM2 = Path(os.environ.get("ENV_DOOM_TURBO_TORCH_IWAD", "/Users/tsilva/roms/vizdoom/doom2.wad"))
+DOOM2 = Path(os.environ.get("GRADOOM_IWAD", "/Users/tsilva/roms/vizdoom/doom2.wad"))
 FREEDOOM2 = Path(
     os.environ.get(
-        "ENV_DOOM_TURBO_TORCH_FREEDOOM_IWAD",
+        "GRADOOM_FREEDOOM_IWAD",
         Path(__file__).resolve().parents[2]
         / "env-ViZDoom-turbo/bin/python3.14/vizdoom/freedoom2.wad",
     )

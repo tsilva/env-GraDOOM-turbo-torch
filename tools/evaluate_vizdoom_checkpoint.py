@@ -1,4 +1,4 @@
-"""Evaluate a standalone env-Doom-turbo-torch checkpoint unchanged in reference ViZDoom.
+"""Evaluate a standalone env-GraDOOM-turbo-torch checkpoint unchanged in reference ViZDoom.
 
 This optional transfer gate depends on ``env-vizdoom-turbo``. The root trainer does
 not import it and remains independent of ViZDoom, GradLab, and Stable-Baselines3.
@@ -36,20 +36,20 @@ TRACE_GAME_VARIABLES = (
 TRACE_INFO_NAMES = tuple(name.casefold() for name in TRACE_GAME_VARIABLES)
 SURVIVAL_GAME_VARIABLES = ("HITS_TAKEN", "DAMAGE_TAKEN")
 SURVIVAL_INFO_NAMES = tuple(name.casefold() for name in SURVIVAL_GAME_VARIABLES)
-ENV_DOOM_TURBO_TORCH_ONLY_SIGNAL_NAMES = frozenset({"player_killcount"})
+GRADOOM_ONLY_SIGNAL_NAMES = frozenset({"player_killcount"})
 
 
 def _reference_signal_names(names: Sequence[str]) -> tuple[str, ...]:
-    """Remove env-Doom-turbo-torch-only diagnostics from a ViZDoom provider contract."""
+    """Remove env-GraDOOM-turbo-torch-only diagnostics from a ViZDoom provider contract."""
 
     return tuple(
-        name for name in names if str(name).casefold() not in ENV_DOOM_TURBO_TORCH_ONLY_SIGNAL_NAMES
+        name for name in names if str(name).casefold() not in GRADOOM_ONLY_SIGNAL_NAMES
     )
 
 
 def _load_standalone_train() -> ModuleType:
     path = Path(__file__).parents[1] / "train.py"
-    spec = importlib.util.spec_from_file_location("env_doom_turbo_torch_standalone_train", path)
+    spec = importlib.util.spec_from_file_location("gradoom_standalone_train", path)
     if spec is None or spec.loader is None:  # pragma: no cover - import invariant
         raise RuntimeError(f"cannot load standalone trainer: {path}")
     module = importlib.util.module_from_spec(spec)
@@ -280,7 +280,7 @@ def _evaluate(args: argparse.Namespace, train: ModuleType) -> dict[str, Any]:
         loaded = torch.load(args.checkpoint, map_location=device, weights_only=False)
         if (
             not isinstance(loaded, Mapping)
-            or loaded.get("format") != "standalone-env_doom_turbo_torch-ppo-v1"
+            or loaded.get("format") != "standalone-gradoom-ppo-v1"
         ):
             raise ValueError(f"unsupported standalone checkpoint: {args.checkpoint}")
         checkpoint_config = loaded.get("config", {})

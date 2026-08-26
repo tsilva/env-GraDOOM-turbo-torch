@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and audit env-doom-turbo-torch release distributions."""
+"""Build and audit env-gradoom-turbo-torch release distributions."""
 
 from __future__ import annotations
 
@@ -19,9 +19,9 @@ from email.parser import BytesParser
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
-PACKAGE_NAME = "env-doom-turbo-torch"
-IMPORT_NAME = "env_doom_turbo_torch"
-DIST_FILE_PREFIX = "env_doom_turbo_torch"
+PACKAGE_NAME = "env-gradoom-turbo-torch"
+IMPORT_NAME = "gradoom"
+DIST_FILE_PREFIX = "env_gradoom_turbo_torch"
 VERSION_PATTERN = re.compile(
     r"^(?P<major>[0-9]+)\.(?P<minor>[0-9]+)\.(?P<patch>[0-9]+)"
     r"(?:(?P<pre>a|b|rc)(?P<pre_number>[0-9]+)"
@@ -108,13 +108,13 @@ def check_version(args: argparse.Namespace) -> None:
     actual = {
         "project.name": project_name,
         "pyproject.toml": project_version,
-        "src/env_doom_turbo_torch/__init__.py": init_version(),
+        "src/gradoom/__init__.py": init_version(),
         "uv.lock": lock_version(),
     }
     wanted = {
         "project.name": PACKAGE_NAME,
         "pyproject.toml": expected,
-        "src/env_doom_turbo_torch/__init__.py": expected,
+        "src/gradoom/__init__.py": expected,
         "uv.lock": expected,
     }
     failures = {key: value for key, value in actual.items() if value != wanted[key]}
@@ -345,17 +345,17 @@ from pathlib import Path
 
 wheel = Path(sys.argv[1]).resolve()
 sys.path.insert(0, str(wheel))
-import env_doom_turbo_torch
+import gradoom
 
-assert env_doom_turbo_torch.__version__ == sys.argv[2]
-assert len(env_doom_turbo_torch.DEATHMATCH_ACTIONS) == 17
-assert env_doom_turbo_torch.scenario_buttons() == env_doom_turbo_torch.DEATHMATCH_BUTTONS
+assert gradoom.__version__ == sys.argv[2]
+assert len(gradoom.DEATHMATCH_ACTIONS) == 17
+assert gradoom.scenario_buttons() == gradoom.DEATHMATCH_BUTTONS
 distribution = next(PathDistribution.discover(path=[str(wheel)]))
-assert distribution.metadata["Name"] == "env-doom-turbo-torch"
+assert distribution.metadata["Name"] == "env-gradoom-turbo-torch"
 assert distribution.version == sys.argv[2]
 print("wheel import smoke passed")
 """
-    with tempfile.TemporaryDirectory(prefix="env_doom_turbo_torch-wheel-smoke-") as directory:
+    with tempfile.TemporaryDirectory(prefix="gradoom-wheel-smoke-") as directory:
         subprocess.run(
             [sys.executable, "-c", code, str(wheel), version],
             cwd=directory,

@@ -1,6 +1,6 @@
 ---
 name: build-release
-description: Automatically version, build, audit, publish, monitor, and verify an env-doom-turbo-torch Python release through PyPI availability. Use when the user asks to build release artifacts, cut/tag/publish a release, requests a specific env-doom-turbo-torch version, invokes $build-release, diagnoses release packaging, or asks whether a version is live on PyPI.
+description: Automatically version, build, audit, publish, monitor, and verify an env-gradoom-turbo-torch Python release through PyPI availability. Use when the user asks to build release artifacts, cut/tag/publish a release, requests a specific env-gradoom-turbo-torch version, invokes $build-release, diagnoses release packaging, or asks whether a version is live on PyPI.
 ---
 
 # Build Release
@@ -24,14 +24,14 @@ source and artifacts but never publishes. Do not manually upload, substitute
 artifacts, or replay only part of the workflow.
 
 Use normal PEP 440 project versions from `pyproject.toml`. Keep that version
-identical to `src/env_doom_turbo_torch/__init__.py` and the root `env-doom-turbo-torch` entry
+identical to `src/gradoom/__init__.py` and the root `env-gradoom-turbo-torch` entry
 in `uv.lock`.
 Automatic version selection always targets a final release. Promote an `aN`,
 `bN`, `rcN`, or `.devN` checked-in version to its final base version; keep an
 unused, untagged final version; otherwise increment the patch component until a
 final version is unused on PyPI and untagged locally. Do not automatically
 continue a prerelease series. A prerelease may be built or published only when
-the user explicitly requests its exact version. `env-doom-turbo-torch` has no
+the user explicitly requests its exact version. `env-gradoom-turbo-torch` has no
 upstream-derived `.postN` release scheme, so advance a `.postN` version to the
 next final patch. Honor any exact user-selected final version as well.
 
@@ -60,8 +60,8 @@ python3 .codex/skills/build-release/scripts/release_build.py \
 For an exact version explicitly requested by the user, add `--to <version>`.
 This is the only path that permits a prerelease. The helper checks local tags
 and PyPI, skips occupied automatic versions, and transactionally updates
-`pyproject.toml`, `src/env_doom_turbo_torch/__init__.py`, and the root
-`env-doom-turbo-torch` entry in `uv.lock`. If the worktree was dirty, run
+`pyproject.toml`, `src/gradoom/__init__.py`, and the root
+`env-gradoom-turbo-torch` entry in `uv.lock`. If the worktree was dirty, run
 without `--write`; proceed only when the reported pending version requires no
 bump. Never layer an automatic version edit onto existing user changes.
 
@@ -118,7 +118,7 @@ Require all of the following before any tag or publication action:
 
 Start clean, run `prepare-version --write`, and complete the source and candidate
 gates. If version preparation changed metadata, commit exactly
-`pyproject.toml`, `src/env_doom_turbo_torch/__init__.py`, and `uv.lock` as
+`pyproject.toml`, `src/gradoom/__init__.py`, and `uv.lock` as
 `Release v<version>`. Verify the committed tree is identical to the source used
 for the passing candidate. Create an annotated tag only after every requirement
 passes, then atomically push the current branch and tag:
@@ -157,7 +157,7 @@ If the workflow fails, inspect only failed logs with
 Confirm the exact PyPI version at:
 
 ```text
-https://pypi.org/project/env-doom-turbo-torch/<version>/
+https://pypi.org/project/env-gradoom-turbo-torch/<version>/
 ```
 
 ## Final response

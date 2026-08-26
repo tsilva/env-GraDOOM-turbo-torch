@@ -121,13 +121,13 @@ def _validate_deathmatch_request(game: Any, scenario: Any) -> None:
     if candidate.is_file():
         if candidate.suffix.casefold() not in {".cfg", ".wad"}:
             raise ValueError(
-                "env-Doom-turbo-torch scenarios must be a ViZDoom .cfg or Doom .wad file"
+                "env-GraDOOM-turbo-torch scenarios must be a ViZDoom .cfg or Doom .wad file"
             )
         return
     alias = str(requested).strip().casefold().removesuffix(".cfg")
     if alias not in {"deathmatch", "vizdoomdeathmatch-v1"}:
         raise ValueError(
-            f"unsupported env-Doom-turbo-torch game/scenario {requested!r}; "
+            f"unsupported env-GraDOOM-turbo-torch game/scenario {requested!r}; "
             "only VizdoomDeathmatch-v1 is supported"
         )
 
@@ -151,7 +151,7 @@ def _resolve_scenario_wad(game: Any, scenario: Any) -> Path:
                     f"scenario WAD referenced by {candidate} does not exist: {wad}"
                 )
             return wad
-    configured = os.environ.get("ENV_DOOM_TURBO_TORCH_DEATHMATCH_WAD")
+    configured = os.environ.get("GRADOOM_DEATHMATCH_WAD")
     if configured:
         path = Path(configured).expanduser().resolve()
         if path.is_file():
@@ -165,7 +165,7 @@ def _resolve_scenario_wad(game: Any, scenario: Any) -> Path:
     except ImportError:
         pass
     raise FileNotFoundError(
-        "cannot locate deathmatch.wad; pass scenario=... or set ENV_DOOM_TURBO_TORCH_DEATHMATCH_WAD"
+        "cannot locate deathmatch.wad; pass scenario=... or set GRADOOM_DEATHMATCH_WAD"
     )
 
 
@@ -205,7 +205,7 @@ class DeviceAutoResetTransition:
     final_info_histories: torch.Tensor
 
 
-class EnvDoomTurboTorchVecEnv(VectorEnv):
+class GraDoomVecEnv(VectorEnv):
     """Device-resident vector deathmatch environment.
 
     Torch tensors are the only transition transport, including reset selectors
@@ -218,7 +218,7 @@ class EnvDoomTurboTorchVecEnv(VectorEnv):
         "render_fps": 35,
         "turbo_api_version": 2,
         "transition_transport": "torch",
-        "env_doom_turbo_torch_device_api_version": 1,
+        "gradoom_device_api_version": 1,
     }
     supports_live_snapshots = False
     live_snapshots_deterministic = False
@@ -287,7 +287,7 @@ class EnvDoomTurboTorchVecEnv(VectorEnv):
         if players != 1:
             raise ValueError("the deathmatch-p1-v1 profile supports players=1")
         if str(obs_type).split(".")[-1].casefold() != "image":
-            raise ValueError("EnvDoomTurboTorchVecEnv supports image observations only")
+            raise ValueError("GraDoomVecEnv supports image observations only")
         if render_mode not in (None, "rgb_array"):
             raise ValueError("render_mode must be None or 'rgb_array'")
         if state is not None and state_catalog is not None:
@@ -402,10 +402,10 @@ class EnvDoomTurboTorchVecEnv(VectorEnv):
         if not self.treat_episode_timeout_as_truncation:
             raise ValueError("deathmatch-p1-v1 treats its native timeout as truncation")
 
-        iwad_value = rom_path or os.environ.get("ENV_DOOM_TURBO_TORCH_IWAD")
+        iwad_value = rom_path or os.environ.get("GRADOOM_IWAD")
         if compiled_scenario is None:
             if not iwad_value:
-                raise FileNotFoundError("pass rom_path=... or set ENV_DOOM_TURBO_TORCH_IWAD")
+                raise FileNotFoundError("pass rom_path=... or set GRADOOM_IWAD")
             scenario_path = _resolve_scenario_wad(game, scenario)
             compiled_scenario = compile_deathmatch_scenario(
                 scenario_path,
@@ -1068,12 +1068,12 @@ class EnvDoomTurboTorchVecEnv(VectorEnv):
         self.closed = True
 
 
-VizdoomGpuVecEnv = EnvDoomTurboTorchVecEnv
+VizdoomGpuVecEnv = GraDoomVecEnv
 
 __all__ = [
     "DeviceAutoResetTransition",
     "DeviceTransition",
-    "EnvDoomTurboTorchVecEnv",
+    "GraDoomVecEnv",
     "VizdoomGpuVecEnv",
     "scenario_buttons",
 ]

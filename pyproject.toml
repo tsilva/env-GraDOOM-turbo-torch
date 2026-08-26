@@ -3,7 +3,7 @@ requires = ["setuptools>=83,<84", "wheel>=0.45,<1"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "env-doom-turbo-torch"
+name = "env-gradoom-turbo-torch"
 version = "0.1.0"
 description = "Torch-native Doom reinforcement-learning environments"
 readme = "README.md"
@@ -19,10 +19,10 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/tsilva/env-Doom-turbo-torch"
-Repository = "https://github.com/tsilva/env-Doom-turbo-torch.git"
-Issues = "https://github.com/tsilva/env-Doom-turbo-torch/issues"
-Changelog = "https://github.com/tsilva/env-Doom-turbo-torch/blob/main/CHANGES.md"
+Homepage = "https://github.com/tsilva/env-GraDOOM-turbo-torch"
+Repository = "https://github.com/tsilva/env-GraDOOM-turbo-torch.git"
+Issues = "https://github.com/tsilva/env-GraDOOM-turbo-torch/issues"
+Changelog = "https://github.com/tsilva/env-GraDOOM-turbo-torch/blob/main/CHANGES.md"
 
 [dependency-groups]
 dev = [
@@ -37,7 +37,7 @@ dev = [
 where = ["src"]
 
 [tool.setuptools.package-data]
-env_doom_turbo_torch = ["assets/*.json"]
+gradoom = ["assets/*.json"]
 
 [tool.pytest.ini_options]
 addopts = "-ra"
