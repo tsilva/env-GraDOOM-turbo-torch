@@ -13,7 +13,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from ._triton_kernels import (
+from ._kernels import (
     enemy_hitscan_trace,
     enemy_projectile_move,
     enemy_sight_blocked,
@@ -533,7 +533,7 @@ DEVICE_SIGNAL_NAMES = (
     "damagecount",
     "hits_taken",
     "damage_taken",
-    # env-Doom-turbo-torch diagnostic: unlike ViZDoom's single-player KILLCOUNT, this
+    # env-GraDOOM-turbo-torch diagnostic: unlike ViZDoom's single-player KILLCOUNT, this
     # excludes countable monsters killed by monster infighting.
     "player_killcount",
 )
@@ -10394,7 +10394,7 @@ class TorchDeathmatchEngine:
     def render_approximate_frame(self, active: torch.Tensor | None = None) -> torch.Tensor:
         """Explicit alias for the current compiled policy hot path."""
 
-        # ``EnvDoomTurboTorchVecEnv`` selects the reference renderer by rebinding the
+        # ``GraDoomVecEnv`` selects the reference renderer by rebinding the
         # instance's ``render_frame`` method. Keep this diagnostic entry point
         # pinned to the class implementation so paired-render comparisons do
         # not silently compare the reference renderer with itself.

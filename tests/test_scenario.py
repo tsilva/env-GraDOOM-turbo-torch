@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from env_doom_turbo_torch.scenario import (
+from gradoom.scenario import (
     KNOWN_DOOM2_WAD_SHA256,
     PINNED_DEATHMATCH_WAD_SHA256,
     compile_deathmatch_scenario,
@@ -13,14 +13,14 @@ from env_doom_turbo_torch.scenario import (
 
 SCENARIO = Path(
     os.environ.get(
-        "ENV_DOOM_TURBO_TORCH_DEATHMATCH_WAD",
+        "GRADOOM_DEATHMATCH_WAD",
         Path(__file__).resolve().parents[2] / "env-ViZDoom-turbo/scenarios/deathmatch.wad",
     )
 )
-DOOM2 = Path(os.environ.get("ENV_DOOM_TURBO_TORCH_IWAD", "/Users/tsilva/roms/vizdoom/doom2.wad"))
+DOOM2 = Path(os.environ.get("GRADOOM_IWAD", "/Users/tsilva/roms/vizdoom/doom2.wad"))
 FREEDOOM2 = Path(
     os.environ.get(
-        "ENV_DOOM_TURBO_TORCH_FREEDOOM_IWAD",
+        "GRADOOM_FREEDOOM_IWAD",
         Path(__file__).resolve().parents[2]
         / "env-ViZDoom-turbo/bin/python3.14/vizdoom/freedoom2.wad",
     )

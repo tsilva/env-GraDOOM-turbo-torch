@@ -25,7 +25,7 @@ PUBLISHED_CHECKPOINT_STEP = 463_970_304
 
 def _load_standalone_train() -> ModuleType:
     path = Path(__file__).parents[1] / "train.py"
-    spec = importlib.util.spec_from_file_location("env_doom_turbo_torch_standalone_train", path)
+    spec = importlib.util.spec_from_file_location("gradoom_standalone_train", path)
     if spec is None or spec.loader is None:  # pragma: no cover - import invariant
         raise RuntimeError(f"cannot load standalone trainer: {path}")
     module = importlib.util.module_from_spec(spec)

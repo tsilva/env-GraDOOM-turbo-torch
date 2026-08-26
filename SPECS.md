@@ -1,6 +1,6 @@
 ## PROJECT PURPOSE
 
-`env-Doom-turbo-torch` is a Torch-native Doom reinforcement-learning environment and integrated training system built primarily for its creator to produce the strongest reproducible cold-start policies, measured by player-attributed kills, whose unchanged behavior transfers zero-shot to `env-ViZDoom-turbo`; it should also be independently reproducible and useful to expert practitioners. Among policies with practically equivalent quality, it minimizes reusable-run wall-clock training time and then raw simulated Doom tics.
+`env-GraDOOM-turbo-torch` is a Torch-native Doom reinforcement-learning environment and integrated training system built primarily for its creator to produce the strongest reproducible cold-start policies, measured by player-attributed kills, whose unchanged behavior transfers zero-shot to `env-ViZDoom-turbo`; it should also be independently reproducible and useful to expert practitioners. Among policies with practically equivalent quality, it minimizes reusable-run wall-clock training time and then raw simulated Doom tics.
 
 ## PROJECT REQUIREMENTS
 
@@ -13,13 +13,13 @@
 - The initial certified hardware target is one NVIDIA RTX 4090 integrated with GradLab, while the design must remain structurally portable to other CUDA-capable NVIDIA GPUs without slowing the certified path.
 - Seed-independent setup artifacts may be excluded from reusable-run timing only when they contain no learned or run-specific state, remain unchanged across cold-start runs, and have their contents and creation costs disclosed.
 - Generality and future features must not impose material overhead on certified fast paths.
-- `env-Doom-turbo-torch` must pursue world-leading reproducible performance without presenting comparative or superlative claims as achieved unless current workload-equivalent evidence supports them.
+- `env-GraDOOM-turbo-torch` must pursue world-leading reproducible performance without presenting comparative or superlative claims as achieved unless current workload-equivalent evidence supports them.
 - Final certification must use five predeclared cold-start seeds, report every outcome without replacement, and require at least four policies to satisfy transfer acceptance.
 - Public comparative evidence must disclose the code, assets, hardware, software, recipes, seeds, timing boundaries, learning outcomes, selected checkpoints, sample counts, statistical analysis, and failures needed for independent reproduction.
 
 ### Transfer and parity
 
-- Transfer acceptance must compare each unchanged frozen Doom-Torch-trained policy under stochastic sampling in `env-Doom-turbo-torch` and `env-ViZDoom-turbo`, without fine-tuning or environment-specific policy-facing compensation.
+- Transfer acceptance must compare each unchanged frozen Doom-Torch-trained policy under stochastic sampling in `env-GraDOOM-turbo-torch` and `env-ViZDoom-turbo`, without fine-tuning or environment-specific policy-facing compensation.
 - Transfer acceptance must require statistical equivalence of `player_kills` within a predeclared practical tolerance while treating other behavior signals as regression guardrails.
 - Transfer acceptance must not depend on matching a separately ViZDoom-trained policy.
 - Deterministic gameplay mechanics must match the reference environment unless an explicitly documented deviation passes low-level parity and transfer acceptance.
@@ -32,8 +32,8 @@
 ### Community, compatibility, and content
 
 - Public releases must be open, installable, documented, and accompanied by independently reproducible benchmark recipes and evidence.
-- Use `env-Doom-turbo-torch` as the project and GitHub repository name, `env-doom-turbo-torch` as the Python distribution name, and `env_doom_turbo_torch` as the public Python import package; current project content must not use any former project name or import identifier.
-- `env-Doom-turbo-torch` must provide the supported deathmatch API exposed by `env-ViZDoom-turbo`.
+- Use `env-GraDOOM-turbo-torch` as the project and GitHub repository name, `env-gradoom-turbo-torch` as the Python distribution name, and `gradoom` as the public Python import package; current project content must not use any former project name or import identifier.
+- `env-GraDOOM-turbo-torch` must provide the supported deathmatch API exposed by `env-ViZDoom-turbo`.
 - Future releases must provide policy-facing semantic parity with ViZDoom across supported environments, maps, actions, observations, signals, rewards, resets, episode semantics, save-state initialization, and multiplayer while retaining Torch-only transition transport and without slowing certified fast paths.
 - Its Turbo-compatible reset and step data plane must accept and return Torch tensors; it must not provide a NumPy transition transport.
 - The first certified environment is the ViZDoom deathmatch scenario.
@@ -49,4 +49,4 @@
 ### Licensing
 
 - License permissiveness is subordinate to training throughput, semantic parity, and policy transfer.
-- `env-Doom-turbo-torch` may reuse compatible reference-engine source when doing so advances the project objective and all provenance and redistribution obligations are satisfied.
+- `env-GraDOOM-turbo-torch` may reuse compatible reference-engine source when doing so advances the project objective and all provenance and redistribution obligations are satisfied.

@@ -21,9 +21,9 @@ from typing import Any
 import numpy as np
 import torch
 
-from env_doom_turbo_torch.actions import DEATHMATCH_BUTTONS
-from env_doom_turbo_torch.engine import TorchDeathmatchEngine
-from env_doom_turbo_torch.scenario import compile_deathmatch_scenario
+from gradoom.actions import DEATHMATCH_BUTTONS
+from gradoom.engine import TorchDeathmatchEngine
+from gradoom.scenario import compile_deathmatch_scenario
 
 UINT32_MASK = (1 << 32) - 1
 FIXED_UNIT = 1 << 16
@@ -66,7 +66,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--rear-class", choices=MONSTER_NAMES, default="ShotgunGuy")
     parser.add_argument("--front-distance", type=float, default=100.0)
     parser.add_argument("--rear-distance", type=float, default=200.0)
-    parser.add_argument("--trace-env_doom_turbo_torch-lane", type=int)
+    parser.add_argument("--trace-gradoom-lane", type=int)
     parser.add_argument("--output", type=Path)
     return parser
 
@@ -133,7 +133,7 @@ def _run_vizdoom_episode(
         raise RuntimeError("infighting comparison requires vizdoom") from exc
 
     game = vzd.DoomGame()
-    config_directory = tempfile.TemporaryDirectory(prefix="env_doom_turbo_torch-vizdoom-infight-")
+    config_directory = tempfile.TemporaryDirectory(prefix="gradoom-vizdoom-infight-")
     game.load_config(str(config))
     game.set_doom_config_path(str(Path(config_directory.name) / "engine.ini"))
     game.set_window_visible(False)
@@ -336,7 +336,7 @@ def _initialize_monster(
     )
 
 
-def _run_env_doom_turbo_torch(
+def _run_gradoom(
     *,
     scenario_path: Path,
     iwad: Path,
@@ -632,10 +632,10 @@ def main() -> int:
     if args.front_distance >= args.rear_distance:
         raise ValueError("front-distance must be less than rear-distance")
     if (
-        args.trace_env_doom_turbo_torch_lane is not None
-        and not 0 <= args.trace_env_doom_turbo_torch_lane < args.episodes
+        args.trace_gradoom_lane is not None
+        and not 0 <= args.trace_gradoom_lane < args.episodes
     ):
-        raise ValueError("trace-env_doom_turbo_torch-lane must select an episode lane")
+        raise ValueError("trace-gradoom-lane must select an episode lane")
     config = args.config.expanduser().resolve()
     scenario = args.scenario.expanduser().resolve()
     iwad = args.iwad.expanduser().resolve()
@@ -657,7 +657,7 @@ def main() -> int:
                 game_seeds,
             )
         )
-    env_doom_turbo_torch, env_doom_turbo_torch_trace = _run_env_doom_turbo_torch(
+    gradoom, gradoom_trace = _run_gradoom(
         scenario_path=scenario,
         iwad=iwad,
         reference=reference,
@@ -665,18 +665,18 @@ def main() -> int:
         rear_type=MONSTER_NAMES.index(args.rear_class),
         decisions=args.decisions,
         frame_skip=args.frame_skip,
-        trace_lane=args.trace_env_doom_turbo_torch_lane,
+        trace_lane=args.trace_gradoom_lane,
     )
     result = {
         "decisions": args.decisions,
         "episodes": args.episodes,
         "frame_skip": args.frame_skip,
         "front_class": args.front_class,
-        "env_doom_turbo_torch": _summary(env_doom_turbo_torch),
-        "env_doom_turbo_torch_trace": env_doom_turbo_torch_trace,
+        "gradoom": _summary(gradoom),
+        "gradoom_trace": gradoom_trace,
         "rear_class": args.rear_class,
         "reference": _summary(reference),
-        "schema": "env_doom_turbo_torch.infighting-outcomes.v3",
+        "schema": "gradoom.infighting-outcomes.v3",
         "seed": args.seed,
     }
     serialized = json.dumps(result, indent=2, sort_keys=True)

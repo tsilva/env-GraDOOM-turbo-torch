@@ -14,12 +14,12 @@ import torch
 from gymnasium.envs.registration import EnvSpec
 from gymnasium.vector import AutoresetMode
 
-import env_doom_turbo_torch
-from env_doom_turbo_torch import EnvDoomTurboTorchVecEnv, scenario_buttons
+import gradoom
+from gradoom import GraDoomVecEnv, scenario_buttons
 
 
-def _env(square_scenario, **kwargs) -> EnvDoomTurboTorchVecEnv:
-    return EnvDoomTurboTorchVecEnv(
+def _env(square_scenario, **kwargs) -> GraDoomVecEnv:
+    return GraDoomVecEnv(
         game="VizdoomDeathmatch-v1",
         compiled_scenario=square_scenario,
         num_envs=2,
@@ -34,28 +34,28 @@ def _env(square_scenario, **kwargs) -> EnvDoomTurboTorchVecEnv:
 
 
 def test_generic_gymnasium_registration_is_vector_only_and_idempotent(monkeypatch):
-    spec = gym.spec(env_doom_turbo_torch.GYMNASIUM_ENV_ID)
+    spec = gym.spec(gradoom.GYMNASIUM_ENV_ID)
     assert spec.entry_point is None
-    assert spec.vector_entry_point == "env_doom_turbo_torch:_make_gymnasium_vec_env"
+    assert spec.vector_entry_point == "gradoom:_make_gymnasium_vec_env"
     assert spec.kwargs == {}
-    env_doom_turbo_torch._register_gymnasium_env()
+    gradoom._register_gymnasium_env()
 
     with pytest.raises(gym.error.Error, match="entry_point is not specified"):
-        gym.make(env_doom_turbo_torch.GYMNASIUM_ENV_ID, game="VizdoomDeathmatch-v1")
+        gym.make(gradoom.GYMNASIUM_ENV_ID, game="VizdoomDeathmatch-v1")
     with pytest.raises(TypeError, match="game"):
-        gym.make_vec(env_doom_turbo_torch.GYMNASIUM_ENV_ID, num_envs=1)
+        gym.make_vec(gradoom.GYMNASIUM_ENV_ID, num_envs=1)
 
     monkeypatch.setitem(
         gym.registry,
-        env_doom_turbo_torch.GYMNASIUM_ENV_ID,
+        gradoom.GYMNASIUM_ENV_ID,
         EnvSpec(
-            id=env_doom_turbo_torch.GYMNASIUM_ENV_ID,
+            id=gradoom.GYMNASIUM_ENV_ID,
             entry_point=None,
             vector_entry_point="tests:conflicting_factory",
         ),
     )
     with pytest.raises(gym.error.Error, match="conflicting specification"):
-        env_doom_turbo_torch._register_gymnasium_env()
+        gradoom._register_gymnasium_env()
 
 
 def test_module_qualified_gymnasium_id_registers_in_a_clean_process():
@@ -67,17 +67,47 @@ def test_module_qualified_gymnasium_id_registers_in_a_clean_process():
             sys.executable,
             "-c",
             'exec("""import gymnasium as gym\n'
-            "assert 'EnvDoomTurboTorch-v0' not in gym.registry\n"
+            "assert 'GraDOOM-v0' not in gym.registry\n"
             "try:\n"
-            "    gym.make_vec('env_doom_turbo_torch:EnvDoomTurboTorch-v0', num_envs=1)\n"
+            "    gym.make_vec('gradoom:GraDOOM-v0', num_envs=1)\n"
             "except TypeError as exc:\n"
             "    assert 'game' in str(exc)\n"
             "else:\n"
             "    raise AssertionError('game was not required')\n"
-            "spec = gym.spec('EnvDoomTurboTorch-v0')\n"
+            "spec = gym.spec('GraDOOM-v0')\n"
             "assert spec.vector_entry_point == "
-            '\'env_doom_turbo_torch:_make_gymnasium_vec_env\'\n""")',
+            '\'gradoom:_make_gymnasium_vec_env\'\n""")',
         ],
+        check=True,
+        cwd=root,
+        env=env,
+    )
+
+
+def test_public_package_import_does_not_require_triton():
+    root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, (str(root / "src"), env.get("PYTHONPATH"))))
+    code = "\n".join(
+        (
+            "import importlib.abc",
+            "import sys",
+            "import torch",
+            "class BlockTriton(importlib.abc.MetaPathFinder):",
+            "    def find_spec(self, fullname, path=None, target=None):",
+            "        if fullname == 'triton' or fullname.startswith('triton.'):",
+            "            raise ModuleNotFoundError('blocked for test', name='triton')",
+            "        return None",
+            "for name in tuple(sys.modules):",
+            "    if name == 'triton' or name.startswith('triton.'):",
+            "        del sys.modules[name]",
+            "sys.meta_path.insert(0, BlockTriton())",
+            "import gradoom",
+            "assert gradoom.GYMNASIUM_ENV_ID == 'GraDOOM-v0'",
+        )
+    )
+    subprocess.run(
+        [sys.executable, "-c", code],
         check=True,
         cwd=root,
         env=env,
@@ -86,14 +116,14 @@ def test_module_qualified_gymnasium_id_registers_in_a_clean_process():
 
 def test_generic_gymnasium_factory_preserves_torch_transport(square_scenario):
     env = gym.make_vec(
-        "env_doom_turbo_torch:EnvDoomTurboTorch-v0",
+        "gradoom:GraDOOM-v0",
         game="VizdoomDeathmatch-v1",
         num_envs=2,
         device="cpu",
         compiled_scenario=square_scenario,
     )
     try:
-        assert isinstance(env, EnvDoomTurboTorchVecEnv)
+        assert isinstance(env, GraDoomVecEnv)
         observations, _infos = env.reset(seed=7)
         assert isinstance(observations, torch.Tensor)
         transition = env.step(torch.zeros(2, dtype=torch.int64))
@@ -103,7 +133,7 @@ def test_generic_gymnasium_factory_preserves_torch_transport(square_scenario):
 
 
 def test_public_surface_matches_turbo_vector_api_v2(square_scenario) -> None:
-    parameters = inspect.signature(EnvDoomTurboTorchVecEnv).parameters
+    parameters = inspect.signature(GraDoomVecEnv).parameters
     common_parameters = (
         "game",
         "state",
@@ -200,10 +230,10 @@ def test_public_surface_matches_turbo_vector_api_v2(square_scenario) -> None:
     assert parameters["transport"].default == "default"
     assert parameters["render_mode"].default is None
     assert parameters["frame_skip"].default == 4
-    assert issubclass(EnvDoomTurboTorchVecEnv, gym.vector.VectorEnv)
-    assert EnvDoomTurboTorchVecEnv.metadata["autoreset_mode"] is AutoresetMode.DISABLED
-    assert EnvDoomTurboTorchVecEnv.metadata["turbo_api_version"] == 2
-    assert EnvDoomTurboTorchVecEnv.metadata["transition_transport"] == "torch"
+    assert issubclass(GraDoomVecEnv, gym.vector.VectorEnv)
+    assert GraDoomVecEnv.metadata["autoreset_mode"] is AutoresetMode.DISABLED
+    assert GraDoomVecEnv.metadata["turbo_api_version"] == 2
+    assert GraDoomVecEnv.metadata["transition_transport"] == "torch"
 
     env = _env(square_scenario)
     try:
@@ -294,7 +324,7 @@ def test_torch_is_the_only_transition_transport(square_scenario) -> None:
 
 
 def test_v2_defaults_action_resolution_rendering_catalog_and_async(square_scenario) -> None:
-    env = EnvDoomTurboTorchVecEnv(
+    env = GraDoomVecEnv(
         game="VizdoomDeathmatch-v1",
         compiled_scenario=square_scenario,
         num_envs=2,
@@ -319,7 +349,7 @@ def test_v2_defaults_action_resolution_rendering_catalog_and_async(square_scenar
         env.close()
 
     with pytest.raises(ValueError, match="mutually exclusive"):
-        EnvDoomTurboTorchVecEnv(
+        GraDoomVecEnv(
             game="VizdoomDeathmatch-v1",
             state="default",
             state_catalog=("default",),
@@ -327,7 +357,7 @@ def test_v2_defaults_action_resolution_rendering_catalog_and_async(square_scenar
             device="cpu",
         )
     with pytest.raises(ValueError, match="unique"):
-        EnvDoomTurboTorchVecEnv(
+        GraDoomVecEnv(
             game="VizdoomDeathmatch-v1",
             state_catalog=("default", "default"),
             compiled_scenario=square_scenario,

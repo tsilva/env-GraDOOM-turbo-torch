@@ -1,4 +1,4 @@
-"""Compare env-Doom-turbo-torch and ViZDoom rendering at identical seeded player poses."""
+"""Compare env-GraDOOM-turbo-torch and ViZDoom rendering at identical seeded player poses."""
 
 from __future__ import annotations
 
@@ -11,8 +11,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from env_doom_turbo_torch.engine import TorchDeathmatchEngine
-from env_doom_turbo_torch.scenario import compile_deathmatch_scenario
+from gradoom.engine import TorchDeathmatchEngine
+from gradoom.scenario import compile_deathmatch_scenario
 
 
 def _reference_policy_frame(reference_rgb: torch.Tensor) -> torch.Tensor:
@@ -298,7 +298,7 @@ def main() -> int:
                 "policy_median_mae": float(np.median(policy_errors)),
                 "records": records,
                 "scenario_sha256": scenario.scenario_sha256,
-                "schema": "env_doom_turbo_torch.renderer-parity.raw-and-policy.v2",
+                "schema": "gradoom.renderer-parity.raw-and-policy.v2",
                 "stochastic_state_alignment": ["mugshot_face_index"],
             },
             sort_keys=True,

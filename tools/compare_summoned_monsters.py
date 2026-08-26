@@ -2,8 +2,8 @@
 
 The deathmatch ACS loop does not begin until tic 106.  This diagnostic summons
 one monster, advances ViZDoom by two tics so the console command materializes,
-then initializes one env-Doom-turbo-torch actor from the observed player and monster pose.
-Subsequent ACS spawns are disabled in env-Doom-turbo-torch and the comparison stops before
+then initializes one env-GraDOOM-turbo-torch actor from the observed player and monster pose.
+Subsequent ACS spawns are disabled in env-GraDOOM-turbo-torch and the comparison stops before
 they can occur in ViZDoom.  The random streams are intentionally independent,
 so the acceptance signal is the distribution of motion and damage outcomes.
 """
@@ -23,9 +23,9 @@ from typing import Any
 import numpy as np
 import torch
 
-from env_doom_turbo_torch.actions import DEATHMATCH_ACTIONS, DEATHMATCH_BUTTONS
-from env_doom_turbo_torch.engine import TorchDeathmatchEngine
-from env_doom_turbo_torch.scenario import compile_deathmatch_scenario
+from gradoom.actions import DEATHMATCH_ACTIONS, DEATHMATCH_BUTTONS
+from gradoom.engine import TorchDeathmatchEngine
+from gradoom.scenario import compile_deathmatch_scenario
 
 UINT32_MASK = (1 << 32) - 1
 FIXED_UNIT = 1 << 16
@@ -130,7 +130,7 @@ def _run_vizdoom_episode(
         raise RuntimeError("summoned-monster comparison requires vizdoom") from exc
 
     game = vzd.DoomGame()
-    config_directory = tempfile.TemporaryDirectory(prefix="env_doom_turbo_torch-vizdoom-monster-")
+    config_directory = tempfile.TemporaryDirectory(prefix="gradoom-vizdoom-monster-")
     game.load_config(str(config))
     game.set_doom_config_path(str(Path(config_directory.name) / "engine.ini"))
     game.set_window_visible(False)
@@ -288,7 +288,7 @@ def _initialize_monsters(
     engine._initialize_enemy_spawn_cuda(enemy_type, spawn, slot, x, y, angle)
     rows = torch.arange(engine.num_envs, device=engine.device)
     # The reference snapshot is captured after the summon command has already
-    # advanced two tics.  env-Doom-turbo-torch's spawn helper stores the first A_Look
+    # advanced two tics.  env-GraDOOM-turbo-torch's spawn helper stores the first A_Look
     # transition as a check-before-decrement countdown, so one less than the
     # observed DECORATE state tic count represents the same next action tic.
     engine.enemy_move_cooldown[rows, slot] = torch.clamp_min(
@@ -312,7 +312,7 @@ def _initialize_monsters(
     )
 
 
-def _run_env_doom_turbo_torch(
+def _run_gradoom(
     *,
     scenario_path: Path,
     iwad: Path,
@@ -482,37 +482,37 @@ def _outcome_values(records: Sequence[Mapping[str, Any]]) -> dict[str, list[floa
 
 def _distribution_comparison(
     reference: Sequence[Mapping[str, Any]],
-    env_doom_turbo_torch: Sequence[Mapping[str, Any]],
+    gradoom: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
     """Report unpaired provider deltas; trajectories intentionally need not align."""
 
     reference_values = _outcome_values(reference)
-    env_doom_turbo_torch_values = _outcome_values(env_doom_turbo_torch)
+    gradoom_values = _outcome_values(gradoom)
     comparison: dict[str, Any] = {}
     for name in reference_values:
         reference_summary = _normal_summary(reference_values[name])
-        env_doom_turbo_torch_summary = _normal_summary(env_doom_turbo_torch_values[name])
+        gradoom_summary = _normal_summary(gradoom_values[name])
         reference_mean = reference_summary["mean"]
-        env_doom_turbo_torch_mean = env_doom_turbo_torch_summary["mean"]
+        gradoom_mean = gradoom_summary["mean"]
         reference_error = reference_summary["standard_error"]
-        env_doom_turbo_torch_error = env_doom_turbo_torch_summary["standard_error"]
-        if reference_mean is None or env_doom_turbo_torch_mean is None:
+        gradoom_error = gradoom_summary["standard_error"]
+        if reference_mean is None or gradoom_mean is None:
             delta = None
             delta_error = None
             interval = None
         else:
-            delta = env_doom_turbo_torch_mean - reference_mean
-            if reference_error is None or env_doom_turbo_torch_error is None:
+            delta = gradoom_mean - reference_mean
+            if reference_error is None or gradoom_error is None:
                 delta_error = None
                 interval = None
             else:
-                delta_error = math.hypot(reference_error, env_doom_turbo_torch_error)
+                delta_error = math.hypot(reference_error, gradoom_error)
                 interval = [delta - 1.96 * delta_error, delta + 1.96 * delta_error]
         comparison[name] = {
-            "env_doom_turbo_torch": env_doom_turbo_torch_summary,
-            "env_doom_turbo_torch_minus_reference": delta,
-            "env_doom_turbo_torch_minus_reference_normal_95_ci": interval,
-            "env_doom_turbo_torch_minus_reference_standard_error": delta_error,
+            "gradoom": gradoom_summary,
+            "gradoom_minus_reference": delta,
+            "gradoom_minus_reference_normal_95_ci": interval,
+            "gradoom_minus_reference_standard_error": delta_error,
             "reference": reference_summary,
         }
     return comparison
@@ -583,7 +583,7 @@ def main() -> int:
                         game_seeds,
                     )
                 )
-            env_doom_turbo_torch = _run_env_doom_turbo_torch(
+            gradoom = _run_gradoom(
                 scenario_path=scenario,
                 iwad=iwad,
                 reference=reference,
@@ -596,10 +596,10 @@ def main() -> int:
                 {
                     "class": monster_name,
                     "distribution_comparison": _distribution_comparison(
-                        reference, env_doom_turbo_torch
+                        reference, gradoom
                     ),
                     "program": program,
-                    "env_doom_turbo_torch": _summary(env_doom_turbo_torch),
+                    "gradoom": _summary(gradoom),
                     "reference": _summary(reference),
                 }
             )
@@ -608,7 +608,7 @@ def main() -> int:
         "episodes": args.episodes,
         "frame_skip": args.frame_skip,
         "results": results,
-        "schema": "env_doom_turbo_torch.summoned-monster-outcomes.v5",
+        "schema": "gradoom.summoned-monster-outcomes.v5",
         "seed": args.seed,
     }
     serialized = json.dumps(result, indent=2, sort_keys=True)

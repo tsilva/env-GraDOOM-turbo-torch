@@ -12,7 +12,7 @@ Before every task in this repository, use the `$specs-author` skill to read the 
 
 ### Issue tracker
 
-Issues and specs are tracked in GitHub Issues for `tsilva/env-Doom-turbo-torch`. See `docs/agents/issue-tracker.md`.
+Issues and specs are tracked in GitHub Issues for `tsilva/env-GraDOOM-turbo-torch`. See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 

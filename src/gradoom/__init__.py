@@ -8,19 +8,19 @@ from .actions import DEATHMATCH_ACTIONS, DEATHMATCH_BUTTONS
 from .env import (
     DeviceAutoResetTransition,
     DeviceTransition,
-    EnvDoomTurboTorchVecEnv,
+    GraDoomVecEnv,
     scenario_buttons,
 )
 from .scenario import CompiledScenario, compile_deathmatch_scenario
 
-GYMNASIUM_ENV_ID = "EnvDoomTurboTorch-v0"
-_GYMNASIUM_VECTOR_ENTRY_POINT = "env_doom_turbo_torch:_make_gymnasium_vec_env"
+GYMNASIUM_ENV_ID = "GraDOOM-v0"
+_GYMNASIUM_VECTOR_ENTRY_POINT = "gradoom:_make_gymnasium_vec_env"
 
 
 def _make_gymnasium_vec_env(
     *, game: str, num_envs: int = 1, **kwargs: Any
-) -> EnvDoomTurboTorchVecEnv:
-    return EnvDoomTurboTorchVecEnv(game=game, num_envs=num_envs, **kwargs)
+) -> GraDoomVecEnv:
+    return GraDoomVecEnv(game=game, num_envs=num_envs, **kwargs)
 
 
 def _register_gymnasium_env() -> None:
@@ -55,7 +55,7 @@ __all__ = [
     "CompiledScenario",
     "DeviceAutoResetTransition",
     "DeviceTransition",
-    "EnvDoomTurboTorchVecEnv",
+    "GraDoomVecEnv",
     "compile_deathmatch_scenario",
     "scenario_buttons",
 ]

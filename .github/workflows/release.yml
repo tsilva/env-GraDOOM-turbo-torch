@@ -98,7 +98,7 @@ jobs:
     runs-on: ubuntu-24.04
     environment:
       name: pypi
-      url: https://pypi.org/p/env-doom-turbo-torch
+      url: https://pypi.org/p/env-gradoom-turbo-torch
     permissions:
       id-token: write
     steps:

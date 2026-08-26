@@ -1,4 +1,4 @@
-"""Stream one env-Doom-turbo-torch deathmatch lane to a remote keyboard player.
+"""Stream one env-GraDOOM-turbo-torch deathmatch lane to a remote keyboard player.
 
 The server steps the environment on its own real-time clock, replaying one
 CUDA-graphed step+reset transaction per Doom tic, and pushes zlib-compressed
@@ -28,9 +28,9 @@ from typing import Any
 
 import torch
 
-from env_doom_turbo_torch import EnvDoomTurboTorchVecEnv
-from env_doom_turbo_torch.actions import DEATHMATCH_HUMAN_ACTIONS
-from env_doom_turbo_torch.engine import DEVICE_SIGNAL_NAMES
+from gradoom import GraDoomVecEnv
+from gradoom.actions import DEATHMATCH_HUMAN_ACTIONS
+from gradoom.engine import DEVICE_SIGNAL_NAMES
 
 _REQUEST = struct.Struct("!BBB")
 _FLAG_RESET = 0x01
@@ -332,7 +332,7 @@ def _nonnegative_float(value: str) -> float:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Stream env-Doom-turbo-torch's deathmatch-p1-v1 environment "
+            "Stream env-GraDOOM-turbo-torch's deathmatch-p1-v1 environment "
             "to a remote player."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -340,12 +340,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--iwad",
         type=Path,
-        help="Doom II or Freedoom IWAD (or set ENV_DOOM_TURBO_TORCH_IWAD)",
+        help="Doom II or Freedoom IWAD (or set GRADOOM_IWAD)",
     )
     parser.add_argument(
         "--scenario",
         type=Path,
-        help="ViZDoom deathmatch.wad (or set ENV_DOOM_TURBO_TORCH_DEATHMATCH_WAD)",
+        help="ViZDoom deathmatch.wad (or set GRADOOM_DEATHMATCH_WAD)",
     )
     parser.add_argument("--device", help="Torch device; defaults to CUDA when available")
     parser.add_argument("--seed", type=int, default=0, help="initial episode seed")
@@ -379,13 +379,13 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _create_env(args: argparse.Namespace) -> EnvDoomTurboTorchVecEnv:
+def _create_env(args: argparse.Namespace) -> GraDoomVecEnv:
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     compile_engine = args.compile_engine
     if compile_engine and not device.startswith("cuda"):
         print("CUDA unavailable; --no-compile-engine is implied", flush=True)
         compile_engine = False
-    return EnvDoomTurboTorchVecEnv(
+    return GraDoomVecEnv(
         game="VizdoomDeathmatch-v1",
         scenario=args.scenario,
         rom_path=None if args.iwad is None else str(args.iwad),
@@ -414,7 +414,7 @@ def _create_env(args: argparse.Namespace) -> EnvDoomTurboTorchVecEnv:
     )
 
 
-def _warm_up(env: EnvDoomTurboTorchVecEnv) -> None:
+def _warm_up(env: GraDoomVecEnv) -> None:
     """Pay the one-time compile/capture cost before the first client connects."""
 
     if env.engine_backend != "torch-compiled-cudagraph":
@@ -433,21 +433,21 @@ def _warm_up(env: EnvDoomTurboTorchVecEnv) -> None:
     print(f"warmup done in {time.monotonic() - start:.0f}s", flush=True)
 
 
-def _reset_lane(env: EnvDoomTurboTorchVecEnv, seed: int) -> list[float]:
+def _reset_lane(env: GraDoomVecEnv, seed: int) -> list[float]:
     mask = torch.ones(1, device=env.device, dtype=torch.bool)
     seeds = torch.tensor([seed], device=env.device, dtype=torch.int64)
     _, signals = env.reset_device(mask, seeds)
     return signals[0].detach().to("cpu").tolist()
 
 
-def _render_frame(env: EnvDoomTurboTorchVecEnv) -> Any:
+def _render_frame(env: GraDoomVecEnv) -> Any:
     frame = env.render()
     if frame is None:  # pragma: no cover - explicit render mode invariant
         raise RuntimeError("rgb_array rendering did not produce a frame")
     return frame
 
 
-def _stream_encoding(env: EnvDoomTurboTorchVecEnv) -> tuple[str, list[int] | None]:
+def _stream_encoding(env: GraDoomVecEnv) -> tuple[str, list[int] | None]:
     """Pick the frame encoding: palette-indexed unless screen flashes are on.
 
     Doom renders to an 8-bit PLAYPAL-indexed framebuffer; streaming those
@@ -461,7 +461,7 @@ def _stream_encoding(env: EnvDoomTurboTorchVecEnv) -> tuple[str, list[int] | Non
     return "zlib-indexed", palette
 
 
-def _render_frame_bytes(env: EnvDoomTurboTorchVecEnv, indexed: bool) -> tuple[bytes, int, int, int]:
+def _render_frame_bytes(env: GraDoomVecEnv, indexed: bool) -> tuple[bytes, int, int, int]:
     """Render the current frame; return (pixels, width, height, channels)."""
 
     if indexed:
@@ -473,7 +473,7 @@ def _render_frame_bytes(env: EnvDoomTurboTorchVecEnv, indexed: bool) -> tuple[by
 
 
 def _serve_connection(
-    env: EnvDoomTurboTorchVecEnv,
+    env: GraDoomVecEnv,
     connection: socket.socket,
     seed: int,
     metrics_interval: float,
@@ -583,7 +583,7 @@ def main(argv: list[str] | None = None) -> int:
             listener.bind((args.bind, args.port))
             listener.listen(1)
             print(
-                f"env-Doom-turbo-torch stream server listening on {args.bind}:{args.port}",
+                f"env-GraDOOM-turbo-torch stream server listening on {args.bind}:{args.port}",
                 flush=True,
             )
             seed = args.seed

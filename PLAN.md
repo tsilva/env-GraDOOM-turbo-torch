@@ -21,7 +21,7 @@ An environment is **supported** after its exact identifier or configuration pass
 
 ## Runtime design
 
-Keep the public `EnvDoomTurboTorchVecEnv` interface small. Put scenario variability behind these deep modules:
+Keep the public `GraDoomVecEnv` interface small. Put scenario variability behind these deep modules:
 
 | Module | Interface | Implementation hidden behind the seam |
 | --- | --- | --- |

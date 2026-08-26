@@ -9,16 +9,16 @@ import numpy as np
 import pytest
 import torch
 
-from env_doom_turbo_torch.engine import TorchDeathmatchEngine
-from env_doom_turbo_torch.scenario import compile_deathmatch_scenario
+from gradoom.engine import TorchDeathmatchEngine
+from gradoom.scenario import compile_deathmatch_scenario
 
 SCENARIO = Path(
     os.environ.get(
-        "ENV_DOOM_TURBO_TORCH_DEATHMATCH_WAD",
+        "GRADOOM_DEATHMATCH_WAD",
         Path(__file__).resolve().parents[2] / "env-ViZDoom-turbo/scenarios/deathmatch.wad",
     )
 )
-DOOM2 = Path(os.environ.get("ENV_DOOM_TURBO_TORCH_IWAD", "/Users/tsilva/roms/vizdoom/doom2.wad"))
+DOOM2 = Path(os.environ.get("GRADOOM_IWAD", "/Users/tsilva/roms/vizdoom/doom2.wad"))
 
 
 @pytest.fixture(scope="module")
@@ -111,7 +111,7 @@ def test_approximate_renderer_draws_front_side_of_one_sided_wall(square_scenario
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 def test_cuda_policy_preprocessing_matches_cpu_reference_arithmetic() -> None:
-    from env_doom_turbo_torch._triton_kernels import policy_area_grayscale
+    from gradoom._triton_kernels import policy_area_grayscale
 
     generator = torch.Generator().manual_seed(20260813)
     indexed = torch.randint(0, 256, (2, 208, 320), generator=generator, dtype=torch.uint8)
@@ -2696,7 +2696,7 @@ def test_native_transparent_sprites_reveal_fifth_farther_actor(square_scenario) 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 def test_fast_native_sprite_respects_portal_surface_depth() -> None:
-    from env_doom_turbo_torch._triton_kernels import render_fast_native_sprites_
+    from gradoom._triton_kernels import render_fast_native_sprites_
 
     device = torch.device("cuda")
     frame = torch.full((1, 208, 320), 7, dtype=torch.uint8, device=device)
@@ -2743,7 +2743,7 @@ def test_fast_native_sprite_respects_portal_surface_depth() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 def test_fast_native_transparent_foreground_reveals_farther_actor() -> None:
-    from env_doom_turbo_torch._triton_kernels import render_fast_native_sprites_
+    from gradoom._triton_kernels import render_fast_native_sprites_
 
     device = torch.device("cuda")
     frame = torch.full((1, 208, 320), 7, dtype=torch.uint8, device=device)
@@ -2793,7 +2793,7 @@ def test_fast_native_transparent_foreground_reveals_farther_actor() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 def test_fast_native_sprite_applies_reference_render_styles() -> None:
-    from env_doom_turbo_torch._triton_kernels import render_fast_native_sprites_
+    from gradoom._triton_kernels import render_fast_native_sprites_
 
     device = torch.device("cuda")
     lanes = 4
