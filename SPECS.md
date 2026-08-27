@@ -7,6 +7,7 @@
 ### Training performance
 
 - The primary training benchmark must measure reusable wall-clock time to reach a mean `player_killcount` of at least 30 over 100 predeclared held-out GraDOOM episodes on the parity-certified Freedoom2 deathmatch profile.
+- The repository must provide a lightweight development benchmark that uses the same training path, timing boundaries, held-out evaluation, and evidence format as the primary benchmark but may use fewer predeclared seeds and a shorter failure budget; its results must be labeled non-authoritative and cannot support public performance claims.
 - Each training benchmark must use five predeclared cold-start seeds with freshly initialized policy and optimizer state, report every outcome without replacement, and require at least four seeds to reach the quality threshold.
 - Reusable-run timing must include every recurring action performed by the documented training command, including initialization, per-process or uncached compilation, warm-up, checkpoint evaluation, and checkpoint writing, and must stop at the first passing checkpoint or the predeclared failure budget.
 - Only run-independent bootstrap artifacts that persist and are reused unchanged across repeated runs may be excluded from reusable-run timing; their contents, hashes, creation costs, and reuse conditions must be disclosed.
