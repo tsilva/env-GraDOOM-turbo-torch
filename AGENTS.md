@@ -14,6 +14,8 @@ Before every task in this repository, use the `$specs-author` skill to read the 
 
 Issues and specs are tracked in GitHub Issues for `tsilva/env-GraDOOM-turbo-torch`. See `docs/agents/issue-tracker.md`.
 
+For explicit AFK implementation of an approved root issue and its child issue graph, use `$codex-issue-orchestrate`. Start with `--dry-run`; the skill uses isolated worktrees, reviewed child PRs into a specification integration branch, and a final PR for human review.
+
 ### Triage labels
 
 Use the canonical `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, and `wontfix` labels. See `docs/agents/triage-labels.md`.
