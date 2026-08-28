@@ -35,12 +35,15 @@ def _parser() -> argparse.ArgumentParser:
 def _write_report(path: Path, report: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        payload = json.dumps(
-            report,
-            allow_nan=False,
-            indent=2,
-            sort_keys=True,
-        ) + "\n"
+        payload = (
+            json.dumps(
+                report,
+                allow_nan=False,
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
+        )
     except (RecursionError, ValueError) as error:
         raise EvidenceError("report cannot be encoded as standard JSON") from error
     descriptor, temporary_name = tempfile.mkstemp(
@@ -92,9 +95,27 @@ def _validate_output_path(
             base_directory=manifest_directory,
         )
         if _paths_alias(resolved_output, resolved_input):
-            raise EvidenceError(
-                f"output path aliases declared input {declared_input['name']!r}"
-            )
+            raise EvidenceError(f"output path aliases declared input {declared_input['name']!r}")
+
+    wad_profile = report.get("wad_profile")
+    if isinstance(wad_profile, dict):
+        providers = wad_profile.get("providers")
+        assert isinstance(providers, list)
+        for provider in providers:
+            assert isinstance(provider, dict)
+            for asset_name in ("iwad", "pwad"):
+                asset = provider[asset_name]
+                assert isinstance(asset, dict)
+                raw_path = asset.get("path")
+                if not isinstance(raw_path, str) or not raw_path.strip():
+                    continue
+                resolved_asset = _resolve_evidence_path(
+                    Path(raw_path),
+                    base_directory=manifest_directory,
+                )
+                if _paths_alias(resolved_output, resolved_asset):
+                    asset_id = f"{provider['id']}.{asset_name}"
+                    raise EvidenceError(f"output path aliases WAD profile asset {asset_id!r}")
 
     if merge_path is not None:
         resolved_merge = _resolve_evidence_path(
@@ -130,6 +151,21 @@ def main(argv: list[str] | None = None) -> int:
                 report["run_identity"],
                 expected_manifest_sha256=manifest_entry["sha256"],
                 manifest_directory=args.manifest.parent,
+                expected_wad_profile=report.get("wad_profile"),
+                expected_evidence_entries=[
+                    entry
+                    for entry in entries
+                    if isinstance(entry, dict)
+                    and entry.get("name")
+                    not in {
+                        "manifest",
+                        *(
+                            item["name"]
+                            for item in report["declared_inputs"]
+                            if isinstance(item, dict)
+                        ),
+                    }
+                ],
             )
         _write_report(args.output, report)
     except (EvidenceError, OSError) as error:
