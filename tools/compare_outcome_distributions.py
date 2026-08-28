@@ -105,8 +105,18 @@ def _align_poses(engine: TorchDeathmatchEngine, infos: dict[str, Any]) -> None:
 def _summary(records: Sequence[dict[str, Any]]) -> dict[str, float | int]:
     summary: dict[str, float | int] = {
         "episodes": len(records),
-        "kills_mean": statistics.fmean(float(record["kills"]) for record in records),
-        "kills_median": statistics.median(float(record["kills"]) for record in records),
+        "player_killcount_mean": statistics.fmean(
+            float(record["player_killcount"]) for record in records
+        ),
+        "player_killcount_median": statistics.median(
+            float(record["player_killcount"]) for record in records
+        ),
+        "compatibility_killcount_mean": statistics.fmean(
+            float(record["compatibility_killcount"]) for record in records
+        ),
+        "compatibility_killcount_median": statistics.median(
+            float(record["compatibility_killcount"]) for record in records
+        ),
         "length_mean": statistics.fmean(float(record["length"]) for record in records),
         "return_mean": statistics.fmean(float(record["return"]) for record in records),
         "terminated_rate": statistics.fmean(float(record["terminated"]) for record in records),
@@ -162,7 +172,8 @@ def _outcome_values(records: Sequence[Mapping[str, Any]]) -> dict[str, list[floa
     values = {
         name: [float(record[name]) for record in records]
         for name in (
-            "kills",
+            "player_killcount",
+            "compatibility_killcount",
             "length",
             "return",
             "terminated",
@@ -368,7 +379,6 @@ def main() -> int:
                         "damagecount": float(np.asarray(step_infos["damagecount"])[lane]),
                         "hits_taken": float(np.asarray(step_infos["hits_taken"])[lane]),
                         "damage_taken": float(np.asarray(step_infos["damage_taken"])[lane]),
-                        "kills": kill_signals["compatibility_killcount"],
                         **kill_signals,
                         "length": decision + 1,
                         "return": float(reference_returns[lane]),
@@ -420,7 +430,6 @@ def main() -> int:
                         "damagecount": float(engine.player_damagecount[lane]),
                         "hits_taken": float(engine.player_hits_taken[lane]),
                         "damage_taken": float(engine.player_damage_taken[lane]),
-                        "kills": float(engine.killcount[lane]),
                         "player_killcount": float(engine.player_killcount[lane]),
                         "compatibility_killcount": float(engine.killcount[lane]),
                         "length": decision + 1,
@@ -458,7 +467,7 @@ def main() -> int:
         "num_envs": args.num_envs,
         "results": results,
         "reference_provider_revision": provider.revision,
-        "schema": "gradoom.outcome-distributions.aligned-pose.v2",
+        "schema": "gradoom.outcome-distributions.aligned-pose.v3",
         "seed": args.seed,
     }
     serialized = json.dumps(result, sort_keys=True)

@@ -8,10 +8,20 @@ def test_policy_execution_identity_forbids_provider_specific_modifications() -> 
 
     gradoom = policy_execution_identity(
         artifact_sha256=artifact_sha256,
+        model_runtime_contract={
+            "architecture": "nature-quarter",
+            "compile_policy": False,
+            "precision": "fp32",
+        },
         stochastic_actions=True,
     )
     reference = policy_execution_identity(
         artifact_sha256=artifact_sha256,
+        model_runtime_contract={
+            "architecture": "nature-quarter",
+            "compile_policy": False,
+            "precision": "fp32",
+        },
         stochastic_actions=True,
     )
 
@@ -20,6 +30,11 @@ def test_policy_execution_identity_forbids_provider_specific_modifications() -> 
         == reference
         == {
             "artifact_sha256": artifact_sha256,
+            "model_runtime_contract": {
+                "architecture": "nature-quarter",
+                "compile_policy": False,
+                "precision": "fp32",
+            },
             "preprocessing_sha256": (
                 "6ff033ce02585302f78e84c16f6a86da99690e0d861092cab41e55b4257e08d0"
             ),

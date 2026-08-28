@@ -16,9 +16,17 @@ sys.modules[_TOOL_SPEC.name] = tool
 _TOOL_SPEC.loader.exec_module(tool)
 
 
-def _record(value: float, *, length: int = 100) -> dict[str, float | int | bool]:
+def _record(
+    value: float,
+    *,
+    compatibility_killcount: float | None = None,
+    length: int = 100,
+) -> dict[str, float | int | bool]:
     return {
-        "kills": value,
+        "player_killcount": value,
+        "compatibility_killcount": (
+            value if compatibility_killcount is None else compatibility_killcount
+        ),
         "length": length,
         "return": value,
         "terminated": bool(value),
@@ -58,6 +66,21 @@ def test_distribution_comparison_uses_independent_provider_uncertainty() -> None
     assert rate["gradoom_minus_vizdoom"] == 20.0
     assert rate["vizdoom"]["count"] == 2
     assert rate["gradoom"]["count"] == 2
+
+
+def test_player_killcount_is_the_quality_distribution_and_compatibility_is_separate() -> None:
+    reference = [_record(1.0, compatibility_killcount=101.0)]
+    gradoom = [_record(3.0, compatibility_killcount=2.0)]
+
+    comparison = tool._distribution_comparison(reference, gradoom)
+    reference_summary = tool._summary(reference)
+
+    assert "kills" not in comparison
+    assert comparison["player_killcount"]["gradoom_minus_vizdoom"] == 2.0
+    assert comparison["compatibility_killcount"]["gradoom_minus_vizdoom"] == -99.0
+    assert "kills_mean" not in reference_summary
+    assert reference_summary["player_killcount_mean"] == 1.0
+    assert reference_summary["compatibility_killcount_mean"] == 101.0
 
 
 def test_retained_diagnostic_requests_player_attributed_kills_too() -> None:

@@ -4,6 +4,8 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import torch
+
 _TOOL_PATH = Path(__file__).parents[1] / "tools" / "evaluate_vizdoom_checkpoint.py"
 _TOOL_SPEC = importlib.util.spec_from_file_location("vizdoom_checkpoint_eval", _TOOL_PATH)
 assert _TOOL_SPEC is not None and _TOOL_SPEC.loader is not None
@@ -64,3 +66,55 @@ def test_reference_contract_explicitly_requests_both_kill_signals() -> None:
     assert "killcount" in game_variables
     assert "player_killcount" in game_variables
     assert "player_killcount" in info_signals
+
+
+def test_checkpoint_execution_uses_frozen_non_default_model_and_runtime_contract(
+    tmp_path: Path,
+) -> None:
+    train = tool._load_standalone_train()
+    source = train.NatureActorCritic("nature-quarter", "channels-last", 3)
+    checkpoint = tmp_path / "quarter-policy.pt"
+    torch.save(
+        {
+            "format": "standalone-gradoom-ppo-v1",
+            "policy_state_dict": source.state_dict(),
+            "config": {
+                "effective_recipe": {
+                    "compile_policy": False,
+                    "float32_matmul_precision": "highest",
+                    "precision": "fp32",
+                },
+                "policy_model": {
+                    "architecture": "nature-quarter",
+                    "memory_format": "channels-last",
+                    "observation_blur_kernel": 3,
+                    "frozen_encoder_custom_conv": False,
+                },
+            },
+        },
+        checkpoint,
+    )
+
+    loaded, policy, calls, precision = tool._load_checkpoint_execution(
+        checkpoint,
+        train,
+        torch.device("cpu"),
+    )
+
+    assert loaded.contract.as_dict() == {
+        "architecture": "nature-quarter",
+        "memory_format": "channels-last",
+        "observation_blur_kernel": 3,
+        "frozen_encoder_custom_conv": False,
+        "precision": "fp32",
+        "compile_policy": False,
+        "float32_matmul_precision": "highest",
+    }
+    assert (
+        policy.observation_feature_count
+        == train.POLICY_ARCHITECTURES["nature-quarter"].observation_features
+    )
+    assert policy.channels_last is True
+    assert policy.observation_blur_kernel == 3
+    assert calls.act.__self__ is policy
+    assert precision.name == "fp32"

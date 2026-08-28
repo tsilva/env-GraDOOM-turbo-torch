@@ -91,9 +91,13 @@ Missing `player_killcount` is an error: it never falls back to compatibility `ki
 Episode records name `player_killcount` as the policy-quality outcome and retain
 `compatibility_killcount` only as a separate diagnostic. GraDOOM and reference checkpoint reports
 also record one provider-neutral execution identity containing the unchanged artifact hash,
-certified preprocessing hash, stochastic or diagnostic argmax action mode, and an empty list of
-provider-specific modifications. The adapter does not offer observation correction, action
-remapping, fine-tuning, or learned adaptation hooks.
+checkpoint-frozen model/runtime contract, certified preprocessing hash, stochastic or diagnostic
+argmax action mode, and an empty list of provider-specific modifications. Both providers load the
+architecture, memory format, observation blur, frozen-encoder convolution mode, precision, policy
+compilation, and float32 matrix-multiplication mode from the checkpoint rather than evaluator
+defaults. The artifact is hashed before and after loading so a concurrently changed checkpoint is
+rejected. The adapter does not offer observation correction, action remapping, fine-tuning, or
+learned adaptation hooks.
 
 ## Report schema version 1
 

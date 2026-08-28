@@ -21,6 +21,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from gradoom.evidence.checkpoint_policy import LoadedPolicyCheckpoint, load_policy_checkpoint
 from gradoom.evidence.policy_execution import policy_execution_identity
 from gradoom.evidence.reference_provider import load_reference_provider
 
@@ -85,11 +86,6 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-envs", type=int, default=DEFAULT_NUM_ENVS)
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--metrics-jsonl", type=Path)
-    parser.add_argument(
-        "--compile-policy",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
     parser.add_argument(
         "--stochastic-actions",
         action=argparse.BooleanOptionalAction,
@@ -215,6 +211,16 @@ def _summary(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     return summary
 
 
+def _load_checkpoint_execution(
+    checkpoint: Path,
+    train: ModuleType,
+    device: torch.device,
+) -> tuple[LoadedPolicyCheckpoint, Any, Any, Any]:
+    loaded = load_policy_checkpoint(checkpoint, map_location=device)
+    policy, calls, precision = train._bind_checkpoint_policy(loaded, device)
+    return loaded, policy, calls, precision
+
+
 def _evaluate(args: argparse.Namespace, train: ModuleType) -> dict[str, Any]:
     provider = load_reference_provider()
     if not torch.cuda.is_available():
@@ -279,31 +285,11 @@ def _evaluate(args: argparse.Namespace, train: ModuleType) -> dict[str, Any]:
     try:
         if tuple(env.action_table or ()) != train.RESTRICTED_ACTIONS:
             raise RuntimeError("reference action table differs from checkpoint contract")
-        loaded = torch.load(args.checkpoint, map_location=device, weights_only=False)
-        if not isinstance(loaded, Mapping) or loaded.get("format") != "standalone-gradoom-ppo-v1":
-            raise ValueError(f"unsupported standalone checkpoint: {args.checkpoint}")
-        checkpoint_config = loaded.get("config", {})
-        effective_recipe = (
-            checkpoint_config.get("effective_recipe", {})
-            if isinstance(checkpoint_config, Mapping)
-            else {}
+        loaded, _policy, calls, precision = _load_checkpoint_execution(
+            args.checkpoint,
+            train,
+            device,
         )
-        observation_invariance = (
-            checkpoint_config.get("observation_invariance", {})
-            if isinstance(checkpoint_config, Mapping)
-            else {}
-        )
-        observation_blur_kernel = int(
-            effective_recipe.get(
-                "observation_blur_kernel",
-                observation_invariance.get("observation_blur_kernel", 1),
-            )
-        )
-        policy = train.NatureActorCritic(observation_blur_kernel=observation_blur_kernel).to(device)
-        policy.load_state_dict(loaded["policy_state_dict"])
-        policy.eval()
-        calls = train.PolicyCalls(policy, compile_policy=bool(args.compile_policy))
-        precision = train.Precision("fp32", device)
         context_encoder = train.CombatContextEncoder(train.MODEL_HISTORY_SIGNALS, device)
 
         episode_indices = np.zeros(num_envs, dtype=np.int64)
@@ -481,7 +467,7 @@ def _evaluate(args: argparse.Namespace, train: ModuleType) -> dict[str, Any]:
         ]
         torch.cuda.synchronize(device)
         evaluation_seconds = time.perf_counter() - started
-        checkpoint_sha256 = train._file_sha256(args.checkpoint)
+        checkpoint_sha256 = loaded.artifact_sha256
         return {
             "type": "evaluation",
             "status": "completed",
@@ -489,8 +475,8 @@ def _evaluate(args: argparse.Namespace, train: ModuleType) -> dict[str, Any]:
             "action_sampling": "stochastic" if args.stochastic_actions else "argmax",
             "checkpoint": str(args.checkpoint),
             "checkpoint_sha256": checkpoint_sha256,
-            "checkpoint_step": int(loaded.get("step", 0)),
-            "checkpoint_config": loaded.get("config"),
+            "checkpoint_step": int(loaded.payload.get("step", 0)),
+            "checkpoint_config": loaded.payload.get("config"),
             "episodes": records,
             "episode_quotas": list(quotas),
             "evaluation_seed": int(args.seed),
@@ -499,6 +485,7 @@ def _evaluate(args: argparse.Namespace, train: ModuleType) -> dict[str, Any]:
             "deterministic_actions": not bool(args.stochastic_actions),
             "policy_execution": policy_execution_identity(
                 artifact_sha256=checkpoint_sha256,
+                model_runtime_contract=loaded.contract.as_dict(),
                 stochastic_actions=bool(args.stochastic_actions),
             ),
             "survival_diagnostics": bool(args.include_survival_diagnostics),
