@@ -591,6 +591,7 @@ def build_readiness_report(manifest_path: Path) -> dict[str, Any]:
             declared_inputs=declared_inputs,
             fixture=manifest["fixture"],
             gradoom_revision=code_provenance["revision"],
+            wad_profile=wad_profile,
         )
     except InvariantSuiteError as error:
         raise EvidenceError(str(error)) from error

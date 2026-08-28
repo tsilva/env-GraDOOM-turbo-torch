@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import secrets
 import subprocess
 import sys
@@ -274,6 +275,167 @@ def _execute_runner(
     )
 
 
+def _resolved_declared_input(
+    name: object,
+    *,
+    field: str,
+    declared_inputs: list[dict[str, Any]],
+    base_directory: Path,
+) -> Path:
+    input_name = _required_string(name, field)
+    matches = [item for item in declared_inputs if item["name"] == input_name]
+    if len(matches) != 1:
+        raise InvariantSuiteError(f"{field} {input_name!r} is not a declared input")
+    path = Path(matches[0]["path"])
+    return (base_directory / path if not path.is_absolute() else path).resolve()
+
+
+def _validated_semantic_probes(value: object) -> dict[str, Any]:
+    expected = {
+        "termination",
+        "truncation",
+        "player_killcount",
+        "player_killcount.enemy_on_enemy_exclusion",
+    }
+    if not isinstance(value, dict) or set(value) != expected:
+        raise InvariantSuiteError(
+            "invariant_suite.real_configuration.semantic_probes must declare every "
+            "required lifecycle and kill probe"
+        )
+    result: dict[str, Any] = {}
+    for behavior in sorted(expected):
+        probe = value[behavior]
+        field = f"invariant_suite.real_configuration.semantic_probes.{behavior}"
+        if not isinstance(probe, dict) or set(probe) != {"seeds", "actions", "max_steps"}:
+            raise InvariantSuiteError(f"{field} has invalid fields")
+        seeds = probe["seeds"]
+        if (
+            not isinstance(seeds, list)
+            or len(seeds) != 2
+            or any(type(seed) is not int or not 0 <= seed <= 0xFFFFFFFF for seed in seeds)
+        ):
+            raise InvariantSuiteError(f"{field}.seeds must contain two uint32 values")
+        actions = probe["actions"]
+        if (
+            not isinstance(actions, list)
+            or not actions
+            or any(
+                not isinstance(row, list)
+                or len(row) != 2
+                or any(
+                    type(action) is not int or not 0 <= action < len(DEATHMATCH_ACTION_MEANINGS)
+                    for action in row
+                )
+                for row in actions
+            )
+        ):
+            raise InvariantSuiteError(
+                f"{field}.actions must contain two-lane rows of pinned action indices"
+            )
+        max_steps = probe["max_steps"]
+        if type(max_steps) is not int or not 1 <= max_steps <= 100_000:
+            raise InvariantSuiteError(f"{field}.max_steps must be in [1, 100000]")
+        result[behavior] = {"seeds": seeds, "actions": actions, "max_steps": max_steps}
+    return result
+
+
+def _prepare_real_configuration(
+    value: object,
+    *,
+    declared_inputs: list[dict[str, Any]],
+    base_directory: Path,
+    wad_profile: dict[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {
+        "device",
+        "reference_scenario_config_input",
+        "semantic_probes",
+    }:
+        raise InvariantSuiteError(
+            "invariant_suite.real_configuration must declare device, "
+            "reference_scenario_config_input, and semantic_probes"
+        )
+    device = _required_string(value["device"], "invariant_suite.real_configuration.device")
+    if (
+        device != "cpu"
+        and device != "cuda"
+        and not (device.startswith("cuda:") and device.removeprefix("cuda:").isdigit())
+    ):
+        raise InvariantSuiteError(
+            "invariant_suite.real_configuration.device must be 'cpu', 'cuda', or 'cuda:N'"
+        )
+    reference_config = _resolved_declared_input(
+        value["reference_scenario_config_input"],
+        field="invariant_suite.real_configuration.reference_scenario_config_input",
+        declared_inputs=declared_inputs,
+        base_directory=base_directory,
+    )
+    if not reference_config.is_file():
+        raise InvariantSuiteError("reference scenario configuration is unavailable")
+    raw_providers = wad_profile.get("providers")
+    if not isinstance(raw_providers, list):
+        raise InvariantSuiteError("matched wad_profile is missing provider bindings")
+    providers: dict[str, dict[str, Any]] = {}
+    for provider in raw_providers:
+        if not isinstance(provider, dict) or provider.get("id") not in _PROVIDER_IDS:
+            raise InvariantSuiteError("matched wad_profile has invalid provider bindings")
+        provider_id = provider["id"]
+        binding: dict[str, Any] = {"configuration": provider.get("configuration")}
+        for asset in ("iwad", "pwad"):
+            report = provider.get(asset)
+            if not isinstance(report, dict):
+                raise InvariantSuiteError("matched wad_profile has incomplete provider assets")
+            raw_path = report.get("path")
+            if not isinstance(raw_path, str):
+                raise InvariantSuiteError("matched wad_profile has incomplete provider paths")
+            path = Path(raw_path)
+            binding[f"{asset}_path"] = str(
+                (base_directory / path if not path.is_absolute() else path).resolve()
+            )
+            binding[f"{asset}_sha256"] = report.get("sha256")
+        providers[provider_id] = binding
+    if set(providers) != set(_PROVIDER_IDS):
+        raise InvariantSuiteError("matched wad_profile must bind both invariant providers")
+    reference_pwad = Path(providers["env-vizdoom-turbo"]["pwad_path"])
+    consumed_pwad = reference_config.with_name("deathmatch.wad")
+    try:
+        same_reference_pwad = consumed_pwad.samefile(reference_pwad)
+    except OSError:
+        same_reference_pwad = False
+    if not same_reference_pwad:
+        raise InvariantSuiteError(
+            "reference scenario configuration must consume the validated reference PWAD"
+        )
+    profile_configuration = providers["env-vizdoom-turbo"]["configuration"]
+    if not isinstance(profile_configuration, dict):
+        raise InvariantSuiteError("matched wad_profile has invalid reference configuration")
+    assignments = {
+        key.replace("_", "").casefold(): raw_value.strip().casefold()
+        for key, raw_value in re.findall(
+            r"(?m)^\s*([A-Za-z_]+)\s*=\s*([^#\r\n{]+)",
+            reference_config.read_text(encoding="utf-8"),
+        )
+    }
+    scenario = profile_configuration["scenario"]
+    expected_assignments = {
+        "doomscenariopath": "deathmatch.wad",
+        "screenresolution": "res_" + "x".join(map(str, scenario["screen_resolution"])),
+        "episodestarttime": str(scenario["episode_start_time"]),
+        "mode": str(scenario["mode"]).casefold(),
+    }
+    if any(assignments.get(key) != expected for key, expected in expected_assignments.items()):
+        raise InvariantSuiteError(
+            "reference scenario configuration does not match the validated scenario binding"
+        )
+    return {
+        "device": device,
+        "reference_scenario_config_path": str(reference_config),
+        "semantic_probes": _validated_semantic_probes(value["semantic_probes"]),
+        "wad_binding_sha256": wad_profile.get("binding_sha256"),
+        "providers": providers,
+    }
+
+
 def _descriptor(value: object, *, shape: list[int], dtype: str) -> bool:
     return (
         isinstance(value, dict)
@@ -296,6 +458,15 @@ def _constructor_valid(value: object) -> bool:
 
 
 def _common_value(behavior: str, value: object) -> object:
+    if behavior == "player_killcount":
+        assert isinstance(value, dict)
+        return {"present": value["present"], "player_kill_observed": value["player_kill_delta"] > 0}
+    if behavior == "player_killcount.enemy_on_enemy_exclusion":
+        assert isinstance(value, dict)
+        return {
+            "enemy_on_enemy_delta": value["enemy_on_enemy_delta"],
+            "compatibility_kill_observed": value["compatibility_kill_delta"] > 0,
+        }
     if behavior in {"observation_shapes", "signal_shapes", "rewards"}:
         assert isinstance(value, dict)
 
@@ -367,6 +538,26 @@ def _valid_common_behavior(behavior: str, value: object) -> bool:
                 for item in value["sample"]
             )
         )
+    if behavior == "player_killcount":
+        return (
+            isinstance(value, dict)
+            and set(value) == {"present", "player_kill_delta"}
+            and value["present"] is True
+            and isinstance(value["player_kill_delta"], (int, float))
+            and not isinstance(value["player_kill_delta"], bool)
+            and math.isfinite(value["player_kill_delta"])
+            and value["player_kill_delta"] > 0
+        )
+    if behavior == "player_killcount.enemy_on_enemy_exclusion":
+        return (
+            isinstance(value, dict)
+            and set(value) == {"enemy_on_enemy_delta", "compatibility_kill_delta"}
+            and value["enemy_on_enemy_delta"] == 0
+            and isinstance(value["compatibility_kill_delta"], (int, float))
+            and not isinstance(value["compatibility_kill_delta"], bool)
+            and math.isfinite(value["compatibility_kill_delta"])
+            and value["compatibility_kill_delta"] > 0
+        )
     expected = {
         "reset": {"returns_observation_and_signals": True},
         "step": {"returns_five_tuple": True},
@@ -374,13 +565,14 @@ def _valid_common_behavior(behavior: str, value: object) -> bool:
         "termination": {"reported_separately": True, "requires_reset": True},
         "truncation": {"reported_separately": True, "requires_reset": True},
         "episode": {"step_before_reset_rejected": True, "autoreset": False},
-        "player_killcount": {"present": True, "player_kill_delta": 1},
-        "player_killcount.enemy_on_enemy_exclusion": {
-            "enemy_on_enemy_delta": 0,
-            "compatibility_kill_delta": 1,
-        },
     }
     return value == expected[behavior]
+
+
+def _invalid_behavior_message(provider: str, behavior: str, value: object) -> str:
+    if isinstance(value, dict) and isinstance(value.get("probe_error"), str):
+        return f"{provider} public {behavior} probe failed: {value['probe_error']}."
+    return f"{provider} public behavior is invalid for {behavior}."
 
 
 def _parse_contracts(values: list[object]) -> dict[str, dict[str, Any]]:
@@ -424,7 +616,7 @@ def _common_checks(contracts: dict[str, dict[str, Any]]) -> list[dict[str, str]]
                     "behavior": behavior,
                     "status": "failed",
                     "provider": "gradoom",
-                    "message": f"gradoom public behavior is invalid for {behavior}.",
+                    "message": _invalid_behavior_message("gradoom", behavior, first_value),
                 }
             )
         elif not _valid_common_behavior(behavior, second_value):
@@ -433,7 +625,9 @@ def _common_checks(contracts: dict[str, dict[str, Any]]) -> list[dict[str, str]]
                     "behavior": behavior,
                     "status": "failed",
                     "provider": "env-vizdoom-turbo",
-                    "message": f"env-vizdoom-turbo public behavior is invalid for {behavior}.",
+                    "message": _invalid_behavior_message(
+                        "env-vizdoom-turbo", behavior, second_value
+                    ),
                 }
             )
         elif _common_value(behavior, first_value) != _common_value(behavior, second_value):
@@ -508,7 +702,7 @@ def _gradoom_device_checks(contract: dict[str, Any]) -> list[dict[str, str]]:
     predicates = {
         "gradoom.tensor_inputs": bool(inputs),
         "gradoom.tensor_outputs": bool(outputs),
-        "gradoom.device": bool(structure),
+        "gradoom.device": bool(inputs and outputs),
     }
     return [
         {"behavior": behavior, "status": "passed"}
@@ -530,6 +724,7 @@ def run_invariant_suite(
     declared_inputs: list[dict[str, Any]],
     fixture: bool,
     gradoom_revision: str,
+    wad_profile: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if declaration is None:
         return _unconfigured_suite()
@@ -561,6 +756,8 @@ def run_invariant_suite(
         raise InvariantSuiteError("invariant_suite.mode must be 'fixture' or 'real'")
     if (mode == "fixture") is not fixture:
         raise InvariantSuiteError("invariant_suite.mode must match the manifest fixture state")
+    if mode == "real" and wad_profile is None:
+        raise InvariantSuiteError("real invariant execution requires a matched wad_profile")
     runner_input = _required_string(declaration.get("runner_input"), "invariant_suite.runner_input")
     _runner_path, runner_sha256 = _declared_runner(
         runner_input,
@@ -568,18 +765,50 @@ def run_invariant_suite(
         base_directory=base_directory,
     )
     fixture_case = declaration.get("fixture_case", "pass")
-    if mode == "fixture" and fixture_case not in {"pass", "reward_mismatch"}:
+    if mode == "fixture" and fixture_case not in {
+        "pass",
+        "reward_mismatch",
+        "missing_player_killcount",
+        "missing_termination",
+    }:
         raise InvariantSuiteError("invariant_suite.fixture_case is invalid")
     if mode == "real" and "fixture_case" in declaration:
         raise InvariantSuiteError("invariant_suite.fixture_case is fixture-only")
+    diagnostics = _diagnostics(declaration.get("diagnostics"))
+    if mode == "real" and wad_profile is not None and wad_profile.get("status") != "matched":
+        return {
+            "version": INVARIANT_SUITE_VERSION,
+            "configured": True,
+            "status": "unavailable",
+            "checks": [],
+            "failures": [],
+            "unavailable_reasons": [
+                {
+                    "code": "wad_profile_not_matched",
+                    "message": "Real invariant execution requires the validated WAD profile.",
+                }
+            ],
+            "providers": [],
+            "diagnostics": diagnostics,
+        }
+    real_configuration = declaration.get("real_configuration")
+    if mode == "real":
+        assert wad_profile is not None
+        real_configuration = _prepare_real_configuration(
+            real_configuration,
+            declared_inputs=declared_inputs,
+            base_directory=base_directory,
+            wad_profile=wad_profile,
+        )
+    elif "real_configuration" in declaration:
+        raise InvariantSuiteError("invariant_suite.real_configuration is real-only")
     response = _execute_runner(
         runner_sha256=runner_sha256,
         mode=mode,
         fixture_case=str(fixture_case),
         gradoom_revision=gradoom_revision,
-        real_configuration=declaration.get("real_configuration"),
+        real_configuration=real_configuration,
     )
-    diagnostics = _diagnostics(declaration.get("diagnostics"))
     if response["status"] == "unavailable":
         reasons = response["unavailable_reasons"]
         if not all(
@@ -591,6 +820,28 @@ def run_invariant_suite(
             raise InvariantSuiteError(
                 "authenticated invariant runner unavailable reasons are invalid"
             )
+        contract_failures = [
+            {
+                "behavior": item["behavior"],
+                "provider": item["provider"],
+                "message": item["message"],
+            }
+            for item in reasons
+            if item.get("code") == "provider_contract_failure"
+            and isinstance(item.get("behavior"), str)
+            and isinstance(item.get("provider"), str)
+        ]
+        if contract_failures:
+            return {
+                "version": INVARIANT_SUITE_VERSION,
+                "configured": True,
+                "status": "failed",
+                "checks": [],
+                "failures": contract_failures,
+                "unavailable_reasons": [],
+                "providers": [],
+                "diagnostics": diagnostics,
+            }
         return {
             "version": INVARIANT_SUITE_VERSION,
             "configured": True,

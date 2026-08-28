@@ -95,14 +95,29 @@ The v1 readiness manifest is a JSON object with these fields:
   paths are resolved from the manifest directory and are verified before report creation.
 - `prerequisites`: uniquely identified readiness prerequisites with an `available` boolean. Every
   unavailable prerequisite must include a human-readable `reason`.
-- `invariant_suite` (optional until a provider runtime is available): version `1.0.0`, exactly one
-  `gradoom` and one `env-vizdoom-turbo` provider process, and optional statuses for the retained
-  deep diagnostics. Each available provider process names a hashed `declared_inputs` runner and a
-  non-shell command array; each unavailable provider gives a reason.
+- `invariant_suite` (optional until a provider runtime is available): version `1.0.0`, a `mode` of
+  `fixture` or `real`, the `runner_input` name of the hash-verified repository runner, and optional
+  statuses for the retained deep diagnostics. Manifests cannot declare provider commands. Fixture
+  mode requires `fixture: true`; its executable examples use `pass`, while the
+  `reward_mismatch`, `missing_player_killcount`, and `missing_termination` cases are retained
+  adversarial test inputs.
+- `invariant_suite.real_configuration` (required in real mode): a requested `device` (`cpu`,
+  `cuda`, or `cuda:N`), a `reference_scenario_config_input` naming a hashed declared input, and
+  `semantic_probes` for `termination`, `truncation`, `player_killcount`, and
+  `player_killcount.enemy_on_enemy_exclusion`. Each probe declares exactly two uint32 `seeds`, a
+  non-empty cycle of two-lane pinned action-index rows under `actions`, and a positive
+  `max_steps`. The action rows retain their published action meanings; success comes only from an
+  event observed in public step results.
 - `wad_profile` (required when `certified_freedoom2_wad_profile` is declared available): the
   `freedoom2-deathmatch-v1` profile ID and exactly one `gradoom` and one `env-vizdoom-turbo`
   provider binding. Each binding declares `iwad_path`, `pwad_path`, and the complete policy-facing
   `configuration`. Relative WAD paths are resolved from the manifest directory.
+
+Real invariant execution additionally requires that `wad_profile` validation has matched. The
+command derives both providers' IWAD/PWAD paths, hashes, map, skill, scenario, action mode, frame
+skip, horizon, and preprocessing directly from that validated binding rather than accepting a
+second copy in `real_configuration`. The reference scenario config must sit beside, and therefore
+load, the exact validated reference `deathmatch.wad`; a substitute PWAD fails before provider work.
 
 The repository fixture is the executable example of this schema:
 [`tests/fixtures/evidence/readiness-manifest.json`](../tests/fixtures/evidence/readiness-manifest.json).
@@ -187,10 +202,13 @@ kill: the former must increment `player_killcount`, while the latter must increm
 `killcount`.
 
 Real execution loads GraDOOM and the immutable reference revision independently through the pinned
-reference adapter and reports unavailable when the runtime, configuration, or assets cannot support
-the probes. Non-fixture execution also requires the GraDOOM provider revision to match
-`code_provenance.revision`. The fixture runner provides deterministic public-operation probes only
-when the manifest itself is `fixture: true`; fixture evidence can never support a real claim.
+reference adapter. An absent optional provider runtime is unavailable; changed assets, an invalid
+binding, or a mismatched scenario config fail closed. Once the runtime is present, missing signals,
+malformed transitions, runtime errors, and unobserved lifecycle or kill events become named failed
+invariants rather than generic unavailability. Non-fixture execution also requires the GraDOOM
+provider revision to match `code_provenance.revision`. The fixture runner provides deterministic
+public-operation probes only when the manifest itself is `fixture: true`; fixture evidence can never
+support a real claim.
 
 The report records every check under `invariant_suite.checks`. A mismatch sets both the suite and
 readiness status to `failed` and names the public `behavior`; missing, unconfigured, or unavailable

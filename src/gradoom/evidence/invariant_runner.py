@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import re
 import sys
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -54,6 +55,7 @@ class _FixtureTurboEnv:
         info_frame_stack_keys: Any = None,
         state_catalog: Any = None,
         fixture_transport: str = "numpy",
+        fixture_missing_signal: str | None = None,
     ) -> None:
         del (
             game,
@@ -90,6 +92,7 @@ class _FixtureTurboEnv:
         )
         self.num_envs = num_envs
         self.fixture_transport = fixture_transport
+        self.fixture_missing_signal = fixture_missing_signal
         self.device = torch.device("cpu")
         self.action_meanings = DEATHMATCH_ACTION_MEANINGS
         self._initialized = np.zeros(num_envs, dtype=np.bool_)
@@ -107,12 +110,15 @@ class _FixtureTurboEnv:
         return self._array(value)
 
     def _infos(self) -> dict[str, Any]:
-        return {
+        infos = {
             "health": self._array(np.full(self.num_envs, 100.0, dtype=np.float64)),
             "killcount": self._array(self._killcount),
             "player_killcount": self._array(self._player_killcount),
             "episode_return": self._array(self._episode_return),
         }
+        if self.fixture_missing_signal is not None:
+            infos.pop(self.fixture_missing_signal)
+        return infos
 
     def reset(
         self,
@@ -200,12 +206,121 @@ def _values(value: Any) -> list[float]:
     return [float(item) for item in np.asarray(value).tolist()]
 
 
-def _mask(provider: str, values: list[bool]) -> Any:
-    return torch.tensor(values, dtype=torch.bool) if provider == "gradoom" else np.asarray(values)
+def _mask(provider: str, values: list[bool], device: torch.device | None = None) -> Any:
+    return (
+        torch.tensor(values, dtype=torch.bool, device=device)
+        if provider == "gradoom"
+        else np.asarray(values)
+    )
 
 
-def _actions(provider: str, values: list[int]) -> Any:
-    return torch.tensor(values, dtype=torch.int64) if provider == "gradoom" else np.asarray(values)
+def _actions(provider: str, values: list[int], device: torch.device | None = None) -> Any:
+    return (
+        torch.tensor(values, dtype=torch.int64, device=device)
+        if provider == "gradoom"
+        else np.asarray(values)
+    )
+
+
+def _probe_error(error: BaseException | str) -> dict[str, str]:
+    return {"probe_error": str(error)}
+
+
+def _kill_signals(
+    infos: Mapping[str, Any],
+    *,
+    kill_signal_reader: Callable[..., dict[str, float]] | None,
+    lane: int,
+) -> tuple[float, float]:
+    if kill_signal_reader is not None:
+        signals = kill_signal_reader(infos, lane=lane)
+        return signals["player_killcount"], signals["compatibility_killcount"]
+    return (
+        _values(infos["player_killcount"])[lane],
+        _values(infos["killcount"])[lane],
+    )
+
+
+def _semantic_probe(
+    *,
+    behavior: str,
+    provider: str,
+    factory: Callable[[], Any],
+    probe: Mapping[str, Any],
+    requested_device: torch.device | None,
+    kill_signal_reader: Callable[..., dict[str, float]] | None,
+) -> dict[str, Any]:
+    env = factory()
+    try:
+        _observation, initial_infos = env.reset(seed=probe["seeds"])
+        initial_kills = [
+            _kill_signals(initial_infos, kill_signal_reader=kill_signal_reader, lane=lane)
+            for lane in range(2)
+        ]
+        observed: tuple[int, tuple[Any, Any, Any, Any, Mapping[str, Any]]] | None = None
+        actions = probe["actions"]
+        for step_index in range(probe["max_steps"]):
+            transition = env.step(
+                _actions(provider, actions[step_index % len(actions)], requested_device)
+            )
+            if not isinstance(transition, tuple) or len(transition) != 5:
+                raise RuntimeError("step did not return the public five-tuple")
+            terminated_values = _values(transition[2])
+            truncated_values = _values(transition[3])
+            infos = transition[4]
+            if not isinstance(infos, Mapping):
+                raise RuntimeError("step signals are not a mapping")
+            for lane in range(2):
+                if behavior == "termination":
+                    matched = bool(terminated_values[lane]) and not bool(truncated_values[lane])
+                elif behavior == "truncation":
+                    matched = bool(truncated_values[lane]) and not bool(terminated_values[lane])
+                else:
+                    player, compatibility = _kill_signals(
+                        infos,
+                        kill_signal_reader=kill_signal_reader,
+                        lane=lane,
+                    )
+                    player_delta = player - initial_kills[lane][0]
+                    compatibility_delta = compatibility - initial_kills[lane][1]
+                    matched = (
+                        player_delta > 0
+                        if behavior == "player_killcount"
+                        else compatibility_delta > 0 and player_delta == 0
+                    )
+                if matched:
+                    observed = (lane, transition)
+                    break
+            if observed is not None:
+                break
+            if any(bool(value) for value in (*terminated_values, *truncated_values)):
+                break
+        if observed is None:
+            raise RuntimeError(f"{behavior} event was not observed through public step results")
+        lane, transition = observed
+        if behavior in {"termination", "truncation"}:
+            try:
+                env.step(_actions(provider, actions[0], requested_device))
+            except RuntimeError:
+                requires_reset = True
+            else:
+                requires_reset = False
+            return {"reported_separately": True, "requires_reset": requires_reset}
+        player, compatibility = _kill_signals(
+            transition[4],
+            kill_signal_reader=kill_signal_reader,
+            lane=lane,
+        )
+        player_delta = player - initial_kills[lane][0]
+        compatibility_delta = compatibility - initial_kills[lane][1]
+        if behavior == "player_killcount":
+            return {"present": True, "player_kill_delta": player_delta}
+        return {
+            "enemy_on_enemy_delta": player_delta,
+            "compatibility_kill_delta": compatibility_delta,
+        }
+    finally:
+        env.close()
 
 
 def _capture_contract(
@@ -215,124 +330,138 @@ def _capture_contract(
     env_class: type[Any],
     factory: Callable[[], Any],
     fixture_case: str,
+    semantic_probes: Mapping[str, Mapping[str, Any]],
+    requested_device: torch.device | None = None,
     kill_signal_reader: Callable[..., dict[str, float]] | None = None,
 ) -> dict[str, Any]:
     signature = inspect.signature(env_class).parameters
     common = list(signature.values())[:32]
-    env = factory()
-    try:
-        try:
-            env.step(_actions(provider, [0, 0]))
-        except RuntimeError:
-            step_before_reset_rejected = True
-        else:
-            step_before_reset_rejected = False
-        reset_observation, reset_infos = env.reset(seed=[7, 8])
-        step_result = env.step(_actions(provider, [0, 0]))
-        step_observation, rewards, terminated, truncated, step_infos = step_result
-        before_masked = (
-            step_observation.clone()
-            if isinstance(step_observation, torch.Tensor)
-            else step_observation.copy()
-        )
-        masked_observation, _masked_infos = env.reset(
-            options={"reset_mask": _mask(provider, [True, False])}
-        )
-        masked_selected_only = bool(
-            _values(masked_observation[:, 0, 0, 0]) == [0.0, _values(before_masked[:, 0, 0, 0])[1]]
-        )
-    finally:
-        env.close()
-
-    terminal_env = factory()
-    try:
-        terminal_env.reset(seed=[9, 10])
-        terminal = terminal_env.step(_actions(provider, [1, 0]))
-        try:
-            terminal_env.step(_actions(provider, [0, 0]))
-        except RuntimeError:
-            termination_requires_reset = True
-        else:
-            termination_requires_reset = False
-    finally:
-        terminal_env.close()
-
-    truncation_env = factory()
-    try:
-        truncation_env.reset(seed=[11, 12])
-        truncation = truncation_env.step(_actions(provider, [0, 2]))
-        try:
-            truncation_env.step(_actions(provider, [0, 0]))
-        except RuntimeError:
-            truncation_requires_reset = True
-        else:
-            truncation_requires_reset = False
-    finally:
-        truncation_env.close()
-
-    kill_env = factory()
-    try:
-        kill_env.reset(seed=[13, 14])
-        player_infos = kill_env.step(_actions(provider, [3, 0]))[4]
-        kill_env.reset(options={"reset_mask": _mask(provider, [True, False])})
-        enemy_infos = kill_env.step(_actions(provider, [4, 0]))[4]
-    finally:
-        kill_env.close()
-
-    signal_shapes = {
-        operation: {name: _descriptor(infos[name]) for name in _SIGNALS}
-        for operation, infos in (("reset", reset_infos), ("step", step_infos))
-    }
-    reward_values = _values(rewards)
-    if fixture_case == "reward_mismatch" and provider == "env-vizdoom-turbo":
-        reward_values = [9.0, 9.0]
-    if kill_signal_reader is None:
-        player_kill_delta = int(_values(player_infos["player_killcount"])[0])
-        enemy_player_kill_delta = int(_values(enemy_infos["player_killcount"])[0])
-        enemy_compatibility_kill_delta = int(_values(enemy_infos["killcount"])[0])
-    else:
-        player_signals = kill_signal_reader(player_infos, lane=0)
-        enemy_signals = kill_signal_reader(enemy_infos, lane=0)
-        player_kill_delta = int(player_signals["player_killcount"])
-        enemy_player_kill_delta = int(enemy_signals["player_killcount"])
-        enemy_compatibility_kill_delta = int(enemy_signals["compatibility_killcount"])
-    behaviors = {
+    behaviors: dict[str, Any] = {
         "constructor": {
-            "accepted": True,
+            "accepted": False,
             "parameters": [parameter.name for parameter in common],
             "defaults": [_json_default(parameter.default) for parameter in common],
             "kinds": [parameter.kind.name for parameter in common],
         },
-        "action_meanings": list(env.action_meanings),
-        "observation_shapes": {
-            "reset": _descriptor(reset_observation),
-            "step": _descriptor(step_observation),
-        },
-        "signal_shapes": signal_shapes,
-        "rewards": {**_descriptor(rewards), "sample": reward_values},
-        "reset": {"returns_observation_and_signals": len((reset_observation, reset_infos)) == 2},
-        "step": {"returns_five_tuple": len(step_result) == 5},
-        "masked_reset": {"supported": True, "selected_lane_only": masked_selected_only},
-        "termination": {
-            "reported_separately": _values(terminal[2]) == [1.0, 0.0]
-            and _values(terminal[3]) == [0.0, 0.0],
-            "requires_reset": termination_requires_reset,
-        },
-        "truncation": {
-            "reported_separately": _values(truncation[2]) == [0.0, 0.0]
-            and _values(truncation[3]) == [0.0, 1.0],
-            "requires_reset": truncation_requires_reset,
-        },
-        "episode": {"step_before_reset_rejected": step_before_reset_rejected, "autoreset": False},
-        "player_killcount": {
-            "present": "player_killcount" in player_infos,
-            "player_kill_delta": player_kill_delta,
-        },
-        "player_killcount.enemy_on_enemy_exclusion": {
-            "enemy_on_enemy_delta": enemy_player_kill_delta,
-            "compatibility_kill_delta": enemy_compatibility_kill_delta,
-        },
+        "action_meanings": _probe_error("provider construction did not complete"),
+        "observation_shapes": _probe_error("reset and step did not complete"),
+        "signal_shapes": _probe_error("reset and step did not complete"),
+        "rewards": _probe_error("step did not complete"),
+        "reset": _probe_error("reset did not complete"),
+        "step": _probe_error("step did not complete"),
+        "masked_reset": _probe_error("masked reset did not complete"),
+        "termination": _probe_error("termination probe did not complete"),
+        "truncation": _probe_error("truncation probe did not complete"),
+        "episode": _probe_error("episode probe did not complete"),
+        "player_killcount": _probe_error("player kill probe did not complete"),
+        "player_killcount.enemy_on_enemy_exclusion": _probe_error(
+            "enemy-on-enemy probe did not complete"
+        ),
     }
+    reset_observation = reset_infos = step_observation = rewards = None
+    terminated = truncated = step_infos = None
+    try:
+        reset_mask = _mask(provider, [True, False], requested_device)
+        step_actions = _actions(provider, [0, 0], requested_device)
+    except Exception as error:
+        reset_mask = step_actions = None
+        behaviors["constructor"]["probe_error"] = str(error)
+        for behavior in behaviors:
+            if behavior != "constructor":
+                behaviors[behavior] = _probe_error(error)
+    try:
+        try:
+            env = factory()
+            behaviors["constructor"]["accepted"] = True
+            behaviors["action_meanings"] = list(env.action_meanings)
+            try:
+                env.step(step_actions)
+            except RuntimeError:
+                step_before_reset_rejected = True
+            else:
+                step_before_reset_rejected = False
+            reset_result = env.reset(seed=[7, 8])
+            if not isinstance(reset_result, tuple) or len(reset_result) != 2:
+                raise RuntimeError("reset did not return observation and signals")
+            reset_observation, reset_infos = reset_result
+            behaviors["reset"] = {"returns_observation_and_signals": True}
+            step_result = env.step(step_actions)
+            if not isinstance(step_result, tuple) or len(step_result) != 5:
+                raise RuntimeError("step did not return the public five-tuple")
+            step_observation, rewards, terminated, truncated, step_infos = step_result
+            behaviors["step"] = {"returns_five_tuple": True}
+            behaviors["observation_shapes"] = {
+                "reset": _descriptor(reset_observation),
+                "step": _descriptor(step_observation),
+            }
+            if not isinstance(reset_infos, Mapping) or not isinstance(step_infos, Mapping):
+                raise RuntimeError("reset or step signals are not a mapping")
+            behaviors["signal_shapes"] = {
+                operation: {name: _descriptor(infos[name]) for name in _SIGNALS if name in infos}
+                for operation, infos in (("reset", reset_infos), ("step", step_infos))
+            }
+            reward_values = _values(rewards)
+            if fixture_case == "reward_mismatch" and provider == "env-vizdoom-turbo":
+                reward_values = [9.0, 9.0]
+            behaviors["rewards"] = {**_descriptor(rewards), "sample": reward_values}
+            before_masked = (
+                step_observation.clone()
+                if isinstance(step_observation, torch.Tensor)
+                else step_observation.copy()
+            )
+            masked_observation, _masked_infos = env.reset(options={"reset_mask": reset_mask})
+            masked_selected_only = bool(
+                torch.equal(masked_observation[1], before_masked[1])
+                if isinstance(masked_observation, torch.Tensor)
+                and isinstance(before_masked, torch.Tensor)
+                else np.array_equal(masked_observation[1], before_masked[1])
+            )
+            behaviors["masked_reset"] = {
+                "supported": True,
+                "selected_lane_only": masked_selected_only,
+            }
+            behaviors["episode"] = {
+                "step_before_reset_rejected": step_before_reset_rejected,
+                "autoreset": False,
+            }
+        except Exception as error:
+            for behavior in (
+                "observation_shapes",
+                "signal_shapes",
+                "rewards",
+                "reset",
+                "step",
+                "masked_reset",
+                "episode",
+            ):
+                if isinstance(behaviors[behavior], dict) and "probe_error" in behaviors[behavior]:
+                    behaviors[behavior] = _probe_error(error)
+        finally:
+            if "env" in locals():
+                env.close()
+        for behavior in (
+            "termination",
+            "truncation",
+            "player_killcount",
+            "player_killcount.enemy_on_enemy_exclusion",
+        ):
+            try:
+                behaviors[behavior] = _semantic_probe(
+                    behavior=behavior,
+                    provider=provider,
+                    factory=factory,
+                    probe=semantic_probes[behavior],
+                    requested_device=requested_device,
+                    kill_signal_reader=kill_signal_reader,
+                )
+            except Exception as error:
+                behaviors[behavior] = _probe_error(error)
+    except Exception as error:
+        behaviors["constructor"]["probe_error"] = str(error)
+        for behavior in behaviors:
+            if behavior != "constructor":
+                behaviors[behavior] = _probe_error(error)
+
     contract: dict[str, Any] = {
         "schema_version": 1,
         "provider": provider,
@@ -340,29 +469,61 @@ def _capture_contract(
         "behaviors": behaviors,
     }
     if provider == "gradoom":
+        declared_device = str(requested_device) if requested_device is not None else "cpu"
         contract["tensor_device"] = {
-            "declared_device": str(reset_observation.device),
-            "reset_mask_input": _descriptor(_mask(provider, [True, False])),
-            "step_action_input": _descriptor(_actions(provider, [0, 0])),
+            "declared_device": declared_device,
+            "reset_mask_input": _descriptor(reset_mask) if reset_mask is not None else {},
+            "step_action_input": _descriptor(step_actions) if step_actions is not None else {},
             "reset_outputs": {
-                "observation": _descriptor(reset_observation),
-                "signals": {name: _descriptor(reset_infos[name]) for name in _SIGNALS},
+                "observation": _descriptor(reset_observation)
+                if reset_observation is not None
+                else {},
+                "signals": {
+                    name: _descriptor(reset_infos[name])
+                    for name in _SIGNALS
+                    if isinstance(reset_infos, Mapping) and name in reset_infos
+                },
             },
             "step_outputs": {
-                "observation": _descriptor(step_observation),
-                "reward": _descriptor(rewards),
-                "terminated": _descriptor(terminated),
-                "truncated": _descriptor(truncated),
-                "signals": {name: _descriptor(step_infos[name]) for name in _SIGNALS},
+                "observation": _descriptor(step_observation)
+                if step_observation is not None
+                else {},
+                "reward": _descriptor(rewards) if rewards is not None else {},
+                "terminated": _descriptor(terminated) if terminated is not None else {},
+                "truncated": _descriptor(truncated) if truncated is not None else {},
+                "signals": {
+                    name: _descriptor(step_infos[name])
+                    for name in _SIGNALS
+                    if isinstance(step_infos, Mapping) and name in step_infos
+                },
             },
         }
     return contract
 
 
 def _fixture_contracts(case: str) -> list[dict[str, Any]]:
-    if case not in {"pass", "reward_mismatch"}:
+    if case not in {
+        "pass",
+        "reward_mismatch",
+        "missing_player_killcount",
+        "missing_termination",
+    }:
         raise ValueError(f"unsupported fixture_case {case!r}")
     contracts = []
+    semantic_probes = {
+        "termination": {
+            "seeds": [9, 10],
+            "actions": [[0, 0]] if case == "missing_termination" else [[1, 0]],
+            "max_steps": 1,
+        },
+        "truncation": {"seeds": [11, 12], "actions": [[0, 2]], "max_steps": 1},
+        "player_killcount": {"seeds": [13, 14], "actions": [[3, 0]], "max_steps": 1},
+        "player_killcount.enemy_on_enemy_exclusion": {
+            "seeds": [15, 16],
+            "actions": [[4, 0]],
+            "max_steps": 1,
+        },
+    }
     for provider, transport in (("gradoom", "torch"), ("env-vizdoom-turbo", "numpy")):
         contracts.append(
             _capture_contract(
@@ -373,96 +534,176 @@ def _fixture_contracts(case: str) -> list[dict[str, Any]]:
                     "VizdoomDeathmatch-v1",
                     num_envs=2,
                     fixture_transport=transport,
+                    fixture_missing_signal=(
+                        "player_killcount" if case == "missing_player_killcount" else None
+                    ),
                 ),
                 fixture_case=case,
+                semantic_probes=semantic_probes,
+                requested_device=torch.device("cpu") if provider == "gradoom" else None,
             )
         )
     return contracts
 
 
 def _real_contracts(request: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
-    try:
-        from gradoom import GraDoomVecEnv
-        from gradoom.evidence.reference_provider import load_reference_provider
-
-        provider = load_reference_provider()
-    except (ImportError, RuntimeError) as error:
-        return [], [{"code": "provider_unavailable", "message": str(error)}]
     configuration = request.get("real_configuration")
     if not isinstance(configuration, dict):
+        raise ValueError("real invariant execution requires bound configuration")
+    provider_bindings = configuration.get("providers")
+    if not isinstance(provider_bindings, dict) or set(provider_bindings) != {
+        "gradoom",
+        "env-vizdoom-turbo",
+    }:
+        raise ValueError("real invariant execution requires both WAD provider bindings")
+    for provider_id, binding in provider_bindings.items():
+        if not isinstance(binding, dict):
+            raise ValueError(f"{provider_id} WAD provider binding is invalid")
+        for asset in ("iwad", "pwad"):
+            path = Path(str(binding.get(f"{asset}_path", "")))
+            expected = binding.get(f"{asset}_sha256")
+            if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+                raise ValueError(f"{provider_id} validated {asset.upper()} binding changed")
+    gradoom_binding = provider_bindings["gradoom"]
+    reference_binding = provider_bindings["env-vizdoom-turbo"]
+    if any(
+        gradoom_binding[f"{asset}_sha256"] != reference_binding[f"{asset}_sha256"]
+        for asset in ("iwad", "pwad")
+    ):
+        raise ValueError("real invariant providers are not bound to byte-identical WADs")
+    reference_config = Path(str(configuration.get("reference_scenario_config_path", "")))
+    reference_pwad = Path(reference_binding["pwad_path"])
+    try:
+        reference_consumes_bound_pwad = reference_config.with_name("deathmatch.wad").samefile(
+            reference_pwad
+        )
+    except OSError:
+        reference_consumes_bound_pwad = False
+    if not reference_config.is_file() or not reference_consumes_bound_pwad:
+        raise ValueError("reference scenario configuration does not consume the bound PWAD")
+    try:
+        from gradoom import GraDoomVecEnv
+        from gradoom.evidence.reference_provider import (
+            ReferenceProviderError,
+            load_reference_provider,
+        )
+    except ImportError as error:
+        return [], [{"code": "provider_unavailable", "message": str(error)}]
+    try:
+        provider = load_reference_provider()
+    except ReferenceProviderError as error:
+        message = str(error)
+        if "is not installed" in message:
+            return [], [{"code": "provider_unavailable", "message": message}]
+        behavior = (
+            "env-vizdoom-turbo.revision"
+            if "revision" in message or "direct_url.json" in message
+            else "env-vizdoom-turbo.provider_api"
+        )
         return [], [
             {
-                "code": "real_probe_configuration_unavailable",
-                "message": (
-                    "Real invariant execution requires matched provider assets and configuration."
-                ),
+                "code": "provider_contract_failure",
+                "provider": "env-vizdoom-turbo",
+                "behavior": behavior,
+                "message": message,
             }
         ]
-    required_paths = ("iwad_path", "pwad_path", "reference_scenario_config_path")
-    if any(not Path(str(configuration.get(name, ""))).is_file() for name in required_paths):
-        return [], [
-            {
-                "code": "real_probe_assets_unavailable",
-                "message": "Real invariant execution assets are unavailable.",
-            }
-        ]
+    profile_configuration = gradoom_binding.get("configuration")
+    if profile_configuration != reference_binding.get("configuration") or not isinstance(
+        profile_configuration, dict
+    ):
+        raise ValueError("real invariant provider configurations do not match")
+    scenario_configuration = profile_configuration["scenario"]
+    assignments = {
+        key.replace("_", "").casefold(): raw_value.strip().casefold()
+        for key, raw_value in re.findall(
+            r"(?m)^\s*([A-Za-z_]+)\s*=\s*([^#\r\n{]+)",
+            reference_config.read_text(encoding="utf-8"),
+        )
+    }
+    expected_assignments = {
+        "doomscenariopath": "deathmatch.wad",
+        "screenresolution": "res_"
+        + "x".join(map(str, scenario_configuration["screen_resolution"])),
+        "episodestarttime": str(scenario_configuration["episode_start_time"]),
+        "mode": str(scenario_configuration["mode"]).casefold(),
+    }
+    if any(assignments.get(key) != expected for key, expected in expected_assignments.items()):
+        raise ValueError("reference scenario config differs from the validated scenario binding")
+    observation = profile_configuration["observation"]
+    crop = observation["crop_or_mask"]
+    resize = observation["resize"]
     common = {
         "use_restricted_actions": DEATHMATCH_ACTIONS,
         "num_envs": 2,
-        "obs_resize": (84, 84),
-        "obs_crop": (0, 32, 0, 0),
-        "obs_crop_mode": "mask",
-        "obs_crop_fill": 0,
-        "obs_grayscale": True,
-        "obs_layout": "chw",
-        "obs_resize_algorithm": "area",
-        "frame_skip": 2,
-        "frame_stack": 4,
+        "obs_resize": tuple(resize["shape"]),
+        "obs_crop": tuple(crop["edges"]),
+        "obs_crop_mode": crop["kind"],
+        "obs_crop_fill": crop["fill"],
+        "obs_grayscale": observation["grayscale"]["enabled"],
+        "obs_layout": observation["layout"],
+        "obs_resize_algorithm": resize["algorithm"],
+        "frame_skip": profile_configuration["frame_skip"],
+        "frame_stack": observation["frame_stack"],
         "reward_clip": False,
         "info": "data",
         "info_filter": {"mode": "all", "keys": list(_SIGNALS)},
         "game_variables": tuple(name.upper() for name in _SIGNALS),
-        "treat_episode_timeout_as_truncation": True,
-        "vizdoom_config": {"episode_timeout": 4200},
+        "treat_episode_timeout_as_truncation": scenario_configuration[
+            "episode_timeout_as_truncation"
+        ],
+        "doom_skill": profile_configuration["skill"],
     }
+    requested_device = torch.device(configuration["device"])
+    semantic_probes = configuration["semantic_probes"]
 
     def gradoom_factory() -> Any:
         return GraDoomVecEnv(
-            "VizdoomDeathmatch-v1",
-            scenario=configuration["pwad_path"],
-            rom_path=configuration["iwad_path"],
-            device=configuration.get("device", "cpu"),
+            scenario_configuration["game"],
+            scenario=gradoom_binding["pwad_path"],
+            rom_path=gradoom_binding["iwad_path"],
+            device=requested_device,
+            vizdoom_config={
+                "episode_timeout": profile_configuration["episode_horizon_tics"],
+                "render_screen_flashes": scenario_configuration["render_screen_flashes"],
+            },
             **common,
         )
 
     def reference_factory() -> Any:
         return provider.make_env(
-            configuration["reference_scenario_config_path"],
-            rom_path=configuration["iwad_path"],
+            str(reference_config),
+            rom_path=reference_binding["iwad_path"],
             num_threads=2,
+            doom_map=profile_configuration["map"],
+            vizdoom_config={
+                "episode_timeout": profile_configuration["episode_horizon_tics"],
+                "render_hud": scenario_configuration["render_hud"],
+                "render_screen_flashes": scenario_configuration["render_screen_flashes"],
+            },
             **common,
         )
 
-    try:
-        contracts = [
-            _capture_contract(
-                provider="gradoom",
-                revision=request["gradoom_revision"],
-                env_class=GraDoomVecEnv,
-                factory=gradoom_factory,
-                fixture_case="pass",
-            ),
-            _capture_contract(
-                provider="env-vizdoom-turbo",
-                revision=provider.revision,
-                env_class=provider.env_class,
-                factory=reference_factory,
-                fixture_case="pass",
-                kill_signal_reader=provider.episode_kill_signals,
-            ),
-        ]
-    except (OSError, RuntimeError, TypeError, ValueError) as error:
-        return [], [{"code": "real_probe_unavailable", "message": str(error)}]
+    contracts = [
+        _capture_contract(
+            provider="gradoom",
+            revision=request["gradoom_revision"],
+            env_class=GraDoomVecEnv,
+            factory=gradoom_factory,
+            fixture_case="pass",
+            semantic_probes=semantic_probes,
+            requested_device=requested_device,
+        ),
+        _capture_contract(
+            provider="env-vizdoom-turbo",
+            revision=provider.revision,
+            env_class=provider.env_class,
+            factory=reference_factory,
+            fixture_case="pass",
+            semantic_probes=semantic_probes,
+            kill_signal_reader=provider.episode_kill_signals,
+        ),
+    ]
     return contracts, []
 
 
@@ -496,7 +737,7 @@ def main() -> int:
         }
         print(json.dumps(response, allow_nan=False, sort_keys=True))
         return 0
-    except (KeyError, OSError, TypeError, ValueError) as error:
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
         print(f"invariant runner: {error}", file=sys.stderr)
         return 2
 
