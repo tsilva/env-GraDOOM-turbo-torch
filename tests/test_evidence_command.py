@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import subprocess
@@ -8,6 +9,22 @@ from pathlib import Path
 import pytest
 
 FIXTURES = Path(__file__).parent / "fixtures" / "evidence"
+
+
+def canonical_sha256(value: object) -> str:
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def rehash_evidence_index(report: dict[str, object]) -> None:
+    evidence_index = report["evidence_index"]
+    assert isinstance(evidence_index, dict)
+    evidence_index["sha256"] = canonical_sha256(evidence_index["entries"])
 
 
 def run_evidence(*args: str) -> subprocess.CompletedProcess[str]:
@@ -142,6 +159,53 @@ def test_invalid_utf8_json_fails_with_a_clear_error(
 
     assert result.returncode == 2
     assert f"{document} is not valid UTF-8" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("document", ["manifest", "merge report"])
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+def test_non_standard_json_constants_fail_with_a_clear_error(
+    tmp_path: Path,
+    document: str,
+    constant: str,
+) -> None:
+    invalid_path = tmp_path / "invalid.json"
+    output = tmp_path / "report.json"
+    if document == "manifest":
+        payload = json.loads(
+            (FIXTURES / "readiness-manifest.json").read_text(encoding="utf-8")
+        )
+        arguments = ["--manifest", str(invalid_path), "--output", str(output)]
+    else:
+        initial_report = tmp_path / "initial-report.json"
+        initial = run_evidence(
+            "--manifest",
+            str(FIXTURES / "readiness-manifest.json"),
+            "--output",
+            str(initial_report),
+        )
+        assert initial.returncode == 0, initial.stderr
+        payload = json.loads(initial_report.read_text(encoding="utf-8"))
+        arguments = [
+            "--manifest",
+            str(FIXTURES / "readiness-manifest.json"),
+            "--output",
+            str(output),
+            "--merge",
+            str(invalid_path),
+        ]
+    payload["prerequisites"][0]["extension"] = {"retained": "INVALID_CONSTANT"}
+    serialized = json.dumps(payload).replace('"INVALID_CONSTANT"', constant)
+    invalid_path.write_text(serialized, encoding="utf-8")
+
+    result = run_evidence(*arguments)
+
+    assert result.returncode == 2
+    assert (
+        f"{document} is not valid JSON: non-standard constant {constant}"
+        in result.stderr
+    )
     assert "Traceback" not in result.stderr
     assert not output.exists()
 
@@ -286,6 +350,206 @@ def test_declared_input_paths_reject_embedded_nulls(
     assert (
         f"{document} contains U+0000 in declared_inputs[0].path" in result.stderr
     )
+    assert "Traceback" not in result.stderr
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    ("document", "invalid_kind", "expected_field"),
+    [
+        ("manifest", "value", "prerequisites[0].extension.nested[0]"),
+        ("manifest", "key", "prerequisites[0].extension.<key>"),
+        ("merge report", "value", "prerequisites[0].extension.nested[0]"),
+        ("merge report", "key", "prerequisites[0].extension.<key>"),
+    ],
+)
+def test_recursive_extension_strings_and_keys_reject_lone_surrogates(
+    tmp_path: Path,
+    document: str,
+    invalid_kind: str,
+    expected_field: str,
+) -> None:
+    invalid_path = tmp_path / "invalid.json"
+    output = tmp_path / "report.json"
+    if document == "manifest":
+        payload = json.loads(
+            (FIXTURES / "readiness-manifest.json").read_text(encoding="utf-8")
+        )
+        arguments = ["--manifest", str(invalid_path), "--output", str(output)]
+    else:
+        initial_report = tmp_path / "initial-report.json"
+        initial = run_evidence(
+            "--manifest",
+            str(FIXTURES / "readiness-manifest.json"),
+            "--output",
+            str(initial_report),
+        )
+        assert initial.returncode == 0, initial.stderr
+        payload = json.loads(initial_report.read_text(encoding="utf-8"))
+        arguments = [
+            "--manifest",
+            str(FIXTURES / "readiness-manifest.json"),
+            "--output",
+            str(output),
+            "--merge",
+            str(invalid_path),
+        ]
+    if invalid_kind == "value":
+        payload["prerequisites"][0]["extension"] = {"nested": ["\ud800"]}
+    else:
+        payload["prerequisites"][0]["extension"] = {"\ud800": "value"}
+    invalid_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = run_evidence(*arguments)
+
+    assert result.returncode == 2
+    assert (
+        f"{document} contains invalid Unicode in {expected_field}" in result.stderr
+    )
+    assert "Traceback" not in result.stderr
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("document", ["manifest", "merge report"])
+def test_whitespace_only_prerequisite_reasons_fail_with_a_clear_error(
+    tmp_path: Path,
+    document: str,
+) -> None:
+    invalid_path = tmp_path / "invalid.json"
+    output = tmp_path / "report.json"
+    if document == "manifest":
+        payload = json.loads(
+            (FIXTURES / "readiness-manifest.json").read_text(encoding="utf-8")
+        )
+        arguments = ["--manifest", str(invalid_path), "--output", str(output)]
+    else:
+        initial_report = tmp_path / "initial-report.json"
+        initial = run_evidence(
+            "--manifest",
+            str(FIXTURES / "readiness-manifest.json"),
+            "--output",
+            str(initial_report),
+        )
+        assert initial.returncode == 0, initial.stderr
+        payload = json.loads(initial_report.read_text(encoding="utf-8"))
+        arguments = [
+            "--manifest",
+            str(FIXTURES / "readiness-manifest.json"),
+            "--output",
+            str(output),
+            "--merge",
+            str(invalid_path),
+        ]
+    payload["prerequisites"][0]["reason"] = " \t\n"
+    invalid_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = run_evidence(*arguments)
+
+    assert result.returncode == 2
+    assert (
+        "prerequisites[0].reason must be a human-readable non-whitespace string"
+        in result.stderr
+    )
+    assert "Traceback" not in result.stderr
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    ("document", "invalid_path", "expected_error"),
+    [
+        (
+            "manifest",
+            "   ",
+            "declared_inputs[0].path must be a non-whitespace path",
+        ),
+        (
+            "merge report",
+            "   ",
+            "declared_inputs[0].path must be a non-whitespace path",
+        ),
+    ],
+)
+def test_declared_input_paths_reject_whitespace(
+    tmp_path: Path,
+    document: str,
+    invalid_path: str,
+    expected_error: str,
+) -> None:
+    document_path = tmp_path / "invalid.json"
+    output = tmp_path / "report.json"
+    if document == "manifest":
+        payload = json.loads(
+            (FIXTURES / "readiness-manifest.json").read_text(encoding="utf-8")
+        )
+        arguments = ["--manifest", str(document_path), "--output", str(output)]
+    else:
+        initial_report = tmp_path / "initial-report.json"
+        initial = run_evidence(
+            "--manifest",
+            str(FIXTURES / "readiness-manifest.json"),
+            "--output",
+            str(initial_report),
+        )
+        assert initial.returncode == 0, initial.stderr
+        payload = json.loads(initial_report.read_text(encoding="utf-8"))
+        arguments = [
+            "--manifest",
+            str(FIXTURES / "readiness-manifest.json"),
+            "--output",
+            str(output),
+            "--merge",
+            str(document_path),
+        ]
+    payload["declared_inputs"][0]["path"] = invalid_path
+    document_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = run_evidence(*arguments)
+
+    assert result.returncode == 2
+    assert expected_error in result.stderr
+    assert "Traceback" not in result.stderr
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("document", ["manifest", "merge report"])
+def test_declared_input_paths_must_be_unique(
+    tmp_path: Path,
+    document: str,
+) -> None:
+    invalid_path = tmp_path / "invalid.json"
+    output = tmp_path / "report.json"
+    if document == "manifest":
+        payload = json.loads(
+            (FIXTURES / "readiness-manifest.json").read_text(encoding="utf-8")
+        )
+        arguments = ["--manifest", str(invalid_path), "--output", str(output)]
+    else:
+        initial_report = tmp_path / "initial-report.json"
+        initial = run_evidence(
+            "--manifest",
+            str(FIXTURES / "readiness-manifest.json"),
+            "--output",
+            str(initial_report),
+        )
+        assert initial.returncode == 0, initial.stderr
+        payload = json.loads(initial_report.read_text(encoding="utf-8"))
+        arguments = [
+            "--manifest",
+            str(FIXTURES / "readiness-manifest.json"),
+            "--output",
+            str(output),
+            "--merge",
+            str(invalid_path),
+        ]
+    duplicate = dict(payload["declared_inputs"][0])
+    duplicate["name"] = "duplicate_provider_contract"
+    payload["declared_inputs"].append(duplicate)
+    invalid_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = run_evidence(*arguments)
+
+    assert result.returncode == 2
+    assert "declared_inputs[1].path is duplicated" in result.stderr
     assert "Traceback" not in result.stderr
     assert not output.exists()
 
@@ -477,6 +741,283 @@ def test_merge_rejects_incoherent_report_envelope_fields(
     assert initial.returncode == 0, initial.stderr
     report = json.loads(report_path.read_text(encoding="utf-8"))
     report[field] = value
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    output = tmp_path / "merged-report.json"
+
+    result = run_evidence(
+        "--manifest",
+        str(FIXTURES / "readiness-manifest.json"),
+        "--output",
+        str(output),
+        "--merge",
+        str(report_path),
+    )
+
+    assert result.returncode == 2
+    assert expected_error in result.stderr
+    assert "Traceback" not in result.stderr
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected_error"),
+    [
+        (
+            "workflow",
+            1,
+            "merge report workflow is required and must be a non-empty string",
+        ),
+        (
+            "evidence_level",
+            [],
+            "merge report evidence_level is required and must be a non-empty string",
+        ),
+        (
+            "status",
+            False,
+            "merge report status is required and must be a non-empty string",
+        ),
+        (
+            "claim_eligible",
+            0,
+            "merge report claim_eligible must be a boolean",
+        ),
+        (
+            "claim_reasons",
+            {},
+            "merge report claim_reasons must be an array",
+        ),
+    ],
+)
+def test_merge_rejects_wrong_typed_envelope_fields_before_identity_validation(
+    tmp_path: Path,
+    field: str,
+    value: object,
+    expected_error: str,
+) -> None:
+    report_path = tmp_path / "report.json"
+    initial = run_evidence(
+        "--manifest",
+        str(FIXTURES / "readiness-manifest.json"),
+        "--output",
+        str(report_path),
+    )
+    assert initial.returncode == 0, initial.stderr
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report[field] = value
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    output = tmp_path / "merged-report.json"
+
+    result = run_evidence(
+        "--manifest",
+        str(FIXTURES / "readiness-manifest.json"),
+        "--output",
+        str(output),
+        "--merge",
+        str(report_path),
+    )
+
+    assert result.returncode == 2
+    assert expected_error in result.stderr
+    assert "run_identity" not in result.stderr
+    assert "Traceback" not in result.stderr
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_error"),
+    [
+        (
+            "empty",
+            "merge report evidence_index.entries missing required names: "
+            "'manifest', 'provider_contract'",
+        ),
+        (
+            "missing_declared_input",
+            "merge report evidence_index.entries missing required names: "
+            "'provider_contract'",
+        ),
+        (
+            "extra",
+            "merge report evidence_index.entries has unexpected names: 'extra'",
+        ),
+        (
+            "wrong_declared_digest",
+            "merge report evidence_index entry 'provider_contract' SHA-256 does not "
+            "match declared_inputs",
+        ),
+        (
+            "duplicate",
+            "merge report evidence_index.entries[2].name 'manifest' is duplicated",
+        ),
+    ],
+)
+def test_merge_rejects_self_consistently_rehashed_mismatched_evidence_indexes(
+    tmp_path: Path,
+    mutation: str,
+    expected_error: str,
+) -> None:
+    report_path = tmp_path / "report.json"
+    initial = run_evidence(
+        "--manifest",
+        str(FIXTURES / "readiness-manifest.json"),
+        "--output",
+        str(report_path),
+    )
+    assert initial.returncode == 0, initial.stderr
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    entries = report["evidence_index"]["entries"]
+    if mutation == "empty":
+        entries.clear()
+    elif mutation == "missing_declared_input":
+        entries[:] = [entry for entry in entries if entry["name"] == "manifest"]
+    elif mutation == "extra":
+        entries.append({"name": "extra", "sha256": "0" * 64})
+    elif mutation == "wrong_declared_digest":
+        next(
+            entry for entry in entries if entry["name"] == "provider_contract"
+        )["sha256"] = "0" * 64
+    else:
+        entries.append(dict(entries[0]))
+    rehash_evidence_index(report)
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    output = tmp_path / "merged-report.json"
+
+    result = run_evidence(
+        "--manifest",
+        str(FIXTURES / "readiness-manifest.json"),
+        "--output",
+        str(output),
+        "--merge",
+        str(report_path),
+    )
+
+    assert result.returncode == 2
+    assert expected_error in result.stderr
+    assert "Traceback" not in result.stderr
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_error"),
+    [
+        (
+            "non_object_entry",
+            "merge report evidence_index.entries[0] must be an object",
+        ),
+        (
+            "missing_name",
+            "merge report evidence_index.entries[0].name is required and must be a "
+            "non-empty string",
+        ),
+        (
+            "wrong_name_type",
+            "merge report evidence_index.entries[0].name is required and must be a "
+            "non-empty string",
+        ),
+        (
+            "missing_digest",
+            "merge report evidence_index.entries[0].sha256 must be a lowercase "
+            "SHA-256 digest",
+        ),
+        (
+            "invalid_digest",
+            "merge report evidence_index.entries[0].sha256 must be a lowercase "
+            "SHA-256 digest",
+        ),
+    ],
+)
+def test_merge_rejects_self_consistently_rehashed_malformed_evidence_entries(
+    tmp_path: Path,
+    mutation: str,
+    expected_error: str,
+) -> None:
+    report_path = tmp_path / "report.json"
+    initial = run_evidence(
+        "--manifest",
+        str(FIXTURES / "readiness-manifest.json"),
+        "--output",
+        str(report_path),
+    )
+    assert initial.returncode == 0, initial.stderr
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    entries = report["evidence_index"]["entries"]
+    if mutation == "non_object_entry":
+        entries[0] = None
+    elif mutation == "missing_name":
+        del entries[0]["name"]
+    elif mutation == "wrong_name_type":
+        entries[0]["name"] = 1
+    elif mutation == "missing_digest":
+        del entries[0]["sha256"]
+    else:
+        entries[0]["sha256"] = "not-a-digest"
+    rehash_evidence_index(report)
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    output = tmp_path / "merged-report.json"
+
+    result = run_evidence(
+        "--manifest",
+        str(FIXTURES / "readiness-manifest.json"),
+        "--output",
+        str(output),
+        "--merge",
+        str(report_path),
+    )
+
+    assert result.returncode == 2
+    assert expected_error in result.stderr
+    assert "Traceback" not in result.stderr
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_error"),
+    [
+        (
+            "missing_algorithm",
+            "merge report evidence_index.algorithm is required",
+        ),
+        (
+            "wrong_algorithm",
+            "merge report evidence_index.algorithm must be 'sha256'",
+        ),
+        ("missing_entries", "merge report evidence_index.entries is required"),
+        ("wrong_entries_type", "merge report evidence_index.entries must be an array"),
+        ("missing_hash", "merge report evidence_index.sha256 is required"),
+        (
+            "invalid_hash",
+            "merge report evidence_index.sha256 must be a lowercase SHA-256 digest",
+        ),
+    ],
+)
+def test_merge_rejects_malformed_evidence_index_envelopes(
+    tmp_path: Path,
+    mutation: str,
+    expected_error: str,
+) -> None:
+    report_path = tmp_path / "report.json"
+    initial = run_evidence(
+        "--manifest",
+        str(FIXTURES / "readiness-manifest.json"),
+        "--output",
+        str(report_path),
+    )
+    assert initial.returncode == 0, initial.stderr
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    evidence_index = report["evidence_index"]
+    if mutation == "missing_algorithm":
+        del evidence_index["algorithm"]
+    elif mutation == "wrong_algorithm":
+        evidence_index["algorithm"] = "md5"
+    elif mutation == "missing_entries":
+        del evidence_index["entries"]
+    elif mutation == "wrong_entries_type":
+        evidence_index["entries"] = {}
+    elif mutation == "missing_hash":
+        del evidence_index["sha256"]
+    else:
+        evidence_index["sha256"] = "not-a-digest"
     report_path.write_text(json.dumps(report), encoding="utf-8")
     output = tmp_path / "merged-report.json"
 

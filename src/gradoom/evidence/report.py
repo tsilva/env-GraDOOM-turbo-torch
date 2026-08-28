@@ -10,6 +10,10 @@ class EvidenceError(ValueError):
     """An evidence manifest or report violates the public contract."""
 
 
+class _NonStandardJsonConstant(ValueError):
+    """A Python JSON decoder extension appeared in an evidence document."""
+
+
 _READINESS_REPORT_FIELDS = (
     "schema_version",
     "workflow",
@@ -28,6 +32,28 @@ _READINESS_REPORT_FIELDS = (
 
 def _sha256_bytes(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
+
+
+def _reject_non_standard_json_constant(constant: str) -> None:
+    raise _NonStandardJsonConstant(constant)
+
+
+def _parse_json_document(payload: bytes, *, document: str) -> Any:
+    try:
+        return json.loads(
+            payload,
+            parse_constant=_reject_non_standard_json_constant,
+        )
+    except UnicodeDecodeError as error:
+        raise EvidenceError(
+            f"{document} is not valid UTF-8 at byte {error.start}"
+        ) from error
+    except json.JSONDecodeError as error:
+        raise EvidenceError(f"{document} is not valid JSON: {error.msg}") from error
+    except _NonStandardJsonConstant as error:
+        raise EvidenceError(
+            f"{document} is not valid JSON: non-standard constant {error}"
+        ) from error
 
 
 def _canonical_sha256(value: object, *, document: str) -> str:
@@ -95,14 +121,7 @@ def _validate_string_content(
 
 def _load_manifest(path: Path) -> tuple[dict[str, Any], bytes]:
     payload = path.read_bytes()
-    try:
-        manifest = json.loads(payload)
-    except UnicodeDecodeError as error:
-        raise EvidenceError(
-            f"manifest is not valid UTF-8 at byte {error.start}"
-        ) from error
-    except json.JSONDecodeError as error:
-        raise EvidenceError(f"manifest is not valid JSON: {error.msg}") from error
+    manifest = _parse_json_document(payload, document="manifest")
     if not isinstance(manifest, dict):
         raise EvidenceError("manifest must be a JSON object")
     _validate_string_content(manifest, document="manifest")
@@ -112,6 +131,16 @@ def _load_manifest(path: Path) -> tuple[dict[str, Any], bytes]:
 def _required_string(value: object, field: str) -> str:
     if not isinstance(value, str) or not value:
         raise EvidenceError(f"{field} is required and must be a non-empty string")
+    return value
+
+
+def _validate_sha256(value: object, field: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise EvidenceError(f"{field} must be a lowercase SHA-256 digest")
     return value
 
 
@@ -137,6 +166,7 @@ def _validate_declared_inputs(value: object) -> list[dict[str, Any]]:
         raise EvidenceError("declared_inputs must be an array")
     inputs: list[dict[str, Any]] = []
     names: set[str] = {"manifest"}
+    paths: set[Path] = set()
     for index, item in enumerate(value):
         field = f"declared_inputs[{index}]"
         if not isinstance(item, dict):
@@ -147,14 +177,14 @@ def _validate_declared_inputs(value: object) -> list[dict[str, Any]]:
         if name in names:
             raise EvidenceError(f"{field}.name {name!r} is duplicated or reserved")
         names.add(name)
-        _required_string(item.get("path"), f"{field}.path")
-        sha256 = item.get("sha256")
-        if (
-            not isinstance(sha256, str)
-            or len(sha256) != 64
-            or any(character not in "0123456789abcdef" for character in sha256)
-        ):
-            raise EvidenceError(f"{field}.sha256 must be a lowercase SHA-256 digest")
+        path = _required_string(item.get("path"), f"{field}.path")
+        if not path.strip():
+            raise EvidenceError(f"{field}.path must be a non-whitespace path")
+        normalized_path = Path(path)
+        if normalized_path in paths:
+            raise EvidenceError(f"{field}.path is duplicated")
+        paths.add(normalized_path)
+        _validate_sha256(item.get("sha256"), f"{field}.sha256")
         inputs.append(item)
     return inputs
 
@@ -175,7 +205,11 @@ def _validate_prerequisites(value: object) -> list[dict[str, Any]]:
         if type(item.get("available")) is not bool:
             raise EvidenceError(f"{field}.available is required and must be a boolean")
         if not item["available"]:
-            _required_string(item.get("reason"), f"{field}.reason")
+            reason = item.get("reason")
+            if not isinstance(reason, str) or not reason.strip():
+                raise EvidenceError(
+                    f"{field}.reason must be a human-readable non-whitespace string"
+                )
         prerequisites.append(item)
     return prerequisites
 
@@ -240,6 +274,59 @@ def _validate_readiness_envelope(
             "merge report claim_reasons do not match its fixture state and "
             "prerequisites"
         )
+
+
+def _validate_evidence_index(
+    value: object,
+    declared_inputs: list[dict[str, Any]],
+) -> None:
+    field = "merge report evidence_index"
+    if not isinstance(value, dict):
+        raise EvidenceError(f"{field} must be an object")
+    if "algorithm" not in value:
+        raise EvidenceError(f"{field}.algorithm is required")
+    if value["algorithm"] != "sha256":
+        raise EvidenceError(f"{field}.algorithm must be 'sha256'")
+    if "entries" not in value:
+        raise EvidenceError(f"{field}.entries is required")
+    entries = value["entries"]
+    if not isinstance(entries, list):
+        raise EvidenceError(f"{field}.entries must be an array")
+    if "sha256" not in value:
+        raise EvidenceError(f"{field}.sha256 is required")
+    stored_sha256 = _validate_sha256(value["sha256"], f"{field}.sha256")
+
+    entries_by_name: dict[str, dict[str, Any]] = {}
+    for index, entry in enumerate(entries):
+        entry_field = f"{field}.entries[{index}]"
+        if not isinstance(entry, dict):
+            raise EvidenceError(f"{entry_field} must be an object")
+        name = _required_string(entry.get("name"), f"{entry_field}.name")
+        if name in entries_by_name:
+            raise EvidenceError(f"{entry_field}.name {name!r} is duplicated")
+        _validate_sha256(entry.get("sha256"), f"{entry_field}.sha256")
+        entries_by_name[name] = entry
+
+    if stored_sha256 != _canonical_sha256(entries, document="merge report"):
+        raise EvidenceError("merge report evidence_index SHA-256 mismatch")
+
+    expected_names = {"manifest", *(item["name"] for item in declared_inputs)}
+    actual_names = set(entries_by_name)
+    missing_names = sorted(expected_names - actual_names)
+    if missing_names:
+        formatted = ", ".join(repr(name) for name in missing_names)
+        raise EvidenceError(f"{field}.entries missing required names: {formatted}")
+    unexpected_names = sorted(actual_names - expected_names)
+    if unexpected_names:
+        formatted = ", ".join(repr(name) for name in unexpected_names)
+        raise EvidenceError(f"{field}.entries has unexpected names: {formatted}")
+    for declared_input in declared_inputs:
+        entry = entries_by_name[declared_input["name"]]
+        if entry["sha256"] != declared_input["sha256"]:
+            raise EvidenceError(
+                f"{field} entry {declared_input['name']!r} SHA-256 does not match "
+                "declared_inputs"
+            )
 
 
 def _run_identity(
@@ -325,14 +412,7 @@ def build_readiness_report(manifest_path: Path) -> dict[str, Any]:
 
 
 def validate_merge_report(path: Path, expected_run_identity: object) -> None:
-    try:
-        report = json.loads(path.read_bytes())
-    except UnicodeDecodeError as error:
-        raise EvidenceError(
-            f"merge report is not valid UTF-8 at byte {error.start}"
-        ) from error
-    except json.JSONDecodeError as error:
-        raise EvidenceError(f"merge report is not valid JSON: {error.msg}") from error
+    report = _parse_json_document(path.read_bytes(), document="merge report")
     if not isinstance(report, dict):
         raise EvidenceError("merge report must be a JSON object")
     _validate_string_content(report, document="merge report")
@@ -340,8 +420,17 @@ def validate_merge_report(path: Path, expected_run_identity: object) -> None:
         if field not in report:
             raise EvidenceError(f"merge report {field} is required")
     _validate_schema_version(report["schema_version"], document="merge report")
+    _required_string(report["workflow"], "merge report workflow")
+    _required_string(report["evidence_level"], "merge report evidence_level")
     if type(report["fixture"]) is not bool:
         raise EvidenceError("merge report fixture is required and must be a boolean")
+    _required_string(report["status"], "merge report status")
+    if type(report["claim_eligible"]) is not bool:
+        raise EvidenceError("merge report claim_eligible must be a boolean")
+    if not isinstance(report["claim_reasons"], list):
+        raise EvidenceError("merge report claim_reasons must be an array")
+    if not isinstance(report["evidence_index"], dict):
+        raise EvidenceError("merge report evidence_index must be an object")
     code_provenance = _validate_code_provenance(report["code_provenance"])
     declared_inputs = _validate_declared_inputs(report["declared_inputs"])
     prerequisites = _validate_prerequisites(report["prerequisites"])
@@ -364,16 +453,7 @@ def validate_merge_report(path: Path, expected_run_identity: object) -> None:
     if report["evidence_level"] != "development":
         raise EvidenceError("merge report evidence_level must be development")
     _validate_readiness_envelope(report, prerequisites)
-    evidence_index = report["evidence_index"]
-    if not isinstance(evidence_index, dict):
-        raise EvidenceError("merge report evidence_index must be an object")
-    entries = evidence_index.get("entries")
-    if evidence_index.get("algorithm") != "sha256" or not isinstance(entries, list):
-        raise EvidenceError("merge report evidence_index is malformed")
-    if evidence_index.get("sha256") != _canonical_sha256(
-        entries, document="merge report"
-    ):
-        raise EvidenceError("merge report evidence_index SHA-256 mismatch")
+    _validate_evidence_index(report["evidence_index"], declared_inputs)
     if recomputed_run_identity != expected_run_identity:
         raise EvidenceError(
             "cannot merge unlike run identities: "
