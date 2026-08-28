@@ -76,6 +76,10 @@ def _validate_output_path(
         manifest_path,
         base_directory=working_directory,
     )
+    manifest_directory = _resolve_evidence_path(
+        manifest_path.parent,
+        base_directory=working_directory,
+    )
     if _paths_alias(resolved_output, resolved_manifest):
         raise EvidenceError("output path aliases the manifest")
 
@@ -85,7 +89,7 @@ def _validate_output_path(
         assert isinstance(declared_input, dict)
         resolved_input = _resolve_evidence_path(
             Path(declared_input["path"]),
-            base_directory=resolved_manifest.parent,
+            base_directory=manifest_directory,
         )
         if _paths_alias(resolved_output, resolved_input):
             raise EvidenceError(

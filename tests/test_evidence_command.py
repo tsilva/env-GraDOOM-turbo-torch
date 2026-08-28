@@ -768,6 +768,36 @@ def test_output_cannot_overwrite_evidence_sources_through_a_path_alias(
     assert source_path.read_bytes() == source_before
 
 
+def test_output_cannot_overwrite_input_relative_to_a_symlinked_manifest(
+    tmp_path: Path,
+) -> None:
+    manifest_target_directory = tmp_path / "manifest-target"
+    manifest_target_directory.mkdir()
+    manifest_target = manifest_target_directory / "manifest.json"
+    manifest_target.write_bytes((FIXTURES / "readiness-manifest.json").read_bytes())
+
+    supplied_directory = tmp_path / "supplied"
+    supplied_directory.mkdir()
+    supplied_manifest = supplied_directory / "manifest.json"
+    supplied_manifest.symlink_to(manifest_target)
+    protected_input = supplied_directory / "provider-contract.json"
+    protected_input.write_bytes((FIXTURES / "provider-contract.json").read_bytes())
+    input_before = protected_input.read_bytes()
+
+    result = run_evidence(
+        "--manifest",
+        str(supplied_manifest),
+        "--output",
+        str(protected_input),
+    )
+
+    assert result.returncode == 2
+    assert "output path aliases declared input 'provider_contract'" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert protected_input.read_bytes() == input_before
+    assert not (manifest_target_directory / "provider-contract.json").exists()
+
+
 def test_merge_rejects_an_unlike_run_identity(tmp_path: Path) -> None:
     first_report = tmp_path / "first-report.json"
     first = run_evidence(
