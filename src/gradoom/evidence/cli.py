@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -142,6 +143,16 @@ def _validate_output_path(
         )
         if _paths_alias(resolved_output, resolved_artifact):
             raise EvidenceError(f"output path aliases bootstrap artifact {artifact['name']!r}")
+        receipt = artifact.get("creation_receipt")
+        if isinstance(receipt, dict) and isinstance(receipt.get("path"), str):
+            resolved_receipt = _resolve_evidence_path(
+                Path(receipt["path"]),
+                base_directory=manifest_directory,
+            )
+            if _paths_alias(resolved_output, resolved_receipt):
+                raise EvidenceError(
+                    f"output path aliases bootstrap artifact {artifact['name']!r} creation receipt"
+                )
 
     if merge_path is not None:
         resolved_merge = _resolve_evidence_path(
@@ -225,9 +236,23 @@ def _validate_document_paths(
                     raise EvidenceError(
                         f"output path aliases bootstrap artifact {artifact.get('name')!r}"
                     )
+                receipt = artifact.get("creation_receipt")
+                if isinstance(receipt, dict):
+                    receipt_path = receipt.get("path")
+                    if isinstance(receipt_path, str) and receipt_path.strip():
+                        resolved_receipt = _resolve_evidence_path(
+                            Path(receipt_path),
+                            base_directory=manifest_directory,
+                        )
+                        if _paths_alias(resolved_output, resolved_receipt):
+                            raise EvidenceError(
+                                "output path aliases bootstrap artifact "
+                                f"{artifact.get('name')!r} creation receipt"
+                            )
 
 
 def main(argv: list[str] | None = None) -> int:
+    invocation_started = time.perf_counter()
     args = _parser().parse_args(argv)
     try:
         manifest, _payload = _load_manifest(args.manifest)
@@ -244,6 +269,7 @@ def main(argv: list[str] | None = None) -> int:
             report = build_development_benchmark_report(
                 args.manifest,
                 merge_path=args.merge,
+                invocation_started=invocation_started,
             )
         else:
             raise EvidenceError(f"unsupported manifest workflow {workflow!r}")

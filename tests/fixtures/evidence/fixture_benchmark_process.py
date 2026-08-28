@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import time
 from pathlib import Path
 
 
@@ -31,6 +32,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--fixture-hardlink-checkpoint-to", type=Path)
     parser.add_argument("--fixture-mutate-bootstrap", type=Path)
     parser.add_argument("--fixture-interrupt-once-at-step", type=int)
+    parser.add_argument("--fixture-hard-crash-once-at-step", type=int)
+    parser.add_argument("--fixture-hold-after-recovery-checkpoint-marker", type=Path)
+    parser.add_argument("--fixture-recovery-child-exited-marker", type=Path)
     parser.add_argument("--evidence-run-identity")
     parser.add_argument("--evidence-attempt-identity")
     return parser
@@ -75,7 +79,9 @@ def main() -> int:
             resumed_checkpoint = json.loads(args.resume.read_text(encoding="utf-8"))
             assert resumed_checkpoint["evidence_run_identity"] == args.evidence_run_identity
             assert resumed_checkpoint["evidence_attempt_identity"] == args.evidence_attempt_identity
-        should_interrupt = args.fixture_interrupt_once_at_step == args.timesteps and not (
+        cooperative_interruption = args.fixture_interrupt_once_at_step == args.timesteps
+        hard_crash = args.fixture_hard_crash_once_at_step == args.timesteps
+        should_interrupt = (cooperative_interruption or hard_crash) and not (
             resumed_checkpoint or {}
         ).get("interrupted", False)
         actual_step = (
@@ -96,7 +102,18 @@ def main() -> int:
                     "policy_state": "fixture-policy-state",
                     "optimizer_state": "fixture-optimizer-state",
                     "rng_state": "fixture-rng-state",
-                    "progress": {"global_step": actual_step, "rollouts": actual_step},
+                    "progress": {
+                        "global_step": actual_step,
+                        "rollouts": actual_step,
+                        "environment_state": {"format": "fixture-live-snapshot-v1", "lanes": 1},
+                        "observations": [[actual_step]],
+                        "context": [[actual_step]],
+                        "episode_starts": [False],
+                        "dones": [False],
+                        "episode_returns": [float(actual_step)],
+                        "episode_lengths": [actual_step],
+                        "episode_index": [0],
+                    },
                     "evidence_run_identity": args.evidence_run_identity,
                     "evidence_attempt_identity": args.evidence_attempt_identity,
                 },
@@ -142,7 +159,21 @@ def main() -> int:
                         "policy": "policy_state" in resumed_checkpoint,
                         "optimizer": "optimizer_state" in resumed_checkpoint,
                         "rng": "rng_state" in resumed_checkpoint,
-                        "progress": "progress" in resumed_checkpoint,
+                        "progress": all(
+                            key in resumed_checkpoint.get("progress", {})
+                            for key in (
+                                "global_step",
+                                "rollouts",
+                                "environment_state",
+                                "observations",
+                                "context",
+                                "episode_starts",
+                                "dones",
+                                "episode_returns",
+                                "episode_lengths",
+                                "episode_index",
+                            )
+                        ),
                     },
                     "evidence_binding": {
                         "run_identity": args.evidence_run_identity,
@@ -163,6 +194,17 @@ def main() -> int:
         )
         _emit(args.metrics_jsonl, *records)
         _mutate_bootstrap(args.fixture_mutate_bootstrap)
+        if should_interrupt and args.fixture_hold_after_recovery_checkpoint_marker is not None:
+            args.fixture_hold_after_recovery_checkpoint_marker.write_text(
+                "checkpoint-ready\n", encoding="utf-8"
+            )
+            time.sleep(0.75)
+            if args.fixture_recovery_child_exited_marker is not None:
+                args.fixture_recovery_child_exited_marker.write_text(
+                    "child-exited\n", encoding="utf-8"
+                )
+        if should_interrupt and hard_crash:
+            os._exit(17)
         return 130 if should_interrupt else 0
 
     checkpoint = json.loads(args.evaluate_checkpoint.read_text(encoding="utf-8"))

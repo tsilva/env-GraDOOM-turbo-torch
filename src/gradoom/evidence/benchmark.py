@@ -3,10 +3,13 @@ from __future__ import annotations
 import json
 import math
 import os
+import shutil
+import signal
 import stat
 import statistics
 import subprocess
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -126,7 +129,7 @@ def _string_array(value: object, field: str, *, non_empty: bool = False) -> list
     return value
 
 
-def _validate_trainer(value: object) -> dict[str, list[str]]:
+def _validate_trainer(value: object) -> dict[str, Any]:
     trainer = _required_mapping(value, "benchmark.trainer")
     command = _string_array(trainer.get("command"), "benchmark.trainer.command", non_empty=True)
     arguments = _string_array(trainer.get("arguments", []), "benchmark.trainer.arguments")
@@ -145,6 +148,47 @@ def _validate_trainer(value: object) -> dict[str, list[str]]:
                 "the evidence command owns cold-start, timing, checkpoint, and evaluation flags"
             )
     return {"command": command, "arguments": arguments}
+
+
+def _bind_trainer_files(
+    trainer: dict[str, Any],
+    *,
+    base_directory: Path,
+) -> dict[str, Any]:
+    command = trainer["command"]
+    executable = shutil.which(command[0])
+    if executable is None:
+        candidate = _resolve_evidence_path(Path(command[0]), base_directory=base_directory)
+        executable_path = candidate
+    else:
+        executable_path = Path(executable).resolve()
+    bound_files = [
+        {
+            "role": "executable",
+            "path": str(executable_path),
+            "sha256": (
+                _sha256_bytes(executable_path.read_bytes()) if executable_path.is_file() else None
+            ),
+        }
+    ]
+    for token in command[1:]:
+        if token.startswith("-"):
+            continue
+        candidate = _resolve_evidence_path(Path(token), base_directory=base_directory)
+        if candidate.is_file():
+            bound_files.append(
+                {
+                    "role": "script",
+                    "path": str(candidate),
+                    "sha256": _sha256_bytes(candidate.read_bytes()),
+                }
+            )
+    executable_name = executable_path.name.lower()
+    if executable_name.startswith(("python", "pypy")) and len(bound_files) == 1:
+        raise EvidenceError(
+            "benchmark trainer interpreter commands must bind a script file by path"
+        )
+    return {**trainer, "bound_files": bound_files}
 
 
 def _validate_certificate(value: object) -> dict[str, Any]:
@@ -173,6 +217,19 @@ _BOOTSTRAP_STATE_FIELDS = {
     "candidate_specific",
 }
 
+_BOOTSTRAP_REPRODUCTION_INPUTS = {
+    "candidate_identity",
+    "run_identity",
+    "training_seed",
+}
+_BOOTSTRAP_STATE_MARKERS = {
+    "learned": (b"policy_state", b"learned_parameters", b"model_weights"),
+    "optimizer": (b"optimizer_state", b"momentum_buffer"),
+    "rollout": (b"rollout_state", b"rollout_buffer"),
+    "seed_specific": (b"training_seed", b"episode_seed", b"rng_state"),
+    "candidate_specific": (b"candidate_identity", b"recipe_candidate"),
+}
+
 
 def _validate_bootstrap_artifacts(value: object) -> list[dict[str, Any]]:
     if value is None:
@@ -190,6 +247,7 @@ def _validate_bootstrap_artifacts(value: object) -> list[dict[str, Any]]:
             "sha256",
             "creation_elapsed_seconds",
             "creation_protocol",
+            "creation_receipt",
             "reuse_conditions",
             "persistent",
             "run_independent",
@@ -220,6 +278,17 @@ def _validate_bootstrap_artifacts(value: object) -> list[dict[str, Any]]:
         creation_protocol = artifact.get("creation_protocol")
         if not isinstance(creation_protocol, str) or not creation_protocol.strip():
             raise EvidenceError(f"{field}.creation_protocol must be a non-whitespace string")
+        creation_receipt = _required_mapping(
+            artifact.get("creation_receipt"), f"{field}.creation_receipt"
+        )
+        if set(creation_receipt) != {"path", "sha256"}:
+            raise EvidenceError(f"{field}.creation_receipt must contain exactly path and sha256")
+        receipt_path = creation_receipt.get("path")
+        if not isinstance(receipt_path, str) or not receipt_path.strip():
+            raise EvidenceError(f"{field}.creation_receipt.path must be a non-whitespace path")
+        receipt_sha256 = _validate_sha256(
+            creation_receipt.get("sha256"), f"{field}.creation_receipt.sha256"
+        )
         reuse_conditions = _string_array(
             artifact.get("reuse_conditions"),
             f"{field}.reuse_conditions",
@@ -254,6 +323,10 @@ def _validate_bootstrap_artifacts(value: object) -> list[dict[str, Any]]:
                 "sha256": sha256,
                 "creation_elapsed_seconds": float(creation_elapsed),
                 "creation_protocol": creation_protocol,
+                "creation_receipt": {
+                    "path": receipt_path,
+                    "sha256": receipt_sha256,
+                },
                 "reuse_conditions": reuse_conditions,
                 "persistent": True,
                 "run_independent": True,
@@ -262,6 +335,119 @@ def _validate_bootstrap_artifacts(value: object) -> list[dict[str, Any]]:
             }
         )
     return artifacts
+
+
+def _bootstrap_state_classes(payload: bytes) -> list[str]:
+    normalized = payload.lower()
+    return sorted(
+        state_class
+        for state_class, markers in _BOOTSTRAP_STATE_MARKERS.items()
+        if any(marker in normalized for marker in markers)
+    )
+
+
+def _validate_bootstrap_creation_receipt(
+    declaration: dict[str, Any],
+    *,
+    base_directory: Path,
+    artifacts_root: Path,
+) -> tuple[dict[str, str], dict[str, Any]]:
+    declared_receipt = declaration["creation_receipt"]
+    receipt_path = _resolve_evidence_path(
+        Path(declared_receipt["path"]), base_directory=base_directory
+    )
+    if receipt_path == artifacts_root or receipt_path.is_relative_to(artifacts_root):
+        raise EvidenceError(
+            f"bootstrap artifact {declaration['name']!r} creation receipt must predate the cohort"
+        )
+    try:
+        metadata = receipt_path.lstat()
+        receipt_bytes = receipt_path.read_bytes()
+    except OSError as error:
+        raise EvidenceError(
+            f"bootstrap artifact {declaration['name']!r} creation receipt is missing or unreadable"
+        ) from error
+    if (
+        receipt_path.is_symlink()
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_mode & 0o222
+    ):
+        raise EvidenceError(
+            f"bootstrap artifact {declaration['name']!r} creation receipt is mutable"
+        )
+    actual_receipt_sha256 = _sha256_bytes(receipt_bytes)
+    if actual_receipt_sha256 != declared_receipt["sha256"]:
+        raise EvidenceError(
+            f"bootstrap artifact {declaration['name']!r} creation receipt SHA-256 mismatch"
+        )
+    receipt = _parse_json_document(receipt_bytes, document="bootstrap creation receipt")
+    if not isinstance(receipt, dict):
+        raise EvidenceError("bootstrap creation receipt must be a JSON object")
+    expected_receipt_fields = {
+        "schema_version",
+        "artifact_sha256",
+        "creation_elapsed_seconds",
+        "creation_protocol",
+        "reuse_conditions",
+        "reproduction",
+    }
+    if set(receipt) != expected_receipt_fields or receipt.get("schema_version") != 1:
+        raise EvidenceError("bootstrap creation receipt has an unsupported contract")
+    for field in (
+        "artifact_sha256",
+        "creation_elapsed_seconds",
+        "creation_protocol",
+        "reuse_conditions",
+    ):
+        if receipt.get(field) != declaration[field if field != "artifact_sha256" else "sha256"]:
+            raise EvidenceError(
+                f"bootstrap creation receipt does not corroborate {field.replace('_', ' ')}"
+            )
+    reproduction = _required_mapping(
+        receipt.get("reproduction"), "bootstrap creation receipt reproduction"
+    )
+    if set(reproduction) != {"varied_inputs", "independent_builds"}:
+        raise EvidenceError("bootstrap creation receipt reproduction has undeclared fields")
+    varied_inputs = reproduction.get("varied_inputs")
+    if not isinstance(varied_inputs, list) or set(varied_inputs) != _BOOTSTRAP_REPRODUCTION_INPUTS:
+        raise EvidenceError(
+            "bootstrap creation receipt must vary run, training-seed, and candidate identities"
+        )
+    builds = reproduction.get("independent_builds")
+    if not isinstance(builds, list) or len(builds) < 2:
+        raise EvidenceError("bootstrap creation receipt requires two independent builds")
+    contexts: set[str] = set()
+    for index, build in enumerate(builds):
+        if not isinstance(build, dict) or set(build) != {
+            "context",
+            "artifact_sha256",
+            "elapsed_seconds",
+        }:
+            raise EvidenceError(f"bootstrap creation receipt build {index} is malformed")
+        context = build.get("context")
+        elapsed = build.get("elapsed_seconds")
+        if not isinstance(context, str) or not context or context in contexts:
+            raise EvidenceError("bootstrap creation receipt build contexts must be unique")
+        contexts.add(context)
+        if build.get("artifact_sha256") != declaration["sha256"]:
+            raise EvidenceError("bootstrap artifact was not reproduced unchanged")
+        if (
+            type(elapsed) not in (int, float)
+            or not math.isfinite(float(elapsed))
+            or float(elapsed) < 0.0
+        ):
+            raise EvidenceError("bootstrap creation receipt build elapsed time is invalid")
+    return (
+        {"path": str(receipt_path), "sha256": actual_receipt_sha256},
+        {
+            "contract": "deterministic-run-independence-v1",
+            "receipt_sha256": actual_receipt_sha256,
+            "independent_builds": len(builds),
+            "varied_inputs": sorted(_BOOTSTRAP_REPRODUCTION_INPUTS),
+            "content_scan": "prohibited-benchmark-state-markers-v1",
+        },
+    )
 
 
 def _validate_bootstrap_files(
@@ -297,10 +483,23 @@ def _validate_bootstrap_files(
                 f"bootstrap artifact {declaration['name']!r} SHA-256 mismatch: "
                 f"expected {declaration['sha256']}, got {actual_sha256}"
             )
+        prohibited_state = _bootstrap_state_classes(payload)
+        if prohibited_state:
+            raise EvidenceError(
+                f"bootstrap artifact {declaration['name']!r} contains prohibited benchmark state: "
+                f"{', '.join(prohibited_state)}"
+            )
+        creation_receipt, eligibility_evidence = _validate_bootstrap_creation_receipt(
+            declaration,
+            base_directory=base_directory,
+            artifacts_root=artifacts_root,
+        )
         validated.append(
             {
                 **declaration,
                 "path": str(path),
+                "creation_receipt": creation_receipt,
+                "eligibility_evidence": eligibility_evidence,
                 "validated_before_cohort": True,
                 "reverified_unchanged_after_cohort": False,
             }
@@ -327,6 +526,26 @@ def _reverify_bootstrap_files(artifacts: list[dict[str, Any]]) -> None:
         ):
             raise EvidenceError(
                 f"bootstrap artifact {artifact['name']!r} changed during the cohort"
+            )
+        receipt_path = Path(artifact["creation_receipt"]["path"])
+        try:
+            receipt_metadata = receipt_path.lstat()
+            receipt_sha256 = _sha256_bytes(receipt_path.read_bytes())
+        except OSError as error:
+            raise EvidenceError(
+                f"bootstrap artifact {artifact['name']!r} creation receipt changed "
+                "during the cohort"
+            ) from error
+        if (
+            receipt_path.is_symlink()
+            or not stat.S_ISREG(receipt_metadata.st_mode)
+            or receipt_metadata.st_nlink != 1
+            or receipt_metadata.st_mode & 0o222
+            or receipt_sha256 != artifact["creation_receipt"]["sha256"]
+        ):
+            raise EvidenceError(
+                f"bootstrap artifact {artifact['name']!r} creation receipt changed "
+                "during the cohort"
             )
         artifact["reverified_unchanged_after_cohort"] = True
 
@@ -776,13 +995,18 @@ def _validate_evaluation_records(
     return evaluation, episodes, mean_player, mean_compatibility
 
 
-def _run_process(command: list[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
+def _run_process(
+    command: list[str],
+    *,
+    cwd: Path,
+    heartbeat: Callable[[], None] | None = None,
+) -> subprocess.CompletedProcess[str]:
     try:
-        return subprocess.run(
+        process = subprocess.Popen(
             command,
             cwd=cwd,
-            check=False,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
             errors="replace",
@@ -794,6 +1018,30 @@ def _run_process(command: list[str], *, cwd: Path) -> subprocess.CompletedProces
             stdout="",
             stderr=f"cannot execute benchmark process {command[0]!r}: {error}",
         )
+    previous_handlers: dict[int, Any] = {}
+
+    def persist_before_termination(signum: int, _frame: Any) -> None:
+        if heartbeat is not None:
+            heartbeat()
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+    try:
+        if heartbeat is not None:
+            for signum in (signal.SIGINT, signal.SIGTERM):
+                previous_handlers[signum] = signal.signal(signum, persist_before_termination)
+        stdout, stderr = process.communicate()
+        if heartbeat is not None:
+            heartbeat()
+        return subprocess.CompletedProcess(
+            command,
+            process.returncode,
+            stdout=stdout,
+            stderr=stderr,
+        )
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
 
 
 def _fsync_file(path: Path, *, field: str) -> str:
@@ -812,6 +1060,21 @@ def _fsync_file(path: Path, *, field: str) -> str:
     except OSError as error:
         raise EvidenceError(f"{field} directory cannot be made durable: {path.parent}") from error
     return _sha256_bytes(payload)
+
+
+def _write_durable_json(path: Path, payload: dict[str, Any], *, field: str) -> str:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+    try:
+        with temporary.open("w", encoding="utf-8") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return _fsync_file(path, field=field)
 
 
 def _write_seed_file(path: Path, seeds: list[int]) -> str:
@@ -836,6 +1099,144 @@ def _failure(
     }
 
 
+def _load_live_interrupted_attempt(
+    attempt_directory: Path,
+    *,
+    seed: int,
+    run_identity: str,
+    attempt_identity: str,
+    protocol: dict[str, Any],
+    manifest_directory: Path,
+    evidence_entries: list[dict[str, str]],
+    wad_profile: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    journals = sorted(
+        attempt_directory.glob("attempt-live-*.json"),
+        key=lambda path: path.stat().st_mtime_ns,
+        reverse=True,
+    )
+    for journal_path in journals:
+        try:
+            journal_bytes = journal_path.read_bytes()
+            journal = _parse_json_document(journal_bytes, document="live benchmark attempt journal")
+        except OSError:
+            continue
+        if not isinstance(journal, dict) or journal.get("status") != "running":
+            continue
+        journal_payload_sha256 = journal.pop("payload_sha256", None)
+        if journal_payload_sha256 != _canonical_sha256(
+            journal,
+            document="live benchmark attempt journal",
+        ):
+            raise EvidenceError(f"seed {seed} live attempt journal checksum mismatch")
+        expected_identity = protocol["continuation_identity"]
+        if (
+            journal.get("schema_version") != 1
+            or journal.get("run_identity") != run_identity
+            or journal.get("attempt_identity") != attempt_identity
+            or journal.get("seed") != seed
+            or journal.get("continuation_identity") != expected_identity
+        ):
+            raise EvidenceError(f"seed {seed} live attempt journal has unlike identity")
+        checkpoint = _resolve_evidence_path(
+            Path(journal.get("checkpoint", "")), base_directory=manifest_directory
+        )
+        training_metrics = _resolve_evidence_path(
+            Path(journal.get("training_metrics", "")), base_directory=manifest_directory
+        )
+        if not checkpoint.is_file() or not training_metrics.is_file():
+            raise EvidenceError(
+                f"seed {seed} interrupted before producing a recoverable checkpoint"
+            )
+        previous_checkpoint = journal.get("previous_checkpoint")
+        if previous_checkpoint is not None:
+            previous_checkpoint = _required_mapping(
+                previous_checkpoint, "live benchmark previous checkpoint"
+            )
+            previous_checkpoint = {
+                **previous_checkpoint,
+                "path": _resolve_evidence_path(
+                    Path(previous_checkpoint["path"]),
+                    base_directory=manifest_directory,
+                ),
+            }
+        requested_step = journal.get("checkpoint_step")
+        if type(requested_step) is not int:
+            raise EvidenceError("live benchmark attempt has invalid checkpoint step")
+        records = _read_jsonl(training_metrics, phase="interrupted training")
+        summary, _resumed = _validate_training_records(
+            records,
+            checkpoint=checkpoint,
+            requested_step=requested_step,
+            previous_checkpoint=previous_checkpoint,
+            manifest_directory=manifest_directory,
+            wad_profile=wad_profile,
+            run_identity=run_identity,
+            attempt_identity=attempt_identity,
+            interrupted=True,
+        )
+        checkpoint_sha256 = _fsync_file(checkpoint, field="live recovery checkpoint")
+        metrics_sha256 = _fsync_file(training_metrics, field="live recovery metrics")
+        journal_sha256 = _sha256_bytes(journal_bytes)
+        indexed = (
+            (journal["checkpoint_evidence_name"], checkpoint_sha256, checkpoint),
+            (journal["metrics_evidence_name"], metrics_sha256, training_metrics),
+            (journal["journal_evidence_name"], journal_sha256, journal_path),
+        )
+        existing_names = {entry["name"] for entry in evidence_entries}
+        generated_artifacts = []
+        for name, sha256, path in indexed:
+            if name not in existing_names:
+                evidence_entries.append({"name": name, "sha256": sha256})
+                existing_names.add(name)
+            generated_artifacts.append({"name": name, "path": str(path)})
+        elapsed = journal.get("reusable_elapsed_seconds")
+        if type(elapsed) not in (int, float) or not math.isfinite(float(elapsed)) or elapsed < 0:
+            raise EvidenceError("live benchmark attempt has invalid accumulated elapsed time")
+        launch_elapsed = journal.get("reusable_elapsed_seconds_at_launch")
+        started_unix_ns = journal.get("started_unix_ns")
+        if (
+            type(launch_elapsed) not in (int, float)
+            or not math.isfinite(float(launch_elapsed))
+            or float(launch_elapsed) < 0
+            or type(started_unix_ns) is not int
+            or started_unix_ns <= 0
+        ):
+            raise EvidenceError("live benchmark attempt has invalid launch timing")
+        elapsed_to_checkpoint = max(
+            0.0,
+            (checkpoint.stat().st_mtime_ns - started_unix_ns) / 1_000_000_000,
+        )
+        elapsed = max(
+            float(elapsed),
+            float(launch_elapsed) + elapsed_to_checkpoint,
+        )
+        return {
+            "seed": seed,
+            "attempt_identity": attempt_identity,
+            "cold_start": journal["cold_start"],
+            "status": "interrupted",
+            "reusable_elapsed_seconds": float(elapsed),
+            "checkpoint": str(checkpoint),
+            "checkpoint_sha256": checkpoint_sha256,
+            "outcomes": journal["outcomes"],
+            "failures": journal["failures"],
+            "recovery": {
+                "checkpoint": str(checkpoint),
+                "checkpoint_sha256": checkpoint_sha256,
+                "progress_step": summary["train/global_step"],
+                "restorable_state": dict(_RESTORABLE_STATE),
+                "run_identity": run_identity,
+                "attempt_identity": attempt_identity,
+                "accumulated_reusable_elapsed_seconds": float(elapsed),
+            },
+            "recovery_history": journal["recovery_history"],
+            "recovery_journal": None,
+            "generated_artifacts": generated_artifacts,
+        }
+    return None
+
+
 def _run_attempt(
     *,
     seed: int,
@@ -846,15 +1247,34 @@ def _run_attempt(
     evidence_entries: list[dict[str, str]],
     wad_profile: dict[str, Any] | None,
     existing_attempt: dict[str, Any] | None = None,
+    started: float | None = None,
+    clock: Callable[[], float] = time.perf_counter,
 ) -> dict[str, Any]:
-    started = time.perf_counter()
+    if started is None:
+        started = clock()
     attempt_directory = run_directory / f"seed-{seed}"
     attempt_identity = _canonical_sha256(
         {"run_identity": run_identity, "seed": seed},
         document="benchmark attempt",
     )
     if existing_attempt is None:
-        attempt_directory.mkdir()
+        if attempt_directory.is_dir():
+            existing_attempt = _load_live_interrupted_attempt(
+                attempt_directory,
+                seed=seed,
+                run_identity=run_identity,
+                attempt_identity=attempt_identity,
+                protocol=protocol,
+                manifest_directory=manifest_directory,
+                evidence_entries=evidence_entries,
+                wad_profile=wad_profile,
+            )
+            if existing_attempt is None:
+                raise EvidenceError(
+                    f"seed {seed} artifact directory exists without a recoverable live attempt"
+                )
+        else:
+            attempt_directory.mkdir()
     elif existing_attempt.get("attempt_identity") != attempt_identity:
         raise EvidenceError(f"seed {seed} continuation has unlike attempt identity")
     elif existing_attempt.get("status") != "interrupted":
@@ -916,7 +1336,9 @@ def _run_attempt(
     final_checkpoint = None if not outcomes else Path(outcomes[-1]["checkpoint"])
     final_checkpoint_sha256 = None if not outcomes else outcomes[-1]["checkpoint_sha256"]
     recovery: dict[str, Any] | None = None
-    generated_artifacts: list[dict[str, str]] = []
+    generated_artifacts: list[dict[str, str]] = list(
+        (existing_attempt or {}).get("generated_artifacts", [])
+    )
     status = "exhausted"
     for checkpoint_step in protocol["checkpoint_steps"]:
         if any(outcome["checkpoint_step"] == checkpoint_step for outcome in outcomes):
@@ -947,8 +1369,92 @@ def _run_attempt(
         ]
         if previous_checkpoint is not None:
             training_command.extend(("--resume", str(previous_checkpoint["path"])))
-        training_process = _run_process(training_command, cwd=manifest_directory)
-        if training_process.returncode not in {0, 130}:
+        checkpoint_evidence_name = f"seed-{seed}-step-{checkpoint_step}{suffix}-checkpoint"
+        metrics_evidence_name = f"seed-{seed}-step-{checkpoint_step}{suffix}-training-metrics"
+        live_journal_path = attempt_directory / f"attempt-live-step-{checkpoint_step}{suffix}.json"
+        journal_evidence_name = f"seed-{seed}-step-{checkpoint_step}{suffix}-live-attempt"
+        live_started_unix_ns = time.time_ns()
+        reusable_elapsed_at_launch = prior_elapsed + clock() - started
+        serialized_previous = None
+        if previous_checkpoint is not None:
+            serialized_previous = {
+                **previous_checkpoint,
+                "path": str(previous_checkpoint["path"]),
+            }
+        cold_start = (existing_attempt or {}).get(
+            "cold_start",
+            {
+                "policy_state": "fresh_random",
+                "optimizer_state": "fresh",
+                "learned_initialization": False,
+            },
+        )
+
+        def persist_live_attempt(
+            *,
+            checkpoint_step: int = checkpoint_step,
+            checkpoint: Path = checkpoint,
+            training_metrics: Path = training_metrics,
+            serialized_previous: dict[str, Any] | None = serialized_previous,
+            cold_start: dict[str, Any] = cold_start,
+            checkpoint_evidence_name: str = checkpoint_evidence_name,
+            metrics_evidence_name: str = metrics_evidence_name,
+            journal_evidence_name: str = journal_evidence_name,
+            live_journal_path: Path = live_journal_path,
+            reusable_elapsed_at_launch: float = reusable_elapsed_at_launch,
+            live_started_unix_ns: int = live_started_unix_ns,
+        ) -> None:
+            live_payload = {
+                "schema_version": 1,
+                "status": "running",
+                "run_identity": run_identity,
+                "attempt_identity": attempt_identity,
+                "seed": seed,
+                "continuation_identity": protocol["continuation_identity"],
+                "checkpoint_step": checkpoint_step,
+                "checkpoint": str(checkpoint),
+                "training_metrics": str(training_metrics),
+                "previous_checkpoint": serialized_previous,
+                "cold_start": cold_start,
+                "outcomes": outcomes,
+                "failures": failures,
+                "recovery_history": recovery_history,
+                "reusable_elapsed_seconds": prior_elapsed + clock() - started,
+                "reusable_elapsed_seconds_at_launch": reusable_elapsed_at_launch,
+                "started_unix_ns": live_started_unix_ns,
+                "checkpoint_evidence_name": checkpoint_evidence_name,
+                "metrics_evidence_name": metrics_evidence_name,
+                "journal_evidence_name": journal_evidence_name,
+            }
+            live_payload["payload_sha256"] = _canonical_sha256(
+                live_payload,
+                document="live benchmark attempt journal",
+            )
+            _write_durable_json(
+                live_journal_path,
+                live_payload,
+                field="live benchmark attempt journal",
+            )
+
+        persist_live_attempt()
+        training_process = _run_process(
+            training_command,
+            cwd=manifest_directory,
+            heartbeat=persist_live_attempt,
+        )
+        live_journal_sha256 = _fsync_file(
+            live_journal_path,
+            field="live benchmark attempt journal",
+        )
+        if journal_evidence_name not in {entry["name"] for entry in evidence_entries}:
+            evidence_entries.append({"name": journal_evidence_name, "sha256": live_journal_sha256})
+        generated_artifacts.append({"name": journal_evidence_name, "path": str(live_journal_path)})
+        crash_left_recovery_evidence = (
+            training_process.returncode not in {0, 130}
+            and checkpoint.is_file()
+            and training_metrics.is_file()
+        )
+        if training_process.returncode not in {0, 130} and not crash_left_recovery_evidence:
             failures.append(
                 _failure(
                     seed=seed,
@@ -959,7 +1465,7 @@ def _run_attempt(
             )
             status = "crashed"
             break
-        was_interrupted = training_process.returncode == 130
+        was_interrupted = training_process.returncode == 130 or crash_left_recovery_evidence
         try:
             training_records = _read_jsonl(training_metrics, phase="training")
             training_summary, resumed_record = _validate_training_records(
@@ -992,20 +1498,15 @@ def _run_attempt(
         evidence_entries.extend(
             (
                 {
-                    "name": f"seed-{seed}-step-{checkpoint_step}-checkpoint",
+                    "name": checkpoint_evidence_name,
                     "sha256": checkpoint_sha256,
                 },
                 {
-                    "name": f"seed-{seed}-step-{checkpoint_step}-training-metrics",
+                    "name": metrics_evidence_name,
                     "sha256": training_metrics_sha256,
                 },
             )
         )
-        if suffix:
-            evidence_entries[-2]["name"] = f"seed-{seed}-step-{checkpoint_step}{suffix}-checkpoint"
-            evidence_entries[-1]["name"] = (
-                f"seed-{seed}-step-{checkpoint_step}{suffix}-training-metrics"
-            )
         generated_artifacts.extend(
             (
                 {"name": evidence_entries[-2]["name"], "path": str(checkpoint)},
@@ -1130,7 +1631,7 @@ def _run_attempt(
         if passed:
             status = "succeeded"
             break
-    elapsed = prior_elapsed + time.perf_counter() - started
+    elapsed = prior_elapsed + clock() - started
     if recovery is not None:
         recovery["accumulated_reusable_elapsed_seconds"] = elapsed
         recovery_journal_path = attempt_directory / (
@@ -1214,9 +1715,17 @@ def build_development_benchmark_report(
     manifest_path: Path,
     *,
     merge_path: Path | None = None,
+    invocation_started: float | None = None,
+    clock: Callable[[], float] = time.perf_counter,
 ) -> dict[str, Any]:
+    if invocation_started is None:
+        invocation_started = clock()
     manifest, manifest_payload = _load_manifest(manifest_path)
     validated = _validate_benchmark(manifest)
+    validated["trainer"] = _bind_trainer_files(
+        validated["trainer"],
+        base_directory=manifest_path.parent,
+    )
     declared_inputs = _validate_declared_inputs(
         manifest.get("declared_inputs"),
         base_directory=manifest_path.parent,
@@ -1233,6 +1742,13 @@ def build_development_benchmark_report(
     )
     evidence_entries.extend(
         {"name": f"bootstrap-{item['name']}", "sha256": item["sha256"]}
+        for item in bootstrap_exclusions
+    )
+    evidence_entries.extend(
+        {
+            "name": f"bootstrap-{item['name']}-creation-receipt",
+            "sha256": item["creation_receipt"]["sha256"],
+        }
         for item in bootstrap_exclusions
     )
     wad_profile = None
@@ -1299,6 +1815,11 @@ def build_development_benchmark_report(
             "learned_initialization_allowed": False,
         },
         "timer_includes": [
+            "command_parsing",
+            "manifest_and_configuration_validation",
+            "identity_and_input_hashing",
+            "artifact_directory_setup",
+            "continuation_and_recovery_verification",
             "recurring_initialization",
             "per_process_or_uncached_compilation",
             "graph_capture",
@@ -1308,7 +1829,10 @@ def build_development_benchmark_report(
             "durable_checkpoint_write",
         ],
         "timer_boundaries": {
-            "start": "immediately_before_recurring_attempt_setup",
+            "start": (
+                "before_command_parsing_manifest_validation_identity_hashing_artifact_setup_"
+                "and_continuation_verification"
+            ),
             "resume": "add_prior_hashed_recovery_elapsed_before_recurring_recovery_work",
             "stop": "after_durable_checkpoint_or_terminal_attempt_state",
         },
@@ -1397,7 +1921,7 @@ def build_development_benchmark_report(
         )
         evidence_entries = [dict(entry) for entry in continuation["evidence_index"]["entries"]]
     run_directory = artifacts_root / run_identity
-    if continuation is None:
+    if continuation is None and not run_directory.exists():
         try:
             run_directory.mkdir(parents=True, exist_ok=False)
         except FileExistsError as error:
@@ -1412,7 +1936,10 @@ def build_development_benchmark_report(
     }
     attempts = []
     actual_generated_artifacts: list[dict[str, str]] = []
+    setup_time_assigned = False
     for seed in validated["training_seeds"]:
+        existing_attempt = existing_by_seed.get(seed)
+        active_attempt = existing_attempt is None or existing_attempt.get("status") == "interrupted"
         attempt = _run_attempt(
             seed=seed,
             protocol=protocol,
@@ -1421,8 +1948,12 @@ def build_development_benchmark_report(
             manifest_directory=manifest_path.parent,
             evidence_entries=evidence_entries,
             wad_profile=wad_profile,
-            existing_attempt=existing_by_seed.get(seed),
+            existing_attempt=existing_attempt,
+            started=(invocation_started if active_attempt and not setup_time_assigned else None),
+            clock=clock,
         )
+        if active_attempt:
+            setup_time_assigned = True
         actual_generated_artifacts.extend(attempt.pop("generated_artifacts", []))
         attempts.append(attempt)
     _reverify_bootstrap_files(bootstrap_exclusions)

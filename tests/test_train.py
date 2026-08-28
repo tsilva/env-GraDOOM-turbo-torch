@@ -689,6 +689,40 @@ def test_resume_optimizer_state_honors_explicit_learning_rate() -> None:
     assert resumed.state[resumed_parameter]["step"] == source.state[source_parameter]["step"]
 
 
+def test_evidence_resume_rejects_checkpoint_without_live_lane_progress() -> None:
+    checkpoint = {
+        "policy_state_dict": {},
+        "optimizer_state_dict": {},
+        "training_state": {
+            "completed_episodes": 4,
+            "executed_rollouts": 2,
+            "episode_index": torch.tensor([2, 3]),
+            "rolling_returns": [],
+            "rolling_kills": [],
+            "rolling_lengths": [],
+            "rolling_success": [],
+            "python_rng_state": object(),
+            "numpy_rng_state": object(),
+            "torch_rng_state": torch.zeros(1, dtype=torch.uint8),
+            "cuda_rng_state": [torch.zeros(1, dtype=torch.uint8)],
+        },
+    }
+
+    assert train._checkpoint_restored_state(checkpoint, num_envs=2) == {
+        "policy": True,
+        "optimizer": True,
+        "rng": True,
+        "progress": False,
+    }
+    with pytest.raises(
+        ValueError,
+        match=(
+            "evidence recovery checkpoint cannot restore continuous environment and lane progress"
+        ),
+    ):
+        train._validate_evidence_recovery_checkpoint(checkpoint, num_envs=2)
+
+
 def test_native_death_reward_is_explicitly_audited() -> None:
     args = _args("--config-only", "--reward-shape", "native-death-v1", "--death-penalty", "3")
 
