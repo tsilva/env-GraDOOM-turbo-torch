@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "workflow": "parity_readiness",
+  "evidence_level": "development",
+  "fixture": true,
+  "code_provenance": {
+    "repository": "tsilva/env-GraDOOM-turbo-torch",
+    "revision": "fixture-revision",
+    "dirty": false
+  },
+  "declared_inputs": [
+    {
+      "name": "provider_contract",
+      "path": "provider-contract.json",
+      "sha256": "09634113116b633334e06263d1c236cc402107c6a98effabe5ff2dbbee0b15d7"
+    }
+  ],
+  "prerequisites": [
+    {
+      "id": "certified_freedoom2_wad_profile",
+      "available": false,
+      "reason": "The real pinned Freedoom2 WAD profile has not been validated."
+    },
+    {
+      "id": "pinned_reference_provider",
+      "available": false,
+      "reason": "The pinned env-ViZDoom-turbo provider has not been verified."
+    },
+    {
+      "id": "real_pretrained_policy_corpus",
+      "available": false,
+      "reason": "The required real pretrained policy corpus is unavailable."
+    }
+  ]
+}
