@@ -14,13 +14,18 @@ def _sha256_bytes(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def _canonical_sha256(value: object) -> str:
-    payload = json.dumps(
-        value,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode()
+def _canonical_sha256(value: object, *, document: str) -> str:
+    try:
+        payload = json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+    except UnicodeEncodeError as error:
+        raise EvidenceError(
+            f"{document} contains invalid Unicode at character {error.start}"
+        ) from error
     return _sha256_bytes(payload)
 
 
@@ -115,6 +120,8 @@ def _run_identity(
     code_provenance: dict[str, Any],
     declared_inputs: list[dict[str, Any]],
     prerequisites: list[dict[str, Any]],
+    *,
+    document: str,
 ) -> str:
     identity = {
         "schema_version": manifest["schema_version"],
@@ -128,7 +135,7 @@ def _run_identity(
         ),
         "prerequisites": sorted(item["id"] for item in prerequisites),
     }
-    return _canonical_sha256(identity)
+    return _canonical_sha256(identity, document=document)
 
 
 def build_readiness_report(manifest_path: Path) -> dict[str, Any]:
@@ -186,7 +193,7 @@ def build_readiness_report(manifest_path: Path) -> dict[str, Any]:
     evidence_index = {
         "algorithm": "sha256",
         "entries": evidence_entries,
-        "sha256": _canonical_sha256(evidence_entries),
+        "sha256": _canonical_sha256(evidence_entries, document="manifest"),
     }
     return {
         "schema_version": 1,
@@ -197,7 +204,11 @@ def build_readiness_report(manifest_path: Path) -> dict[str, Any]:
         "claim_eligible": False,
         "claim_reasons": claim_reasons,
         "run_identity": _run_identity(
-            manifest, code_provenance, declared_inputs, prerequisites
+            manifest,
+            code_provenance,
+            declared_inputs,
+            prerequisites,
+            document="manifest",
         ),
         "code_provenance": code_provenance,
         "declared_inputs": declared_inputs,
@@ -229,7 +240,11 @@ def validate_merge_report(path: Path, expected_run_identity: object) -> None:
         report.get("run_identity"), "merge report run_identity"
     )
     recomputed_run_identity = _run_identity(
-        report, code_provenance, declared_inputs, prerequisites
+        report,
+        code_provenance,
+        declared_inputs,
+        prerequisites,
+        document="merge report",
     )
     if stored_run_identity != recomputed_run_identity:
         raise EvidenceError(
@@ -241,7 +256,9 @@ def validate_merge_report(path: Path, expected_run_identity: object) -> None:
     entries = evidence_index.get("entries")
     if evidence_index.get("algorithm") != "sha256" or not isinstance(entries, list):
         raise EvidenceError("merge report evidence_index is malformed")
-    if evidence_index.get("sha256") != _canonical_sha256(entries):
+    if evidence_index.get("sha256") != _canonical_sha256(
+        entries, document="merge report"
+    ):
         raise EvidenceError("merge report evidence_index SHA-256 mismatch")
     if recomputed_run_identity != expected_run_identity:
         raise EvidenceError(
