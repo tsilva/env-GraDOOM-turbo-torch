@@ -8,8 +8,10 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from .benchmark import build_development_benchmark_report
 from .report import (
     EvidenceError,
+    _load_manifest,
     _paths_alias,
     _resolve_evidence_path,
     build_readiness_report,
@@ -117,6 +119,19 @@ def _validate_output_path(
                     asset_id = f"{provider['id']}.{asset_name}"
                     raise EvidenceError(f"output path aliases WAD profile asset {asset_id!r}")
 
+    generated_artifacts = report.get("generated_artifacts", [])
+    assert isinstance(generated_artifacts, list)
+    for artifact in generated_artifacts:
+        assert isinstance(artifact, dict)
+        resolved_artifact = _resolve_evidence_path(
+            Path(artifact["path"]),
+            base_directory=manifest_directory,
+        )
+        if _paths_alias(resolved_output, resolved_artifact):
+            raise EvidenceError(
+                f"output path aliases generated benchmark artifact {artifact['name']!r}"
+            )
+
     if merge_path is not None:
         resolved_merge = _resolve_evidence_path(
             merge_path,
@@ -126,10 +141,84 @@ def _validate_output_path(
             raise EvidenceError("output path aliases the merge report")
 
 
+def _validate_document_paths(
+    output_path: Path,
+    *,
+    manifest_path: Path,
+    manifest: dict[str, Any],
+    merge_path: Path | None,
+) -> None:
+    """Reject document/asset aliases before a workflow can perform expensive work."""
+    working_directory = Path.cwd()
+    resolved_output = _resolve_evidence_path(output_path, base_directory=working_directory)
+    resolved_manifest = _resolve_evidence_path(manifest_path, base_directory=working_directory)
+    if _paths_alias(resolved_output, resolved_manifest):
+        raise EvidenceError("output path aliases the manifest")
+    if merge_path is not None:
+        resolved_merge = _resolve_evidence_path(merge_path, base_directory=working_directory)
+        if _paths_alias(resolved_output, resolved_merge):
+            raise EvidenceError("output path aliases the merge report")
+    manifest_directory = _resolve_evidence_path(
+        manifest_path.parent,
+        base_directory=working_directory,
+    )
+    declared_inputs = manifest.get("declared_inputs")
+    if isinstance(declared_inputs, list):
+        for declared_input in declared_inputs:
+            if not isinstance(declared_input, dict):
+                continue
+            raw_path = declared_input.get("path")
+            if not isinstance(raw_path, str) or not raw_path.strip():
+                continue
+            resolved_input = _resolve_evidence_path(
+                Path(raw_path),
+                base_directory=manifest_directory,
+            )
+            if _paths_alias(resolved_output, resolved_input):
+                raise EvidenceError(
+                    f"output path aliases declared input {declared_input.get('name')!r}"
+                )
+    wad_profile = manifest.get("wad_profile")
+    if isinstance(wad_profile, dict):
+        providers = wad_profile.get("providers")
+        if isinstance(providers, list):
+            for provider in providers:
+                if not isinstance(provider, dict):
+                    continue
+                for asset_name in ("iwad", "pwad"):
+                    raw_path = provider.get(f"{asset_name}_path")
+                    if not isinstance(raw_path, str) or not raw_path.strip():
+                        continue
+                    resolved_asset = _resolve_evidence_path(
+                        Path(raw_path),
+                        base_directory=manifest_directory,
+                    )
+                    if _paths_alias(resolved_output, resolved_asset):
+                        asset_id = f"{provider.get('id')}.{asset_name}"
+                        raise EvidenceError(f"output path aliases WAD profile asset {asset_id!r}")
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
-        report = build_readiness_report(args.manifest)
+        manifest, _payload = _load_manifest(args.manifest)
+        _validate_document_paths(
+            args.output,
+            manifest_path=args.manifest,
+            manifest=manifest,
+            merge_path=args.merge,
+        )
+        workflow = manifest.get("workflow")
+        if workflow == "parity_readiness":
+            report = build_readiness_report(args.manifest)
+        elif workflow == "development_training_benchmark":
+            if args.merge is not None:
+                raise EvidenceError(
+                    "development training benchmark continuation is not supported yet"
+                )
+            report = build_development_benchmark_report(args.manifest)
+        else:
+            raise EvidenceError(f"unsupported manifest workflow {workflow!r}")
         _validate_output_path(
             args.output,
             manifest_path=args.manifest,
