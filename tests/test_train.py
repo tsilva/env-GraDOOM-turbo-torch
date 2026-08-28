@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -39,9 +42,68 @@ def test_checkpoint_evaluation_defaults_to_exact_stochastic_100() -> None:
     assert args.wandb_mode == "online"
     assert args.observation_blur_kernel == 1
     assert args.observation_augmentation == "none"
+    assert audit["state_initialization"] == {
+        "policy_state": "fresh_random",
+        "optimizer_state": "fresh",
+    }
     assert audit["evaluation"]["kills_signal"] == "player_killcount"
     assert audit["evaluation"]["compatibility_killcount_signal"] == "killcount"
     assert audit["evaluation"]["kills_target_signal"] == "player_killcount"
+
+
+def test_training_command_rejects_ten_step_budget_without_overshoot(tmp_path: Path) -> None:
+    metrics = tmp_path / "metrics.jsonl"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(_TRAIN_PATH),
+            "--config-only",
+            "--timesteps",
+            "10",
+            "--metrics-jsonl",
+            str(metrics),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "CUDA_VISIBLE_DEVICES": ""},
+    )
+
+    assert result.returncode != 0
+    assert "at least one rollout transition quantum" in result.stderr
+    assert not metrics.exists()
+
+
+def test_checkpoint_evaluation_accepts_exact_predeclared_episode_seed_grid(
+    tmp_path: Path,
+) -> None:
+    seed_file = tmp_path / "evaluation-seeds.json"
+    seeds = list(range(10_000, 10_100))
+    seed_file.write_text(json.dumps(seeds), encoding="utf-8")
+    args = _args("--config-only", "--evaluation-seeds-file", str(seed_file))
+
+    train._validate_args(args)
+    evaluation = train._audit_config(args)["evaluation"]
+
+    assert evaluation["episode_seed_protocol"] == "predeclared-game-seeds-v1"
+    assert evaluation["episode_seeds"] == seeds
+    assert evaluation["episode_seeds_sha256"] == train._file_sha256(seed_file)
+
+
+@pytest.mark.parametrize(
+    "seeds",
+    [list(range(99)), [1] * 100],
+)
+def test_checkpoint_evaluation_rejects_invalid_predeclared_episode_seed_grid(
+    tmp_path: Path,
+    seeds: list[int],
+) -> None:
+    seed_file = tmp_path / "evaluation-seeds.json"
+    seed_file.write_text(json.dumps(seeds), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="exactly 100 unique"):
+        train._validate_args(_args("--config-only", "--evaluation-seeds-file", str(seed_file)))
 
 
 def test_observation_blur_is_audited_and_rejects_even_kernels() -> None:
@@ -461,7 +523,7 @@ def test_weights_only_initialization_is_audited_and_mutually_exclusive(
         )
 
 
-def test_evaluation_aggregate_uses_exact_records_and_reference_target() -> None:
+def test_evaluation_aggregate_uses_player_killcount_quality_target() -> None:
     records = [
         {
             "player_killcount": 30.0,
@@ -488,6 +550,18 @@ def test_evaluation_aggregate_uses_exact_records_and_reference_target() -> None:
     assert result["evaluation/target/kills/mean"] == 31.78
     assert result["evaluation/target/kills/signal"] == "player_killcount"
     assert result["evaluation/target/passed"] is True
+
+    compatibility_only = train._evaluation_aggregate(
+        [
+            {
+                "player_killcount": 29.0,
+                "compatibility_killcount": 100.0,
+                "return": 29.0,
+                "length": 2100,
+            }
+        ]
+    )
+    assert compatibility_only["evaluation/target/passed"] is False
 
 
 def test_evaluation_aggregate_rejects_no_completed_episodes() -> None:

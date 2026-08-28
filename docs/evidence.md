@@ -6,6 +6,12 @@ inputs before the real WAD profile, reference provider, and pretrained policy co
 It reports those prerequisites as unavailable; it does not issue a parity certificate or make a
 performance claim.
 
+The command also provides the `development_training_benchmark` workflow. It is the inexpensive
+integration benchmark: it drives the standalone GPU-resident trainer from a fresh policy and
+optimizer, evaluates predeclared checkpoints on GraDOOM, and records its complete result using the
+same evidence envelope. Development benchmark evidence is permanently non-authoritative and
+claim-ineligible, even when every seed passes or no current parity certificate exists.
+
 Run the repository fixture with:
 
 ```bash
@@ -17,6 +23,64 @@ gradoom-evidence \
 The command exits with status 2 and a concise error when the manifest is malformed, its schema
 version is unsupported, a declared file does not match its SHA-256 digest, or a merge report is
 incompatible. It writes the report only after all validation succeeds.
+
+## Development training benchmark
+
+A `development_training_benchmark` manifest uses the common `schema_version`, `workflow`,
+`evidence_level`, `fixture`, `code_provenance`, and `declared_inputs` fields. Its `benchmark` object
+contains:
+
+- `training_seeds`: an optional non-empty array of unique uint32 cold-start seeds. Omitting it uses
+  the predeclared protocol default `[123]`; development cohorts may contain fewer than five seeds.
+- `failure_budget_steps`: the positive, predeclared maximum training step for each attempt.
+- `checkpoint_steps`: unique increasing positive steps to evaluate, ending exactly at the failure
+  budget. No checkpoint after the first passing checkpoint is trained or evaluated.
+- `evaluation_episode_seeds`: exactly 100 unique predeclared uint32 GraDOOM game seeds, reused in
+  the same order for every checkpoint and every training seed.
+- `evaluation_action_seed`: the optional predeclared stochastic-policy RNG seed, defaulting to
+  `123`.
+- `trainer.command` and `trainer.arguments`: the standalone trainer invocation and fixed recipe,
+  asset, and runtime arguments. The evidence command owns all seed, initialization, resume,
+  checkpoint, timing, metrics, and evaluation arguments and rejects attempts to override them.
+- `artifacts_directory`: the directory under which the run-identity and per-seed artifacts are
+  durably retained.
+- `parity_certificate`: the current certificate availability and, when unavailable, its reason.
+  An unavailable certificate is recorded as a claim-ineligibility reason but does not prevent a
+  development run.
+- `wad_profile`: required for non-fixture runs and validated through the immutable
+  `freedoom2-deathmatch-v1` binding before training. The trainer and evaluator must report the same
+  IWAD and PWAD hashes. CPU-only fixture manifests may omit real WAD assets.
+
+For each seed, the command starts the reusable timer before attempt setup and invokes the existing
+`standalone-gradoom-deathmatch-ppo-v2` trainer contract at every checkpoint cadence. The first
+segment receives no resume or learned initialization; later segments resume only the preceding
+checkpoint from that same attempt. This preserves one cold-start policy and optimizer lineage while
+including recurring process initialization, uncached or per-process compilation, warm-up, training,
+checkpoint evaluation, and durable checkpoint writing in measured elapsed time.
+The standalone trainer rounds an unaligned request down to the preceding complete-rollout boundary,
+never up. A benchmark segment is accepted only when that execution boundary equals its exact
+predeclared checkpoint; otherwise it fails closed without evaluation. The final report output must
+not alias any generated checkpoint, seed file, or metrics file through an equal path, symlink, or
+hardlink.
+
+Evaluation uses the same trainer executable with `--evaluate-checkpoint`,
+`--evaluation-episodes 100`, `--evaluation-seeds-file`, and stochastic actions. Every evaluator must
+return all 100 episode records in the predeclared order. Passage is computed solely from their mean
+`player_killcount` and requires at least `30.0`; separately reported `compatibility_killcount` is a
+diagnostic and cannot change the verdict. The passing checkpoint, metrics, all preceding checkpoint
+outcomes, all episode outcomes, and every process or evidence failure are retained and hashed in the
+report evidence index.
+
+The report has `authoritative: false` and `claim_eligible: false` unconditionally. Its per-seed
+attempt states are `succeeded`, `exhausted`, `crashed`, `evaluation_failed`, or `evidence_failed`.
+The workflow status is `passed` only when every predeclared development attempt succeeds; either
+status remains ineligible for public claims. Benchmark continuation and bootstrap exclusions are not
+part of this workflow version; `--merge` is rejected for development benchmarks.
+
+The standalone trainer's `--evaluation-seeds-file` accepts a UTF-8 JSON array of exactly 100 unique
+uint32 game seeds. Its emitted config binds the complete ordered seed list, file hash, stochastic
+action setting, `player_killcount` gate signal, and separate compatibility signal into the retained
+evaluation evidence.
 
 ## Manifest schema version 1
 
