@@ -57,6 +57,11 @@ segment receives no resume or learned initialization; later segments resume only
 checkpoint from that same attempt. This preserves one cold-start policy and optimizer lineage while
 including recurring process initialization, uncached or per-process compilation, warm-up, training,
 checkpoint evaluation, and durable checkpoint writing in measured elapsed time.
+The standalone trainer rounds an unaligned request down to the preceding complete-rollout boundary,
+never up. A benchmark segment is accepted only when that execution boundary equals its exact
+predeclared checkpoint; otherwise it fails closed without evaluation. The final report output must
+not alias any generated checkpoint, seed file, or metrics file through an equal path, symlink, or
+hardlink.
 
 Evaluation uses the same trainer executable with `--evaluate-checkpoint`,
 `--evaluation-episodes 100`, `--evaluation-seeds-file`, and stochastic actions. Every evaluator must

@@ -119,6 +119,19 @@ def _validate_output_path(
                     asset_id = f"{provider['id']}.{asset_name}"
                     raise EvidenceError(f"output path aliases WAD profile asset {asset_id!r}")
 
+    generated_artifacts = report.get("generated_artifacts", [])
+    assert isinstance(generated_artifacts, list)
+    for artifact in generated_artifacts:
+        assert isinstance(artifact, dict)
+        resolved_artifact = _resolve_evidence_path(
+            Path(artifact["path"]),
+            base_directory=manifest_directory,
+        )
+        if _paths_alias(resolved_output, resolved_artifact):
+            raise EvidenceError(
+                f"output path aliases generated benchmark artifact {artifact['name']!r}"
+            )
+
     if merge_path is not None:
         resolved_merge = _resolve_evidence_path(
             merge_path,

@@ -184,6 +184,107 @@ def test_development_benchmark_retains_process_launch_failures(tmp_path: Path) -
     assert "cannot execute benchmark process" in report["failures"][0]["stderr"]
 
 
+def test_development_benchmark_rejects_legacy_kills_without_player_killcount(
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest(
+        tmp_path,
+        checkpoint_steps=[10],
+        outcomes={"10": [31.0, 999.0]},
+        extra_arguments=["--fixture-omit-player-killcount"],
+    )
+    output = tmp_path / "report.json"
+
+    result = _run_evidence("--manifest", str(manifest), "--output", str(output))
+
+    assert result.returncode == 0, result.stderr
+    report = json.loads(output.read_text(encoding="utf-8"))
+    attempt = report["attempts"][0]
+    assert report["status"] == "failed"
+    assert attempt["status"] == "evidence_failed"
+    assert attempt["outcomes"] == []
+    assert "episodes[0].player_killcount must be finite" in attempt["failures"][0]["message"]
+
+
+def test_development_benchmark_rejects_training_past_predeclared_step(
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest(
+        tmp_path,
+        checkpoint_steps=[10],
+        outcomes={"10": [31.0, 0.0]},
+        extra_arguments=["--fixture-training-step-offset", "4086"],
+    )
+    output = tmp_path / "report.json"
+
+    result = _run_evidence("--manifest", str(manifest), "--output", str(output))
+
+    assert result.returncode == 0, result.stderr
+    report = json.loads(output.read_text(encoding="utf-8"))
+    attempt = report["attempts"][0]
+    assert report["status"] == "failed"
+    assert attempt["status"] == "evidence_failed"
+    assert attempt["outcomes"] == []
+    assert "outside the predeclared checkpoint step" in attempt["failures"][0]["message"]
+
+
+@pytest.mark.parametrize("alias_kind", ["direct", "symlink", "hardlink"])
+def test_report_output_cannot_alias_generated_benchmark_artifacts(
+    tmp_path: Path,
+    alias_kind: str,
+) -> None:
+    alias_output = tmp_path / f"{alias_kind}-report.json"
+    extra_arguments = (
+        ["--fixture-hardlink-checkpoint-to", str(alias_output)] if alias_kind == "hardlink" else []
+    )
+    manifest_path = _manifest(
+        tmp_path,
+        checkpoint_steps=[10],
+        outcomes={"10": [31.0, 0.0]},
+        extra_arguments=extra_arguments,
+    )
+    seed_report = tmp_path / "seed-report.json"
+    seeded = _run_evidence(
+        "--manifest",
+        str(manifest_path),
+        "--output",
+        str(seed_report),
+    )
+    assert seeded.returncode == 0, seeded.stderr
+    run_identity = json.loads(seed_report.read_text(encoding="utf-8"))["run_identity"]
+    alias_output.unlink(missing_ok=True)
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["benchmark"]["artifacts_directory"] = "protected-artifacts"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    attempt_directory = tmp_path / "protected-artifacts" / run_identity / "seed-123"
+    checkpoint = attempt_directory / "checkpoint-step-10.pt"
+    if alias_kind == "direct":
+        output = checkpoint
+    elif alias_kind == "symlink":
+        alias_output.symlink_to(checkpoint)
+        output = alias_output
+    else:
+        output = alias_output
+
+    result = _run_evidence(
+        "--manifest",
+        str(manifest_path),
+        "--output",
+        str(output),
+    )
+
+    assert result.returncode == 2
+    assert "output path aliases generated benchmark artifact" in result.stderr
+    assert checkpoint.is_file()
+    evaluation_metrics = attempt_directory / "evaluation-step-10.jsonl"
+    evaluation = json.loads(evaluation_metrics.read_text(encoding="utf-8").splitlines()[-1])
+    assert evaluation["checkpoint_sha256"] == hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+    assert json.loads(checkpoint.read_text(encoding="utf-8"))["format"] == (
+        "standalone-gradoom-ppo-v1"
+    )
+
+
 @pytest.mark.parametrize(
     ("mutation", "error"),
     [

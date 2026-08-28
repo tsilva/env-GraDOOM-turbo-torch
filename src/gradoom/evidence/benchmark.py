@@ -257,8 +257,16 @@ def _validate_training_records(
     if summary.get("status") != "completed":
         raise EvidenceError(f"training process reported status {summary.get('status')!r}")
     step = summary.get("train/global_step")
-    if type(step) is not int or step < requested_step:
-        raise EvidenceError("training process stopped before the predeclared checkpoint step")
+    if type(step) is not int or step != requested_step:
+        raise EvidenceError("training process stopped outside the predeclared checkpoint step")
+    if config.get("requested_timesteps") != requested_step:
+        raise EvidenceError("training config did not bind the predeclared checkpoint step")
+    if config.get("execution_timesteps") != requested_step:
+        raise EvidenceError("training config would execute outside the predeclared checkpoint step")
+    if summary.get("requested_timesteps") != requested_step:
+        raise EvidenceError("training summary did not bind the predeclared checkpoint step")
+    if summary.get("execution_timesteps") != requested_step:
+        raise EvidenceError("training summary executed outside the predeclared checkpoint step")
     recorded_checkpoint = _resolved_record_path(
         summary.get("checkpoint"),
         field="training summary checkpoint",
@@ -343,7 +351,7 @@ def _validate_evaluation_records(
             raise EvidenceError("evaluation episode indices do not match their declared order")
         if raw_episode.get("game_seed") != episode_seeds[index]:
             raise EvidenceError("evaluation episode seeds do not match the predeclared seed grid")
-        player_value = raw_episode.get("player_killcount", raw_episode.get("kills"))
+        player_value = raw_episode.get("player_killcount")
         if type(player_value) not in (int, float) or not math.isfinite(float(player_value)):
             raise EvidenceError(f"evaluation episodes[{index}].player_killcount must be finite")
         player_killcounts.append(float(player_value))
@@ -738,6 +746,27 @@ def build_development_benchmark_report(manifest_path: Path) -> dict[str, Any]:
         )
         for seed in validated["training_seeds"]
     ]
+    generated_artifacts: list[dict[str, str]] = []
+    for seed in validated["training_seeds"]:
+        attempt_directory = run_directory / f"seed-{seed}"
+        generated_artifacts.append(
+            {
+                "name": f"seed-{seed}-evaluation-seeds",
+                "path": str(attempt_directory / "evaluation-seeds.json"),
+            }
+        )
+        for step in validated["checkpoint_steps"]:
+            for kind, path in (
+                ("checkpoint", attempt_directory / f"checkpoint-step-{step}.pt"),
+                ("training-metrics", attempt_directory / f"training-step-{step}.jsonl"),
+                ("evaluation-metrics", attempt_directory / f"evaluation-step-{step}.jsonl"),
+            ):
+                generated_artifacts.append(
+                    {
+                        "name": f"seed-{seed}-step-{step}-{kind}",
+                        "path": str(path),
+                    }
+                )
     failures = [failure for attempt in attempts for failure in attempt["failures"]]
     evidence_names = [entry["name"] for entry in evidence_entries]
     if len(evidence_names) != len(set(evidence_names)):
@@ -780,6 +809,7 @@ def build_development_benchmark_report(manifest_path: Path) -> dict[str, Any]:
         "wad_profile": wad_profile,
         "attempts": attempts,
         "failures": failures,
+        "generated_artifacts": generated_artifacts,
         "evidence_index": {
             "algorithm": "sha256",
             "entries": evidence_entries,

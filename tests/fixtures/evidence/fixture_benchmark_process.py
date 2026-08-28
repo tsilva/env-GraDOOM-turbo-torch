@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 
 
@@ -24,6 +25,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--fixture-outcomes", required=True)
     parser.add_argument("--fixture-fail-training-seed", type=int)
     parser.add_argument("--fixture-fail-evaluation-step", type=int)
+    parser.add_argument("--fixture-omit-player-killcount", action="store_true")
+    parser.add_argument("--fixture-training-step-offset", type=int, default=0)
+    parser.add_argument("--fixture-hardlink-checkpoint-to", type=Path)
     return parser
 
 
@@ -47,24 +51,32 @@ def main() -> int:
             return 17
         assert args.checkpoint is not None
         assert args.timesteps is not None
+        actual_step = args.timesteps + args.fixture_training_step_offset
         args.checkpoint.parent.mkdir(parents=True, exist_ok=True)
         args.checkpoint.write_text(
             json.dumps(
                 {
                     "format": "standalone-gradoom-ppo-v1",
                     "seed": args.seed,
-                    "step": args.timesteps,
+                    "step": actual_step,
                     "resumed": args.resume is not None,
                 },
                 sort_keys=True,
             ),
             encoding="utf-8",
         )
+        if (
+            args.fixture_hardlink_checkpoint_to is not None
+            and not args.fixture_hardlink_checkpoint_to.exists()
+        ):
+            os.link(args.checkpoint, args.fixture_hardlink_checkpoint_to)
         records: list[dict[str, object]] = [
             {
                 "type": "config",
                 "contract": "standalone-gradoom-deathmatch-ppo-v2",
                 "operation": "train",
+                "requested_timesteps": args.timesteps,
+                "execution_timesteps": actual_step,
                 "initialization": {
                     "mode": "random",
                     "checkpoint": None,
@@ -88,7 +100,9 @@ def main() -> int:
             {
                 "type": "summary",
                 "status": "completed",
-                "train/global_step": args.timesteps,
+                "train/global_step": actual_step,
+                "requested_timesteps": args.timesteps,
+                "execution_timesteps": actual_step,
                 "checkpoint": str(args.checkpoint),
                 "training_transitions_per_second": 1000.0,
             }
@@ -107,18 +121,21 @@ def main() -> int:
         f"{checkpoint['seed']}:{step}",
         outcomes.get(str(step), [0.0, 0.0]),
     )
-    episodes = [
-        {
+    episodes = []
+    for index, game_seed in enumerate(episode_seeds):
+        episode = {
             "index": index,
             "game_seed": game_seed,
-            "player_killcount": float(player_quality),
             "killcount": float(compatibility_quality),
             "length": 10,
             "terminated": True,
             "truncated": False,
         }
-        for index, game_seed in enumerate(episode_seeds)
-    ]
+        if args.fixture_omit_player_killcount:
+            episode["kills"] = float(player_quality)
+        else:
+            episode["player_killcount"] = float(player_quality)
+        episodes.append(episode)
     _emit(
         args.metrics_jsonl,
         {

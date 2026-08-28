@@ -652,6 +652,11 @@ def _validate_args(args: argparse.Namespace) -> None:
             "observation blur is incompatible with the frozen-encoder custom convolution"
         )
     rollout_transitions = int(args.num_envs) * int(args.n_steps)
+    if int(args.timesteps) < rollout_transitions:
+        raise ValueError(
+            "timesteps must cover at least one rollout transition quantum "
+            "(num-envs * n-steps); partial rollouts are not executed"
+        )
     if int(args.batch_size) > rollout_transitions:
         raise ValueError("batch-size cannot exceed num-envs * n-steps")
     if args.checkpoint is not None:
@@ -700,7 +705,7 @@ def _runtime_paths(args: argparse.Namespace) -> None:
 
 def _execution_timesteps(args: argparse.Namespace) -> int:
     quantum = int(args.num_envs) * int(args.n_steps)
-    return math.ceil(int(args.timesteps) / quantum) * quantum
+    return int(args.timesteps) // quantum * quantum
 
 
 def _audit_config(args: argparse.Namespace) -> dict[str, Any]:
@@ -2965,7 +2970,7 @@ def _train(
                 "cuda_rng_state": torch.cuda.get_rng_state_all(),
             }
 
-        while global_step < int(args.timesteps) and not interrupted:
+        while global_step < _execution_timesteps(args) and not interrupted:
             executed_rollouts += 1
             episode_seeds.ensure(int(episode_index.max().item()) + int(args.n_steps) + 1)
             buffer.reset()

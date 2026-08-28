@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -43,6 +45,30 @@ def test_checkpoint_evaluation_defaults_to_exact_stochastic_100() -> None:
         "policy_state": "fresh_random",
         "optimizer_state": "fresh",
     }
+
+
+def test_training_command_rejects_ten_step_budget_without_overshoot(tmp_path: Path) -> None:
+    metrics = tmp_path / "metrics.jsonl"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(_TRAIN_PATH),
+            "--config-only",
+            "--timesteps",
+            "10",
+            "--metrics-jsonl",
+            str(metrics),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "CUDA_VISIBLE_DEVICES": ""},
+    )
+
+    assert result.returncode != 0
+    assert "at least one rollout transition quantum" in result.stderr
+    assert not metrics.exists()
 
 
 def test_checkpoint_evaluation_accepts_exact_predeclared_episode_seed_grid(
