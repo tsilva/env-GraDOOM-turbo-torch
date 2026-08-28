@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -38,6 +39,41 @@ def test_checkpoint_evaluation_defaults_to_exact_stochastic_100() -> None:
     assert args.wandb_mode == "online"
     assert args.observation_blur_kernel == 1
     assert args.observation_augmentation == "none"
+    assert train._audit_config(args)["state_initialization"] == {
+        "policy_state": "fresh_random",
+        "optimizer_state": "fresh",
+    }
+
+
+def test_checkpoint_evaluation_accepts_exact_predeclared_episode_seed_grid(
+    tmp_path: Path,
+) -> None:
+    seed_file = tmp_path / "evaluation-seeds.json"
+    seeds = list(range(10_000, 10_100))
+    seed_file.write_text(json.dumps(seeds), encoding="utf-8")
+    args = _args("--config-only", "--evaluation-seeds-file", str(seed_file))
+
+    train._validate_args(args)
+    evaluation = train._audit_config(args)["evaluation"]
+
+    assert evaluation["episode_seed_protocol"] == "predeclared-game-seeds-v1"
+    assert evaluation["episode_seeds"] == seeds
+    assert evaluation["episode_seeds_sha256"] == train._file_sha256(seed_file)
+
+
+@pytest.mark.parametrize(
+    "seeds",
+    [list(range(99)), [1] * 100],
+)
+def test_checkpoint_evaluation_rejects_invalid_predeclared_episode_seed_grid(
+    tmp_path: Path,
+    seeds: list[int],
+) -> None:
+    seed_file = tmp_path / "evaluation-seeds.json"
+    seed_file.write_text(json.dumps(seeds), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="exactly 100 unique"):
+        train._validate_args(_args("--config-only", "--evaluation-seeds-file", str(seed_file)))
 
 
 def test_observation_blur_is_audited_and_rejects_even_kernels() -> None:
@@ -60,8 +96,7 @@ def test_bounded_observation_augmentation_is_training_only_and_audited() -> None
 
     assert audit["effective_recipe"]["observation_augmentation"] == "bounded-shift-gray-v1"
     assert (
-        audit["policy_model"]["training_only_observation_augmentation"]
-        == "bounded-shift-gray-v1"
+        audit["policy_model"]["training_only_observation_augmentation"] == "bounded-shift-gray-v1"
     )
 
 
@@ -458,7 +493,7 @@ def test_weights_only_initialization_is_audited_and_mutually_exclusive(
         )
 
 
-def test_evaluation_aggregate_uses_exact_records_and_reference_target() -> None:
+def test_evaluation_aggregate_uses_player_killcount_quality_target() -> None:
     records = [
         {"kills": 30.0, "vizdoom_killcount": 30.0, "return": 30.0, "length": 2100},
         {"kills": 34.0, "vizdoom_killcount": 32.0, "return": 34.0, "length": 2100},
@@ -472,9 +507,14 @@ def test_evaluation_aggregate_uses_exact_records_and_reference_target() -> None:
     assert result["evaluation/kills/std"] == 2.0
     assert result["evaluation/kills/signal"] == "player_killcount"
     assert result["evaluation/vizdoom_killcount/mean"] == 31.0
-    assert result["evaluation/target/kills/mean"] == 31.78
-    assert result["evaluation/target/kills/signal"] == "killcount"
-    assert result["evaluation/target/passed"] is False
+    assert result["evaluation/target/kills/mean"] == 30.0
+    assert result["evaluation/target/kills/signal"] == "player_killcount"
+    assert result["evaluation/target/passed"] is True
+
+    compatibility_only = train._evaluation_aggregate(
+        [{"kills": 29.0, "vizdoom_killcount": 100.0, "return": 29.0, "length": 2100}]
+    )
+    assert compatibility_only["evaluation/target/passed"] is False
 
 
 def test_evaluation_aggregate_rejects_no_completed_episodes() -> None:
