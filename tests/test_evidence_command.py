@@ -5,6 +5,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import pytest
+
 FIXTURES = Path(__file__).parent / "fixtures" / "evidence"
 
 
@@ -51,6 +53,10 @@ def test_fixture_manifest_emits_non_claim_eligible_readiness_report(
             "sha256": "09634113116b633334e06263d1c236cc402107c6a98effabe5ff2dbbee0b15d7",
         }
     ]
+    fixture_manifest = json.loads(
+        (FIXTURES / "readiness-manifest.json").read_text(encoding="utf-8")
+    )
+    assert report["prerequisites"] == fixture_manifest["prerequisites"]
     assert report["run_identity"] == (
         "7974e35ef137d77a42dcec2766b8ae912c43078c3aaca6df6bcf3ffc1c8d9b4e"
     )
@@ -237,3 +243,56 @@ def test_merge_rejects_a_changed_evidence_index_hash(tmp_path: Path) -> None:
 
     assert result.returncode == 2
     assert "merge report evidence_index SHA-256 mismatch" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "tampered_field",
+    [
+        "evidence_level",
+        "fixture",
+        "code_provenance",
+        "declared_input_hash",
+        "prerequisites",
+    ],
+)
+def test_merge_rejects_tampered_identity_bearing_report_fields(
+    tmp_path: Path,
+    tampered_field: str,
+) -> None:
+    report_path = tmp_path / "report.json"
+    initial = run_evidence(
+        "--manifest",
+        str(FIXTURES / "readiness-manifest.json"),
+        "--output",
+        str(report_path),
+    )
+    assert initial.returncode == 0, initial.stderr
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    if tampered_field == "evidence_level":
+        report["evidence_level"] = "formal"
+    elif tampered_field == "fixture":
+        report["fixture"] = False
+    elif tampered_field == "code_provenance":
+        report["code_provenance"]["revision"] = "tampered-revision"
+    elif tampered_field == "declared_input_hash":
+        report["declared_inputs"][0]["sha256"] = "0" * 64
+    else:
+        report["prerequisites"][0]["id"] = "tampered_prerequisite"
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    output = tmp_path / "merged-report.json"
+
+    result = run_evidence(
+        "--manifest",
+        str(FIXTURES / "readiness-manifest.json"),
+        "--output",
+        str(output),
+        "--merge",
+        str(report_path),
+    )
+
+    assert result.returncode == 2
+    assert (
+        "merge report run_identity does not match its identity-bearing fields"
+        in result.stderr
+    )
+    assert not output.exists()

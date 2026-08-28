@@ -197,6 +197,7 @@ def build_readiness_report(manifest_path: Path) -> dict[str, Any]:
         ),
         "code_provenance": code_provenance,
         "declared_inputs": declared_inputs,
+        "prerequisites": prerequisites,
         "evidence_index": evidence_index,
     }
 
@@ -209,11 +210,22 @@ def validate_merge_report(path: Path, expected_run_identity: object) -> None:
     if not isinstance(report, dict):
         raise EvidenceError("merge report must be a JSON object")
     _validate_schema_version(report.get("schema_version"), document="report")
-    run_identity = report.get("run_identity")
-    if run_identity != expected_run_identity:
+    _required_string(report.get("workflow"), "merge report workflow")
+    _required_string(report.get("evidence_level"), "merge report evidence_level")
+    if type(report.get("fixture")) is not bool:
+        raise EvidenceError("merge report fixture is required and must be a boolean")
+    code_provenance = _validate_code_provenance(report.get("code_provenance"))
+    declared_inputs = _validate_declared_inputs(report.get("declared_inputs"))
+    prerequisites = _validate_prerequisites(report.get("prerequisites"))
+    stored_run_identity = _required_string(
+        report.get("run_identity"), "merge report run_identity"
+    )
+    recomputed_run_identity = _run_identity(
+        report, code_provenance, declared_inputs, prerequisites
+    )
+    if stored_run_identity != recomputed_run_identity:
         raise EvidenceError(
-            "cannot merge unlike run identities: "
-            f"existing {run_identity!r}, requested {expected_run_identity!r}"
+            "merge report run_identity does not match its identity-bearing fields"
         )
     evidence_index = report.get("evidence_index")
     if not isinstance(evidence_index, dict):
@@ -223,3 +235,8 @@ def validate_merge_report(path: Path, expected_run_identity: object) -> None:
         raise EvidenceError("merge report evidence_index is malformed")
     if evidence_index.get("sha256") != _canonical_sha256(entries):
         raise EvidenceError("merge report evidence_index SHA-256 mismatch")
+    if recomputed_run_identity != expected_run_identity:
+        raise EvidenceError(
+            "cannot merge unlike run identities: "
+            f"existing {recomputed_run_identity!r}, requested {expected_run_identity!r}"
+        )
