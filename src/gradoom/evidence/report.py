@@ -10,6 +10,22 @@ class EvidenceError(ValueError):
     """An evidence manifest or report violates the public contract."""
 
 
+_READINESS_REPORT_FIELDS = (
+    "schema_version",
+    "workflow",
+    "evidence_level",
+    "fixture",
+    "status",
+    "claim_eligible",
+    "claim_reasons",
+    "run_identity",
+    "code_provenance",
+    "declared_inputs",
+    "prerequisites",
+    "evidence_index",
+)
+
+
 def _sha256_bytes(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
@@ -29,13 +45,20 @@ def _canonical_sha256(value: object, *, document: str) -> str:
     return _sha256_bytes(payload)
 
 
-def _validate_unicode_scalars(
+def _validate_string_content(
     value: object,
     *,
     document: str,
     field: str = "",
 ) -> None:
     if isinstance(value, str):
+        null_index = value.find("\0")
+        if null_index >= 0:
+            location = field or "<root>"
+            raise EvidenceError(
+                f"{document} contains U+0000 in {location} "
+                f"at character {null_index}"
+            )
         try:
             value.encode("utf-8")
         except UnicodeEncodeError as error:
@@ -48,7 +71,7 @@ def _validate_unicode_scalars(
     if isinstance(value, list):
         for index, item in enumerate(value):
             child_field = f"{field}[{index}]" if field else f"[{index}]"
-            _validate_unicode_scalars(
+            _validate_string_content(
                 item,
                 document=document,
                 field=child_field,
@@ -57,13 +80,13 @@ def _validate_unicode_scalars(
     if isinstance(value, dict):
         for key, item in value.items():
             key_field = f"{field}.<key>" if field else "<key>"
-            _validate_unicode_scalars(
+            _validate_string_content(
                 key,
                 document=document,
                 field=key_field,
             )
             child_field = f"{field}.{key}" if field else key
-            _validate_unicode_scalars(
+            _validate_string_content(
                 item,
                 document=document,
                 field=child_field,
@@ -82,7 +105,7 @@ def _load_manifest(path: Path) -> tuple[dict[str, Any], bytes]:
         raise EvidenceError(f"manifest is not valid JSON: {error.msg}") from error
     if not isinstance(manifest, dict):
         raise EvidenceError("manifest must be a JSON object")
-    _validate_unicode_scalars(manifest, document="manifest")
+    _validate_string_content(manifest, document="manifest")
     return manifest, payload
 
 
@@ -157,6 +180,68 @@ def _validate_prerequisites(value: object) -> list[dict[str, Any]]:
     return prerequisites
 
 
+def _readiness_claim_reasons(
+    fixture: bool,
+    prerequisites: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    reasons: list[dict[str, Any]] = [
+        {
+            "code": "development_evidence",
+            "message": "Development evidence is non-authoritative and cannot support claims.",
+        }
+    ]
+    if fixture:
+        reasons.append(
+            {
+                "code": "fixture_evidence",
+                "message": "Fixture evidence cannot support public claims.",
+            }
+        )
+    reasons.extend(
+        {
+            "code": "missing_prerequisite",
+            "prerequisite": item["id"],
+            "message": item["reason"],
+        }
+        for item in prerequisites
+        if not item["available"]
+    )
+    return reasons
+
+
+def _validate_readiness_envelope(
+    report: dict[str, Any],
+    prerequisites: list[dict[str, Any]],
+) -> None:
+    missing = [item for item in prerequisites if not item["available"]]
+    expected_status = "unavailable" if missing else "ready"
+    if report["status"] != expected_status:
+        raise EvidenceError(
+            f"merge report status must be {expected_status!r} for its prerequisites"
+        )
+    if report["claim_eligible"] is not False:
+        raise EvidenceError(
+            "merge report claim_eligible must be false for development evidence"
+        )
+    claim_reasons = report["claim_reasons"]
+    if not isinstance(claim_reasons, list):
+        raise EvidenceError("merge report claim_reasons must be an array")
+    expected_reasons = _readiness_claim_reasons(report["fixture"], prerequisites)
+    canonical_reasons = sorted(
+        json.dumps(reason, sort_keys=True, separators=(",", ":"))
+        for reason in claim_reasons
+    )
+    canonical_expected = sorted(
+        json.dumps(reason, sort_keys=True, separators=(",", ":"))
+        for reason in expected_reasons
+    )
+    if canonical_reasons != canonical_expected:
+        raise EvidenceError(
+            "merge report claim_reasons do not match its fixture state and "
+            "prerequisites"
+        )
+
+
 def _run_identity(
     manifest: dict[str, Any],
     code_provenance: dict[str, Any],
@@ -211,27 +296,7 @@ def build_readiness_report(manifest_path: Path) -> dict[str, Any]:
         evidence_entries.append({"name": name, "sha256": actual_sha256})
 
     missing = [item for item in prerequisites if not item["available"]]
-    claim_reasons = [
-        {
-            "code": "development_evidence",
-            "message": "Development evidence is non-authoritative and cannot support claims.",
-        }
-    ]
-    if manifest["fixture"]:
-        claim_reasons.append(
-            {
-                "code": "fixture_evidence",
-                "message": "Fixture evidence cannot support public claims.",
-            }
-        )
-    claim_reasons.extend(
-        {
-            "code": "missing_prerequisite",
-            "prerequisite": item["id"],
-            "message": item["reason"],
-        }
-        for item in missing
-    )
+    claim_reasons = _readiness_claim_reasons(manifest["fixture"], prerequisites)
     evidence_index = {
         "algorithm": "sha256",
         "entries": evidence_entries,
@@ -270,17 +335,18 @@ def validate_merge_report(path: Path, expected_run_identity: object) -> None:
         raise EvidenceError(f"merge report is not valid JSON: {error.msg}") from error
     if not isinstance(report, dict):
         raise EvidenceError("merge report must be a JSON object")
-    _validate_unicode_scalars(report, document="merge report")
-    _validate_schema_version(report.get("schema_version"), document="report")
-    _required_string(report.get("workflow"), "merge report workflow")
-    _required_string(report.get("evidence_level"), "merge report evidence_level")
-    if type(report.get("fixture")) is not bool:
+    _validate_string_content(report, document="merge report")
+    for field in _READINESS_REPORT_FIELDS:
+        if field not in report:
+            raise EvidenceError(f"merge report {field} is required")
+    _validate_schema_version(report["schema_version"], document="merge report")
+    if type(report["fixture"]) is not bool:
         raise EvidenceError("merge report fixture is required and must be a boolean")
-    code_provenance = _validate_code_provenance(report.get("code_provenance"))
-    declared_inputs = _validate_declared_inputs(report.get("declared_inputs"))
-    prerequisites = _validate_prerequisites(report.get("prerequisites"))
+    code_provenance = _validate_code_provenance(report["code_provenance"])
+    declared_inputs = _validate_declared_inputs(report["declared_inputs"])
+    prerequisites = _validate_prerequisites(report["prerequisites"])
     stored_run_identity = _required_string(
-        report.get("run_identity"), "merge report run_identity"
+        report["run_identity"], "merge report run_identity"
     )
     recomputed_run_identity = _run_identity(
         report,
@@ -293,7 +359,12 @@ def validate_merge_report(path: Path, expected_run_identity: object) -> None:
         raise EvidenceError(
             "merge report run_identity does not match its identity-bearing fields"
         )
-    evidence_index = report.get("evidence_index")
+    if report["workflow"] != "parity_readiness":
+        raise EvidenceError("merge report workflow must be parity_readiness")
+    if report["evidence_level"] != "development":
+        raise EvidenceError("merge report evidence_level must be development")
+    _validate_readiness_envelope(report, prerequisites)
+    evidence_index = report["evidence_index"]
     if not isinstance(evidence_index, dict):
         raise EvidenceError("merge report evidence_index must be an object")
     entries = evidence_index.get("entries")

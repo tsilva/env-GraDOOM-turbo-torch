@@ -247,6 +247,49 @@ def test_all_schema_strings_reject_lone_surrogates(
     assert not output.exists()
 
 
+@pytest.mark.parametrize("document", ["manifest", "merge report"])
+def test_declared_input_paths_reject_embedded_nulls(
+    tmp_path: Path,
+    document: str,
+) -> None:
+    invalid_path = tmp_path / "invalid.json"
+    output = tmp_path / "report.json"
+    if document == "manifest":
+        payload = json.loads(
+            (FIXTURES / "readiness-manifest.json").read_text(encoding="utf-8")
+        )
+        arguments = ["--manifest", str(invalid_path), "--output", str(output)]
+    else:
+        initial_report = tmp_path / "initial-report.json"
+        initial = run_evidence(
+            "--manifest",
+            str(FIXTURES / "readiness-manifest.json"),
+            "--output",
+            str(initial_report),
+        )
+        assert initial.returncode == 0, initial.stderr
+        payload = json.loads(initial_report.read_text(encoding="utf-8"))
+        arguments = [
+            "--manifest",
+            str(FIXTURES / "readiness-manifest.json"),
+            "--output",
+            str(output),
+            "--merge",
+            str(invalid_path),
+        ]
+    payload["declared_inputs"][0]["path"] = "provider\u0000-contract.json"
+    invalid_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = run_evidence(*arguments)
+
+    assert result.returncode == 2
+    assert (
+        f"{document} contains U+0000 in declared_inputs[0].path" in result.stderr
+    )
+    assert "Traceback" not in result.stderr
+    assert not output.exists()
+
+
 def test_unknown_manifest_schema_version_fails_with_a_clear_error(tmp_path: Path) -> None:
     manifest = json.loads(
         (FIXTURES / "readiness-manifest.json").read_text(encoding="utf-8")
@@ -346,6 +389,110 @@ def test_merge_accepts_the_same_stable_run_identity(tmp_path: Path) -> None:
     first_payload = json.loads(first_report.read_text(encoding="utf-8"))
     merged_payload = json.loads(merged_report.read_text(encoding="utf-8"))
     assert merged_payload["run_identity"] == first_payload["run_identity"]
+
+
+@pytest.mark.parametrize(
+    "missing_field",
+    [
+        "schema_version",
+        "workflow",
+        "evidence_level",
+        "fixture",
+        "status",
+        "claim_eligible",
+        "claim_reasons",
+        "run_identity",
+        "code_provenance",
+        "declared_inputs",
+        "prerequisites",
+        "evidence_index",
+    ],
+)
+def test_merge_rejects_missing_required_report_fields(
+    tmp_path: Path,
+    missing_field: str,
+) -> None:
+    report_path = tmp_path / "report.json"
+    initial = run_evidence(
+        "--manifest",
+        str(FIXTURES / "readiness-manifest.json"),
+        "--output",
+        str(report_path),
+    )
+    assert initial.returncode == 0, initial.stderr
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    del report[missing_field]
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    output = tmp_path / "merged-report.json"
+
+    result = run_evidence(
+        "--manifest",
+        str(FIXTURES / "readiness-manifest.json"),
+        "--output",
+        str(output),
+        "--merge",
+        str(report_path),
+    )
+
+    assert result.returncode == 2
+    assert f"merge report {missing_field} is required" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected_error"),
+    [
+        (
+            "status",
+            "ready",
+            "merge report status must be 'unavailable' for its prerequisites",
+        ),
+        (
+            "claim_eligible",
+            True,
+            "merge report claim_eligible must be false for development evidence",
+        ),
+        (
+            "claim_reasons",
+            [],
+            "merge report claim_reasons do not match its fixture state and "
+            "prerequisites",
+        ),
+    ],
+)
+def test_merge_rejects_incoherent_report_envelope_fields(
+    tmp_path: Path,
+    field: str,
+    value: object,
+    expected_error: str,
+) -> None:
+    report_path = tmp_path / "report.json"
+    initial = run_evidence(
+        "--manifest",
+        str(FIXTURES / "readiness-manifest.json"),
+        "--output",
+        str(report_path),
+    )
+    assert initial.returncode == 0, initial.stderr
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report[field] = value
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    output = tmp_path / "merged-report.json"
+
+    result = run_evidence(
+        "--manifest",
+        str(FIXTURES / "readiness-manifest.json"),
+        "--output",
+        str(output),
+        "--merge",
+        str(report_path),
+    )
+
+    assert result.returncode == 2
+    assert expected_error in result.stderr
+    assert "Traceback" not in result.stderr
+    assert not output.exists()
 
 
 def test_merge_rejects_a_changed_evidence_index_hash(tmp_path: Path) -> None:
