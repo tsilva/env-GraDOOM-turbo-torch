@@ -80,6 +80,7 @@ def test_fixture_manifest_emits_non_claim_eligible_readiness_report(
     assert {reason["code"] for reason in report["claim_reasons"]} == {
         "development_evidence",
         "fixture_evidence",
+        "invariant_suite_unavailable",
         "missing_prerequisite",
     }
     missing = {

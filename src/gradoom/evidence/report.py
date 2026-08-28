@@ -39,6 +39,7 @@ _READINESS_REPORT_FIELDS = (
 )
 
 _MAX_JSON_NESTING = 256
+_REQUIRED_READINESS_PREREQUISITES = ("real_pretrained_policy_corpus",)
 
 
 def _sha256_bytes(payload: bytes) -> str:
@@ -325,7 +326,17 @@ def _readiness_claim_reasons(
         for item in prerequisites
         if not item["available"]
     )
-    if invariant_suite is not None and invariant_suite["configured"]:
+    declared_prerequisites = {item["id"] for item in prerequisites}
+    reasons.extend(
+        {
+            "code": "missing_required_prerequisite",
+            "prerequisite": identifier,
+            "message": f"Required readiness prerequisite {identifier!r} was not declared.",
+        }
+        for identifier in _REQUIRED_READINESS_PREREQUISITES
+        if identifier not in declared_prerequisites
+    )
+    if invariant_suite is not None:
         reasons.extend(
             {
                 "code": "invariant_failure",
@@ -355,6 +366,8 @@ def _validate_readiness_envelope(
     invariant_suite: dict[str, Any] | None = None,
 ) -> None:
     missing = [item for item in prerequisites if not item["available"]]
+    declared_prerequisites = {item["id"] for item in prerequisites}
+    omitted_required = set(_REQUIRED_READINESS_PREREQUISITES) - declared_prerequisites
     expected_status = (
         "failed"
         if (
@@ -363,11 +376,8 @@ def _validate_readiness_envelope(
         )
         else "unavailable"
         if missing
-        or (
-            invariant_suite is not None
-            and invariant_suite["configured"]
-            and invariant_suite["status"] == "unavailable"
-        )
+        or omitted_required
+        or (invariant_suite is not None and invariant_suite["status"] == "unavailable")
         else "ready"
     )
     if report["status"] != expected_status:
@@ -578,7 +588,7 @@ def build_readiness_report(manifest_path: Path) -> dict[str, Any]:
         invariant_suite = run_invariant_suite(
             manifest.get("invariant_suite"),
             base_directory=manifest_path.parent,
-            declared_input_names={item["name"] for item in declared_inputs},
+            declared_inputs=declared_inputs,
             fixture=manifest["fixture"],
             gradoom_revision=code_provenance["revision"],
         )
@@ -586,6 +596,8 @@ def build_readiness_report(manifest_path: Path) -> dict[str, Any]:
         raise EvidenceError(str(error)) from error
 
     missing = [item for item in prerequisites if not item["available"]]
+    declared_prerequisites = {item["id"] for item in prerequisites}
+    omitted_required = set(_REQUIRED_READINESS_PREREQUISITES) - declared_prerequisites
     claim_reasons = _readiness_claim_reasons(
         manifest["fixture"], prerequisites, wad_profile, invariant_suite
     )
@@ -606,8 +618,7 @@ def build_readiness_report(manifest_path: Path) -> dict[str, Any]:
                 or invariant_suite["status"] == "failed"
             )
             else "unavailable"
-            if missing
-            or (invariant_suite["configured"] and invariant_suite["status"] == "unavailable")
+            if missing or omitted_required or invariant_suite["status"] == "unavailable"
             else "ready"
         ),
         "claim_eligible": False,

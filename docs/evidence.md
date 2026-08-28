@@ -171,26 +171,32 @@ learned adaptation hooks.
 
 ## Fast Turbo invariant suite
 
-Invariant suite `1.0.0` runs before readiness is decided. Each declared provider process exercises
-its public construction, reset, step, and masked-reset surface and returns the versioned provider
-contract on standard output. The command compares common constructor parameters, action meanings,
-observation and signal shapes, rewards, lifecycle operations, termination, truncation, manual
-episode reset semantics, and `player_killcount`. It additionally requires GraDOOM reset-mask and
-action inputs plus reset and step outputs to be Torch tensors on the declared device. The
-player-attributed kill checks require a player kill to increment `player_killcount` and an
-enemy-on-enemy kill to leave it unchanged.
+Invariant suite `1.0.0` runs before readiness is decided. The manifest cannot supply provider
+commands. It names the repository-owned invariant runner as a declared input; the command verifies
+that input's path and hash, invokes only the installed runner module, and authenticates the response
+with a fresh challenge plus the runner-source digest. Arbitrary executables and static contract
+emitters therefore cannot satisfy the suite.
 
-Provider commands are argv arrays and are never interpreted by a shell. Their runner files must be
-declared and hash-verified before execution. Non-fixture execution also requires the GraDOOM
-provider revision to match `code_provenance.revision` and the reference provider revision to match
-the immutable pin above. Fixture processes can provide deterministic lifecycle evidence, but the
-report remains `fixture: true` and can never become claim-eligible.
+The runner exercises each provider through public construction, reset, step, and masked-reset
+operations. The command requires the complete common constructor signature and defaults, full
+action meanings, exact observation, signal, and reward shapes and dtypes, lifecycle operations,
+termination, truncation, manual episode-reset semantics, and `player_killcount`. It additionally
+requires every GraDOOM reset-mask and action input plus reset and step output to be a Torch tensor on
+the declared device. The player-attributed kill probes perform a player kill and an enemy-on-enemy
+kill: the former must increment `player_killcount`, while the latter must increment only compatibility
+`killcount`.
+
+Real execution loads GraDOOM and the immutable reference revision independently through the pinned
+reference adapter and reports unavailable when the runtime, configuration, or assets cannot support
+the probes. Non-fixture execution also requires the GraDOOM provider revision to match
+`code_provenance.revision`. The fixture runner provides deterministic public-operation probes only
+when the manifest itself is `fixture: true`; fixture evidence can never support a real claim.
 
 The report records every check under `invariant_suite.checks`. A mismatch sets both the suite and
-readiness status to `failed` and names the public `behavior`; an unavailable provider records a
-reason and leaves readiness `unavailable`. A complete invariant pass can still only report
-certification unavailable while the real pretrained policy corpus is missing, with
-`claim_eligible: false`.
+readiness status to `failed` and names the public `behavior`; missing, unconfigured, or unavailable
+suite execution leaves readiness `unavailable`. A complete invariant pass still reports
+certification unavailable when the required real pretrained policy corpus is unavailable or was not
+declared, with `claim_eligible: false`.
 
 Mechanics, trace, outcome-distribution, policy-observation, and rendering diagnostics remain
 separate reproducible tools. Their declared statuses are copied under

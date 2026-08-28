@@ -10,9 +10,9 @@
   },
   "declared_inputs": [
     {
-      "name": "invariant_provider_runner",
-      "path": "invariant-provider.py",
-      "sha256": "a41823ac06cd184f56df93f380b6ebed9f779cd07232108c72c66167c7502942"
+      "name": "invariant_runner",
+      "path": "../../../src/gradoom/evidence/invariant_runner.py",
+      "sha256": "a60fb55e405c0b1c1e18745fc1c8f9f71a69a26d249cf0437cdc54f6fb4246d1"
     }
   ],
   "prerequisites": [
@@ -33,20 +33,9 @@
   ],
   "invariant_suite": {
     "version": "1.0.0",
-    "providers": [
-      {
-        "id": "gradoom",
-        "available": true,
-        "runner_input": "invariant_provider_runner",
-        "command": ["python", "invariant-provider.py", "gradoom"]
-      },
-      {
-        "id": "env-vizdoom-turbo",
-        "available": true,
-        "runner_input": "invariant_provider_runner",
-        "command": ["python", "invariant-provider.py", "env-vizdoom-turbo"]
-      }
-    ],
+    "mode": "fixture",
+    "runner_input": "invariant_runner",
+    "fixture_case": "pass",
     "diagnostics": [
       {"id": "mechanics", "status": "failed"},
       {"id": "trace", "status": "unavailable"},
