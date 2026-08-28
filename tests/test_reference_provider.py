@@ -1,0 +1,165 @@
+from __future__ import annotations
+
+import json
+from types import ModuleType
+
+import numpy as np
+import pytest
+
+from gradoom.evidence import reference_provider
+
+
+class _Distribution:
+    def __init__(self, direct_url: dict[str, object] | None) -> None:
+        self._direct_url = direct_url
+
+    def read_text(self, filename: str) -> str | None:
+        assert filename == "direct_url.json"
+        return None if self._direct_url is None else json.dumps(self._direct_url)
+
+
+class _CurrentEnv:
+    def __init__(self, *args, **kwargs) -> None:
+        self.args = args
+        self.kwargs = kwargs
+
+
+def _pinned_direct_url(*, commit_id: str = reference_provider.REFERENCE_REVISION):
+    return {
+        "url": "https://github.com/tsilva/env-ViZDoom-turbo.git",
+        "subdirectory": "turbo",
+        "vcs_info": {
+            "vcs": "git",
+            "requested_revision": reference_provider.REFERENCE_REVISION,
+            "commit_id": commit_id,
+        },
+    }
+
+
+def _install_fake_provider(monkeypatch: pytest.MonkeyPatch, direct_url=None) -> None:
+    module = ModuleType("env_vizdoom_turbo")
+    module.EnvViZDoomTurboVecEnv = _CurrentEnv
+    native = ModuleType("env_vizdoom_turbo._env_vizdoom_turbo")
+    native.preprocess_into = lambda *args: args
+    monkeypatch.setattr(
+        reference_provider.importlib_metadata,
+        "distribution",
+        lambda name: _Distribution(direct_url or _pinned_direct_url()),
+    )
+    monkeypatch.setattr(
+        reference_provider.importlib,
+        "import_module",
+        lambda name: {
+            "env_vizdoom_turbo": module,
+            "env_vizdoom_turbo._env_vizdoom_turbo": native,
+        }[name],
+    )
+
+
+def test_pinned_provider_loads_the_current_public_export(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_provider(monkeypatch)
+
+    provider = reference_provider.load_reference_provider()
+
+    assert provider.revision == "5b74973e4fbb1a96550a1884805b51fd6dcfe90f"
+    assert provider.env_class is _CurrentEnv
+    assert provider.preprocess_into("frame") == ("frame",)
+
+
+def test_provider_revision_mismatch_fails_before_import(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        reference_provider.importlib_metadata,
+        "distribution",
+        lambda name: _Distribution(_pinned_direct_url(commit_id="0" * 40)),
+    )
+
+    with pytest.raises(
+        reference_provider.ReferenceProviderError,
+        match=r"revision mismatch.*5b74973e",
+    ):
+        reference_provider.load_reference_provider()
+
+
+def test_unverifiable_provider_install_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        reference_provider.importlib_metadata,
+        "distribution",
+        lambda name: _Distribution(None),
+    )
+
+    with pytest.raises(
+        reference_provider.ReferenceProviderError,
+        match=r"cannot verify.*direct_url.json",
+    ):
+        reference_provider.load_reference_provider()
+
+
+def test_missing_player_killcount_never_falls_back_to_killcount(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_provider(monkeypatch)
+    provider = reference_provider.load_reference_provider()
+
+    with pytest.raises(
+        reference_provider.ReferenceProviderError,
+        match="missing required player_killcount",
+    ):
+        provider.episode_kill_signals({"killcount": np.asarray([17.0])}, lane=0)
+
+
+def test_episode_kills_keep_quality_and_compatibility_signals_separate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_provider(monkeypatch)
+    provider = reference_provider.load_reference_provider()
+
+    signals = provider.episode_kill_signals(
+        {
+            "player_killcount": np.asarray([4.0, 7.0]),
+            "killcount": np.asarray([9.0, 12.0]),
+        },
+        lane=1,
+    )
+
+    assert signals == {
+        "player_killcount": 7.0,
+        "compatibility_killcount": 12.0,
+    }
+
+
+def test_reference_constructor_requires_both_explicit_kill_signals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_provider(monkeypatch)
+    provider = reference_provider.load_reference_provider()
+
+    with pytest.raises(
+        reference_provider.ReferenceProviderError,
+        match="must explicitly request player_killcount",
+    ):
+        provider.make_env("deathmatch.cfg", game_variables=("KILLCOUNT",))
+
+
+def test_reference_constructor_forwards_the_shared_contract_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_provider(monkeypatch)
+    provider = reference_provider.load_reference_provider()
+    game_variables = ("KILLCOUNT", "PLAYER_KILLCOUNT")
+
+    env = provider.make_env(
+        "deathmatch.cfg",
+        game_variables=game_variables,
+        obs_crop=(0, 32, 0, 0),
+        obs_resize=(84, 84),
+    )
+
+    assert type(env) is _CurrentEnv
+    assert env.args == ("deathmatch.cfg",)
+    assert env.kwargs == {
+        "game_variables": game_variables,
+        "obs_crop": (0, 32, 0, 0),
+        "obs_resize": (84, 84),
+    }

@@ -112,8 +112,18 @@ def _summary(records: Sequence[Mapping[str, Any]]) -> dict[str, float | int]:
     total_length = sum(lengths)
     result: dict[str, float | int] = {
         "episodes": len(records),
-        "kills_mean": statistics.fmean(float(record["kills"]) for record in records),
-        "kills_median": statistics.median(float(record["kills"]) for record in records),
+        "player_killcount_mean": statistics.fmean(
+            float(record["player_killcount"]) for record in records
+        ),
+        "player_killcount_median": statistics.median(
+            float(record["player_killcount"]) for record in records
+        ),
+        "compatibility_killcount_mean": statistics.fmean(
+            float(record["compatibility_killcount"]) for record in records
+        ),
+        "compatibility_killcount_median": statistics.median(
+            float(record["compatibility_killcount"]) for record in records
+        ),
         "length_mean": statistics.fmean(lengths),
         "return_mean": statistics.fmean(float(record["return"]) for record in records),
         "terminated_rate": statistics.fmean(float(record["terminated"]) for record in records),
@@ -184,7 +194,8 @@ def main() -> int:
     action_rows = _action_rows(device)
     returns = torch.zeros(num_envs, device=device)
     recorded = torch.zeros(num_envs, device=device, dtype=torch.bool)
-    result_kills = torch.zeros(num_envs, device=device)
+    result_player_killcount = torch.zeros(num_envs, device=device)
+    result_compatibility_killcount = torch.zeros(num_envs, device=device)
     result_returns = torch.zeros(num_envs, device=device)
     result_lengths = torch.zeros(num_envs, device=device, dtype=torch.int64)
     result_terminated = torch.zeros(num_envs, device=device, dtype=torch.bool)
@@ -198,7 +209,12 @@ def main() -> int:
         returns.add_(torch.where(within_horizon & ~recorded, rewards, 0.0))
         reached_horizon = decision + 1 >= lengths
         finished = ~recorded & (terminated | truncated | reached_horizon)
-        result_kills.copy_(torch.where(finished, engine.killcount, result_kills))
+        result_player_killcount.copy_(
+            torch.where(finished, engine.player_killcount, result_player_killcount)
+        )
+        result_compatibility_killcount.copy_(
+            torch.where(finished, engine.killcount, result_compatibility_killcount)
+        )
         result_returns.copy_(torch.where(finished, returns, result_returns))
         result_lengths.copy_(
             torch.where(
@@ -225,7 +241,8 @@ def main() -> int:
         {
             "damage_taken": float(result_damage_taken[lane]),
             "hits_taken": float(result_hits_taken[lane]),
-            "kills": float(result_kills[lane]),
+            "player_killcount": float(result_player_killcount[lane]),
+            "compatibility_killcount": float(result_compatibility_killcount[lane]),
             "length": int(result_lengths[lane]),
             "return": float(result_returns[lane]),
             "terminated": bool(result_terminated[lane]),
@@ -236,19 +253,25 @@ def main() -> int:
         {
             "damage_taken": float(record.get("damage_taken", 0.0)),
             "hits_taken": float(record.get("hits_taken", 0.0)),
-            "kills": float(record["kills"]),
+            "player_killcount": float(record["player_killcount"]),
+            "compatibility_killcount": float(record["compatibility_killcount"]),
             "length": int(record["length"]),
             "return": float(record["return"]),
             "terminated": bool(record["terminated"]),
         }
         for record in episodes
     ]
-    kill_deltas = [
-        gradoom_records[index]["kills"] - reference_records[index]["kills"]
+    player_killcount_deltas = [
+        gradoom_records[index]["player_killcount"] - reference_records[index]["player_killcount"]
+        for index in range(num_envs)
+    ]
+    compatibility_killcount_deltas = [
+        gradoom_records[index]["compatibility_killcount"]
+        - reference_records[index]["compatibility_killcount"]
         for index in range(num_envs)
     ]
     result = {
-        "schema": "gradoom.vizdoom-action-trace-replay.v1",
+        "schema": "gradoom.vizdoom-action-trace-replay.v2",
         "source_trace": str(args.trace_jsonl.expanduser().resolve()),
         "frame_skip": frame_skip,
         "doom_skill": doom_skill,
@@ -257,10 +280,14 @@ def main() -> int:
         "reference": _summary(reference_records),
         "gradoom": _summary(gradoom_records),
         "paired": {
-            "kills_delta_mean": statistics.fmean(kill_deltas),
-            "kills_delta_median": statistics.median(kill_deltas),
-            "kills_at_least_reference_rate": statistics.fmean(
-                float(delta >= 0) for delta in kill_deltas
+            "player_killcount_delta_mean": statistics.fmean(player_killcount_deltas),
+            "player_killcount_delta_median": statistics.median(player_killcount_deltas),
+            "player_killcount_at_least_reference_rate": statistics.fmean(
+                float(delta >= 0) for delta in player_killcount_deltas
+            ),
+            "compatibility_killcount_delta_mean": statistics.fmean(compatibility_killcount_deltas),
+            "compatibility_killcount_delta_median": statistics.median(
+                compatibility_killcount_deltas
             ),
             "gradoom_survived_reference_horizon_rate": statistics.fmean(
                 float(not record["terminated"]) for record in gradoom_records

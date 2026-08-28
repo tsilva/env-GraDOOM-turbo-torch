@@ -21,6 +21,7 @@ import torch
 
 from gradoom.actions import DEATHMATCH_ACTIONS, DEATHMATCH_BUTTONS
 from gradoom.engine import TorchDeathmatchEngine
+from gradoom.evidence.reference_provider import load_reference_provider
 from gradoom.scenario import compile_deathmatch_scenario
 
 UINT32_MASK = (1 << 32) - 1
@@ -29,6 +30,7 @@ BAM_TO_RADIANS = 2.0 * math.pi / float(1 << 32)
 POSE_NAMES = ("position_x", "position_y", "position_z", "camera_position_z", "angle")
 GAME_VARIABLES = (
     "KILLCOUNT",
+    "PLAYER_KILLCOUNT",
     "HITCOUNT",
     "DAMAGECOUNT",
     "HITS_TAKEN",
@@ -103,8 +105,18 @@ def _align_poses(engine: TorchDeathmatchEngine, infos: dict[str, Any]) -> None:
 def _summary(records: Sequence[dict[str, Any]]) -> dict[str, float | int]:
     summary: dict[str, float | int] = {
         "episodes": len(records),
-        "kills_mean": statistics.fmean(float(record["kills"]) for record in records),
-        "kills_median": statistics.median(float(record["kills"]) for record in records),
+        "player_killcount_mean": statistics.fmean(
+            float(record["player_killcount"]) for record in records
+        ),
+        "player_killcount_median": statistics.median(
+            float(record["player_killcount"]) for record in records
+        ),
+        "compatibility_killcount_mean": statistics.fmean(
+            float(record["compatibility_killcount"]) for record in records
+        ),
+        "compatibility_killcount_median": statistics.median(
+            float(record["compatibility_killcount"]) for record in records
+        ),
         "length_mean": statistics.fmean(float(record["length"]) for record in records),
         "return_mean": statistics.fmean(float(record["return"]) for record in records),
         "terminated_rate": statistics.fmean(float(record["terminated"]) for record in records),
@@ -160,7 +172,8 @@ def _outcome_values(records: Sequence[Mapping[str, Any]]) -> dict[str, list[floa
     values = {
         name: [float(record[name]) for record in records]
         for name in (
-            "kills",
+            "player_killcount",
+            "compatibility_killcount",
             "length",
             "return",
             "terminated",
@@ -250,11 +263,7 @@ def main() -> int:
     if args.frame_skip <= 0:
         parser.error("--frame-skip must be positive")
 
-    try:
-        from vizdoom_turbo import VizdoomTurboVecEnv
-    except ImportError as exc:
-        raise RuntimeError("comparison requires env-vizdoom-turbo") from exc
-
+    provider = load_reference_provider()
     device = torch.device("cuda")
     scenario = compile_deathmatch_scenario(args.scenario, args.iwad)
     provider_seeds = [args.seed + lane for lane in range(args.num_envs)]
@@ -267,7 +276,7 @@ def main() -> int:
     results: list[dict[str, Any]] = []
 
     for program in args.programs:
-        env = VizdoomTurboVecEnv(
+        env = provider.make_env(
             str(args.config),
             use_restricted_actions=DEATHMATCH_ACTIONS,
             rom_path=str(args.iwad),
@@ -360,6 +369,7 @@ def main() -> int:
                 reference_health = next_reference_health.copy()
                 reference_armor = next_reference_armor.copy()
                 for lane in np.flatnonzero(newly_reference_done).tolist():
+                    kill_signals = provider.episode_kill_signals(step_infos, lane=lane)
                     reference_records[lane] = {
                         "armor_gain": float(reference_armor_gain[lane]),
                         "armor_loss": float(reference_armor_loss[lane]),
@@ -369,7 +379,7 @@ def main() -> int:
                         "damagecount": float(np.asarray(step_infos["damagecount"])[lane]),
                         "hits_taken": float(np.asarray(step_infos["hits_taken"])[lane]),
                         "damage_taken": float(np.asarray(step_infos["damage_taken"])[lane]),
-                        "kills": float(np.asarray(step_infos["killcount"])[lane]),
+                        **kill_signals,
                         "length": decision + 1,
                         "return": float(reference_returns[lane]),
                         "terminated": bool(np.asarray(terminated)[lane]),
@@ -391,33 +401,25 @@ def main() -> int:
                     action_rows[action_index].expand(args.num_envs, -1)
                 )
                 gradoom_active = ~gradoom_done
-                gradoom_returns.add_(
-                    torch.where(gradoom_active, rewards_device, 0.0)
-                )
+                gradoom_returns.add_(torch.where(gradoom_active, rewards_device, 0.0))
                 health_delta_device = engine.health - gradoom_health
                 armor_delta_device = engine.armor - gradoom_armor
                 gradoom_health_gain.add_(
                     torch.where(gradoom_active, health_delta_device.clamp_min(0), 0.0)
                 )
                 gradoom_health_loss.add_(
-                    torch.where(
-                        gradoom_active, (-health_delta_device).clamp_min(0), 0.0
-                    )
+                    torch.where(gradoom_active, (-health_delta_device).clamp_min(0), 0.0)
                 )
                 gradoom_armor_gain.add_(
                     torch.where(gradoom_active, armor_delta_device.clamp_min(0), 0.0)
                 )
                 gradoom_armor_loss.add_(
-                    torch.where(
-                        gradoom_active, (-armor_delta_device).clamp_min(0), 0.0
-                    )
+                    torch.where(gradoom_active, (-armor_delta_device).clamp_min(0), 0.0)
                 )
                 gradoom_health.copy_(engine.health)
                 gradoom_armor.copy_(engine.armor)
                 current_gradoom_done = terminated_device | truncated_device
-                newly_gradoom_done = (
-                    ~gradoom_done & current_gradoom_done
-                )
+                newly_gradoom_done = ~gradoom_done & current_gradoom_done
                 for lane in torch.nonzero(newly_gradoom_done).flatten().cpu().tolist():
                     gradoom_records[lane] = {
                         "armor_gain": float(gradoom_armor_gain[lane]),
@@ -428,7 +430,8 @@ def main() -> int:
                         "damagecount": float(engine.player_damagecount[lane]),
                         "hits_taken": float(engine.player_hits_taken[lane]),
                         "damage_taken": float(engine.player_damage_taken[lane]),
-                        "kills": float(engine.killcount[lane]),
+                        "player_killcount": float(engine.player_killcount[lane]),
+                        "compatibility_killcount": float(engine.killcount[lane]),
                         "length": decision + 1,
                         "return": float(gradoom_returns[lane]),
                         "terminated": bool(terminated_device[lane]),
@@ -443,9 +446,7 @@ def main() -> int:
         if any(record is None for record in reference_records + gradoom_records):
             raise RuntimeError(f"{program} did not complete every scripted episode")
         reference_complete = [record for record in reference_records if record is not None]
-        gradoom_complete = [
-            record for record in gradoom_records if record is not None
-        ]
+        gradoom_complete = [record for record in gradoom_records if record is not None]
         results.append(
             {
                 "comparison": _distribution_comparison(
@@ -465,7 +466,8 @@ def main() -> int:
         "initial_pose_alignment": True,
         "num_envs": args.num_envs,
         "results": results,
-        "schema": "gradoom.outcome-distributions.aligned-pose.v2",
+        "reference_provider_revision": provider.revision,
+        "schema": "gradoom.outcome-distributions.aligned-pose.v3",
         "seed": args.seed,
     }
     serialized = json.dumps(result, sort_keys=True)
