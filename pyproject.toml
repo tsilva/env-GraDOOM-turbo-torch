@@ -40,7 +40,7 @@ dev = [
 where = ["src"]
 
 [tool.setuptools.package-data]
-gradoom = ["assets/*.json"]
+gradoom = ["assets/*.json", "evidence/profiles/*.json"]
 
 [tool.pytest.ini_options]
 addopts = "-ra"
