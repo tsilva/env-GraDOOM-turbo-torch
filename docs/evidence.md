@@ -41,15 +41,21 @@ contains:
   `123`.
 - `trainer.command` and `trainer.arguments`: the standalone trainer invocation and fixed recipe,
   asset, and runtime arguments. The evidence command owns all seed, initialization, resume,
-  checkpoint, timing, metrics, and evaluation arguments and rejects attempts to override them.
+  checkpoint, timing, metrics, and evaluation arguments and rejects attempts to override them. The
+  resolved executable and script bytes are hashed into the recipe identity, so replacing a command
+  file at the same path invalidates continuation.
 - `artifacts_directory`: the directory under which the run-identity and per-seed artifacts are
   durably retained.
 - `bootstrap_artifacts`: optional one-time exclusions declared before the cohort. Every entry names
   a persistent read-only regular file outside the benchmark artifact directory, its SHA-256,
   creation elapsed seconds, creation protocol, exact reuse conditions, and true
   `persistent`/`run_independent`/`reused_unchanged` assertions. `contains_state` must explicitly set
-  `learned`, `optimizer`, `rollout`, `seed_specific`, and `candidate_specific` to false. Missing,
-  writable, linked, changed, incompletely disclosed, or state-bearing artifacts are rejected.
+  `learned`, `optimizer`, `rollout`, `seed_specific`, and `candidate_specific` to false. Each entry
+  also names an immutable hashed creation receipt that repeats the cost, protocol, and conditions
+  and records at least two byte-identical builds while varying run, training-seed, and candidate
+  identities. The command scans the artifact bytes for prohibited benchmark state rather than
+  trusting those booleans. Missing, writable, linked, changed, incompletely disclosed,
+  irreproducible, or state-bearing artifacts are rejected.
 - `parity_certificate`: the current certificate availability and, when unavailable, its reason.
   An unavailable certificate is recorded as a claim-ineligibility reason but does not prevent a
   development run.
@@ -57,7 +63,9 @@ contains:
   `freedoom2-deathmatch-v1` binding before training. The trainer and evaluator must report the same
   IWAD and PWAD hashes. CPU-only fixture manifests may omit real WAD assets.
 
-For each seed, the command starts the reusable timer before attempt setup and invokes the existing
+The command starts the reusable timer before argument parsing, manifest and configuration
+validation, identity and input hashing, artifact setup, and continuation or recovery verification.
+For each seed it invokes the existing
 `standalone-gradoom-deathmatch-ppo-v2` trainer contract at every checkpoint cadence. The first
 segment receives no resume or learned initialization; later segments resume only the preceding
 checkpoint from that same attempt. This preserves one cold-start policy and optimizer lineage while
@@ -84,7 +92,7 @@ attempt states are `succeeded`, `exhausted`, `crashed`, `interrupted`, `evaluati
 `evidence_failed`. The workflow status is `passed` only when every predeclared development attempt
 succeeds; either status remains ineligible for public claims.
 
-An interrupted trainer may leave a recovery checkpoint only when its metrics prove that policy,
+An interrupted or crashed trainer may leave a recovery checkpoint only when its metrics prove that policy,
 optimizer, RNG, and progress state are all restorable and the checkpoint carries the exact run and
 attempt identities. The report retains a hashed recovery journal binding that checkpoint, progress,
 and accumulated reusable elapsed time. A later `--merge` resumes the same attempt, adds new elapsed
@@ -92,6 +100,16 @@ time to the journaled elapsed time, and preserves the original cold-start identi
 failed seeds are reused unchanged and are never rerun or replaced. Every attempt also has a durable
 hashed state journal, so edited elapsed time, outcomes, failures, or recovery metadata cannot be
 accepted as a completed unit.
+
+Before every trainer launch, the command writes and periodically refreshes a durable, checksummed
+live-attempt journal. If the public command itself is interrupted before it can write a report, a
+later invocation with the identical manifest discovers the live journal and its completed recovery
+checkpoint, verifies every bound identity and artifact, and continues the same attempt without
+requiring a missing report. A crash that produces no complete recovery checkpoint remains terminal.
+The current real environment does not expose a deterministic live-snapshot codec, so its evidence
+resume path fails before environment construction instead of resetting active lanes while claiming
+continuous progress; a future recoverable checkpoint must include environment, observation,
+context, episode accumulators, and every per-lane in-progress state.
 
 `benchmark_protocol.continuation_identity` separately hashes the exact schema/trainer contract,
 recipe, assets and bootstrap bytes, training/evaluation seeds, and timer phases/boundaries. Any

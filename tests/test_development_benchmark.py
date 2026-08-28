@@ -97,6 +97,11 @@ def test_development_benchmark_defaults_to_one_cold_seed_and_stops_at_first_pass
     assert report["benchmark_protocol"]["evaluation_episode_seeds"] == EVALUATION_SEEDS
     assert report["benchmark_protocol"]["evaluation_action_seed"] == 123
     assert report["benchmark_protocol"]["timer_includes"] == [
+        "command_parsing",
+        "manifest_and_configuration_validation",
+        "identity_and_input_hashing",
+        "artifact_directory_setup",
+        "continuation_and_recovery_verification",
         "recurring_initialization",
         "per_process_or_uncached_compilation",
         "graph_capture",

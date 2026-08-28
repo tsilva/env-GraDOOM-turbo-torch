@@ -2312,6 +2312,91 @@ def _restore_episode_indices(
     return preserved
 
 
+_CONTINUOUS_PROGRESS_FIELDS = {
+    "completed_episodes",
+    "executed_rollouts",
+    "episode_index",
+    "rolling_returns",
+    "rolling_kills",
+    "rolling_lengths",
+    "rolling_success",
+    "environment_state",
+    "observations",
+    "context",
+    "episode_starts",
+    "dones",
+    "episode_returns",
+    "episode_lengths",
+}
+
+
+def _checkpoint_restored_state(
+    checkpoint: Mapping[str, Any],
+    *,
+    num_envs: int,
+) -> dict[str, bool]:
+    training_state = checkpoint.get("training_state")
+    if not isinstance(training_state, Mapping):
+        training_state = {}
+    rng_complete = all(
+        key in training_state
+        for key in (
+            "python_rng_state",
+            "numpy_rng_state",
+            "torch_rng_state",
+            "cuda_rng_state",
+        )
+    )
+    environment_state = training_state.get("environment_state")
+    environment_complete = (
+        isinstance(environment_state, Mapping)
+        and environment_state.get("format") == "gradoom-live-snapshot-v1"
+        and environment_state.get("lane_count") == int(num_envs)
+    )
+    lane_fields = (
+        "episode_index",
+        "observations",
+        "context",
+        "episode_starts",
+        "dones",
+        "episode_returns",
+        "episode_lengths",
+    )
+    lanes_complete = all(
+        isinstance(training_state.get(field), torch.Tensor)
+        and training_state[field].ndim >= 1
+        and training_state[field].shape[0] == int(num_envs)
+        for field in lane_fields
+    )
+    progress_complete = (
+        set(training_state) >= _CONTINUOUS_PROGRESS_FIELDS
+        and environment_complete
+        and lanes_complete
+    )
+    return {
+        "policy": "policy_state_dict" in checkpoint,
+        "optimizer": "optimizer_state_dict" in checkpoint,
+        "rng": rng_complete,
+        "progress": progress_complete,
+    }
+
+
+def _validate_evidence_recovery_checkpoint(
+    checkpoint: Mapping[str, Any],
+    *,
+    num_envs: int,
+) -> None:
+    if _checkpoint_restored_state(checkpoint, num_envs=num_envs) != {
+        "policy": True,
+        "optimizer": True,
+        "rng": True,
+        "progress": True,
+    }:
+        raise ValueError(
+            "evidence recovery checkpoint cannot restore continuous environment and lane progress"
+        )
+
+
 def _save_checkpoint(
     path: Path,
     *,
@@ -2758,6 +2843,24 @@ def _train(
     torch.manual_seed(int(args.seed))
     torch.cuda.manual_seed_all(int(args.seed))
     device = torch.device("cuda")
+    preloaded_resume: Mapping[str, Any] | None = None
+    if args.resume is not None:
+        loaded = torch.load(args.resume, map_location=device, weights_only=False)
+        if not isinstance(loaded, Mapping) or loaded.get("format") != "standalone-gradoom-ppo-v1":
+            raise ValueError(f"unsupported resume checkpoint: {args.resume}")
+        if args.evidence_run_identity is not None:
+            loaded_config = loaded.get("config")
+            expected_evidence_binding = {
+                "run_identity": args.evidence_run_identity,
+                "attempt_identity": args.evidence_attempt_identity,
+            }
+            if (
+                not isinstance(loaded_config, Mapping)
+                or loaded_config.get("evidence_binding") != expected_evidence_binding
+            ):
+                raise ValueError("resume checkpoint has unlike evidence run or attempt identity")
+            _validate_evidence_recovery_checkpoint(loaded, num_envs=int(args.num_envs))
+        preloaded_resume = loaded
     env = _make_env(args, device)
     interrupted = False
     previous_handlers: dict[int, Any] = {}
@@ -2835,25 +2938,8 @@ def _train(
                 }
             )
         if args.resume is not None:
-            loaded = torch.load(args.resume, map_location=device, weights_only=False)
-            if (
-                not isinstance(loaded, Mapping)
-                or loaded.get("format") != "standalone-gradoom-ppo-v1"
-            ):
-                raise ValueError(f"unsupported resume checkpoint: {args.resume}")
-            if args.evidence_run_identity is not None:
-                loaded_config = loaded.get("config")
-                expected_evidence_binding = {
-                    "run_identity": args.evidence_run_identity,
-                    "attempt_identity": args.evidence_attempt_identity,
-                }
-                if (
-                    not isinstance(loaded_config, Mapping)
-                    or loaded_config.get("evidence_binding") != expected_evidence_binding
-                ):
-                    raise ValueError(
-                        "resume checkpoint has unlike evidence run or attempt identity"
-                    )
+            assert preloaded_resume is not None
+            loaded = preloaded_resume
             policy.load_state_dict(loaded["policy_state_dict"])
             _load_optimizer_state(
                 optimizer,
@@ -3007,31 +3093,10 @@ def _train(
                     "event": "resumed",
                     "checkpoint": str(args.resume),
                     "train/global_step": global_step,
-                    "restored_state": {
-                        "policy": "policy_state_dict" in resume_payload,
-                        "optimizer": "optimizer_state_dict" in resume_payload,
-                        "rng": all(
-                            key in saved_training_state
-                            for key in (
-                                "python_rng_state",
-                                "numpy_rng_state",
-                                "torch_rng_state",
-                                "cuda_rng_state",
-                            )
-                        ),
-                        "progress": all(
-                            key in saved_training_state
-                            for key in (
-                                "completed_episodes",
-                                "executed_rollouts",
-                                "episode_index",
-                                "rolling_returns",
-                                "rolling_kills",
-                                "rolling_lengths",
-                                "rolling_success",
-                            )
-                        ),
-                    },
+                    "restored_state": _checkpoint_restored_state(
+                        resume_payload,
+                        num_envs=int(args.num_envs),
+                    ),
                     "evidence_binding": {
                         "run_identity": args.evidence_run_identity,
                         "attempt_identity": args.evidence_attempt_identity,
