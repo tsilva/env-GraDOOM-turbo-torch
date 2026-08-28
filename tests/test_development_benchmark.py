@@ -99,6 +99,7 @@ def test_development_benchmark_defaults_to_one_cold_seed_and_stops_at_first_pass
     assert report["benchmark_protocol"]["timer_includes"] == [
         "recurring_initialization",
         "per_process_or_uncached_compilation",
+        "graph_capture",
         "warmup",
         "training",
         "checkpoint_evaluation",
