@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +13,10 @@ class EvidenceError(ValueError):
 
 class _NonStandardJsonConstant(ValueError):
     """A Python JSON decoder extension appeared in an evidence document."""
+
+
+class _InvalidJsonNumber(ValueError):
+    """A JSON number cannot be represented safely by the evidence contract."""
 
 
 _READINESS_REPORT_FIELDS = (
@@ -29,6 +34,8 @@ _READINESS_REPORT_FIELDS = (
     "evidence_index",
 )
 
+_MAX_JSON_NESTING = 256
+
 
 def _sha256_bytes(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
@@ -38,11 +45,41 @@ def _reject_non_standard_json_constant(constant: str) -> None:
     raise _NonStandardJsonConstant(constant)
 
 
+def _parse_json_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise _InvalidJsonNumber("numeric value is not finite")
+    return parsed
+
+
+def _parse_json_integer(value: str) -> int:
+    try:
+        return int(value)
+    except (OverflowError, ValueError) as error:
+        raise _InvalidJsonNumber("integer value exceeds supported range") from error
+
+
+def _validate_json_nesting(value: object, *, document: str) -> None:
+    pending = [(value, 0)]
+    while pending:
+        current, depth = pending.pop()
+        if depth > _MAX_JSON_NESTING:
+            raise EvidenceError(
+                f"{document} is not valid JSON: nesting is too deep"
+            )
+        if isinstance(current, list):
+            pending.extend((item, depth + 1) for item in current)
+        elif isinstance(current, dict):
+            pending.extend((item, depth + 1) for item in current.values())
+
+
 def _parse_json_document(payload: bytes, *, document: str) -> Any:
     try:
-        return json.loads(
+        parsed = json.loads(
             payload,
             parse_constant=_reject_non_standard_json_constant,
+            parse_float=_parse_json_float,
+            parse_int=_parse_json_integer,
         )
     except UnicodeDecodeError as error:
         raise EvidenceError(
@@ -54,6 +91,18 @@ def _parse_json_document(payload: bytes, *, document: str) -> Any:
         raise EvidenceError(
             f"{document} is not valid JSON: non-standard constant {error}"
         ) from error
+    except _InvalidJsonNumber as error:
+        raise EvidenceError(f"{document} is not valid JSON: {error}") from error
+    except RecursionError as error:
+        raise EvidenceError(
+            f"{document} is not valid JSON: nesting is too deep"
+        ) from error
+    except (OverflowError, ValueError) as error:
+        raise EvidenceError(
+            f"{document} is not valid JSON: numeric value is invalid"
+        ) from error
+    _validate_json_nesting(parsed, document=document)
+    return parsed
 
 
 def _canonical_sha256(value: object, *, document: str) -> str:
@@ -68,6 +117,10 @@ def _canonical_sha256(value: object, *, document: str) -> str:
         raise EvidenceError(
             f"{document} contains invalid Unicode at character {error.start}"
         ) from error
+    except (RecursionError, ValueError) as error:
+        raise EvidenceError(
+            f"{document} cannot be encoded as standard JSON"
+        ) from error
     return _sha256_bytes(payload)
 
 
@@ -77,46 +130,39 @@ def _validate_string_content(
     document: str,
     field: str = "",
 ) -> None:
-    if isinstance(value, str):
-        null_index = value.find("\0")
-        if null_index >= 0:
-            location = field or "<root>"
-            raise EvidenceError(
-                f"{document} contains U+0000 in {location} "
-                f"at character {null_index}"
+    pending = [(value, field)]
+    while pending:
+        current, current_field = pending.pop()
+        if isinstance(current, str):
+            null_index = current.find("\0")
+            if null_index >= 0:
+                location = current_field or "<root>"
+                raise EvidenceError(
+                    f"{document} contains U+0000 in {location} "
+                    f"at character {null_index}"
+                )
+            try:
+                current.encode("utf-8")
+            except UnicodeEncodeError as error:
+                location = current_field or "<root>"
+                raise EvidenceError(
+                    f"{document} contains invalid Unicode in {location} "
+                    f"at character {error.start}"
+                ) from error
+        elif isinstance(current, list):
+            pending.extend(
+                (
+                    item,
+                    f"{current_field}[{index}]" if current_field else f"[{index}]",
+                )
+                for index, item in reversed(list(enumerate(current)))
             )
-        try:
-            value.encode("utf-8")
-        except UnicodeEncodeError as error:
-            location = field or "<root>"
-            raise EvidenceError(
-                f"{document} contains invalid Unicode in {location} "
-                f"at character {error.start}"
-            ) from error
-        return
-    if isinstance(value, list):
-        for index, item in enumerate(value):
-            child_field = f"{field}[{index}]" if field else f"[{index}]"
-            _validate_string_content(
-                item,
-                document=document,
-                field=child_field,
-            )
-        return
-    if isinstance(value, dict):
-        for key, item in value.items():
-            key_field = f"{field}.<key>" if field else "<key>"
-            _validate_string_content(
-                key,
-                document=document,
-                field=key_field,
-            )
-            child_field = f"{field}.{key}" if field else key
-            _validate_string_content(
-                item,
-                document=document,
-                field=child_field,
-            )
+        elif isinstance(current, dict):
+            for key, item in reversed(list(current.items())):
+                child_field = f"{current_field}.{key}" if current_field else key
+                key_field = f"{current_field}.<key>" if current_field else "<key>"
+                pending.append((item, child_field))
+                pending.append((key, key_field))
 
 
 def _load_manifest(path: Path) -> tuple[dict[str, Any], bytes]:
@@ -161,12 +207,32 @@ def _validate_code_provenance(value: object) -> dict[str, Any]:
     return value
 
 
-def _validate_declared_inputs(value: object) -> list[dict[str, Any]]:
+def _resolve_evidence_path(path: Path, *, base_directory: Path) -> Path:
+    if not path.is_absolute():
+        path = base_directory / path
+    return path.resolve(strict=False)
+
+
+def _paths_alias(first: Path, second: Path) -> bool:
+    if first == second:
+        return True
+    try:
+        return first.samefile(second)
+    except OSError:
+        return False
+
+
+def _validate_declared_inputs(
+    value: object,
+    *,
+    base_directory: Path,
+) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         raise EvidenceError("declared_inputs must be an array")
     inputs: list[dict[str, Any]] = []
     names: set[str] = {"manifest"}
     paths: set[Path] = set()
+    resolved_paths: list[Path] = []
     for index, item in enumerate(value):
         field = f"declared_inputs[{index}]"
         if not isinstance(item, dict):
@@ -184,6 +250,13 @@ def _validate_declared_inputs(value: object) -> list[dict[str, Any]]:
         if normalized_path in paths:
             raise EvidenceError(f"{field}.path is duplicated")
         paths.add(normalized_path)
+        resolved_path = _resolve_evidence_path(
+            normalized_path,
+            base_directory=base_directory,
+        )
+        if any(_paths_alias(resolved_path, previous) for previous in resolved_paths):
+            raise EvidenceError(f"{field}.path aliases an earlier declared input")
+        resolved_paths.append(resolved_path)
         _validate_sha256(item.get("sha256"), f"{field}.sha256")
         inputs.append(item)
     return inputs
@@ -279,10 +352,16 @@ def _validate_readiness_envelope(
 def _validate_evidence_index(
     value: object,
     declared_inputs: list[dict[str, Any]],
+    *,
+    expected_manifest_sha256: str,
 ) -> None:
     field = "merge report evidence_index"
     if not isinstance(value, dict):
         raise EvidenceError(f"{field} must be an object")
+    undeclared_fields = sorted(set(value) - {"algorithm", "entries", "sha256"})
+    if undeclared_fields:
+        formatted = ", ".join(repr(name) for name in undeclared_fields)
+        raise EvidenceError(f"{field} has undeclared fields: {formatted}")
     if "algorithm" not in value:
         raise EvidenceError(f"{field}.algorithm is required")
     if value["algorithm"] != "sha256":
@@ -301,6 +380,10 @@ def _validate_evidence_index(
         entry_field = f"{field}.entries[{index}]"
         if not isinstance(entry, dict):
             raise EvidenceError(f"{entry_field} must be an object")
+        undeclared_fields = sorted(set(entry) - {"name", "sha256"})
+        if undeclared_fields:
+            formatted = ", ".join(repr(name) for name in undeclared_fields)
+            raise EvidenceError(f"{entry_field} has undeclared fields: {formatted}")
         name = _required_string(entry.get("name"), f"{entry_field}.name")
         if name in entries_by_name:
             raise EvidenceError(f"{entry_field}.name {name!r} is duplicated")
@@ -320,6 +403,11 @@ def _validate_evidence_index(
     if unexpected_names:
         formatted = ", ".join(repr(name) for name in unexpected_names)
         raise EvidenceError(f"{field}.entries has unexpected names: {formatted}")
+    if entries_by_name["manifest"]["sha256"] != expected_manifest_sha256:
+        raise EvidenceError(
+            "merge report evidence_index entry 'manifest' SHA-256 does not match "
+            "the source manifest"
+        )
     for declared_input in declared_inputs:
         entry = entries_by_name[declared_input["name"]]
         if entry["sha256"] != declared_input["sha256"]:
@@ -363,7 +451,10 @@ def build_readiness_report(manifest_path: Path) -> dict[str, Any]:
         raise EvidenceError("fixture is required and must be a boolean")
 
     code_provenance = _validate_code_provenance(manifest.get("code_provenance"))
-    declared_inputs = _validate_declared_inputs(manifest.get("declared_inputs"))
+    declared_inputs = _validate_declared_inputs(
+        manifest.get("declared_inputs"),
+        base_directory=manifest_path.parent,
+    )
     prerequisites = _validate_prerequisites(manifest.get("prerequisites"))
 
     evidence_entries = [
@@ -371,9 +462,10 @@ def build_readiness_report(manifest_path: Path) -> dict[str, Any]:
     ]
     for declared_input in declared_inputs:
         name = declared_input["name"]
-        input_path = Path(declared_input["path"])
-        if not input_path.is_absolute():
-            input_path = manifest_path.parent / input_path
+        input_path = _resolve_evidence_path(
+            Path(declared_input["path"]),
+            base_directory=manifest_path.parent,
+        )
         actual_sha256 = _sha256_bytes(input_path.read_bytes())
         if actual_sha256 != declared_input["sha256"]:
             raise EvidenceError(
@@ -411,7 +503,13 @@ def build_readiness_report(manifest_path: Path) -> dict[str, Any]:
     }
 
 
-def validate_merge_report(path: Path, expected_run_identity: object) -> None:
+def validate_merge_report(
+    path: Path,
+    expected_run_identity: object,
+    *,
+    expected_manifest_sha256: str,
+    manifest_directory: Path,
+) -> None:
     report = _parse_json_document(path.read_bytes(), document="merge report")
     if not isinstance(report, dict):
         raise EvidenceError("merge report must be a JSON object")
@@ -432,7 +530,10 @@ def validate_merge_report(path: Path, expected_run_identity: object) -> None:
     if not isinstance(report["evidence_index"], dict):
         raise EvidenceError("merge report evidence_index must be an object")
     code_provenance = _validate_code_provenance(report["code_provenance"])
-    declared_inputs = _validate_declared_inputs(report["declared_inputs"])
+    declared_inputs = _validate_declared_inputs(
+        report["declared_inputs"],
+        base_directory=manifest_directory,
+    )
     prerequisites = _validate_prerequisites(report["prerequisites"])
     stored_run_identity = _required_string(
         report["run_identity"], "merge report run_identity"
@@ -448,14 +549,18 @@ def validate_merge_report(path: Path, expected_run_identity: object) -> None:
         raise EvidenceError(
             "merge report run_identity does not match its identity-bearing fields"
         )
-    if report["workflow"] != "parity_readiness":
-        raise EvidenceError("merge report workflow must be parity_readiness")
-    if report["evidence_level"] != "development":
-        raise EvidenceError("merge report evidence_level must be development")
-    _validate_readiness_envelope(report, prerequisites)
-    _validate_evidence_index(report["evidence_index"], declared_inputs)
     if recomputed_run_identity != expected_run_identity:
         raise EvidenceError(
             "cannot merge unlike run identities: "
             f"existing {recomputed_run_identity!r}, requested {expected_run_identity!r}"
         )
+    if report["workflow"] != "parity_readiness":
+        raise EvidenceError("merge report workflow must be parity_readiness")
+    if report["evidence_level"] != "development":
+        raise EvidenceError("merge report evidence_level must be development")
+    _validate_readiness_envelope(report, prerequisites)
+    _validate_evidence_index(
+        report["evidence_index"],
+        declared_inputs,
+        expected_manifest_sha256=expected_manifest_sha256,
+    )
