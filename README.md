@@ -86,7 +86,16 @@ uv run python tools/convert_gradlab_checkpoint.py \
 uv run python tools/evaluate_vizdoom_checkpoint.py \
   --checkpoint /path/to/policy.pt --iwad /path/to/doom2.wad \
   --scenario-config /path/to/deathmatch.cfg                      # zero-shot transfer gate
+uv run gradoom-evidence \
+  --manifest tests/fixtures/evidence/readiness-manifest.json \
+  --output readiness-report.json                                # readiness evidence
 ```
+
+`gradoom-evidence` is the single public command for versioned parity and training evidence.
+Its initial `parity_readiness` path validates every declared input hash and emits a
+machine-readable, non-claim-eligible report that names unavailable real prerequisites. See the
+[evidence contract](./docs/evidence.md) for the versioned manifest, report, hashing, and safe merge
+rules.
 
 ## Notes
 

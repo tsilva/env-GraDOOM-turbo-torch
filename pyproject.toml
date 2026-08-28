@@ -18,6 +18,9 @@ dependencies = [
   "wandb>=0.18,<0.23",
 ]
 
+[project.scripts]
+gradoom-evidence = "gradoom.evidence.cli:main"
+
 [project.urls]
 Homepage = "https://github.com/tsilva/env-GraDOOM-turbo-torch"
 Repository = "https://github.com/tsilva/env-GraDOOM-turbo-torch.git"
