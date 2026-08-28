@@ -356,14 +356,16 @@ def _validate_evaluation_records(
             raise EvidenceError(f"evaluation episodes[{index}].player_killcount must be finite")
         player_killcounts.append(float(player_value))
         compatibility_value = raw_episode.get(
-            "killcount",
-            raw_episode.get("vizdoom_killcount"),
+            "compatibility_killcount",
+            raw_episode.get("killcount", raw_episode.get("vizdoom_killcount")),
         )
         if compatibility_value is not None:
             if type(compatibility_value) not in (int, float) or not math.isfinite(
                 float(compatibility_value)
             ):
-                raise EvidenceError(f"evaluation episodes[{index}].killcount must be finite")
+                raise EvidenceError(
+                    f"evaluation episodes[{index}].compatibility_killcount must be finite"
+                )
             compatibility_killcounts.append(float(compatibility_value))
         episodes.append(raw_episode)
     mean_player = statistics.fmean(player_killcounts)

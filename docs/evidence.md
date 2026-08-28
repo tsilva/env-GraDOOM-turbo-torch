@@ -66,7 +66,7 @@ hardlink.
 Evaluation uses the same trainer executable with `--evaluate-checkpoint`,
 `--evaluation-episodes 100`, `--evaluation-seeds-file`, and stochastic actions. Every evaluator must
 return all 100 episode records in the predeclared order. Passage is computed solely from their mean
-`player_killcount` and requires at least `30.0`; separately reported compatibility `killcount` is a
+`player_killcount` and requires at least `30.0`; separately reported `compatibility_killcount` is a
 diagnostic and cannot change the verdict. The passing checkpoint, metrics, all preceding checkpoint
 outcomes, all episode outcomes, and every process or evidence failure are retained and hashed in the
 report evidence index.
@@ -134,6 +134,34 @@ identity fields; their verified bytes and every policy-facing setting are.
 These checks apply only to formal evidence. `GraDoomVecEnv` continues to accept compatible
 operator-supplied Doom II and Freedoom IWADs for ordinary deathmatch use, where
 `parity_certified` remains false and no WAD-profile evidence is inherited.
+
+## Reference provider
+
+Reference evaluation is bound to `env-ViZDoom-turbo` revision
+`5b74973e4fbb1a96550a1884805b51fd6dcfe90f`. Install that immutable source revision into the
+evaluation runtime:
+
+```bash
+uv pip install \
+  'env-vizdoom-turbo @ git+https://github.com/tsilva/env-ViZDoom-turbo.git@5b74973e4fbb1a96550a1884805b51fd6dcfe90f#subdirectory=turbo'
+```
+
+The reference adapter verifies the installed Git commit from distribution provenance before it
+imports the provider. Registry wheels, editable installs without verifiable Git provenance, and
+all other revisions fail rather than silently running. Evaluation uses the current
+`EnvViZDoomTurboVecEnv` export and explicitly requests both `player_killcount` and `killcount`.
+Missing `player_killcount` is an error: it never falls back to compatibility `killcount`.
+
+Episode records name `player_killcount` as the policy-quality outcome and retain
+`compatibility_killcount` only as a separate diagnostic. GraDOOM and reference checkpoint reports
+also record one provider-neutral execution identity containing the unchanged artifact hash,
+checkpoint-frozen model/runtime contract, certified preprocessing hash, stochastic or diagnostic
+argmax action mode, and an empty list of provider-specific modifications. Both providers load the
+architecture, memory format, observation blur, frozen-encoder convolution mode, precision, policy
+compilation, and float32 matrix-multiplication mode from the checkpoint rather than evaluator
+defaults. The artifact is hashed before and after loading so a concurrently changed checkpoint is
+rejected. The adapter does not offer observation correction, action remapping, fine-tuning, or
+learned adaptation hooks.
 
 ## Report schema version 1
 

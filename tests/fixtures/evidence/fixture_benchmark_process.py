@@ -126,7 +126,7 @@ def main() -> int:
         episode = {
             "index": index,
             "game_seed": game_seed,
-            "killcount": float(compatibility_quality),
+            "compatibility_killcount": float(compatibility_quality),
             "length": 10,
             "terminated": True,
             "truncated": False,
@@ -147,7 +147,7 @@ def main() -> int:
                 "seed": args.evaluation_seed,
                 "stochastic_actions": args.evaluation_stochastic,
                 "kills_signal": "player_killcount",
-                "vizdoom_compatibility_kills_signal": "killcount",
+                "compatibility_killcount_signal": "killcount",
             },
         },
         {

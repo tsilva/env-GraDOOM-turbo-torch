@@ -25,6 +25,7 @@ def _args(*arguments: str):
 
 def test_checkpoint_evaluation_defaults_to_exact_stochastic_100() -> None:
     args = _args()
+    audit = train._audit_config(args)
 
     assert args.ent_coef == train.REFERENCE_RECIPE.ent_coef
     assert args.num_envs == 256
@@ -41,10 +42,13 @@ def test_checkpoint_evaluation_defaults_to_exact_stochastic_100() -> None:
     assert args.wandb_mode == "online"
     assert args.observation_blur_kernel == 1
     assert args.observation_augmentation == "none"
-    assert train._audit_config(args)["state_initialization"] == {
+    assert audit["state_initialization"] == {
         "policy_state": "fresh_random",
         "optimizer_state": "fresh",
     }
+    assert audit["evaluation"]["kills_signal"] == "player_killcount"
+    assert audit["evaluation"]["compatibility_killcount_signal"] == "killcount"
+    assert audit["evaluation"]["kills_target_signal"] == "player_killcount"
 
 
 def test_training_command_rejects_ten_step_budget_without_overshoot(tmp_path: Path) -> None:
@@ -521,8 +525,18 @@ def test_weights_only_initialization_is_audited_and_mutually_exclusive(
 
 def test_evaluation_aggregate_uses_player_killcount_quality_target() -> None:
     records = [
-        {"kills": 30.0, "vizdoom_killcount": 30.0, "return": 30.0, "length": 2100},
-        {"kills": 34.0, "vizdoom_killcount": 32.0, "return": 34.0, "length": 2100},
+        {
+            "player_killcount": 30.0,
+            "compatibility_killcount": 130.0,
+            "return": 30.0,
+            "length": 2100,
+        },
+        {
+            "player_killcount": 34.0,
+            "compatibility_killcount": 132.0,
+            "return": 34.0,
+            "length": 2100,
+        },
     ]
 
     result = train._evaluation_aggregate(records)
@@ -532,13 +546,20 @@ def test_evaluation_aggregate_uses_player_killcount_quality_target() -> None:
     assert result["evaluation/kills/median"] == 32.0
     assert result["evaluation/kills/std"] == 2.0
     assert result["evaluation/kills/signal"] == "player_killcount"
-    assert result["evaluation/vizdoom_killcount/mean"] == 31.0
-    assert result["evaluation/target/kills/mean"] == 30.0
+    assert result["evaluation/compatibility_killcount/mean"] == 131.0
+    assert result["evaluation/target/kills/mean"] == 31.78
     assert result["evaluation/target/kills/signal"] == "player_killcount"
     assert result["evaluation/target/passed"] is True
 
     compatibility_only = train._evaluation_aggregate(
-        [{"kills": 29.0, "vizdoom_killcount": 100.0, "return": 29.0, "length": 2100}]
+        [
+            {
+                "player_killcount": 29.0,
+                "compatibility_killcount": 100.0,
+                "return": 29.0,
+                "length": 2100,
+            }
+        ]
     )
     assert compatibility_only["evaluation/target/passed"] is False
 
@@ -554,8 +575,8 @@ def test_evaluation_aggregate_summarizes_action_histograms() -> None:
     first[2] = 3
     second[9] = 1
     records = [
-        {"kills": 1, "return": 2, "length": 3, "action_counts": first},
-        {"kills": 2, "return": 4, "length": 1, "action_counts": second},
+        {"player_killcount": 1, "return": 2, "length": 3, "action_counts": first},
+        {"player_killcount": 2, "return": 4, "length": 1, "action_counts": second},
     ]
 
     result = train._evaluation_aggregate(records)

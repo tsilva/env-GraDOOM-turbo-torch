@@ -37,11 +37,16 @@ import torch.nn.functional as F
 from torch import nn
 
 from gradoom._kernels import bounded_observation_augment, frozen_nature_conv1
+from gradoom.evidence.checkpoint_policy import (
+    LoadedPolicyCheckpoint,
+    load_policy_checkpoint,
+)
+from gradoom.evidence.policy_execution import policy_execution_identity
 
 REFERENCE_NAME = "GradLab VizdoomDeathmatch-v1/ppo"
 REFERENCE_CAPTURED_AT = "2026-08-11"
 ROLLING_EPISODES = 100
-PLAYER_KILLS_TARGET = 30.0
+REFERENCE_KILLS_TARGET = 31.78
 GRADLAB_WANDB_PROJECT = "VizdoomDeathmatch-v1"
 GRADLAB_RETURN_METRIC = "train/episode/return/shaped/origin/target/rolling/mean"
 GRADLAB_KILLS_METRIC = "train/progress/kills/origin/target/rolling/mean"
@@ -836,8 +841,8 @@ def _audit_config(args: argparse.Namespace) -> dict[str, Any]:
             "survival_diagnostics": bool(args.evaluation_survival_diagnostics),
             "action_diagnostics": bool(args.evaluation_action_diagnostics),
             "kills_signal": "player_killcount",
-            "vizdoom_compatibility_kills_signal": "killcount",
-            "kills_target": PLAYER_KILLS_TARGET,
+            "compatibility_killcount_signal": "killcount",
+            "kills_target": REFERENCE_KILLS_TARGET,
             "kills_target_signal": "player_killcount",
         },
         "effective_recipe": effective,
@@ -1580,6 +1585,38 @@ class Precision:
         )
 
 
+def _bind_checkpoint_policy(
+    loaded: LoadedPolicyCheckpoint,
+    device: torch.device,
+) -> tuple[NatureActorCritic, PolicyCalls, Precision]:
+    """Reconstruct one checkpoint's frozen model/runtime contract for either provider."""
+
+    contract = loaded.contract
+    if contract.architecture not in POLICY_ARCHITECTURES:
+        raise ValueError(f"unsupported checkpoint policy architecture: {contract.architecture}")
+    torch.set_float32_matmul_precision(contract.float32_matmul_precision)
+    policy = NatureActorCritic(
+        contract.architecture,
+        contract.memory_format,
+        contract.observation_blur_kernel,
+    ).to(
+        device=device,
+        memory_format=(
+            torch.channels_last
+            if contract.memory_format == "channels-last"
+            else torch.contiguous_format
+        ),
+    )
+    policy.load_state_dict(loaded.payload["policy_state_dict"])
+    policy.use_frozen_encoder_custom_conv = contract.frozen_encoder_custom_conv
+    policy.eval()
+    return (
+        policy,
+        PolicyCalls(policy, compile_policy=contract.compile_policy),
+        Precision(contract.precision, device),
+    )
+
+
 class RolloutBuffer:
     def __init__(
         self,
@@ -2302,14 +2339,10 @@ def _file_sha256(path: Path) -> str:
 def _evaluation_aggregate(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     if not records:
         raise ValueError("evaluation requires at least one completed episode")
-    kills = [float(record["kills"]) for record in records]
+    kills = [float(record["player_killcount"]) for record in records]
     returns = [float(record["return"]) for record in records]
     lengths = [float(record["length"]) for record in records]
     mean_kills = statistics.fmean(kills)
-    vizdoom_killcounts = [
-        float(record.get("vizdoom_killcount", record["kills"])) for record in records
-    ]
-    mean_vizdoom_killcount = statistics.fmean(vizdoom_killcounts)
     aggregate = {
         "evaluation/episode/count": len(records),
         "evaluation/kills/mean": mean_kills,
@@ -2318,16 +2351,26 @@ def _evaluation_aggregate(records: Sequence[Mapping[str, Any]]) -> dict[str, Any
         "evaluation/kills/min": min(kills),
         "evaluation/kills/max": max(kills),
         "evaluation/kills/signal": "player_killcount",
-        "evaluation/vizdoom_killcount/mean": mean_vizdoom_killcount,
-        "evaluation/vizdoom_killcount/median": statistics.median(vizdoom_killcounts),
-        "evaluation/vizdoom_killcount/min": min(vizdoom_killcounts),
-        "evaluation/vizdoom_killcount/max": max(vizdoom_killcounts),
         "evaluation/return/native/mean": statistics.fmean(returns),
         "evaluation/episode/length/mean": statistics.fmean(lengths),
-        "evaluation/target/kills/mean": PLAYER_KILLS_TARGET,
+        "evaluation/target/kills/mean": REFERENCE_KILLS_TARGET,
         "evaluation/target/kills/signal": "player_killcount",
-        "evaluation/target/passed": mean_kills >= PLAYER_KILLS_TARGET,
+        "evaluation/target/passed": mean_kills >= REFERENCE_KILLS_TARGET,
     }
+    if all("compatibility_killcount" in record for record in records):
+        compatibility_killcounts = [float(record["compatibility_killcount"]) for record in records]
+        aggregate.update(
+            {
+                "evaluation/compatibility_killcount/mean": statistics.fmean(
+                    compatibility_killcounts
+                ),
+                "evaluation/compatibility_killcount/median": statistics.median(
+                    compatibility_killcounts
+                ),
+                "evaluation/compatibility_killcount/min": min(compatibility_killcounts),
+                "evaluation/compatibility_killcount/max": max(compatibility_killcounts),
+            }
+        )
     if all("damage_taken" in record and "hits_taken" in record for record in records):
         damage_taken = [float(record["damage_taken"]) for record in records]
         hits_taken = [float(record["hits_taken"]) for record in records]
@@ -2403,28 +2446,8 @@ def _evaluate(
     episode_quotas = _episode_quotas(int(args.evaluation_episodes), evaluation_envs)
     env = _make_env(args, device, num_envs=evaluation_envs)
     try:
-        loaded = torch.load(args.evaluate_checkpoint, map_location=device, weights_only=False)
-        if not isinstance(loaded, Mapping) or loaded.get("format") != "standalone-gradoom-ppo-v1":
-            raise ValueError(f"unsupported evaluation checkpoint: {args.evaluate_checkpoint}")
-        policy = NatureActorCritic(
-            str(args.policy_architecture),
-            str(args.policy_memory_format),
-            int(args.observation_blur_kernel),
-        ).to(
-            device=device,
-            memory_format=(
-                torch.channels_last
-                if str(args.policy_memory_format) == "channels-last"
-                else torch.contiguous_format
-            ),
-        )
-        policy.load_state_dict(loaded["policy_state_dict"])
-        policy.use_frozen_encoder_custom_conv = bool(
-            args.freeze_observation_encoder and args.frozen_encoder_custom_conv
-        )
-        policy.eval()
-        calls = PolicyCalls(policy, compile_policy=bool(args.compile_policy))
-        precision = Precision(str(args.precision), device)
+        loaded = load_policy_checkpoint(args.evaluate_checkpoint, map_location=device)
+        _policy, calls, precision = _bind_checkpoint_policy(loaded, device)
         context_encoder = CombatContextEncoder(env.device_info_history_names, device)
         episode_index = torch.zeros(evaluation_envs, dtype=torch.int64, device=device)
         episode_seeds = (
@@ -2450,7 +2473,7 @@ def _evaluate(
         episode_lengths = torch.zeros(evaluation_envs, dtype=torch.int32, device=device)
         signal_indices = {name: index for index, name in enumerate(env.device_signal_names)}
         kill_index = signal_indices["player_killcount"]
-        vizdoom_killcount_index = signal_indices["killcount"]
+        compatibility_killcount_index = signal_indices["killcount"]
         hits_taken_index = signal_indices["hits_taken"]
         damage_taken_index = signal_indices["damage_taken"]
         health_index = signal_indices["health"]
@@ -2487,7 +2510,7 @@ def _evaluate(
             dtype=torch.float32,
             device=device,
         )
-        completed_vizdoom_killcounts = torch.empty_like(completed_kills)
+        completed_compatibility_killcounts = torch.empty_like(completed_kills)
         completed_returns = torch.empty_like(completed_kills)
         completed_hits_taken = torch.empty_like(completed_kills)
         completed_damage_taken = torch.empty_like(completed_kills)
@@ -2519,7 +2542,7 @@ def _evaluate(
                 "type": "event",
                 "event": "evaluation_started",
                 "checkpoint": str(args.evaluate_checkpoint),
-                "checkpoint_step": int(loaded.get("step", 0)),
+                "checkpoint_step": int(loaded.payload.get("step", 0)),
                 "episodes": int(args.evaluation_episodes),
                 "num_envs": evaluation_envs,
                 "episode_quotas": list(episode_quotas),
@@ -2556,8 +2579,8 @@ def _evaluate(
             done = transition.terminated | transition.truncated
             completed[decision].copy_(done)
             completed_kills[decision].copy_(transition.final_signals[:, kill_index])
-            completed_vizdoom_killcounts[decision].copy_(
-                transition.final_signals[:, vizdoom_killcount_index]
+            completed_compatibility_killcounts[decision].copy_(
+                transition.final_signals[:, compatibility_killcount_index]
             )
             completed_hits_taken[decision].copy_(transition.final_signals[:, hits_taken_index])
             completed_damage_taken[decision].copy_(transition.final_signals[:, damage_taken_index])
@@ -2593,9 +2616,12 @@ def _evaluate(
 
         torch.cuda.synchronize(device)
         evaluation_seconds = time.perf_counter() - evaluation_started
+        checkpoint_sha256 = loaded.artifact_sha256
         completed_cpu = completed[:executed_decisions].cpu().numpy()
         kills_cpu = completed_kills[:executed_decisions].cpu().numpy()
-        vizdoom_killcounts_cpu = completed_vizdoom_killcounts[:executed_decisions].cpu().numpy()
+        compatibility_killcounts_cpu = (
+            completed_compatibility_killcounts[:executed_decisions].cpu().numpy()
+        )
         returns_cpu = completed_returns[:executed_decisions].cpu().numpy()
         hits_taken_cpu = completed_hits_taken[:executed_decisions].cpu().numpy()
         damage_taken_cpu = completed_damage_taken[:executed_decisions].cpu().numpy()
@@ -2626,10 +2652,10 @@ def _evaluate(
                     "lane": int(lane),
                     "lane_episode": lane_episode,
                     "game_seed": int(seeds_cpu[completion_decision, lane]),
-                    "kills": float(kills_cpu[completion_decision, lane]),
-                    "vizdoom_killcount": float(vizdoom_killcounts_cpu[completion_decision, lane]),
                     "player_killcount": float(kills_cpu[completion_decision, lane]),
-                    "killcount": float(vizdoom_killcounts_cpu[completion_decision, lane]),
+                    "compatibility_killcount": float(
+                        compatibility_killcounts_cpu[completion_decision, lane]
+                    ),
                     "return": float(returns_cpu[completion_decision, lane]),
                     "length": int(lengths_cpu[completion_decision, lane]),
                     "terminated": bool(terminated_cpu[completion_decision, lane]),
@@ -2673,11 +2699,16 @@ def _evaluate(
                 "status": "completed",
                 "protocol": ("standalone-gradoom-deathmatch-checkpoint-eval-v3-balanced-seed-grid"),
                 "checkpoint": str(args.evaluate_checkpoint),
-                "checkpoint_sha256": _file_sha256(args.evaluate_checkpoint),
-                "checkpoint_step": int(loaded.get("step", 0)),
-                "checkpoint_config": loaded.get("config"),
+                "checkpoint_sha256": checkpoint_sha256,
+                "checkpoint_step": int(loaded.payload.get("step", 0)),
+                "checkpoint_config": loaded.payload.get("config"),
                 "evaluation_config": audit["evaluation"],
                 "deterministic_actions": not bool(args.evaluation_stochastic),
+                "policy_execution": policy_execution_identity(
+                    artifact_sha256=checkpoint_sha256,
+                    model_runtime_contract=loaded.contract.as_dict(),
+                    stochastic_actions=bool(args.evaluation_stochastic),
+                ),
                 "episode_quotas": list(episode_quotas),
                 "evaluation_seconds": evaluation_seconds,
                 "process_elapsed_seconds": time.perf_counter() - process_started,
