@@ -529,6 +529,14 @@ def _parser() -> argparse.ArgumentParser:
         help="Independent GradLab-compatible evaluation seed (default: 123).",
     )
     parser.add_argument(
+        "--evaluation-seeds-file",
+        type=Path,
+        help=(
+            "JSON array containing exactly 100 unique predeclared GraDOOM game seeds. "
+            "Used by evidence workflows instead of the derived GradLab seed grid."
+        ),
+    )
+    parser.add_argument(
         "--evaluation-stochastic",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -585,6 +593,31 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError(f"seed must be in [0, {UINT32_MASK}]")
     if not 0 <= int(args.evaluation_seed) <= UINT32_MASK:
         raise ValueError(f"evaluation-seed must be in [0, {UINT32_MASK}]")
+    args.evaluation_episode_seeds = None
+    if args.evaluation_seeds_file is not None:
+        args.evaluation_seeds_file = args.evaluation_seeds_file.expanduser().resolve()
+        if not args.evaluation_seeds_file.is_file():
+            raise FileNotFoundError(
+                f"evaluation seeds file does not exist: {args.evaluation_seeds_file}"
+            )
+        try:
+            evaluation_seeds = json.loads(args.evaluation_seeds_file.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise ValueError("evaluation seeds file must be valid UTF-8 JSON") from error
+        if (
+            not isinstance(evaluation_seeds, list)
+            or len(evaluation_seeds) != ROLLING_EPISODES
+            or any(
+                type(seed) is not int or not 0 <= seed <= UINT32_MASK for seed in evaluation_seeds
+            )
+            or len(set(evaluation_seeds)) != ROLLING_EPISODES
+        ):
+            raise ValueError(
+                "evaluation seeds file must contain exactly 100 unique uint32 integers"
+            )
+        if int(args.evaluation_episodes) != ROLLING_EPISODES:
+            raise ValueError("evaluation-seeds-file requires evaluation-episodes=100")
+        args.evaluation_episode_seeds = evaluation_seeds
     if int(args.evaluation_num_envs) > int(args.evaluation_episodes):
         raise ValueError("evaluation-num-envs cannot exceed evaluation-episodes")
     if not math.isfinite(args.learning_rate) or args.learning_rate <= 0.0:
@@ -624,6 +657,11 @@ def _validate_args(args: argparse.Namespace) -> None:
             "observation blur is incompatible with the frozen-encoder custom convolution"
         )
     rollout_transitions = int(args.num_envs) * int(args.n_steps)
+    if int(args.timesteps) < rollout_transitions:
+        raise ValueError(
+            "timesteps must cover at least one rollout transition quantum "
+            "(num-envs * n-steps); partial rollouts are not executed"
+        )
     if int(args.batch_size) > rollout_transitions:
         raise ValueError("batch-size cannot exceed num-envs * n-steps")
     if args.checkpoint is not None:
@@ -672,7 +710,7 @@ def _runtime_paths(args: argparse.Namespace) -> None:
 
 def _execution_timesteps(args: argparse.Namespace) -> int:
     quantum = int(args.num_envs) * int(args.n_steps)
-    return math.ceil(int(args.timesteps) / quantum) * quantum
+    return int(args.timesteps) // quantum * quantum
 
 
 def _audit_config(args: argparse.Namespace) -> dict[str, Any]:
@@ -771,6 +809,16 @@ def _audit_config(args: argparse.Namespace) -> dict[str, Any]:
             "checkpoint_sha256": initialization_sha256,
             "mode": "policy-weights-only" if initialization_checkpoint is not None else "random",
         },
+        "state_initialization": {
+            "policy_state": (
+                "resumed"
+                if args.resume is not None
+                else "learned_weights"
+                if initialization_checkpoint is not None
+                else "fresh_random"
+            ),
+            "optimizer_state": "resumed" if args.resume is not None else "fresh",
+        },
         "evaluation": {
             "checkpoint": (
                 None if args.evaluate_checkpoint is None else str(args.evaluate_checkpoint)
@@ -778,6 +826,17 @@ def _audit_config(args: argparse.Namespace) -> dict[str, Any]:
             "episodes": int(args.evaluation_episodes),
             "num_envs": int(args.evaluation_num_envs),
             "seed": int(args.evaluation_seed),
+            "episode_seed_protocol": (
+                "predeclared-game-seeds-v1"
+                if getattr(args, "evaluation_episode_seeds", None) is not None
+                else "gradlab-vizdoom-turbo-v1"
+            ),
+            "episode_seeds": getattr(args, "evaluation_episode_seeds", None),
+            "episode_seeds_sha256": (
+                None
+                if args.evaluation_seeds_file is None
+                else _file_sha256(args.evaluation_seeds_file)
+            ),
             "stochastic_actions": bool(args.evaluation_stochastic),
             "survival_diagnostics": bool(args.evaluation_survival_diagnostics),
             "action_diagnostics": bool(args.evaluation_action_diagnostics),
@@ -2161,6 +2220,51 @@ class GradLabEpisodeSeeds:
         return self.table.gather(1, episode_indices[:, None]).flatten()
 
 
+class PredeclaredEpisodeSeeds:
+    """Map one ordered held-out seed grid onto stable lane episode streams."""
+
+    def __init__(
+        self,
+        seeds: Sequence[int],
+        episode_quotas: Sequence[int],
+        device: torch.device,
+    ) -> None:
+        self.seeds = tuple(int(seed) for seed in seeds)
+        self.episode_quotas = tuple(int(quota) for quota in episode_quotas)
+        self.n_envs = len(self.episode_quotas)
+        self.device = device
+        self.capacity = 0
+        self.table = torch.empty((self.n_envs, 0), dtype=torch.int64, device=device)
+        self.ensure(SEED_TABLE_INITIAL_EPISODES - 1)
+
+    def _episode_seed(self, lane: int, episode_index: int) -> int:
+        offset = sum(self.episode_quotas[:lane])
+        if episode_index < self.episode_quotas[lane]:
+            return self.seeds[offset + episode_index]
+        sequence = np.random.SeedSequence([0x47524144, lane, episode_index, *self.seeds[:2]])
+        return int(sequence.generate_state(1, dtype=np.uint32)[0])
+
+    def ensure(self, episode_index: int) -> None:
+        required = int(episode_index) + 1
+        if required <= self.capacity:
+            return
+        new_capacity = max(required, SEED_TABLE_INITIAL_EPISODES, self.capacity * 2)
+        extension = np.empty(
+            (self.n_envs, new_capacity - self.capacity),
+            dtype=np.int64,
+        )
+        for lane in range(self.n_envs):
+            for index in range(self.capacity, new_capacity):
+                extension[lane, index - self.capacity] = self._episode_seed(lane, index)
+        self.table = torch.cat((self.table, torch.from_numpy(extension).to(self.device)), dim=1)
+        self.capacity = new_capacity
+
+    def lookup(self, episode_indices: torch.Tensor) -> torch.Tensor:
+        if episode_indices.shape != (self.n_envs,):
+            raise ValueError(f"episode indices must have shape ({self.n_envs},)")
+        return self.table.gather(1, episode_indices[:, None]).flatten()
+
+
 def _rolling_mean(values: Sequence[float]) -> float | None:
     return None if not values else statistics.fmean(values)
 
@@ -2339,16 +2443,25 @@ def _evaluate(
     torch.cuda.manual_seed_all(int(args.evaluation_seed))
     device = torch.device("cuda")
     evaluation_envs = int(args.evaluation_num_envs)
+    episode_quotas = _episode_quotas(int(args.evaluation_episodes), evaluation_envs)
     env = _make_env(args, device, num_envs=evaluation_envs)
     try:
         loaded = load_policy_checkpoint(args.evaluate_checkpoint, map_location=device)
         _policy, calls, precision = _bind_checkpoint_policy(loaded, device)
         context_encoder = CombatContextEncoder(env.device_info_history_names, device)
         episode_index = torch.zeros(evaluation_envs, dtype=torch.int64, device=device)
-        episode_seeds = GradLabEpisodeSeeds(
-            int(args.evaluation_seed),
-            evaluation_envs,
-            device,
+        episode_seeds = (
+            PredeclaredEpisodeSeeds(
+                args.evaluation_episode_seeds,
+                episode_quotas,
+                device,
+            )
+            if args.evaluation_episode_seeds is not None
+            else GradLabEpisodeSeeds(
+                int(args.evaluation_seed),
+                evaluation_envs,
+                device,
+            )
         )
         current_seeds = episode_seeds.lookup(episode_index)
         observations, signals = env.reset_device(
@@ -2381,7 +2494,6 @@ def _evaluate(
             dtype=episode_action_counts.dtype,
             device=device,
         )
-        episode_quotas = _episode_quotas(int(args.evaluation_episodes), evaluation_envs)
         decisions_per_episode = math.ceil(
             REFERENCE_RECIPE.episode_timeout / REFERENCE_RECIPE.frame_skip
         )
@@ -2434,7 +2546,7 @@ def _evaluate(
                 "episodes": int(args.evaluation_episodes),
                 "num_envs": evaluation_envs,
                 "episode_quotas": list(episode_quotas),
-                "seed_grid": "gradlab-vizdoom-turbo-v1 lanes x episode-index",
+                "seed_grid": audit["evaluation"]["episode_seed_protocol"],
                 "deterministic_actions": not bool(args.evaluation_stochastic),
                 "kills_signal": "player_killcount",
             }
@@ -2889,7 +3001,7 @@ def _train(
                 "cuda_rng_state": torch.cuda.get_rng_state_all(),
             }
 
-        while global_step < int(args.timesteps) and not interrupted:
+        while global_step < _execution_timesteps(args) and not interrupted:
             executed_rollouts += 1
             episode_seeds.ensure(int(episode_index.max().item()) + int(args.n_steps) + 1)
             buffer.reset()

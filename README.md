@@ -97,6 +97,11 @@ machine-readable, non-claim-eligible report that names unavailable real prerequi
 [evidence contract](./docs/evidence.md) for the versioned manifest, report, hashing, and safe merge
 rules.
 
+The `development_training_benchmark` path runs predeclared cold-start attempts through the same
+standalone trainer and exact 100-episode stochastic GraDOOM evaluation path. Its reports are always
+non-authoritative and claim-ineligible, including passes made before a current parity certificate
+exists.
+
 ## Notes
 
 - `env-GraDOOM-turbo-torch` is under active construction and is not yet parity-certified. No current release supports a public quality- or speed-leadership claim.
