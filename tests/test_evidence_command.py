@@ -190,6 +190,63 @@ def test_lone_surrogate_json_fails_with_a_clear_error(
     assert not output.exists()
 
 
+@pytest.mark.parametrize(
+    ("document", "field"),
+    [
+        ("manifest", "declared_inputs[0].path"),
+        ("manifest", "prerequisites[0].reason"),
+        ("merge report", "declared_inputs[0].path"),
+        ("merge report", "prerequisites[0].reason"),
+    ],
+)
+def test_all_schema_strings_reject_lone_surrogates(
+    tmp_path: Path,
+    document: str,
+    field: str,
+) -> None:
+    invalid_path = tmp_path / "invalid.json"
+    output = tmp_path / "report.json"
+    if document == "manifest":
+        payload = json.loads(
+            (FIXTURES / "readiness-manifest.json").read_text(encoding="utf-8")
+        )
+        payload["declared_inputs"][0]["path"] = str(
+            FIXTURES / "provider-contract.json"
+        )
+        arguments = ["--manifest", str(invalid_path), "--output", str(output)]
+    else:
+        initial_report = tmp_path / "initial-report.json"
+        initial = run_evidence(
+            "--manifest",
+            str(FIXTURES / "readiness-manifest.json"),
+            "--output",
+            str(initial_report),
+        )
+        assert initial.returncode == 0, initial.stderr
+        payload = json.loads(initial_report.read_text(encoding="utf-8"))
+        arguments = [
+            "--manifest",
+            str(FIXTURES / "readiness-manifest.json"),
+            "--output",
+            str(output),
+            "--merge",
+            str(invalid_path),
+        ]
+
+    if field == "declared_inputs[0].path":
+        payload["declared_inputs"][0]["path"] = "\ud800"
+    else:
+        payload["prerequisites"][0]["reason"] = "\ud800"
+    invalid_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = run_evidence(*arguments)
+
+    assert result.returncode == 2
+    assert f"{document} contains invalid Unicode in {field}" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert not output.exists()
+
+
 def test_unknown_manifest_schema_version_fails_with_a_clear_error(tmp_path: Path) -> None:
     manifest = json.loads(
         (FIXTURES / "readiness-manifest.json").read_text(encoding="utf-8")

@@ -29,6 +29,47 @@ def _canonical_sha256(value: object, *, document: str) -> str:
     return _sha256_bytes(payload)
 
 
+def _validate_unicode_scalars(
+    value: object,
+    *,
+    document: str,
+    field: str = "",
+) -> None:
+    if isinstance(value, str):
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError as error:
+            location = field or "<root>"
+            raise EvidenceError(
+                f"{document} contains invalid Unicode in {location} "
+                f"at character {error.start}"
+            ) from error
+        return
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            child_field = f"{field}[{index}]" if field else f"[{index}]"
+            _validate_unicode_scalars(
+                item,
+                document=document,
+                field=child_field,
+            )
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            key_field = f"{field}.<key>" if field else "<key>"
+            _validate_unicode_scalars(
+                key,
+                document=document,
+                field=key_field,
+            )
+            child_field = f"{field}.{key}" if field else key
+            _validate_unicode_scalars(
+                item,
+                document=document,
+                field=child_field,
+            )
+
+
 def _load_manifest(path: Path) -> tuple[dict[str, Any], bytes]:
     payload = path.read_bytes()
     try:
@@ -41,6 +82,7 @@ def _load_manifest(path: Path) -> tuple[dict[str, Any], bytes]:
         raise EvidenceError(f"manifest is not valid JSON: {error.msg}") from error
     if not isinstance(manifest, dict):
         raise EvidenceError("manifest must be a JSON object")
+    _validate_unicode_scalars(manifest, document="manifest")
     return manifest, payload
 
 
@@ -228,6 +270,7 @@ def validate_merge_report(path: Path, expected_run_identity: object) -> None:
         raise EvidenceError(f"merge report is not valid JSON: {error.msg}") from error
     if not isinstance(report, dict):
         raise EvidenceError("merge report must be a JSON object")
+    _validate_unicode_scalars(report, document="merge report")
     _validate_schema_version(report.get("schema_version"), document="report")
     _required_string(report.get("workflow"), "merge report workflow")
     _required_string(report.get("evidence_level"), "merge report evidence_level")
