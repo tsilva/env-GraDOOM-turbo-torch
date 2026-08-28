@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "profile_id": "freedoom2-deathmatch-v1",
+  "assets": {
+    "iwad": {
+      "name": "Freedoom2",
+      "sha256": "a8772e088847032510d97ba2312406a6998f21cbab44d4ff10696faa9c0ecd4b"
+    },
+    "pwad": {
+      "name": "ViZDoom deathmatch",
+      "sha256": "1d06c2113f2c1546062635ad599f49cd852287a08b7b07b26d30b8f4c362a42d"
+    }
+  },
+  "configuration": {
+    "map": "MAP01",
+    "skill": 1,
+    "scenario": {
+      "game": "VizdoomDeathmatch-v1",
+      "mode": "PLAYER",
+      "screen_resolution": [320, 240],
+      "episode_start_time": 1,
+      "player_death_termination": true,
+      "episode_timeout_as_truncation": true,
+      "render_hud": false,
+      "render_screen_flashes": false
+    },
+    "action_mode": {
+      "kind": "custom_discrete",
+      "count": 17,
+      "table_sha256": "0bd9dd28d67a88ef6bc54734f53d55bc4af597e672665a7f20d4b204098036af"
+    },
+    "frame_skip": 2,
+    "episode_horizon_tics": 4200,
+    "observation": {
+      "crop_or_mask": {
+        "kind": "mask",
+        "edges": [0, 32, 0, 0],
+        "fill": 0
+      },
+      "resize": {
+        "shape": [84, 84],
+        "algorithm": "area"
+      },
+      "grayscale": {
+        "enabled": true,
+        "conversion": "env-vizdoom-turbo-rgb-area-gray8-v1"
+      },
+      "layout": "chw",
+      "frame_stack": 4
+    }
+  }
+}

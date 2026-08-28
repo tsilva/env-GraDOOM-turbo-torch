@@ -6,6 +6,8 @@ import math
 from pathlib import Path
 from typing import Any
 
+from .wad_profile import validate_wad_profile
+
 
 class EvidenceError(ValueError):
     """An evidence manifest or report violates the public contract."""
@@ -64,9 +66,7 @@ def _validate_json_nesting(value: object, *, document: str) -> None:
     while pending:
         current, depth = pending.pop()
         if depth > _MAX_JSON_NESTING:
-            raise EvidenceError(
-                f"{document} is not valid JSON: nesting is too deep"
-            )
+            raise EvidenceError(f"{document} is not valid JSON: nesting is too deep")
         if isinstance(current, list):
             pending.extend((item, depth + 1) for item in current)
         elif isinstance(current, dict):
@@ -82,9 +82,7 @@ def _parse_json_document(payload: bytes, *, document: str) -> Any:
             parse_int=_parse_json_integer,
         )
     except UnicodeDecodeError as error:
-        raise EvidenceError(
-            f"{document} is not valid UTF-8 at byte {error.start}"
-        ) from error
+        raise EvidenceError(f"{document} is not valid UTF-8 at byte {error.start}") from error
     except json.JSONDecodeError as error:
         raise EvidenceError(f"{document} is not valid JSON: {error.msg}") from error
     except _NonStandardJsonConstant as error:
@@ -94,13 +92,9 @@ def _parse_json_document(payload: bytes, *, document: str) -> Any:
     except _InvalidJsonNumber as error:
         raise EvidenceError(f"{document} is not valid JSON: {error}") from error
     except RecursionError as error:
-        raise EvidenceError(
-            f"{document} is not valid JSON: nesting is too deep"
-        ) from error
+        raise EvidenceError(f"{document} is not valid JSON: nesting is too deep") from error
     except (OverflowError, ValueError) as error:
-        raise EvidenceError(
-            f"{document} is not valid JSON: numeric value is invalid"
-        ) from error
+        raise EvidenceError(f"{document} is not valid JSON: numeric value is invalid") from error
     _validate_json_nesting(parsed, document=document)
     return parsed
 
@@ -118,9 +112,7 @@ def _canonical_sha256(value: object, *, document: str) -> str:
             f"{document} contains invalid Unicode at character {error.start}"
         ) from error
     except (RecursionError, ValueError) as error:
-        raise EvidenceError(
-            f"{document} cannot be encoded as standard JSON"
-        ) from error
+        raise EvidenceError(f"{document} cannot be encoded as standard JSON") from error
     return _sha256_bytes(payload)
 
 
@@ -138,16 +130,14 @@ def _validate_string_content(
             if null_index >= 0:
                 location = current_field or "<root>"
                 raise EvidenceError(
-                    f"{document} contains U+0000 in {location} "
-                    f"at character {null_index}"
+                    f"{document} contains U+0000 in {location} at character {null_index}"
                 )
             try:
                 current.encode("utf-8")
             except UnicodeEncodeError as error:
                 location = current_field or "<root>"
                 raise EvidenceError(
-                    f"{document} contains invalid Unicode in {location} "
-                    f"at character {error.start}"
+                    f"{document} contains invalid Unicode in {location} at character {error.start}"
                 ) from error
         elif isinstance(current, list):
             pending.extend(
@@ -290,6 +280,7 @@ def _validate_prerequisites(value: object) -> list[dict[str, Any]]:
 def _readiness_claim_reasons(
     fixture: bool,
     prerequisites: list[dict[str, Any]],
+    wad_profile: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     reasons: list[dict[str, Any]] = [
         {
@@ -304,6 +295,24 @@ def _readiness_claim_reasons(
                 "message": "Fixture evidence cannot support public claims.",
             }
         )
+    if wad_profile is not None and wad_profile["status"] == "failed":
+        authority = wad_profile.get("authority")
+        if isinstance(authority, dict) and authority.get("status") == "failed":
+            failure = wad_profile["failures"][0]
+            reasons.append(
+                {
+                    "code": "wad_profile_authority_failure",
+                    "context": failure["context"],
+                    "message": failure["message"],
+                }
+            )
+        else:
+            reasons.append(
+                {
+                    "code": "wad_profile_mismatch",
+                    "message": "The certified Freedoom2 WAD profile did not match.",
+                }
+            )
     reasons.extend(
         {
             "code": "missing_prerequisite",
@@ -319,33 +328,35 @@ def _readiness_claim_reasons(
 def _validate_readiness_envelope(
     report: dict[str, Any],
     prerequisites: list[dict[str, Any]],
+    wad_profile: dict[str, Any] | None = None,
 ) -> None:
     missing = [item for item in prerequisites if not item["available"]]
-    expected_status = "unavailable" if missing else "ready"
+    expected_status = (
+        "failed"
+        if wad_profile is not None and wad_profile["status"] == "failed"
+        else "unavailable"
+        if missing
+        else "ready"
+    )
     if report["status"] != expected_status:
         raise EvidenceError(
             f"merge report status must be {expected_status!r} for its prerequisites"
         )
     if report["claim_eligible"] is not False:
-        raise EvidenceError(
-            "merge report claim_eligible must be false for development evidence"
-        )
+        raise EvidenceError("merge report claim_eligible must be false for development evidence")
     claim_reasons = report["claim_reasons"]
     if not isinstance(claim_reasons, list):
         raise EvidenceError("merge report claim_reasons must be an array")
-    expected_reasons = _readiness_claim_reasons(report["fixture"], prerequisites)
+    expected_reasons = _readiness_claim_reasons(report["fixture"], prerequisites, wad_profile)
     canonical_reasons = sorted(
-        json.dumps(reason, sort_keys=True, separators=(",", ":"))
-        for reason in claim_reasons
+        json.dumps(reason, sort_keys=True, separators=(",", ":")) for reason in claim_reasons
     )
     canonical_expected = sorted(
-        json.dumps(reason, sort_keys=True, separators=(",", ":"))
-        for reason in expected_reasons
+        json.dumps(reason, sort_keys=True, separators=(",", ":")) for reason in expected_reasons
     )
     if canonical_reasons != canonical_expected:
         raise EvidenceError(
-            "merge report claim_reasons do not match its fixture state and "
-            "prerequisites"
+            "merge report claim_reasons do not match its fixture state and prerequisites"
         )
 
 
@@ -354,6 +365,7 @@ def _validate_evidence_index(
     declared_inputs: list[dict[str, Any]],
     *,
     expected_manifest_sha256: str,
+    expected_entries: list[dict[str, str]] | None = None,
 ) -> None:
     field = "merge report evidence_index"
     if not isinstance(value, dict):
@@ -393,7 +405,13 @@ def _validate_evidence_index(
     if stored_sha256 != _canonical_sha256(entries, document="merge report"):
         raise EvidenceError("merge report evidence_index SHA-256 mismatch")
 
-    expected_names = {"manifest", *(item["name"] for item in declared_inputs)}
+    expected_by_name = {
+        "manifest": expected_manifest_sha256,
+        **{item["name"]: item["sha256"] for item in declared_inputs},
+    }
+    for entry in expected_entries or ():
+        expected_by_name[entry["name"]] = entry["sha256"]
+    expected_names = set(expected_by_name)
     actual_names = set(entries_by_name)
     missing_names = sorted(expected_names - actual_names)
     if missing_names:
@@ -403,17 +421,20 @@ def _validate_evidence_index(
     if unexpected_names:
         formatted = ", ".join(repr(name) for name in unexpected_names)
         raise EvidenceError(f"{field}.entries has unexpected names: {formatted}")
-    if entries_by_name["manifest"]["sha256"] != expected_manifest_sha256:
-        raise EvidenceError(
-            "merge report evidence_index entry 'manifest' SHA-256 does not match "
-            "the source manifest"
-        )
-    for declared_input in declared_inputs:
-        entry = entries_by_name[declared_input["name"]]
-        if entry["sha256"] != declared_input["sha256"]:
+    for name, expected_sha256 in expected_by_name.items():
+        entry = entries_by_name[name]
+        if entry["sha256"] != expected_sha256:
+            if name == "manifest":
+                raise EvidenceError(
+                    "merge report evidence_index entry 'manifest' SHA-256 does not "
+                    "match the source manifest"
+                )
+            if name in {item["name"] for item in declared_inputs}:
+                raise EvidenceError(
+                    f"{field} entry {name!r} SHA-256 does not match declared_inputs"
+                )
             raise EvidenceError(
-                f"{field} entry {declared_input['name']!r} SHA-256 does not match "
-                "declared_inputs"
+                f"{field} entry {name!r} SHA-256 does not match current evidence sources"
             )
 
 
@@ -424,6 +445,7 @@ def _run_identity(
     prerequisites: list[dict[str, Any]],
     *,
     document: str,
+    wad_profile: dict[str, Any] | None = None,
 ) -> str:
     identity = {
         "schema_version": manifest["schema_version"],
@@ -437,6 +459,13 @@ def _run_identity(
         ),
         "prerequisites": sorted(item["id"] for item in prerequisites),
     }
+    if wad_profile is not None:
+        binding_identity = wad_profile["binding_identity"]
+        identity["wad_profile"] = (
+            binding_identity
+            if binding_identity is not None
+            else {"authority": wad_profile["authority"]}
+        )
     return _canonical_sha256(identity, document=document)
 
 
@@ -457,6 +486,31 @@ def build_readiness_report(manifest_path: Path) -> dict[str, Any]:
     )
     prerequisites = _validate_prerequisites(manifest.get("prerequisites"))
 
+    wad_profile = None
+    wad_evidence_entries: list[dict[str, str]] = []
+    if "wad_profile" in manifest:
+        wad_profile, wad_evidence_entries = validate_wad_profile(
+            manifest["wad_profile"],
+            base_directory=manifest_path.parent,
+        )
+        profile_prerequisite = next(
+            (item for item in prerequisites if item["id"] == "certified_freedoom2_wad_profile"),
+            None,
+        )
+        if profile_prerequisite is None:
+            raise EvidenceError("wad_profile requires prerequisite certified_freedoom2_wad_profile")
+        if wad_profile["status"] == "matched":
+            profile_prerequisite["available"] = True
+            profile_prerequisite.pop("reason", None)
+        else:
+            profile_prerequisite["available"] = False
+            profile_prerequisite["reason"] = "The certified Freedoom2 WAD profile did not match."
+    elif any(
+        item["id"] == "certified_freedoom2_wad_profile" and item["available"]
+        for item in prerequisites
+    ):
+        raise EvidenceError("available certified_freedoom2_wad_profile requires wad_profile")
+
     evidence_entries = [
         {"name": "manifest", "sha256": _sha256_bytes(manifest_payload)},
     ]
@@ -473,20 +527,33 @@ def build_readiness_report(manifest_path: Path) -> dict[str, Any]:
                 f"expected {declared_input['sha256']}, got {actual_sha256}"
             )
         evidence_entries.append({"name": name, "sha256": actual_sha256})
+    declared_evidence_names = {entry["name"] for entry in evidence_entries}
+    profile_evidence_names = {entry["name"] for entry in wad_evidence_entries}
+    colliding_names = sorted(declared_evidence_names & profile_evidence_names)
+    if colliding_names:
+        formatted = ", ".join(repr(name) for name in colliding_names)
+        raise EvidenceError(f"declared_inputs use reserved WAD profile evidence names: {formatted}")
+    evidence_entries.extend(wad_evidence_entries)
 
     missing = [item for item in prerequisites if not item["available"]]
-    claim_reasons = _readiness_claim_reasons(manifest["fixture"], prerequisites)
+    claim_reasons = _readiness_claim_reasons(manifest["fixture"], prerequisites, wad_profile)
     evidence_index = {
         "algorithm": "sha256",
         "entries": evidence_entries,
         "sha256": _canonical_sha256(evidence_entries, document="manifest"),
     }
-    return {
+    report = {
         "schema_version": 1,
         "workflow": "parity_readiness",
         "evidence_level": "development",
         "fixture": manifest["fixture"],
-        "status": "unavailable" if missing else "ready",
+        "status": (
+            "failed"
+            if wad_profile is not None and wad_profile["status"] == "failed"
+            else "unavailable"
+            if missing
+            else "ready"
+        ),
         "claim_eligible": False,
         "claim_reasons": claim_reasons,
         "run_identity": _run_identity(
@@ -495,12 +562,16 @@ def build_readiness_report(manifest_path: Path) -> dict[str, Any]:
             declared_inputs,
             prerequisites,
             document="manifest",
+            wad_profile=wad_profile,
         ),
         "code_provenance": code_provenance,
         "declared_inputs": declared_inputs,
         "prerequisites": prerequisites,
         "evidence_index": evidence_index,
     }
+    if wad_profile is not None:
+        report["wad_profile"] = wad_profile
+    return report
 
 
 def validate_merge_report(
@@ -509,6 +580,8 @@ def validate_merge_report(
     *,
     expected_manifest_sha256: str,
     manifest_directory: Path,
+    expected_wad_profile: dict[str, Any] | None = None,
+    expected_evidence_entries: list[dict[str, str]] | None = None,
 ) -> None:
     report = _parse_json_document(path.read_bytes(), document="merge report")
     if not isinstance(report, dict):
@@ -535,20 +608,22 @@ def validate_merge_report(
         base_directory=manifest_directory,
     )
     prerequisites = _validate_prerequisites(report["prerequisites"])
-    stored_run_identity = _required_string(
-        report["run_identity"], "merge report run_identity"
-    )
+    wad_profile = report.get("wad_profile")
+    if wad_profile != expected_wad_profile:
+        raise EvidenceError(
+            "merge report wad_profile does not match the current profile validation"
+        )
+    stored_run_identity = _required_string(report["run_identity"], "merge report run_identity")
     recomputed_run_identity = _run_identity(
         report,
         code_provenance,
         declared_inputs,
         prerequisites,
         document="merge report",
+        wad_profile=wad_profile,
     )
     if stored_run_identity != recomputed_run_identity:
-        raise EvidenceError(
-            "merge report run_identity does not match its identity-bearing fields"
-        )
+        raise EvidenceError("merge report run_identity does not match its identity-bearing fields")
     if recomputed_run_identity != expected_run_identity:
         raise EvidenceError(
             "cannot merge unlike run identities: "
@@ -558,9 +633,10 @@ def validate_merge_report(
         raise EvidenceError("merge report workflow must be parity_readiness")
     if report["evidence_level"] != "development":
         raise EvidenceError("merge report evidence_level must be development")
-    _validate_readiness_envelope(report, prerequisites)
+    _validate_readiness_envelope(report, prerequisites, wad_profile)
     _validate_evidence_index(
         report["evidence_index"],
         declared_inputs,
         expected_manifest_sha256=expected_manifest_sha256,
+        expected_entries=expected_evidence_entries,
     )
