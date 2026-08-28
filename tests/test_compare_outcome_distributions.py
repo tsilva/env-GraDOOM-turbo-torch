@@ -58,3 +58,8 @@ def test_distribution_comparison_uses_independent_provider_uncertainty() -> None
     assert rate["gradoom_minus_vizdoom"] == 20.0
     assert rate["vizdoom"]["count"] == 2
     assert rate["gradoom"]["count"] == 2
+
+
+def test_retained_diagnostic_requests_player_attributed_kills_too() -> None:
+    assert "KILLCOUNT" in tool.GAME_VARIABLES
+    assert "PLAYER_KILLCOUNT" in tool.GAME_VARIABLES

@@ -1,7 +1,7 @@
-"""Evaluate a standalone env-GraDOOM-turbo-torch checkpoint unchanged in reference ViZDoom.
+"""Evaluate a standalone GraDOOM checkpoint unchanged in the pinned reference provider.
 
-This optional transfer gate depends on ``env-vizdoom-turbo``. The root trainer does
-not import it and remains independent of ViZDoom, GradLab, and Stable-Baselines3.
+Reference evaluation depends on an immutable ``env-vizdoom-turbo`` Git revision. The
+root trainer remains independent of ViZDoom, GradLab, and Stable-Baselines3.
 """
 
 from __future__ import annotations
@@ -21,11 +21,14 @@ from typing import Any
 import numpy as np
 import torch
 
+from gradoom.evidence.policy_execution import policy_execution_identity
+from gradoom.evidence.reference_provider import load_reference_provider
+
 UINT32_MASK = (1 << 32) - 1
 DEFAULT_EPISODES = 100
 DEFAULT_NUM_ENVS = 16
 REFERENCE_KILLS_TARGET = 31.78
-REFERENCE_RENDER_HUD = True
+REFERENCE_RENDER_HUD = False
 TRACE_GAME_VARIABLES = (
     "POSITION_X",
     "POSITION_Y",
@@ -36,15 +39,12 @@ TRACE_GAME_VARIABLES = (
 TRACE_INFO_NAMES = tuple(name.casefold() for name in TRACE_GAME_VARIABLES)
 SURVIVAL_GAME_VARIABLES = ("HITS_TAKEN", "DAMAGE_TAKEN")
 SURVIVAL_INFO_NAMES = tuple(name.casefold() for name in SURVIVAL_GAME_VARIABLES)
-GRADOOM_ONLY_SIGNAL_NAMES = frozenset({"player_killcount"})
 
 
 def _reference_signal_names(names: Sequence[str]) -> tuple[str, ...]:
-    """Remove env-GraDOOM-turbo-torch-only diagnostics from a ViZDoom provider contract."""
+    """Normalize the shared signal contract without dropping player-attributed kills."""
 
-    return tuple(
-        name for name in names if str(name).casefold() not in GRADOOM_ONLY_SIGNAL_NAMES
-    )
+    return tuple(str(name).casefold() for name in names)
 
 
 def _load_standalone_train() -> ModuleType:
@@ -141,9 +141,10 @@ def _info_values(
 
 
 def _summary(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    kills = [float(record["kills"]) for record in records]
+    kills = [float(record["player_killcount"]) for record in records]
     if not kills:
         raise ValueError("zero-shot evaluation requires completed episodes")
+    compatibility_kills = [float(record["compatibility_killcount"]) for record in records]
     mean_kills = statistics.fmean(kills)
     summary = {
         "evaluation/episode/count": len(records),
@@ -152,10 +153,16 @@ def _summary(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "evaluation/kills/std": statistics.pstdev(kills),
         "evaluation/kills/min": min(kills),
         "evaluation/kills/max": max(kills),
+        "evaluation/kills/signal": "player_killcount",
+        "evaluation/compatibility_killcount/mean": statistics.fmean(compatibility_kills),
+        "evaluation/compatibility_killcount/median": statistics.median(compatibility_kills),
+        "evaluation/compatibility_killcount/min": min(compatibility_kills),
+        "evaluation/compatibility_killcount/max": max(compatibility_kills),
         "evaluation/episode/length/mean": statistics.fmean(
             float(record["length"]) for record in records
         ),
         "evaluation/target/kills/mean": REFERENCE_KILLS_TARGET,
+        "evaluation/target/kills/signal": "player_killcount",
         "evaluation/target/passed": mean_kills >= REFERENCE_KILLS_TARGET,
     }
     if all("damage_taken" in record and "hits_taken" in record for record in records):
@@ -209,12 +216,7 @@ def _summary(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
 
 
 def _evaluate(args: argparse.Namespace, train: ModuleType) -> dict[str, Any]:
-    try:
-        from vizdoom_turbo import VizdoomTurboVecEnv
-    except ImportError as exc:
-        raise RuntimeError(
-            "zero-shot evaluation requires env-vizdoom-turbo in the selected Python runtime"
-        ) from exc
+    provider = load_reference_provider()
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for standalone checkpoint policy inference")
 
@@ -243,7 +245,7 @@ def _evaluate(args: argparse.Namespace, train: ModuleType) -> dict[str, Any]:
         *_reference_signal_names(train.INFO_SIGNALS),
         *extra_info_names,
     )
-    env = VizdoomTurboVecEnv(
+    env = provider.make_env(
         str(args.scenario_config),
         use_restricted_actions=train.RESTRICTED_ACTIONS,
         rom_path=str(args.iwad),
@@ -278,10 +280,7 @@ def _evaluate(args: argparse.Namespace, train: ModuleType) -> dict[str, Any]:
         if tuple(env.action_table or ()) != train.RESTRICTED_ACTIONS:
             raise RuntimeError("reference action table differs from checkpoint contract")
         loaded = torch.load(args.checkpoint, map_location=device, weights_only=False)
-        if (
-            not isinstance(loaded, Mapping)
-            or loaded.get("format") != "standalone-gradoom-ppo-v1"
-        ):
+        if not isinstance(loaded, Mapping) or loaded.get("format") != "standalone-gradoom-ppo-v1":
             raise ValueError(f"unsupported standalone checkpoint: {args.checkpoint}")
         checkpoint_config = loaded.get("config", {})
         effective_recipe = (
@@ -379,7 +378,7 @@ def _evaluate(args: argparse.Namespace, train: ModuleType) -> dict[str, Any]:
                         "lane_episode": lane_episode,
                         "provider_seed": provider_seed,
                         "game_seed": _game_seed(provider_seed),
-                        "kills": float(np.asarray(step_infos["killcount"])[lane]),
+                        **provider.episode_kill_signals(step_infos, lane=lane),
                         "return": float(episode_returns[lane]),
                         "length": int(episode_lengths[lane]),
                         "terminated": bool(np.asarray(terminated)[lane]),
@@ -481,21 +480,27 @@ def _evaluate(args: argparse.Namespace, train: ModuleType) -> dict[str, Any]:
             {"index": index, **records_by_grid[key]} for index, key in enumerate(expected_grid)
         ]
         torch.cuda.synchronize(device)
+        evaluation_seconds = time.perf_counter() - started
+        checkpoint_sha256 = train._file_sha256(args.checkpoint)
         return {
             "type": "evaluation",
             "status": "completed",
             "protocol": "standalone-zero-shot-vizdoom-turbo-v2-fixed-seed-grid",
             "action_sampling": "stochastic" if args.stochastic_actions else "argmax",
             "checkpoint": str(args.checkpoint),
-            "checkpoint_sha256": train._file_sha256(args.checkpoint),
+            "checkpoint_sha256": checkpoint_sha256,
             "checkpoint_step": int(loaded.get("step", 0)),
             "checkpoint_config": loaded.get("config"),
             "episodes": records,
             "episode_quotas": list(quotas),
             "evaluation_seed": int(args.seed),
             "evaluation_num_envs": num_envs,
-            "evaluation_seconds": time.perf_counter() - started,
+            "evaluation_seconds": evaluation_seconds,
             "deterministic_actions": not bool(args.stochastic_actions),
+            "policy_execution": policy_execution_identity(
+                artifact_sha256=checkpoint_sha256,
+                stochastic_actions=bool(args.stochastic_actions),
+            ),
             "survival_diagnostics": bool(args.include_survival_diagnostics),
             "iwad_sha256": train._file_sha256(args.iwad),
             "scenario_config_sha256": train._file_sha256(args.scenario_config),
@@ -512,6 +517,7 @@ def _evaluate(args: argparse.Namespace, train: ModuleType) -> dict[str, Any]:
             },
             "device": torch.cuda.get_device_name(device),
             "torch": torch.__version__,
+            "reference_provider_revision": provider.revision,
             **_summary(records),
         }
     finally:

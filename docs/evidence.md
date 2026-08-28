@@ -71,6 +71,30 @@ These checks apply only to formal evidence. `GraDoomVecEnv` continues to accept 
 operator-supplied Doom II and Freedoom IWADs for ordinary deathmatch use, where
 `parity_certified` remains false and no WAD-profile evidence is inherited.
 
+## Reference provider
+
+Reference evaluation is bound to `env-ViZDoom-turbo` revision
+`5b74973e4fbb1a96550a1884805b51fd6dcfe90f`. Install that immutable source revision into the
+evaluation runtime:
+
+```bash
+uv pip install \
+  'env-vizdoom-turbo @ git+https://github.com/tsilva/env-ViZDoom-turbo.git@5b74973e4fbb1a96550a1884805b51fd6dcfe90f#subdirectory=turbo'
+```
+
+The reference adapter verifies the installed Git commit from distribution provenance before it
+imports the provider. Registry wheels, editable installs without verifiable Git provenance, and
+all other revisions fail rather than silently running. Evaluation uses the current
+`EnvViZDoomTurboVecEnv` export and explicitly requests both `player_killcount` and `killcount`.
+Missing `player_killcount` is an error: it never falls back to compatibility `killcount`.
+
+Episode records name `player_killcount` as the policy-quality outcome and retain
+`compatibility_killcount` only as a separate diagnostic. GraDOOM and reference checkpoint reports
+also record one provider-neutral execution identity containing the unchanged artifact hash,
+certified preprocessing hash, stochastic or diagnostic argmax action mode, and an empty list of
+provider-specific modifications. The adapter does not offer observation correction, action
+remapping, fine-tuning, or learned adaptation hooks.
+
 ## Report schema version 1
 
 The JSON report records its schema version, workflow, evidence level, fixture state, readiness

@@ -29,27 +29,38 @@ def test_provider_and_game_seed_protocol_matches_known_first_lane() -> None:
 def test_zero_shot_summary_uses_reference_kill_target() -> None:
     result = tool._summary(
         (
-            {"kills": 31.0, "length": 100},
-            {"kills": 33.0, "length": 200},
+            {
+                "player_killcount": 31.0,
+                "compatibility_killcount": 91.0,
+                "length": 100,
+            },
+            {
+                "player_killcount": 33.0,
+                "compatibility_killcount": 99.0,
+                "length": 200,
+            },
         )
     )
 
     assert result["evaluation/kills/mean"] == 32.0
+    assert result["evaluation/kills/signal"] == "player_killcount"
+    assert result["evaluation/compatibility_killcount/mean"] == 95.0
     assert result["evaluation/episode/count"] == 2
     assert result["evaluation/target/kills/mean"] == 31.78
+    assert result["evaluation/target/kills/signal"] == "player_killcount"
     assert result["evaluation/target/passed"] is True
 
 
-def test_zero_shot_contract_keeps_the_training_hud_enabled() -> None:
-    assert tool.REFERENCE_RENDER_HUD is True
+def test_reference_contract_uses_the_certified_profile_hud_setting() -> None:
+    assert tool.REFERENCE_RENDER_HUD is False
 
 
-def test_reference_contract_excludes_gradoom_only_player_kill_signal() -> None:
+def test_reference_contract_explicitly_requests_both_kill_signals() -> None:
     train = tool._load_standalone_train()
 
     game_variables = tool._reference_signal_names(train.GAME_VARIABLES)
     info_signals = tool._reference_signal_names(train.INFO_SIGNALS)
 
     assert "killcount" in game_variables
-    assert "player_killcount" not in game_variables
-    assert "player_killcount" not in info_signals
+    assert "player_killcount" in game_variables
+    assert "player_killcount" in info_signals

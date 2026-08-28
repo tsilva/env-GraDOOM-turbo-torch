@@ -12,21 +12,17 @@ import numpy as np
 import torch
 
 from gradoom.engine import TorchDeathmatchEngine
+from gradoom.evidence.reference_provider import load_reference_provider
 from gradoom.scenario import compile_deathmatch_scenario
 
 
 def _reference_policy_frame(reference_rgb: torch.Tensor) -> torch.Tensor:
     """Apply the pinned env-ViZDoom-turbo deathmatch observation transform."""
 
-    try:
-        from vizdoom_turbo._vizdoom_turbo import preprocess_into
-    except ImportError as exc:
-        raise RuntimeError(
-            "compare_renderer.py requires the reference vizdoom_turbo package"
-        ) from exc
+    provider = load_reference_provider()
     current = reference_rgb.to(torch.uint8).numpy()[None]
     output = np.empty((1, 84, 84, 1), dtype=np.uint8)
-    preprocess_into(current, output, [0, 32, 0, 0], True, 0, "area")
+    provider.preprocess_into(current, output, [0, 32, 0, 0], True, 0, "area")
     return torch.from_numpy(output[0, ..., 0]).to(torch.float32)
 
 

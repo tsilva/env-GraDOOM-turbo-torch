@@ -37,6 +37,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from gradoom._kernels import bounded_observation_augment, frozen_nature_conv1
+from gradoom.evidence.policy_execution import policy_execution_identity
 
 REFERENCE_NAME = "GradLab VizdoomDeathmatch-v1/ppo"
 REFERENCE_CAPTURED_AT = "2026-08-11"
@@ -2299,10 +2300,7 @@ def _evaluate(
     env = _make_env(args, device, num_envs=evaluation_envs)
     try:
         loaded = torch.load(args.evaluate_checkpoint, map_location=device, weights_only=False)
-        if (
-            not isinstance(loaded, Mapping)
-            or loaded.get("format") != "standalone-gradoom-ppo-v1"
-        ):
+        if not isinstance(loaded, Mapping) or loaded.get("format") != "standalone-gradoom-ppo-v1":
             raise ValueError(f"unsupported evaluation checkpoint: {args.evaluate_checkpoint}")
         policy = NatureActorCritic(
             str(args.policy_architecture),
@@ -2484,6 +2482,7 @@ def _evaluate(
 
         torch.cuda.synchronize(device)
         evaluation_seconds = time.perf_counter() - evaluation_started
+        checkpoint_sha256 = _file_sha256(args.evaluate_checkpoint)
         completed_cpu = completed[:executed_decisions].cpu().numpy()
         kills_cpu = completed_kills[:executed_decisions].cpu().numpy()
         vizdoom_killcounts_cpu = completed_vizdoom_killcounts[:executed_decisions].cpu().numpy()
@@ -2560,16 +2559,17 @@ def _evaluate(
             {
                 "type": "evaluation",
                 "status": "completed",
-                "protocol": (
-                    "standalone-gradoom-deathmatch-checkpoint-eval-"
-                    "v3-balanced-seed-grid"
-                ),
+                "protocol": ("standalone-gradoom-deathmatch-checkpoint-eval-v3-balanced-seed-grid"),
                 "checkpoint": str(args.evaluate_checkpoint),
-                "checkpoint_sha256": _file_sha256(args.evaluate_checkpoint),
+                "checkpoint_sha256": checkpoint_sha256,
                 "checkpoint_step": int(loaded.get("step", 0)),
                 "checkpoint_config": loaded.get("config"),
                 "evaluation_config": audit["evaluation"],
                 "deterministic_actions": not bool(args.evaluation_stochastic),
+                "policy_execution": policy_execution_identity(
+                    artifact_sha256=checkpoint_sha256,
+                    stochastic_actions=bool(args.evaluation_stochastic),
+                ),
                 "episode_quotas": list(episode_quotas),
                 "evaluation_seconds": evaluation_seconds,
                 "process_elapsed_seconds": time.perf_counter() - process_started,
