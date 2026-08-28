@@ -28,6 +28,10 @@ def _load_manifest(path: Path) -> tuple[dict[str, Any], bytes]:
     payload = path.read_bytes()
     try:
         manifest = json.loads(payload)
+    except UnicodeDecodeError as error:
+        raise EvidenceError(
+            f"manifest is not valid UTF-8 at byte {error.start}"
+        ) from error
     except json.JSONDecodeError as error:
         raise EvidenceError(f"manifest is not valid JSON: {error.msg}") from error
     if not isinstance(manifest, dict):
@@ -205,6 +209,10 @@ def build_readiness_report(manifest_path: Path) -> dict[str, Any]:
 def validate_merge_report(path: Path, expected_run_identity: object) -> None:
     try:
         report = json.loads(path.read_bytes())
+    except UnicodeDecodeError as error:
+        raise EvidenceError(
+            f"merge report is not valid UTF-8 at byte {error.start}"
+        ) from error
     except json.JSONDecodeError as error:
         raise EvidenceError(f"merge report is not valid JSON: {error.msg}") from error
     if not isinstance(report, dict):

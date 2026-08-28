@@ -118,6 +118,34 @@ def test_malformed_manifest_fails_with_a_clear_error(tmp_path: Path) -> None:
     assert "Traceback" not in result.stderr
 
 
+@pytest.mark.parametrize("document", ["manifest", "merge report"])
+def test_invalid_utf8_json_fails_with_a_clear_error(
+    tmp_path: Path,
+    document: str,
+) -> None:
+    invalid_path = tmp_path / "invalid.json"
+    invalid_path.write_bytes(b"\xff")
+    output = tmp_path / "report.json"
+    if document == "manifest":
+        arguments = ["--manifest", str(invalid_path), "--output", str(output)]
+    else:
+        arguments = [
+            "--manifest",
+            str(FIXTURES / "readiness-manifest.json"),
+            "--output",
+            str(output),
+            "--merge",
+            str(invalid_path),
+        ]
+
+    result = run_evidence(*arguments)
+
+    assert result.returncode == 2
+    assert f"{document} is not valid UTF-8" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert not output.exists()
+
+
 def test_unknown_manifest_schema_version_fails_with_a_clear_error(tmp_path: Path) -> None:
     manifest = json.loads(
         (FIXTURES / "readiness-manifest.json").read_text(encoding="utf-8")
