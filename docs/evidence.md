@@ -31,6 +31,10 @@ The v1 readiness manifest is a JSON object with these fields:
   paths are resolved from the manifest directory and are verified before report creation.
 - `prerequisites`: uniquely identified readiness prerequisites with an `available` boolean. Every
   unavailable prerequisite must include a human-readable `reason`.
+- `invariant_suite` (optional until a provider runtime is available): version `1.0.0`, exactly one
+  `gradoom` and one `env-vizdoom-turbo` provider process, and optional statuses for the retained
+  deep diagnostics. Each available provider process names a hashed `declared_inputs` runner and a
+  non-shell command array; each unavailable provider gives a reason.
 - `wad_profile` (required when `certified_freedoom2_wad_profile` is declared available): the
   `freedoom2-deathmatch-v1` profile ID and exactly one `gradoom` and one `env-vizdoom-turbo`
   provider binding. Each binding declares `iwad_path`, `pwad_path`, and the complete policy-facing
@@ -38,6 +42,8 @@ The v1 readiness manifest is a JSON object with these fields:
 
 The repository fixture is the executable example of this schema:
 [`tests/fixtures/evidence/readiness-manifest.json`](../tests/fixtures/evidence/readiness-manifest.json).
+The independently versioned two-provider invariant example is
+[`tests/fixtures/evidence/invariant-readiness-manifest.json`](../tests/fixtures/evidence/invariant-readiness-manifest.json).
 
 ## First WAD profile
 
@@ -99,19 +105,48 @@ defaults. The artifact is hashed before and after loading so a concurrently chan
 rejected. The adapter does not offer observation correction, action remapping, fine-tuning, or
 learned adaptation hooks.
 
+## Fast Turbo invariant suite
+
+Invariant suite `1.0.0` runs before readiness is decided. Each declared provider process exercises
+its public construction, reset, step, and masked-reset surface and returns the versioned provider
+contract on standard output. The command compares common constructor parameters, action meanings,
+observation and signal shapes, rewards, lifecycle operations, termination, truncation, manual
+episode reset semantics, and `player_killcount`. It additionally requires GraDOOM reset-mask and
+action inputs plus reset and step outputs to be Torch tensors on the declared device. The
+player-attributed kill checks require a player kill to increment `player_killcount` and an
+enemy-on-enemy kill to leave it unchanged.
+
+Provider commands are argv arrays and are never interpreted by a shell. Their runner files must be
+declared and hash-verified before execution. Non-fixture execution also requires the GraDOOM
+provider revision to match `code_provenance.revision` and the reference provider revision to match
+the immutable pin above. Fixture processes can provide deterministic lifecycle evidence, but the
+report remains `fixture: true` and can never become claim-eligible.
+
+The report records every check under `invariant_suite.checks`. A mismatch sets both the suite and
+readiness status to `failed` and names the public `behavior`; an unavailable provider records a
+reason and leaves readiness `unavailable`. A complete invariant pass can still only report
+certification unavailable while the real pretrained policy corpus is missing, with
+`claim_eligible: false`.
+
+Mechanics, trace, outcome-distribution, policy-observation, and rendering diagnostics remain
+separate reproducible tools. Their declared statuses are copied under
+`invariant_suite.diagnostics` with `affects_verdict: false`; they never change the invariant or
+readiness verdict.
+
 ## Report schema version 1
 
 The JSON report records its schema version, workflow, evidence level, fixture state, readiness
 status, claim eligibility and structured reasons, stable run identity, declared code provenance,
 declared inputs, prerequisites, optional WAD-profile validation, and evidence index. A fixture
-report is `unavailable` while real
-prerequisites are missing, has `claim_eligible: false`, and names every missing prerequisite in
-`claim_reasons`.
+report is `unavailable` while real prerequisites are missing, has `claim_eligible: false`, and
+names every missing prerequisite in `claim_reasons`. Every report records the invariant-suite
+version even when provider execution has not yet been configured.
 
 `run_identity` is the lowercase SHA-256 digest of canonical JSON containing the manifest schema,
 workflow, evidence level, fixture state, code provenance, input names and declared hashes,
 prerequisite identifiers, and—when supplied—the complete normalized WAD-profile binding. Input and
-prerequisite ordering does not affect it. Canonical JSON uses
+prerequisite ordering does not affect it. A configured invariant suite also binds its independent
+version and each provider's revision and canonical contract digest. Canonical JSON uses
 UTF-8, sorted object keys, no insignificant whitespace, and JSON separators `,` and `:`. File paths
 are not identity fields; the declared content hashes are.
 

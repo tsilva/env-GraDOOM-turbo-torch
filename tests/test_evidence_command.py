@@ -873,6 +873,7 @@ def test_merge_accepts_the_same_stable_run_identity(tmp_path: Path) -> None:
         "code_provenance",
         "declared_inputs",
         "prerequisites",
+        "invariant_suite",
         "evidence_index",
     ],
 )
