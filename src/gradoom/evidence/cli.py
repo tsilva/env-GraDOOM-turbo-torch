@@ -132,6 +132,17 @@ def _validate_output_path(
                 f"output path aliases generated benchmark artifact {artifact['name']!r}"
             )
 
+    bootstrap_exclusions = report.get("bootstrap_exclusions", [])
+    assert isinstance(bootstrap_exclusions, list)
+    for artifact in bootstrap_exclusions:
+        assert isinstance(artifact, dict)
+        resolved_artifact = _resolve_evidence_path(
+            Path(artifact["path"]),
+            base_directory=manifest_directory,
+        )
+        if _paths_alias(resolved_output, resolved_artifact):
+            raise EvidenceError(f"output path aliases bootstrap artifact {artifact['name']!r}")
+
     if merge_path is not None:
         resolved_merge = _resolve_evidence_path(
             merge_path,
@@ -196,6 +207,24 @@ def _validate_document_paths(
                     if _paths_alias(resolved_output, resolved_asset):
                         asset_id = f"{provider.get('id')}.{asset_name}"
                         raise EvidenceError(f"output path aliases WAD profile asset {asset_id!r}")
+    benchmark = manifest.get("benchmark")
+    if isinstance(benchmark, dict):
+        bootstrap_artifacts = benchmark.get("bootstrap_artifacts")
+        if isinstance(bootstrap_artifacts, list):
+            for artifact in bootstrap_artifacts:
+                if not isinstance(artifact, dict):
+                    continue
+                raw_path = artifact.get("path")
+                if not isinstance(raw_path, str) or not raw_path.strip():
+                    continue
+                resolved_artifact = _resolve_evidence_path(
+                    Path(raw_path),
+                    base_directory=manifest_directory,
+                )
+                if _paths_alias(resolved_output, resolved_artifact):
+                    raise EvidenceError(
+                        f"output path aliases bootstrap artifact {artifact.get('name')!r}"
+                    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -212,11 +241,10 @@ def main(argv: list[str] | None = None) -> int:
         if workflow == "parity_readiness":
             report = build_readiness_report(args.manifest)
         elif workflow == "development_training_benchmark":
-            if args.merge is not None:
-                raise EvidenceError(
-                    "development training benchmark continuation is not supported yet"
-                )
-            report = build_development_benchmark_report(args.manifest)
+            report = build_development_benchmark_report(
+                args.manifest,
+                merge_path=args.merge,
+            )
         else:
             raise EvidenceError(f"unsupported manifest workflow {workflow!r}")
         _validate_output_path(
@@ -225,7 +253,7 @@ def main(argv: list[str] | None = None) -> int:
             report=report,
             merge_path=args.merge,
         )
-        if args.merge is not None:
+        if args.merge is not None and workflow == "parity_readiness":
             evidence_index = report["evidence_index"]
             assert isinstance(evidence_index, dict)
             entries = evidence_index["entries"]

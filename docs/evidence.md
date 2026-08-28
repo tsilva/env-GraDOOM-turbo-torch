@@ -44,6 +44,12 @@ contains:
   checkpoint, timing, metrics, and evaluation arguments and rejects attempts to override them.
 - `artifacts_directory`: the directory under which the run-identity and per-seed artifacts are
   durably retained.
+- `bootstrap_artifacts`: optional one-time exclusions declared before the cohort. Every entry names
+  a persistent read-only regular file outside the benchmark artifact directory, its SHA-256,
+  creation elapsed seconds, creation protocol, exact reuse conditions, and true
+  `persistent`/`run_independent`/`reused_unchanged` assertions. `contains_state` must explicitly set
+  `learned`, `optimizer`, `rollout`, `seed_specific`, and `candidate_specific` to false. Missing,
+  writable, linked, changed, incompletely disclosed, or state-bearing artifacts are rejected.
 - `parity_certificate`: the current certificate availability and, when unavailable, its reason.
   An unavailable certificate is recorded as a claim-ineligibility reason but does not prevent a
   development run.
@@ -55,8 +61,10 @@ For each seed, the command starts the reusable timer before attempt setup and in
 `standalone-gradoom-deathmatch-ppo-v2` trainer contract at every checkpoint cadence. The first
 segment receives no resume or learned initialization; later segments resume only the preceding
 checkpoint from that same attempt. This preserves one cold-start policy and optimizer lineage while
-including recurring process initialization, uncached or per-process compilation, warm-up, training,
-checkpoint evaluation, and durable checkpoint writing in measured elapsed time.
+including recurring process initialization, uncached or per-process compilation, graph capture,
+warm-up, training, checkpoint evaluation, and durable checkpoint writing in measured elapsed time.
+Bootstrap bytes are verified before training and again after the cohort; their disclosed creation
+cost is reported but excluded from reusable time. The output report cannot alias a bootstrap file.
 The standalone trainer rounds an unaligned request down to the preceding complete-rollout boundary,
 never up. A benchmark segment is accepted only when that execution boundary equals its exact
 predeclared checkpoint; otherwise it fails closed without evaluation. The final report output must
@@ -72,10 +80,23 @@ outcomes, all episode outcomes, and every process or evidence failure are retain
 report evidence index.
 
 The report has `authoritative: false` and `claim_eligible: false` unconditionally. Its per-seed
-attempt states are `succeeded`, `exhausted`, `crashed`, `evaluation_failed`, or `evidence_failed`.
-The workflow status is `passed` only when every predeclared development attempt succeeds; either
-status remains ineligible for public claims. Benchmark continuation and bootstrap exclusions are not
-part of this workflow version; `--merge` is rejected for development benchmarks.
+attempt states are `succeeded`, `exhausted`, `crashed`, `interrupted`, `evaluation_failed`, or
+`evidence_failed`. The workflow status is `passed` only when every predeclared development attempt
+succeeds; either status remains ineligible for public claims.
+
+An interrupted trainer may leave a recovery checkpoint only when its metrics prove that policy,
+optimizer, RNG, and progress state are all restorable and the checkpoint carries the exact run and
+attempt identities. The report retains a hashed recovery journal binding that checkpoint, progress,
+and accumulated reusable elapsed time. A later `--merge` resumes the same attempt, adds new elapsed
+time to the journaled elapsed time, and preserves the original cold-start identity. Completed and
+failed seeds are reused unchanged and are never rerun or replaced. Every attempt also has a durable
+hashed state journal, so edited elapsed time, outcomes, failures, or recovery metadata cannot be
+accepted as a completed unit.
+
+`benchmark_protocol.continuation_identity` separately hashes the exact schema/trainer contract,
+recipe, assets and bootstrap bytes, training/evaluation seeds, and timer phases/boundaries. Any
+recipe, asset, seed, timer, schema, code provenance, WAD binding, evidence index, or artifact mismatch
+fails before additional training work begins.
 
 The standalone trainer's `--evaluation-seeds-file` accepts a UTF-8 JSON array of exactly 100 unique
 uint32 game seeds. Its emitted config binds the complete ordered seed list, file hash, stochastic
@@ -192,3 +213,8 @@ existing report schema, recomputes its run identity from its recorded identity-b
 validates its evidence-index hash, then requires the recomputed identity to equal the run described
 by the new manifest. Unlike code provenance, evidence levels, declared input hashes, or prerequisite
 sets fail instead of being combined.
+
+For `development_training_benchmark`, continuation additionally re-hashes every retained generated
+artifact and validates every per-seed attempt journal. Only an `interrupted` attempt with a matching
+recovery checkpoint and journal may execute more trainer work. Terminal successes and failures remain
+attached to their original predeclared seed without replacement.

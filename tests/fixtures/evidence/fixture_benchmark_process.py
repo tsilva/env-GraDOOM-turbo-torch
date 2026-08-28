@@ -24,10 +24,15 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--metrics-jsonl", type=Path, required=True)
     parser.add_argument("--fixture-outcomes", required=True)
     parser.add_argument("--fixture-fail-training-seed", type=int)
+    parser.add_argument("--fixture-fail-training-once-marker", type=Path)
     parser.add_argument("--fixture-fail-evaluation-step", type=int)
     parser.add_argument("--fixture-omit-player-killcount", action="store_true")
     parser.add_argument("--fixture-training-step-offset", type=int, default=0)
     parser.add_argument("--fixture-hardlink-checkpoint-to", type=Path)
+    parser.add_argument("--fixture-mutate-bootstrap", type=Path)
+    parser.add_argument("--fixture-interrupt-once-at-step", type=int)
+    parser.add_argument("--evidence-run-identity")
+    parser.add_argument("--evidence-attempt-identity")
     return parser
 
 
@@ -43,15 +48,42 @@ def _emit(path: Path, *records: dict[str, object]) -> None:
     )
 
 
+def _mutate_bootstrap(path: Path | None) -> None:
+    if path is None:
+        return
+    path.chmod(0o600)
+    with path.open("ab") as stream:
+        stream.write(b"mutated during benchmark\n")
+
+
 def main() -> int:
     args, _unknown = _parser().parse_known_args()
     outcomes = json.loads(args.fixture_outcomes)
     if args.evaluate_checkpoint is None:
+        if (
+            args.fixture_fail_training_once_marker is not None
+            and not args.fixture_fail_training_once_marker.exists()
+        ):
+            args.fixture_fail_training_once_marker.write_text("failed\n", encoding="utf-8")
+            return 17
         if args.fixture_fail_training_seed == args.seed:
             return 17
         assert args.checkpoint is not None
         assert args.timesteps is not None
-        actual_step = args.timesteps + args.fixture_training_step_offset
+        resumed_checkpoint = None
+        if args.resume is not None:
+            resumed_checkpoint = json.loads(args.resume.read_text(encoding="utf-8"))
+            assert resumed_checkpoint["evidence_run_identity"] == args.evidence_run_identity
+            assert resumed_checkpoint["evidence_attempt_identity"] == args.evidence_attempt_identity
+        should_interrupt = args.fixture_interrupt_once_at_step == args.timesteps and not (
+            resumed_checkpoint or {}
+        ).get("interrupted", False)
+        actual_step = (
+            max(1, args.timesteps // 2)
+            if should_interrupt
+            else args.timesteps + args.fixture_training_step_offset
+        )
+        execution_timesteps = args.timesteps if should_interrupt else actual_step
         args.checkpoint.parent.mkdir(parents=True, exist_ok=True)
         args.checkpoint.write_text(
             json.dumps(
@@ -60,6 +92,13 @@ def main() -> int:
                     "seed": args.seed,
                     "step": actual_step,
                     "resumed": args.resume is not None,
+                    "interrupted": should_interrupt,
+                    "policy_state": "fixture-policy-state",
+                    "optimizer_state": "fixture-optimizer-state",
+                    "rng_state": "fixture-rng-state",
+                    "progress": {"global_step": actual_step, "rollouts": actual_step},
+                    "evidence_run_identity": args.evidence_run_identity,
+                    "evidence_attempt_identity": args.evidence_attempt_identity,
                 },
                 sort_keys=True,
             ),
@@ -76,7 +115,7 @@ def main() -> int:
                 "contract": "standalone-gradoom-deathmatch-ppo-v2",
                 "operation": "train",
                 "requested_timesteps": args.timesteps,
-                "execution_timesteps": actual_step,
+                "execution_timesteps": execution_timesteps,
                 "initialization": {
                     "mode": "random",
                     "checkpoint": None,
@@ -86,6 +125,10 @@ def main() -> int:
                     "policy_state": "resumed" if args.resume is not None else "fresh_random",
                     "optimizer_state": "resumed" if args.resume is not None else "fresh",
                 },
+                "evidence_binding": {
+                    "run_identity": args.evidence_run_identity,
+                    "attempt_identity": args.evidence_attempt_identity,
+                },
             }
         ]
         if args.resume is not None:
@@ -94,21 +137,33 @@ def main() -> int:
                     "type": "event",
                     "event": "resumed",
                     "checkpoint": str(args.resume),
+                    "train/global_step": int(resumed_checkpoint["step"]),
+                    "restored_state": {
+                        "policy": "policy_state" in resumed_checkpoint,
+                        "optimizer": "optimizer_state" in resumed_checkpoint,
+                        "rng": "rng_state" in resumed_checkpoint,
+                        "progress": "progress" in resumed_checkpoint,
+                    },
+                    "evidence_binding": {
+                        "run_identity": args.evidence_run_identity,
+                        "attempt_identity": args.evidence_attempt_identity,
+                    },
                 }
             )
         records.append(
             {
                 "type": "summary",
-                "status": "completed",
+                "status": "interrupted" if should_interrupt else "completed",
                 "train/global_step": actual_step,
                 "requested_timesteps": args.timesteps,
-                "execution_timesteps": actual_step,
+                "execution_timesteps": execution_timesteps,
                 "checkpoint": str(args.checkpoint),
                 "training_transitions_per_second": 1000.0,
             }
         )
         _emit(args.metrics_jsonl, *records)
-        return 0
+        _mutate_bootstrap(args.fixture_mutate_bootstrap)
+        return 130 if should_interrupt else 0
 
     checkpoint = json.loads(args.evaluate_checkpoint.read_text(encoding="utf-8"))
     step = int(checkpoint["step"])

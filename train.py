@@ -491,6 +491,8 @@ def _parser() -> argparse.ArgumentParser:
         type=Path,
         help="Resume policy, optimizer, counters, and RNG state from a trusted checkpoint.",
     )
+    parser.add_argument("--evidence-run-identity", help=argparse.SUPPRESS)
+    parser.add_argument("--evidence-attempt-identity", help=argparse.SUPPRESS)
     parser.add_argument(
         "--initialize-from",
         type=Path,
@@ -646,6 +648,16 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("steady-state-after-rollouts must be non-negative")
     if args.checkpoint_every_rollouts < 0:
         raise ValueError("checkpoint-every-rollouts must be non-negative")
+    evidence_identities = (args.evidence_run_identity, args.evidence_attempt_identity)
+    if (evidence_identities[0] is None) != (evidence_identities[1] is None):
+        raise ValueError("evidence run and attempt identities must be supplied together")
+    for identity in (value for value in evidence_identities if value is not None):
+        if len(identity) != 64 or any(
+            character not in "0123456789abcdef" for character in identity
+        ):
+            raise ValueError(
+                "evidence run and attempt identities must be lowercase SHA-256 digests"
+            )
     if int(args.observation_blur_kernel) <= 0 or int(args.observation_blur_kernel) % 2 == 0:
         raise ValueError("observation-blur-kernel must be a positive odd integer")
     if (
@@ -818,6 +830,10 @@ def _audit_config(args: argparse.Namespace) -> dict[str, Any]:
                 else "fresh_random"
             ),
             "optimizer_state": "resumed" if args.resume is not None else "fresh",
+        },
+        "evidence_binding": {
+            "run_identity": args.evidence_run_identity,
+            "attempt_identity": args.evidence_attempt_identity,
         },
         "evaluation": {
             "checkpoint": (
@@ -2825,6 +2841,19 @@ def _train(
                 or loaded.get("format") != "standalone-gradoom-ppo-v1"
             ):
                 raise ValueError(f"unsupported resume checkpoint: {args.resume}")
+            if args.evidence_run_identity is not None:
+                loaded_config = loaded.get("config")
+                expected_evidence_binding = {
+                    "run_identity": args.evidence_run_identity,
+                    "attempt_identity": args.evidence_attempt_identity,
+                }
+                if (
+                    not isinstance(loaded_config, Mapping)
+                    or loaded_config.get("evidence_binding") != expected_evidence_binding
+                ):
+                    raise ValueError(
+                        "resume checkpoint has unlike evidence run or attempt identity"
+                    )
             policy.load_state_dict(loaded["policy_state_dict"])
             _load_optimizer_state(
                 optimizer,
@@ -2978,6 +3007,35 @@ def _train(
                     "event": "resumed",
                     "checkpoint": str(args.resume),
                     "train/global_step": global_step,
+                    "restored_state": {
+                        "policy": "policy_state_dict" in resume_payload,
+                        "optimizer": "optimizer_state_dict" in resume_payload,
+                        "rng": all(
+                            key in saved_training_state
+                            for key in (
+                                "python_rng_state",
+                                "numpy_rng_state",
+                                "torch_rng_state",
+                                "cuda_rng_state",
+                            )
+                        ),
+                        "progress": all(
+                            key in saved_training_state
+                            for key in (
+                                "completed_episodes",
+                                "executed_rollouts",
+                                "episode_index",
+                                "rolling_returns",
+                                "rolling_kills",
+                                "rolling_lengths",
+                                "rolling_success",
+                            )
+                        ),
+                    },
+                    "evidence_binding": {
+                        "run_identity": args.evidence_run_identity,
+                        "attempt_identity": args.evidence_attempt_identity,
+                    },
                 }
             )
         last_metrics: dict[str, Any] = {}
