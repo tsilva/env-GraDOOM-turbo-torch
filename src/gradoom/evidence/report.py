@@ -296,12 +296,23 @@ def _readiness_claim_reasons(
             }
         )
     if wad_profile is not None and wad_profile["status"] == "failed":
-        reasons.append(
-            {
-                "code": "wad_profile_mismatch",
-                "message": "The certified Freedoom2 WAD profile did not match.",
-            }
-        )
+        authority = wad_profile.get("authority")
+        if isinstance(authority, dict) and authority.get("status") == "failed":
+            failure = wad_profile["failures"][0]
+            reasons.append(
+                {
+                    "code": "wad_profile_authority_failure",
+                    "context": failure["context"],
+                    "message": failure["message"],
+                }
+            )
+        else:
+            reasons.append(
+                {
+                    "code": "wad_profile_mismatch",
+                    "message": "The certified Freedoom2 WAD profile did not match.",
+                }
+            )
     reasons.extend(
         {
             "code": "missing_prerequisite",
@@ -449,7 +460,12 @@ def _run_identity(
         "prerequisites": sorted(item["id"] for item in prerequisites),
     }
     if wad_profile is not None:
-        identity["wad_profile"] = wad_profile["binding_identity"]
+        binding_identity = wad_profile["binding_identity"]
+        identity["wad_profile"] = (
+            binding_identity
+            if binding_identity is not None
+            else {"authority": wad_profile["authority"]}
+        )
     return _canonical_sha256(identity, document=document)
 
 

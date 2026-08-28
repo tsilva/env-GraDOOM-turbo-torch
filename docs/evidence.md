@@ -53,6 +53,13 @@ The immutable `freedoom2-deathmatch-v1` manifest binds:
 - a zero-filled bottom-32 mask, 84x84 area resize, the pinned RGB/area/GRAY8 conversion, CHW
   layout, and four-frame stacking.
 
+The bundled JSON is a packaged representation, not its own authority. The evidence implementation
+independently pins canonical profile SHA-256
+`a3953ddfd4de7c8a99f51fed58dfbdc7002f6bf1c561ebbd25819aedf6e0cde7` and strictly checks every
+key, type, and fixed value against the approved profile. A missing, undecodable, malformed,
+incomplete, or semantically changed resource fails readiness before provider assets are inspected,
+records `wad_profile_authority_failure`, and emits no profile or binding identity.
+
 The command hashes all four provider asset paths before provider or training work. A missing or
 incorrect asset, unequal provider bytes, or any configuration difference produces `status:
 failed`, structured `wad_profile.failures`, and a `wad_profile_mismatch` claim reason in the

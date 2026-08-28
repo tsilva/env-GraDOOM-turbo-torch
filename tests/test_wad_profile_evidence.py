@@ -10,6 +10,9 @@ from pathlib import Path
 
 import pytest
 
+from gradoom.evidence import wad_profile as wad_profile_module
+from gradoom.evidence.cli import main as evidence_main
+
 APPROVED_IWAD_SHA256 = "a8772e088847032510d97ba2312406a6998f21cbab44d4ff10696faa9c0ecd4b"
 APPROVED_PWAD_SHA256 = "1d06c2113f2c1546062635ad599f49cd852287a08b7b07b26d30b8f4c362a42d"
 APPROVED_CONFIGURATION = {
@@ -43,6 +46,35 @@ APPROVED_CONFIGURATION = {
         "frame_stack": 4,
     },
 }
+
+
+def approved_profile() -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "profile_id": "freedoom2-deathmatch-v1",
+        "assets": {
+            "iwad": {"name": "Freedoom2", "sha256": APPROVED_IWAD_SHA256},
+            "pwad": {"name": "ViZDoom deathmatch", "sha256": APPROVED_PWAD_SHA256},
+        },
+        "configuration": copy.deepcopy(APPROVED_CONFIGURATION),
+    }
+
+
+class ProfileResourceRoot:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    def joinpath(self, resource: str) -> Path:
+        assert resource == "profiles/freedoom2-deathmatch-v1.json"
+        return self.path
+
+
+def use_profile_resource(monkeypatch: pytest.MonkeyPatch, path: Path) -> None:
+    monkeypatch.setattr(
+        wad_profile_module,
+        "files",
+        lambda package: ProfileResourceRoot(path),
+    )
 
 
 def canonical_sha256(value: object) -> str:
@@ -170,6 +202,148 @@ def test_asset_and_policy_mismatches_fail_readiness_in_the_report(tmp_path: Path
         "available": False,
         "reason": "The certified Freedoom2 WAD profile did not match.",
     }
+
+
+def test_bundled_profile_cannot_reauthorize_changed_hashes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    asset = tmp_path / "tampered-authority.wad"
+    asset.write_bytes(b"bytes selected by a tampered bundled profile")
+    fake_sha256 = hashlib.sha256(asset.read_bytes()).hexdigest()
+    tampered_profile = approved_profile()
+    tampered_profile["assets"]["iwad"]["sha256"] = fake_sha256
+    tampered_profile["assets"]["pwad"]["sha256"] = fake_sha256
+    resource = tmp_path / "installed-profile.json"
+    resource.write_text(json.dumps(tampered_profile), encoding="utf-8")
+    use_profile_resource(monkeypatch, resource)
+    manifest = write_manifest(
+        tmp_path,
+        gradoom_iwad=asset,
+        gradoom_pwad=asset,
+        reference_iwad=asset,
+        reference_pwad=asset,
+    )
+    report_path = tmp_path / "report.json"
+
+    returncode = evidence_main(["--manifest", str(manifest), "--output", str(report_path)])
+    captured = capsys.readouterr()
+
+    assert returncode == 0
+    assert captured.err == ""
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["status"] == "failed"
+    profile = report["wad_profile"]
+    assert profile["status"] == "failed"
+    assert profile["authority"]["status"] == "failed"
+    assert profile["authority"]["failure_code"] == "profile_resource_semantic_mismatch"
+    assert profile["profile"] is None
+    assert profile["profile_identity"] is None
+    assert profile["binding_identity"] is None
+    assert profile["binding_sha256"] is None
+    assert profile["providers"] == []
+    assert [failure["code"] for failure in profile["failures"]] == ["profile_authority_failure"]
+    assert any(
+        reason["code"] == "wad_profile_authority_failure" for reason in report["claim_reasons"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("corruption", "expected_context"),
+    [
+        ("malformed_json", "profile_resource_invalid_json"),
+        ("decode_error", "profile_resource_invalid_json"),
+        ("duplicate_key", "profile_resource_invalid_json"),
+        ("incomplete_profile", "profile_resource_semantic_mismatch"),
+        ("extra_policy_field", "profile_resource_semantic_mismatch"),
+        ("changed_policy_field", "profile_resource_semantic_mismatch"),
+        ("unexpected_type", "profile_resource_semantic_mismatch"),
+        ("missing_resource", "profile_resource_missing"),
+    ],
+)
+def test_corrupt_or_missing_bundled_profile_fails_closed_before_asset_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    corruption: str,
+    expected_context: str,
+) -> None:
+    profile = approved_profile()
+    provider_configuration = copy.deepcopy(APPROVED_CONFIGURATION)
+    resource = tmp_path / "installed-profile.json"
+    if corruption == "malformed_json":
+        resource.write_bytes(b'{"schema_version":')
+    elif corruption == "decode_error":
+        resource.write_bytes(b"\xff")
+    elif corruption == "duplicate_key":
+        resource.write_text(
+            '{"schema_version":1,"schema_version":1}',
+            encoding="utf-8",
+        )
+    elif corruption == "incomplete_profile":
+        del profile["assets"]
+        resource.write_text(json.dumps(profile), encoding="utf-8")
+    elif corruption == "extra_policy_field":
+        provider_configuration["observation"]["normalization"] = "unapproved"
+        profile["configuration"] = copy.deepcopy(provider_configuration)
+        resource.write_text(json.dumps(profile), encoding="utf-8")
+    elif corruption == "changed_policy_field":
+        provider_configuration["skill"] = 3
+        profile["configuration"] = copy.deepcopy(provider_configuration)
+        resource.write_text(json.dumps(profile), encoding="utf-8")
+    elif corruption == "unexpected_type":
+        profile["schema_version"] = True
+        resource.write_text(json.dumps(profile), encoding="utf-8")
+    else:
+        assert corruption == "missing_resource"
+    use_profile_resource(monkeypatch, resource)
+    absent_asset = tmp_path / "provider-work-must-not-start.wad"
+    manifest = write_manifest(
+        tmp_path,
+        gradoom_iwad=absent_asset,
+        gradoom_pwad=absent_asset,
+        reference_iwad=absent_asset,
+        reference_pwad=absent_asset,
+        reference_configuration=provider_configuration,
+    )
+    manifest_payload = json.loads(manifest.read_text(encoding="utf-8"))
+    manifest_payload["wad_profile"]["providers"][0]["configuration"] = copy.deepcopy(
+        provider_configuration
+    )
+    manifest.write_text(json.dumps(manifest_payload), encoding="utf-8")
+    report_path = tmp_path / "report.json"
+
+    returncode = evidence_main(["--manifest", str(manifest), "--output", str(report_path)])
+    captured = capsys.readouterr()
+
+    assert returncode == 0
+    assert captured.err == ""
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["status"] == "failed"
+    profile_report = report["wad_profile"]
+    assert profile_report["status"] == "failed"
+    assert profile_report["authority"]["failure_code"] == expected_context
+    assert profile_report["profile"] is None
+    assert profile_report["profile_identity"] is None
+    assert profile_report["binding_identity"] is None
+    assert profile_report["binding_sha256"] is None
+    assert profile_report["providers"] == []
+    assert [failure["code"] for failure in profile_report["failures"]] == [
+        "profile_authority_failure"
+    ]
+    assert not any(
+        failure["code"] in {"asset_unavailable", "asset_hash_mismatch"}
+        for failure in profile_report["failures"]
+    )
+    authority_reasons = [
+        reason
+        for reason in report["claim_reasons"]
+        if reason["code"] == "wad_profile_authority_failure"
+    ]
+    assert [reason["context"] for reason in authority_reasons] == [expected_context]
+    assert "Bundled certified WAD profile resource" in authority_reasons[0]["message"]
+    assert "Traceback" not in captured.err
 
 
 def test_report_output_cannot_overwrite_a_profile_asset(tmp_path: Path) -> None:
@@ -337,6 +511,16 @@ def test_exact_profile_match_binds_complete_profile_and_provider_assets_to_run_i
     profile = report["wad_profile"]
     assert profile["status"] == "matched"
     assert profile["failures"] == []
+    assert profile["authority"] == {
+        "status": "verified",
+        "failure_code": None,
+        "expected_canonical_sha256": (
+            "a3953ddfd4de7c8a99f51fed58dfbdc7002f6bf1c561ebbd25819aedf6e0cde7"
+        ),
+        "actual_canonical_sha256": (
+            "a3953ddfd4de7c8a99f51fed58dfbdc7002f6bf1c561ebbd25819aedf6e0cde7"
+        ),
+    }
     assert profile["profile"] == {
         "schema_version": 1,
         "profile_id": "freedoom2-deathmatch-v1",
