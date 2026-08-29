@@ -392,6 +392,89 @@ def test_gradoom_probe_inputs_are_allocated_on_the_requested_device() -> None:
     assert mask.dtype == torch.bool
 
 
+def synthetic_tensor_device_contract(
+    declared_device: str,
+    *,
+    tensor_device: str,
+    reward_device: str | None = None,
+) -> dict[str, object]:
+    def descriptor(
+        shape: list[int], dtype: str, *, device: str = tensor_device
+    ) -> dict[str, object]:
+        return {
+            "transport": "torch",
+            "shape": shape,
+            "dtype": dtype,
+            "device": device,
+        }
+
+    signals = {
+        name: descriptor([2], "float64")
+        for name in ("health", "killcount", "player_killcount", "episode_return")
+    }
+    return {
+        "tensor_device": {
+            "declared_device": declared_device,
+            "reset_mask_input": descriptor([2], "bool"),
+            "step_action_input": descriptor([2], "int64"),
+            "reset_outputs": {
+                "observation": descriptor([2, 4, 84, 84], "uint8"),
+                "signals": signals,
+            },
+            "step_outputs": {
+                "observation": descriptor([2, 4, 84, 84], "uint8"),
+                "reward": descriptor(
+                    [2],
+                    "float32",
+                    device=reward_device or tensor_device,
+                ),
+                "terminated": descriptor([2], "bool"),
+                "truncated": descriptor([2], "bool"),
+                "signals": signals,
+            },
+        }
+    }
+
+
+@pytest.mark.parametrize(
+    ("declared_device", "tensor_device"),
+    [("cuda", "cuda:0"), ("cuda", "cuda:3"), ("cuda:0", "cuda:0")],
+)
+def test_requested_cuda_device_accepts_one_consistent_concrete_index(
+    declared_device: str,
+    tensor_device: str,
+) -> None:
+    checks = invariant_suite._gradoom_device_checks(
+        synthetic_tensor_device_contract(declared_device, tensor_device=tensor_device)
+    )
+
+    assert all(check["status"] == "passed" for check in checks)
+
+
+def test_requested_cuda_device_rejects_an_explicit_index_mismatch() -> None:
+    checks = invariant_suite._gradoom_device_checks(
+        synthetic_tensor_device_contract("cuda:1", tensor_device="cuda:0")
+    )
+
+    assert all(check["status"] == "failed" for check in checks)
+
+
+def test_requested_cuda_shorthand_rejects_mixed_concrete_indices() -> None:
+    checks = invariant_suite._gradoom_device_checks(
+        synthetic_tensor_device_contract(
+            "cuda",
+            tensor_device="cuda:0",
+            reward_device="cuda:1",
+        )
+    )
+
+    assert {check["behavior"]: check["status"] for check in checks} == {
+        "gradoom.tensor_inputs": "passed",
+        "gradoom.tensor_outputs": "failed",
+        "gradoom.device": "failed",
+    }
+
+
 def test_semantic_probe_forwards_published_action_indices_without_reinterpretation() -> None:
     class ProgrammedPublicEnv:
         def __init__(self) -> None:

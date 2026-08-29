@@ -667,11 +667,25 @@ def _gradoom_device_checks(contract: dict[str, Any]) -> list[dict[str, str]]:
         and bool(declared)
     )
 
+    expected_device = declared
+    if structure and declared == "cuda":
+        input_devices = {
+            item.get("device")
+            for item in (value["reset_mask_input"], value["step_action_input"])
+            if isinstance(item, dict)
+        }
+        if len(input_devices) == 1:
+            concrete_device = next(iter(input_devices))
+            if isinstance(concrete_device, str) and re.fullmatch(
+                r"cuda:(0|[1-9]\d*)", concrete_device
+            ):
+                expected_device = concrete_device
+
     def torch_descriptor(item: object, *, shape: list[int], dtype: str) -> bool:
         return (
             _descriptor(item, shape=shape, dtype=dtype)
             and item["transport"] == "torch"
-            and item["device"] == declared
+            and item["device"] == expected_device
         )  # type: ignore[index]
 
     inputs = (
