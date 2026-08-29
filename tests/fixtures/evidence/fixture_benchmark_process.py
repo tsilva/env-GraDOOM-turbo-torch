@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import signal
 import time
 from pathlib import Path
 
@@ -64,6 +65,16 @@ def _mutate_bootstrap(path: Path | None) -> None:
 
 def main() -> int:
     args, _unknown = _parser().parse_known_args()
+
+    def stop_after_checkpoint(_signum: int, _frame: object) -> None:
+        if args.fixture_recovery_child_exited_marker is not None:
+            args.fixture_recovery_child_exited_marker.write_text(
+                "child-exited-after-forwarded-signal\n", encoding="utf-8"
+            )
+        raise SystemExit(130)
+
+    signal.signal(signal.SIGINT, stop_after_checkpoint)
+    signal.signal(signal.SIGTERM, stop_after_checkpoint)
     outcomes = json.loads(args.fixture_outcomes)
     if args.evaluate_checkpoint is None:
         if (

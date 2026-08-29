@@ -2329,6 +2329,8 @@ _CONTINUOUS_PROGRESS_FIELDS = {
     "episode_lengths",
     "lane_identity",
     "reward_shaper_state",
+    "precision_scaler_state",
+    "encoder_anchor_targets",
 }
 
 
@@ -2416,6 +2418,8 @@ def _checkpoint_restored_state(
         and lanes_complete
         and isinstance(training_state.get("reward_shaper_state"), Mapping)
         and training_state["reward_shaper_state"].get("format") == "gradoom-live-component-v1"
+        and isinstance(training_state.get("precision_scaler_state"), Mapping)
+        and isinstance(training_state.get("encoder_anchor_targets"), list)
     )
     return {
         "policy": "policy_state_dict" in checkpoint,
@@ -2423,6 +2427,55 @@ def _checkpoint_restored_state(
         "rng": rng_complete,
         "progress": progress_complete,
     }
+
+
+def _has_compatible_live_state(training_state: Mapping[str, Any], *, num_envs: int) -> bool:
+    environment_state = training_state.get("environment_state")
+    lane_fields = (
+        "observations",
+        "context",
+        "episode_starts",
+        "dones",
+        "episode_returns",
+        "episode_lengths",
+        "lane_identity",
+    )
+    return (
+        isinstance(environment_state, Mapping)
+        and environment_state.get("format") == "gradoom-live-snapshot-v1"
+        and environment_state.get("lane_count") == int(num_envs)
+        and all(
+            isinstance(training_state.get(field), torch.Tensor)
+            and training_state[field].ndim >= 1
+            and training_state[field].shape[0] == int(num_envs)
+            for field in lane_fields
+        )
+    )
+
+
+def _encoder_anchors_from_state(
+    policy: NatureActorCritic,
+    saved_targets: object,
+    *,
+    coefficient: float,
+) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
+    parameters = tuple(policy.observation_encoder.parameters())
+    if coefficient <= 0.0:
+        if saved_targets not in (None, []):
+            raise ValueError("checkpoint unexpectedly contains encoder-anchor targets")
+        return ()
+    if saved_targets is None:
+        return tuple((parameter, parameter.detach().clone()) for parameter in parameters)
+    if not isinstance(saved_targets, list) or len(saved_targets) != len(parameters):
+        raise ValueError("checkpoint encoder-anchor target inventory mismatch")
+    anchors = []
+    for index, (parameter, target) in enumerate(zip(parameters, saved_targets, strict=True)):
+        if not isinstance(target, torch.Tensor):
+            raise ValueError(f"checkpoint encoder-anchor target {index} is not a tensor")
+        if target.shape != parameter.shape or target.dtype != parameter.dtype:
+            raise ValueError(f"checkpoint encoder-anchor target {index} has a shape mismatch")
+        anchors.append((parameter, target.to(device=parameter.device).clone()))
+    return tuple(anchors)
 
 
 def _validate_evidence_recovery_checkpoint(
@@ -2991,16 +3044,25 @@ def _train(
                 learning_rate=float(args.learning_rate),
             )
             resume_payload = loaded
-        encoder_anchors = (
-            tuple(
-                (parameter, parameter.detach().clone())
-                for parameter in policy.observation_encoder.parameters()
-            )
-            if float(args.encoder_anchor_coef) > 0.0
-            else ()
-        )
         calls = PolicyCalls(policy, compile_policy=bool(args.compile_policy))
         precision = Precision(str(args.precision), device)
+        saved_training_state = (
+            resume_payload.get("training_state", {}) if resume_payload is not None else {}
+        )
+        if not isinstance(saved_training_state, Mapping):
+            raise ValueError("checkpoint training_state must be a mapping")
+        if resume_payload is not None:
+            scaler_state = saved_training_state.get("precision_scaler_state")
+            if not isinstance(scaler_state, Mapping):
+                raise ValueError("checkpoint precision scaler state is missing")
+            precision.scaler.load_state_dict(dict(scaler_state))
+        encoder_anchors = _encoder_anchors_from_state(
+            policy,
+            saved_training_state.get("encoder_anchor_targets")
+            if resume_payload is not None
+            else None,
+            coefficient=float(args.encoder_anchor_coef),
+        )
         buffer = RolloutBuffer(
             int(args.n_steps),
             int(args.num_envs),
@@ -3051,11 +3113,6 @@ def _train(
         )
         disabled_teacher_actions = torch.zeros(int(args.num_envs), dtype=torch.int64, device=device)
         disabled_teacher_valid = torch.zeros(int(args.num_envs), dtype=torch.bool, device=device)
-        saved_training_state = (
-            resume_payload.get("training_state", {}) if resume_payload is not None else {}
-        )
-        if not isinstance(saved_training_state, Mapping):
-            raise ValueError("checkpoint training_state must be a mapping")
         rolling_returns: deque[float] = deque(
             (float(value) for value in saved_training_state.get("rolling_returns", ())),
             maxlen=ROLLING_EPISODES,
@@ -3108,17 +3165,9 @@ def _train(
                     }
                 )
             environment_state = saved_training_state.get("environment_state")
-            live_state_available = isinstance(environment_state, Mapping) and all(
-                isinstance(saved_training_state.get(field), torch.Tensor)
-                for field in (
-                    "observations",
-                    "context",
-                    "episode_starts",
-                    "dones",
-                    "episode_returns",
-                    "episode_lengths",
-                    "lane_identity",
-                )
+            live_state_available = _has_compatible_live_state(
+                saved_training_state,
+                num_envs=int(args.num_envs),
             )
             if live_state_available:
                 lane_identity = saved_training_state["lane_identity"]
@@ -3205,6 +3254,10 @@ def _train(
                 "episode_returns": episode_returns.detach().cpu().clone(),
                 "episode_lengths": episode_lengths.detach().cpu().clone(),
                 "reward_shaper_state": _capture_live_component_state(reward_shaper),
+                "precision_scaler_state": precision.scaler.state_dict(),
+                "encoder_anchor_targets": [
+                    target.detach().cpu().clone() for _parameter, target in encoder_anchors
+                ],
             }
 
         while global_step < _execution_timesteps(args) and not interrupted:

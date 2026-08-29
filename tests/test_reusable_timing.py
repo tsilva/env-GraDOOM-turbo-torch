@@ -112,9 +112,13 @@ def _bootstrap_artifact(
     tmp_path: Path,
     *,
     payload: bytes | None = None,
+    compiler_target: dict[str, object] | None = None,
 ) -> tuple[Path, dict[str, object]]:
     immutable_input = tmp_path / "compiler-target.json"
-    immutable_input.write_text('{"target":"generic"}\n', encoding="utf-8")
+    immutable_input.write_text(
+        json.dumps(compiler_target or {"target": "generic"}, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
     immutable_input_sha256 = hashlib.sha256(immutable_input.read_bytes()).hexdigest()
     binding = {
         "contract": "gradoom-declarative-bootstrap-v1",
@@ -147,6 +151,30 @@ def _bootstrap_artifact(
         "persistent": True,
         "run_independent": True,
         "reused_unchanged": True,
+    }
+    attestation_payload = {
+        "schema_version": 1,
+        "authority": "gradoom-fixture-independent-anchor-v1",
+        "artifact_name": declaration["name"],
+        "artifact_sha256": declaration["sha256"],
+        "creation_elapsed_seconds": declaration["creation_elapsed_seconds"],
+        "creation_protocol": declaration["creation_protocol"],
+        "immutable_inputs": declaration["immutable_inputs"],
+        "reuse_conditions": declaration["reuse_conditions"],
+    }
+    declaration["eligibility_attestation"] = {
+        "payload": attestation_payload,
+        "public_key": base64.b64encode(
+            ANCHOR_PRIVATE_KEY.public_key().public_bytes(
+                serialization.Encoding.Raw,
+                serialization.PublicFormat.Raw,
+            )
+        ).decode(),
+        "signature": base64.b64encode(
+            ANCHOR_PRIVATE_KEY.sign(
+                json.dumps(attestation_payload, sort_keys=True, separators=(",", ":")).encode()
+            )
+        ).decode(),
     }
     return artifact, declaration
 
@@ -215,6 +243,23 @@ def test_public_command_rejects_forged_self_authored_bootstrap_receipt(tmp_path:
 
     assert result.returncode == 2
     assert "creation_receipt" in result.stderr
+
+
+def test_public_command_rejects_signed_seed_specific_bootstrap_input(tmp_path: Path) -> None:
+    _artifact, declaration = _bootstrap_artifact(
+        tmp_path, compiler_target={"target": "generic", "training_seed": 123}
+    )
+    manifest = _manifest(
+        tmp_path,
+        outcomes={"10": [30.0, 0.0]},
+        bootstrap_artifacts=[declaration],
+        declared_inputs=_bootstrap_declared_inputs(tmp_path),
+    )
+
+    result = _run_evidence("--manifest", str(manifest), "--output", str(tmp_path / "report.json"))
+
+    assert result.returncode == 2
+    assert "compiler-target input has unsupported fields" in result.stderr
 
 
 def test_public_command_accepts_only_disclosed_immutable_bootstrap_exclusion(
@@ -305,7 +350,7 @@ def test_reusable_timer_starts_before_recurring_manifest_and_identity_setup(
         ),
         (
             lambda artifact, declaration: declaration.update(sha256="0" * 64),
-            "SHA-256 mismatch",
+            "eligibility_attestation does not bind canonical claims",
         ),
         (
             lambda artifact, declaration: declaration.update(
@@ -473,11 +518,9 @@ def test_public_command_does_not_advertise_recovery_without_signed_elapsed_ancho
 
     result = _run_evidence("--manifest", str(manifest), "--output", str(output))
 
-    assert result.returncode == 0, result.stderr
-    attempt = json.loads(output.read_text(encoding="utf-8"))["attempts"][0]
-    assert attempt["status"] == "evidence_failed"
-    assert attempt["recovery"] is None
-    assert attempt["failures"][0]["phase"] == "recovery_trust"
+    assert result.returncode == 2
+    assert "elapsed_time_anchors are required" in result.stderr
+    assert not output.exists()
 
 
 def test_public_command_rejects_invalid_elapsed_anchor_signature(tmp_path: Path) -> None:
@@ -885,7 +928,7 @@ def test_public_command_rejects_tampered_accumulated_recovery_elapsed(
     )
 
     assert result.returncode == 2
-    assert "journal does not match" in result.stderr
+    assert "authority attestation" in result.stderr
 
 
 def test_public_command_rejects_consistently_rewritten_local_elapsed_evidence(
@@ -947,7 +990,7 @@ def test_public_command_rejects_consistently_rewritten_local_elapsed_evidence(
     )
 
     assert result.returncode == 2
-    assert "signed elapsed-time floor" in result.stderr
+    assert "attempt journal generation is invalid" in result.stderr
 
 
 def test_public_command_rejects_tampered_completed_unit_elapsed(
@@ -977,4 +1020,141 @@ def test_public_command_rejects_tampered_completed_unit_elapsed(
     )
 
     assert result.returncode == 2
-    assert "attempt journal does not match completed unit" in result.stderr
+    assert "authority attestation" in result.stderr
+
+
+def test_public_command_rejects_consistently_rewritten_completed_elapsed(
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest(tmp_path, outcomes={"10": [30.0, 0.0]})
+    completed = tmp_path / "completed.json"
+    initial = _run_evidence("--manifest", str(manifest), "--output", str(completed))
+    assert initial.returncode == 0, initial.stderr
+    report = json.loads(completed.read_text(encoding="utf-8"))
+    attempt = report["attempts"][0]
+    attempt["reusable_elapsed_seconds"] = 0.0
+    journal_path = Path(attempt["attempt_journal"]["path"])
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    journal["reusable_elapsed_seconds"] = 0.0
+    journal_path.write_text(
+        json.dumps(journal, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    journal_sha = hashlib.sha256(journal_path.read_bytes()).hexdigest()
+    attempt["attempt_journal"]["sha256"] = journal_sha
+    artifact_name = next(
+        item["name"] for item in report["generated_artifacts"] if item["path"] == str(journal_path)
+    )
+    next(item for item in report["evidence_index"]["entries"] if item["name"] == artifact_name)[
+        "sha256"
+    ] = journal_sha
+    report["evidence_index"]["sha256"] = _canonical_sha256(
+        report["evidence_index"]["entries"], document="forged completed index"
+    )
+    forged = tmp_path / "forged-completed.json"
+    forged.write_text(json.dumps(report), encoding="utf-8")
+
+    result = _run_evidence(
+        "--manifest",
+        str(manifest),
+        "--output",
+        str(tmp_path / "continued.json"),
+        "--merge",
+        str(forged),
+    )
+
+    assert result.returncode == 2
+    assert "authority attestation" in result.stderr
+
+
+def test_public_command_rejects_stale_interrupted_report_after_terminal_generation(
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "resume-failed"
+    manifest = _manifest(
+        tmp_path,
+        outcomes={"10": [30.0, 0.0]},
+        extra_arguments=[
+            "--fixture-interrupt-once-at-step",
+            "10",
+            "--fixture-fail-after-resume-once-marker",
+            str(marker),
+        ],
+    )
+    interrupted = tmp_path / "interrupted.json"
+    first = _run_evidence("--manifest", str(manifest), "--output", str(interrupted))
+    assert first.returncode == 0, first.stderr
+    terminal = tmp_path / "terminal.json"
+    second = _run_evidence(
+        "--manifest", str(manifest), "--output", str(terminal), "--merge", str(interrupted)
+    )
+    assert second.returncode == 0, second.stderr
+    assert json.loads(terminal.read_text(encoding="utf-8"))["attempts"][0]["status"] == "crashed"
+
+    replay = _run_evidence(
+        "--manifest",
+        str(manifest),
+        "--output",
+        str(tmp_path / "replayed.json"),
+        "--merge",
+        str(interrupted),
+    )
+
+    assert replay.returncode == 2
+    assert "stale attempt journal generation" in replay.stderr
+
+
+def test_trainer_relative_executable_is_resolved_from_manifest_directory(
+    tmp_path: Path,
+) -> None:
+    trainer = tmp_path / "trainer.py"
+    shutil.copyfile(FIXTURE_PROCESS, trainer)
+    launcher = tmp_path / "trainer"
+    launcher.symlink_to(Path(sys.executable))
+    manifest = _manifest(
+        tmp_path,
+        outcomes={"10": [30.0, 0.0]},
+        trainer_script=Path("trainer.py"),
+        trainer_command=["./trainer", "trainer.py"],
+        trainer_code_root=tmp_path,
+    )
+
+    result = _run_evidence("--manifest", str(manifest), "--output", str(tmp_path / "report.json"))
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_public_command_binds_from_package_import_submodule(tmp_path: Path) -> None:
+    code_root = tmp_path / "code"
+    package = code_root / "pkg"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    worker = package / "worker.py"
+    shutil.copyfile(FIXTURE_PROCESS, worker)
+    launcher = code_root / "launcher.py"
+    launcher.write_text(
+        "from pkg import worker\nraise SystemExit(worker.main())\n", encoding="utf-8"
+    )
+    manifest = _manifest(
+        tmp_path,
+        outcomes={"10": [30.0, 0.0]},
+        trainer_script=launcher,
+        trainer_code_root=code_root,
+        extra_arguments=["--fixture-interrupt-once-at-step", "10"],
+    )
+    interrupted = tmp_path / "interrupted.json"
+    first = _run_evidence("--manifest", str(manifest), "--output", str(interrupted))
+    assert first.returncode == 0, first.stderr
+    worker.write_text(worker.read_text(encoding="utf-8") + "\n# changed\n", encoding="utf-8")
+
+    result = _run_evidence(
+        "--manifest",
+        str(manifest),
+        "--output",
+        str(tmp_path / "continued.json"),
+        "--merge",
+        str(interrupted),
+    )
+
+    assert result.returncode == 2
+    assert "unlike run identity" in result.stderr
