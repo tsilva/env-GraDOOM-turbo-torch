@@ -112,15 +112,21 @@ def _load_matching_benchmark(
     if not isinstance(declared_inputs, list) or not isinstance(protocol, dict):
         raise EvidenceError("matching benchmark report identity-bearing fields are missing")
     normalized_inputs: list[dict[str, Any]] = []
+    input_names: set[str] = set()
     for index, item in enumerate(declared_inputs):
         if not isinstance(item, dict):
             raise EvidenceError(f"matching benchmark report declared_inputs[{index}] is invalid")
         name = item.get("name")
         digest = item.get("sha256")
-        if not isinstance(name, str):
+        if not isinstance(name, str) or not name:
             raise EvidenceError(
                 f"matching benchmark report declared_inputs[{index}].name is invalid"
             )
+        if name in input_names:
+            raise EvidenceError(
+                f"matching benchmark report declared_inputs[{index}].name {name!r} is duplicated"
+            )
+        input_names.add(name)
         _validate_sha256(
             digest,
             f"matching benchmark report declared_inputs[{index}].sha256",
@@ -551,6 +557,124 @@ def _reconcile_generated_artifacts(
     return artifacts
 
 
+def _declared_input_set_failure(
+    *,
+    benchmark_inputs: list[dict[str, Any]],
+    diagnostic_inputs: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    expected = {item["name"]: item["sha256"] for item in benchmark_inputs}
+    actual = {item["name"]: item["sha256"] for item in diagnostic_inputs}
+    if actual == expected:
+        return None
+    shared_names = expected.keys() & actual.keys()
+    return {
+        "phase": "matching_benchmark_evidence",
+        "message": "diagnostic and benchmark declared input name and SHA-256 sets do not match",
+        "missing_names": sorted(expected.keys() - actual.keys()),
+        "unexpected_names": sorted(actual.keys() - expected.keys()),
+        "changed_digests": [
+            {
+                "name": name,
+                "benchmark_sha256": expected[name],
+                "diagnostic_sha256": actual[name],
+            }
+            for name in sorted(shared_names)
+            if expected[name] != actual[name]
+        ],
+        "benchmark_inputs": [
+            {"name": name, "sha256": digest} for name, digest in sorted(expected.items())
+        ],
+        "diagnostic_inputs": [
+            {"name": name, "sha256": digest} for name, digest in sorted(actual.items())
+        ],
+    }
+
+
+def _assemble_diagnostic_report(
+    *,
+    manifest: dict[str, Any],
+    validated: dict[str, Any],
+    benchmark: dict[str, Any],
+    benchmark_path: Path,
+    benchmark_sha256: str,
+    declared_inputs: list[dict[str, Any]],
+    protocol: dict[str, Any],
+    run_identity: str,
+    wad_profile: dict[str, Any] | None,
+    attempts: list[dict[str, Any]],
+    generated_artifacts: list[dict[str, Any]],
+    evidence_entries: list[dict[str, str]],
+    matching_failures: list[dict[str, Any]],
+) -> dict[str, Any]:
+    failures = [
+        *matching_failures,
+        *(failure for attempt in attempts for failure in attempt["failures"]),
+    ]
+    matched = not matching_failures
+    completed = matched and all(attempt["status"] == "completed" for attempt in attempts)
+    benchmark_claim_eligible = benchmark.get("claim_eligible") is True
+    return {
+        "schema_version": 1,
+        "workflow": _WORKFLOW,
+        "evidence_level": manifest["evidence_level"],
+        "fixture": manifest["fixture"],
+        "authoritative": False,
+        "status": "completed" if completed else "failed",
+        "claim_eligible": False,
+        "claim_reasons": [
+            {
+                "code": "diagnostic_evidence",
+                "message": "Fixed-time evidence is diagnostic and cannot alter benchmark passage.",
+            }
+        ],
+        "run_identity": run_identity,
+        "code_provenance": validated["code_provenance"],
+        "declared_inputs": [
+            *declared_inputs,
+            {
+                "name": "matching-benchmark-report",
+                "path": str(benchmark_path),
+                "sha256": benchmark_sha256,
+            },
+        ],
+        "diagnostic_protocol": protocol,
+        "wad_profile": wad_profile,
+        "diagnostics": {
+            "fixed_time": {
+                "status": "completed" if completed else "failed",
+                "affects_passage": False,
+                "matching_benchmark": {
+                    "matched": matched,
+                    "path": str(benchmark_path),
+                    "sha256": benchmark_sha256,
+                    "run_identity": benchmark["run_identity"],
+                    "passage": {"status": benchmark.get("status"), "unchanged": True},
+                    "failures": matching_failures,
+                },
+                "attempts": attempts,
+                "failures": failures,
+            }
+        },
+        "failures": failures,
+        "public_performance_evidence": {
+            "complete": completed and benchmark_claim_eligible and not manifest["fixture"],
+            "reason": (
+                "complete"
+                if completed and benchmark_claim_eligible and not manifest["fixture"]
+                else "matching_fixed_time_diagnostic_failed"
+                if not completed
+                else "matching_benchmark_is_not_claim_eligible"
+            ),
+        },
+        "generated_artifacts": generated_artifacts,
+        "evidence_index": {
+            "algorithm": "sha256",
+            "entries": evidence_entries,
+            "sha256": _canonical_sha256(evidence_entries, document="report"),
+        },
+    }
+
+
 def build_fixed_time_diagnostic_report(manifest_path: Path) -> dict[str, Any]:
     manifest, manifest_payload = _load_manifest(manifest_path)
     validated, benchmark, benchmark_path, benchmark_sha256 = _validate_diagnostic(
@@ -630,6 +754,27 @@ def build_fixed_time_diagnostic_report(manifest_path: Path) -> dict[str, Any]:
         "diagnostic_protocol": protocol,
     }
     run_identity = _canonical_sha256(identity_payload, document="manifest")
+    declared_input_failure = _declared_input_set_failure(
+        benchmark_inputs=benchmark["declared_inputs"],
+        diagnostic_inputs=declared_inputs,
+    )
+    if declared_input_failure is not None:
+        _validate_unique_evidence_entries(evidence_entries)
+        return _assemble_diagnostic_report(
+            manifest=manifest,
+            validated=validated,
+            benchmark=benchmark,
+            benchmark_path=benchmark_path,
+            benchmark_sha256=benchmark_sha256,
+            declared_inputs=declared_inputs,
+            protocol=protocol,
+            run_identity=run_identity,
+            wad_profile=wad_profile,
+            attempts=[],
+            generated_artifacts=[],
+            evidence_entries=evidence_entries,
+            matching_failures=[declared_input_failure],
+        )
     artifacts_root = _resolve_evidence_path(
         Path(validated["artifacts_directory"]),
         base_directory=manifest_path.parent,
@@ -662,64 +807,18 @@ def build_fixed_time_diagnostic_report(manifest_path: Path) -> dict[str, Any]:
         specs=generated_specs,
         evidence_entries=evidence_entries,
     )
-    failures = [failure for attempt in attempts for failure in attempt["failures"]]
-    completed = all(attempt["status"] == "completed" for attempt in attempts)
-    benchmark_claim_eligible = benchmark.get("claim_eligible") is True
-    return {
-        "schema_version": 1,
-        "workflow": _WORKFLOW,
-        "evidence_level": manifest["evidence_level"],
-        "fixture": manifest["fixture"],
-        "authoritative": False,
-        "status": "completed" if completed else "failed",
-        "claim_eligible": False,
-        "claim_reasons": [
-            {
-                "code": "diagnostic_evidence",
-                "message": "Fixed-time evidence is diagnostic and cannot alter benchmark passage.",
-            }
-        ],
-        "run_identity": run_identity,
-        "code_provenance": validated["code_provenance"],
-        "declared_inputs": [
-            *declared_inputs,
-            {
-                "name": "matching-benchmark-report",
-                "path": str(benchmark_path),
-                "sha256": benchmark_sha256,
-            },
-        ],
-        "diagnostic_protocol": protocol,
-        "wad_profile": wad_profile,
-        "diagnostics": {
-            "fixed_time": {
-                "status": "completed" if completed else "failed",
-                "affects_passage": False,
-                "matching_benchmark": {
-                    "matched": True,
-                    "path": str(benchmark_path),
-                    "sha256": benchmark_sha256,
-                    "run_identity": benchmark["run_identity"],
-                    "passage": {"status": benchmark.get("status"), "unchanged": True},
-                },
-                "attempts": attempts,
-            }
-        },
-        "failures": failures,
-        "public_performance_evidence": {
-            "complete": completed and benchmark_claim_eligible and not manifest["fixture"],
-            "reason": (
-                "complete"
-                if completed and benchmark_claim_eligible and not manifest["fixture"]
-                else "matching_fixed_time_diagnostic_failed"
-                if not completed
-                else "matching_benchmark_is_not_claim_eligible"
-            ),
-        },
-        "generated_artifacts": generated_artifacts,
-        "evidence_index": {
-            "algorithm": "sha256",
-            "entries": evidence_entries,
-            "sha256": _canonical_sha256(evidence_entries, document="report"),
-        },
-    }
+    return _assemble_diagnostic_report(
+        manifest=manifest,
+        validated=validated,
+        benchmark=benchmark,
+        benchmark_path=benchmark_path,
+        benchmark_sha256=benchmark_sha256,
+        declared_inputs=declared_inputs,
+        protocol=protocol,
+        run_identity=run_identity,
+        wad_profile=wad_profile,
+        attempts=attempts,
+        generated_artifacts=generated_artifacts,
+        evidence_entries=evidence_entries,
+        matching_failures=[],
+    )

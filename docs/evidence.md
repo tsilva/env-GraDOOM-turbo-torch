@@ -114,7 +114,12 @@ manifest uses the common envelope fields and a `diagnostic` object containing:
 
 Before starting training, the command verifies the matched report's digest, evidence index, run
 identity, evidence level, fixture status, code provenance, recipe, training seeds, evaluation seeds,
-action seed, and WAD-profile binding. Any mismatch fails before creating diagnostic artifacts. The
+action seed, WAD-profile binding, and the complete order-insensitive set of declared input names and
+SHA-256 digests. The diagnostic manifest itself and its matched-benchmark report are envelope
+documents rather than declared workload inputs, so those two diagnostic-owned evidence entries are
+the only exclusions from the declared-input set comparison; recipe, WAD, seed, command, and timing
+identity remain independently bound. A declared-input mismatch produces a retained failed diagnostic
+with `matching_benchmark.matched: false` before creating diagnostic artifacts. The
 trainer starts every diagnostic seed from fresh policy and optimizer state and receives the outer
 absolute monotonic deadline. It starts no rollout after that deadline; a deadline consumed by
 startup therefore produces zero training transitions, while an in-flight rollout may finish before
