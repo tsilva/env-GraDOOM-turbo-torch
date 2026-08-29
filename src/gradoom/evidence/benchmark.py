@@ -78,13 +78,21 @@ def _attempt_journal_payload(
     generation: int | None = None,
     previous_journal_sha256: str | None = None,
 ) -> dict[str, Any]:
+    recovery = attempt.get("recovery")
+    normalized_recovery = recovery
+    if isinstance(recovery, dict):
+        normalized_recovery = {
+            **recovery,
+            "accumulated_reusable_elapsed_seconds": None,
+        }
     payload = {
         "schema_version": 1,
         "run_identity": run_identity,
         "attempt_identity": attempt.get("attempt_identity"),
         "seed": attempt.get("seed"),
         "status": attempt.get("status"),
-        "reusable_elapsed_seconds": attempt.get("reusable_elapsed_seconds"),
+        # Final elapsed is issued by the external authority only after this payload is durable.
+        "reusable_elapsed_seconds": None,
         "cold_start": attempt.get("cold_start"),
         "checkpoint": attempt.get("checkpoint"),
         "checkpoint_sha256": attempt.get("checkpoint_sha256"),
@@ -98,7 +106,7 @@ def _attempt_journal_payload(
         ),
         "recovery_sha256": _canonical_sha256(
             {
-                "recovery": attempt.get("recovery"),
+                "recovery": normalized_recovery,
                 "recovery_history": attempt.get("recovery_history"),
                 "recovery_journal": attempt.get("recovery_journal"),
             },
@@ -182,20 +190,53 @@ def _validated_python_tree(path: Path) -> ast.AST:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     except (OSError, SyntaxError, UnicodeError) as error:
         raise EvidenceError(f"benchmark trainer Python source is unreadable: {path}") from error
-    forbidden_imports = {"importlib", "runpy", "subprocess"}
+    forbidden_imports = {"ctypes", "importlib", "multiprocessing", "runpy", "subprocess"}
     forbidden_builtins = {"__import__", "eval", "exec", "compile"}
-    forbidden_attributes = {"system", "popen"}
+    forbidden_attributes = {
+        "system",
+        "popen",
+        "execl",
+        "execle",
+        "execlp",
+        "execlpe",
+        "execv",
+        "execve",
+        "execvp",
+        "execvpe",
+        "posix_spawn",
+        "posix_spawnp",
+        "spawnl",
+        "spawnle",
+        "spawnlp",
+        "spawnlpe",
+        "spawnv",
+        "spawnve",
+        "spawnvp",
+        "spawnvpe",
+    }
     for node in ast.walk(tree):
         if isinstance(node, ast.Import) and any(
-            alias.name in forbidden_imports for alias in node.names
+            alias.name.split(".", 1)[0] in forbidden_imports for alias in node.names
         ):
             raise EvidenceError("shell, -c, eval, and opaque trainer indirection are forbidden")
-        if isinstance(node, ast.ImportFrom) and (node.module or "") in forbidden_imports:
-            raise EvidenceError("shell, -c, eval, and opaque trainer indirection are forbidden")
+        if isinstance(node, ast.ImportFrom):
+            root_module = (node.module or "").split(".", 1)[0]
+            if root_module in forbidden_imports or any(
+                alias.name in forbidden_attributes for alias in node.names
+            ):
+                raise EvidenceError("shell, -c, eval, and opaque trainer indirection are forbidden")
         if isinstance(node, ast.Call):
             forbidden_call = (
                 isinstance(node.func, ast.Name) and node.func.id in forbidden_builtins
             ) or (isinstance(node.func, ast.Attribute) and node.func.attr in forbidden_attributes)
+            if (
+                isinstance(node.func, ast.Name)
+                and node.func.id == "getattr"
+                and len(node.args) >= 2
+                and isinstance(node.args[1], ast.Constant)
+                and node.args[1].value in forbidden_attributes
+            ):
+                forbidden_call = True
             if forbidden_call:
                 raise EvidenceError("shell, -c, eval, and opaque trainer indirection are forbidden")
     return tree
@@ -239,6 +280,13 @@ def _python_source_closure(script_path: Path, code_root: Path) -> list[Path]:
             if resolved is None:
                 continue
             pending.append(resolved)
+            relative = resolved.relative_to(code_root)
+            for parent in relative.parents:
+                if parent == Path("."):
+                    continue
+                initializer = code_root / parent / "__init__.py"
+                if initializer.is_file():
+                    pending.append(initializer)
         for module, member in imported_members:
             parts = [*module.split("."), *member.split(".")]
             candidates = (
@@ -251,6 +299,13 @@ def _python_source_closure(script_path: Path, code_root: Path) -> list[Path]:
             resolved = next((candidate for candidate in candidates if candidate.is_file()), None)
             if resolved is not None:
                 pending.append(resolved)
+                relative = resolved.relative_to(code_root)
+                for parent in relative.parents:
+                    if parent == Path("."):
+                        continue
+                    initializer = code_root / parent / "__init__.py"
+                    if initializer.is_file():
+                        pending.append(initializer)
         for level, module in relative_modules:
             base = path.parent
             for _ in range(level - 1):
@@ -264,6 +319,13 @@ def _python_source_closure(script_path: Path, code_root: Path) -> list[Path]:
             if resolved is None:
                 continue
             pending.append(resolved)
+            relative = resolved.relative_to(code_root)
+            for parent in relative.parents:
+                if parent == Path("."):
+                    continue
+                initializer = code_root / parent / "__init__.py"
+                if initializer.is_file():
+                    pending.append(initializer)
     return sorted(closure)
 
 
@@ -495,9 +557,20 @@ def _sign_generation_attestation(
     payload: dict[str, Any],
     *,
     anchor: dict[str, Any],
+    prior_elapsed: float,
+    minimum_elapsed: float,
+    started: float,
+    clock: Callable[[], float],
 ) -> dict[str, Any]:
     authority = anchor["payload"]["authority"]
     if authority == _FIXTURE_ELAPSED_ANCHOR_AUTHORITY:
+        payload = {
+            **payload,
+            "reusable_elapsed_seconds": max(
+                minimum_elapsed,
+                prior_elapsed + max(0.0, clock() - started),
+            ),
+        }
         private_key = Ed25519PrivateKey.from_private_bytes(b"\x19" * 32)
         signature = private_key.sign(_attestation_bytes(payload))
     else:
@@ -507,16 +580,38 @@ def _sign_generation_attestation(
                 "formal benchmark outcomes require GRADOOM_EVIDENCE_AUTHORITY to obtain "
                 "an externally maintained signed journal head"
             )
+        request = {
+            **payload,
+            "prior_reusable_elapsed_seconds": prior_elapsed,
+            "minimum_reusable_elapsed_seconds": minimum_elapsed,
+        }
         result = subprocess.run(
             [*shlex.split(raw_command), "sign-journal-head"],
-            input=json.dumps(payload, sort_keys=True, separators=(",", ":")),
+            input=json.dumps(request, sort_keys=True, separators=(",", ":")),
             capture_output=True,
             text=True,
             check=False,
         )
         if result.returncode != 0:
             raise EvidenceError("external evidence authority refused the journal generation")
-        signature = _decode_base64(result.stdout.strip(), "authority signature", length=64)
+        try:
+            attestation = _parse_json_document(
+                result.stdout.encode(), document="external authority journal seal"
+            )
+        except EvidenceError as error:
+            raise EvidenceError("external authority returned an invalid journal seal") from error
+        if not isinstance(attestation, dict):
+            raise EvidenceError("external authority returned an invalid journal seal")
+        sealed_payload = attestation.get("payload")
+        if not isinstance(sealed_payload, dict) or any(
+            sealed_payload.get(key) != value for key, value in payload.items()
+        ):
+            raise EvidenceError("external authority journal seal changed the requested head")
+        elapsed = sealed_payload.get("reusable_elapsed_seconds")
+        if type(elapsed) not in (int, float) or float(elapsed) < minimum_elapsed:
+            raise EvidenceError("external authority journal seal has an invalid elapsed time")
+        payload = sealed_payload
+        signature = _decode_base64(attestation.get("signature"), "authority signature", length=64)
     attestation = {
         "payload": payload,
         "signature": base64.b64encode(signature).decode(),
@@ -529,6 +624,7 @@ def _journal_attestation_payload(
     journal_payload: dict[str, Any],
     *,
     anchor: dict[str, Any],
+    journal_sha256: str,
 ) -> dict[str, Any]:
     return {
         "schema_version": 1,
@@ -537,11 +633,8 @@ def _journal_attestation_payload(
         "started_unix_ns": anchor["payload"]["started_unix_ns"],
         "generation": journal_payload["generation"],
         "previous_journal_sha256": journal_payload["previous_journal_sha256"],
-        "journal_payload_sha256": _canonical_sha256(
-            journal_payload, document="unsigned benchmark attempt journal"
-        ),
+        "journal_sha256": journal_sha256,
         "status": journal_payload["status"],
-        "reusable_elapsed_seconds": journal_payload["reusable_elapsed_seconds"],
     }
 
 
@@ -661,7 +754,41 @@ def _validate_bootstrap_artifacts(value: object, *, fixture: bool) -> list[dict[
             "creation_protocol": creation_protocol,
             "immutable_inputs": normalized_inputs,
             "reuse_conditions": reuse_conditions,
+            "artifact_identity": attestation.get("payload", {}).get("artifact_identity")
+            if isinstance(attestation.get("payload"), dict)
+            else None,
+            "creation_event": attestation.get("payload", {}).get("creation_event")
+            if isinstance(attestation.get("payload"), dict)
+            else None,
+            "prior_reuse_event": attestation.get("payload", {}).get("prior_reuse_event")
+            if isinstance(attestation.get("payload"), dict)
+            else None,
         }
+        artifact_identity = expected_attestation_payload["artifact_identity"]
+        creation_event = expected_attestation_payload["creation_event"]
+        prior_reuse_event = expected_attestation_payload["prior_reuse_event"]
+        if not isinstance(artifact_identity, dict) or set(artifact_identity) != {
+            "resolved_path",
+            "device",
+            "inode",
+        }:
+            raise EvidenceError(f"{field}.eligibility_attestation has no artifact object identity")
+        if not isinstance(creation_event, dict) or creation_event.get("artifact_sha256") != sha256:
+            raise EvidenceError(f"{field}.eligibility_attestation has no valid creation event")
+        if not isinstance(prior_reuse_event, dict):
+            raise EvidenceError(
+                f"{field}.eligibility_attestation has no prior unchanged reuse event"
+            )
+        if (
+            prior_reuse_event.get("artifact_sha256") != sha256
+            or prior_reuse_event.get("artifact_identity") != artifact_identity
+            or not isinstance(prior_reuse_event.get("event_id"), str)
+            or not prior_reuse_event["event_id"]
+            or prior_reuse_event.get("event_id") == creation_event.get("event_id")
+        ):
+            raise EvidenceError(
+                f"{field}.eligibility_attestation prior unchanged reuse event is invalid"
+            )
         if (
             attestation.get("payload") != expected_attestation_payload
             or attestation.get("public_key") != expected_public_key
@@ -730,6 +857,39 @@ def _validate_bootstrap_files(
             )
         if metadata.st_nlink != 1 or metadata.st_mode & 0o222:
             raise EvidenceError(f"bootstrap artifact {declaration['name']!r} is mutable")
+        attestation = declaration["eligibility_attestation"]
+        signed_identity = attestation["payload"]["artifact_identity"]
+        actual_identity = {
+            "resolved_path": str(path),
+            "device": metadata.st_dev,
+            "inode": metadata.st_ino,
+        }
+        if signed_identity != actual_identity:
+            raise EvidenceError(
+                f"bootstrap artifact {declaration['name']!r} does not match its externally "
+                "attested artifact object identity"
+            )
+        if attestation["payload"]["prior_reuse_event"]["artifact_identity"] != actual_identity:
+            raise EvidenceError(
+                f"bootstrap artifact {declaration['name']!r} has no prior unchanged reuse of "
+                "this artifact object"
+            )
+        if attestation["payload"]["authority"] != _FIXTURE_ELAPSED_ANCHOR_AUTHORITY:
+            raw_command = os.environ.get("GRADOOM_EVIDENCE_AUTHORITY")
+            if not raw_command:
+                raise EvidenceError(
+                    "formal bootstrap exclusion requires GRADOOM_EVIDENCE_AUTHORITY to verify "
+                    "external creation and prior-reuse ledger state"
+                )
+            authority_result = subprocess.run(
+                [*shlex.split(raw_command), "verify-bootstrap-reuse"],
+                input=json.dumps(attestation, sort_keys=True, separators=(",", ":")),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if authority_result.returncode != 0 or authority_result.stdout.strip() != "reused":
+                raise EvidenceError("external authority rejected bootstrap reuse history")
         actual_sha256 = _sha256_bytes(payload)
         if actual_sha256 != declaration["sha256"]:
             raise EvidenceError(
@@ -969,7 +1129,6 @@ def _load_benchmark_continuation(
                 != previous_sha256
             ):
                 raise EvidenceError("attempt journal generation continuity is broken")
-        attestation = stored_attempt.pop("authority_attestation", None)
         expected_stored = _attempt_journal_payload(
             attempt,
             run_identity=run_identity,
@@ -986,10 +1145,17 @@ def _load_benchmark_continuation(
         )
         if anchor is None:
             raise EvidenceError("benchmark attempt outcome has no external time authority")
+        attestation = attempt_journal.get("authority_attestation")
+        attestation_payload = _journal_attestation_payload(
+            expected_stored,
+            anchor=anchor,
+            journal_sha256=_sha256_bytes(attempt_journal_bytes),
+        )
+        attestation_payload["reusable_elapsed_seconds"] = attempt.get("reusable_elapsed_seconds")
         _verify_generation_attestation(
             attestation,
             anchor=anchor,
-            expected_payload=_journal_attestation_payload(expected_stored, anchor=anchor),
+            expected_payload=attestation_payload,
         )
         if stored_attempt != expected_stored or attempt_journal.get("sha256") != _sha256_bytes(
             attempt_journal_bytes
@@ -1023,6 +1189,17 @@ def _load_benchmark_continuation(
                 )
             except OSError as error:
                 raise EvidenceError("recovery journal is missing") from error
+            recovery_journal_elapsed = (
+                journal_payload.get("accumulated_reusable_elapsed_seconds")
+                if isinstance(journal_payload, dict)
+                else None
+            )
+            if (
+                type(recovery_journal_elapsed) not in (int, float)
+                or float(recovery_journal_elapsed) < 0.0
+                or float(recovery_journal_elapsed) > float(attempt["reusable_elapsed_seconds"])
+            ):
+                raise EvidenceError("recovery journal has invalid pre-terminal elapsed time")
             expected_journal = {
                 "schema_version": 1,
                 "run_identity": run_identity,
@@ -1032,7 +1209,7 @@ def _load_benchmark_continuation(
                 "checkpoint_sha256": recovery["checkpoint_sha256"],
                 "progress_step": recovery["progress_step"],
                 "restorable_state": _RESTORABLE_STATE,
-                "accumulated_reusable_elapsed_seconds": attempt["reusable_elapsed_seconds"],
+                "accumulated_reusable_elapsed_seconds": recovery_journal_elapsed,
             }
             if journal_payload != expected_journal or journal.get("sha256") != _sha256_bytes(
                 journal_path.read_bytes()
@@ -2089,10 +2266,6 @@ def _run_attempt(
     )
     if elapsed_time_anchor is None:
         raise EvidenceError("benchmark attempt outcome has no external time authority")
-    attempt_journal_payload["authority_attestation"] = _sign_generation_attestation(
-        _journal_attestation_payload(attempt_journal_payload, anchor=elapsed_time_anchor),
-        anchor=elapsed_time_anchor,
-    )
     _write_durable_json(
         attempt_journal_path,
         attempt_journal_payload,
@@ -2102,12 +2275,29 @@ def _run_attempt(
         attempt_journal_path,
         field="benchmark attempt journal",
     )
+    authority_attestation = _sign_generation_attestation(
+        _journal_attestation_payload(
+            attempt_journal_payload,
+            anchor=elapsed_time_anchor,
+            journal_sha256=attempt_journal_sha256,
+        ),
+        anchor=elapsed_time_anchor,
+        prior_elapsed=prior_elapsed,
+        minimum_elapsed=elapsed,
+        started=started,
+        clock=clock,
+    )
+    elapsed = float(authority_attestation["payload"]["reusable_elapsed_seconds"])
+    attempt["reusable_elapsed_seconds"] = elapsed
+    if recovery is not None:
+        recovery["accumulated_reusable_elapsed_seconds"] = elapsed
     attempt_journal_name = f"seed-{seed}-attempt-state-{attempt_journal_generation}"
     evidence_entries.append({"name": attempt_journal_name, "sha256": attempt_journal_sha256})
     generated_artifacts.append({"name": attempt_journal_name, "path": str(attempt_journal_path)})
     attempt["attempt_journal"] = {
         "path": str(attempt_journal_path),
         "sha256": attempt_journal_sha256,
+        "authority_attestation": authority_attestation,
     }
     return attempt
 
@@ -2332,7 +2522,7 @@ def build_development_benchmark_report(
     }
     attempts = []
     actual_generated_artifacts: list[dict[str, str]] = []
-    setup_time_assigned = False
+    recurring_setup_elapsed = max(0.0, clock() - invocation_started)
     anchors_by_seed = {
         anchor["payload"]["seed"]: anchor for anchor in validated["elapsed_time_anchors"]
     }
@@ -2349,11 +2539,9 @@ def build_development_benchmark_report(
             wad_profile=wad_profile,
             elapsed_time_anchor=anchors_by_seed.get(seed),
             existing_attempt=existing_attempt,
-            started=(invocation_started if active_attempt and not setup_time_assigned else None),
+            started=(clock() - recurring_setup_elapsed if active_attempt else None),
             clock=clock,
         )
-        if active_attempt:
-            setup_time_assigned = True
         actual_generated_artifacts.extend(attempt.pop("generated_artifacts", []))
         attempts.append(attempt)
     _reverify_bootstrap_files(bootstrap_exclusions)
