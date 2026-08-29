@@ -55,7 +55,10 @@ contains:
   a persistent read-only regular file outside the benchmark artifact directory, its SHA-256,
   creation elapsed seconds, and exact canonical reuse conditions. Eligibility is not established by
   those operator-authored fields: a pinned external authority must sign the artifact hash, creation
-  cost, canonical protocol, constrained `compiler-target` input, and reuse conditions. Eligible
+  cost, canonical protocol, constrained `compiler-target` input, reuse conditions, persistent
+  object identity, creation event, and a distinct prior unchanged-reuse event. Formal validation
+  queries the authority's private ledger; first creation, deletion/recreation, copied paths, and
+  replayed signatures are ineligible. Eligible
   bytes use only the `gradoom-declarative-bootstrap-v1` canonical JSON contract. Compiler-target
   inputs reject seed, candidate, policy, optimizer, rollout, and learned state, and opaque outputs
   remain ineligible. Files are verified before and after the cohort.
@@ -64,7 +67,12 @@ contains:
   anchors are pinned to the public fixture key and real anchors are pinned to the
   `gradoom-reusable-time-authority-v1` package key; caller-selected keys and authorities are
   rejected. Every terminal or interrupted attempt generation receives a second authority signature
-  over its status, cumulative elapsed time, generation, predecessor hash, and journal payload hash.
+  over its status, cumulative elapsed time, generation, predecessor hash, and durable journal hash.
+  The command first writes and fsyncs an elapsed-neutral terminal journal, then asks the authority to
+  issue the final elapsed seal. Thus journal persistence and signing are timed without requiring a
+  journal to contain its own eventual digest. The authority seal is the terminal boundary; the
+  report's local copy of that externally retained seal is transport rather than a new benchmark
+  operation.
   For formal evidence, `GRADOOM_EVIDENCE_AUTHORITY` identifies the independently controlled signer;
   it enforces wall-clock floors and an external monotonic latest-head ledger, and continuation asks
   it to reject rollback. Signing private keys and ledger state never enter the manifest, report, or
@@ -78,6 +86,8 @@ contains:
 
 The command starts the reusable timer before argument parsing, manifest and configuration
 validation, identity and input hashing, artifact setup, and continuation or recovery verification.
+That recurring command-setup duration is included independently in every active seed's elapsed
+outcome; it is retained once as cohort activity and is not summed into a second aggregate duration.
 For each seed it invokes the existing
 `standalone-gradoom-deathmatch-ppo-v2` trainer contract at every checkpoint cadence. The first
 segment receives no resume or learned initialization; later segments resume only the preceding
@@ -128,7 +138,8 @@ shaper state, policy, optimizer, AMP GradScaler state, original encoder-anchor t
 Python/NumPy/Torch/CUDA RNG states. Live restoration requires the exact saved lane count; an ordinary
 non-evidence resume with a different environment count uses the documented lane-migration reset
 path. Resume validation requires that complete inventory before the public command may advertise
-the interruption as restorable.
+the interruption as restorable. Ordinary legacy FP32 checkpoints may omit the disabled GradScaler
+state; mixed-precision evidence checkpoints remain required to carry it.
 
 `benchmark_protocol.continuation_identity` separately hashes the exact schema/trainer contract,
 recipe, assets and bootstrap bytes, training/evaluation seeds, and timer phases/boundaries. Any

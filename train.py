@@ -2329,8 +2329,6 @@ _CONTINUOUS_PROGRESS_FIELDS = {
     "episode_lengths",
     "lane_identity",
     "reward_shaper_state",
-    "precision_scaler_state",
-    "encoder_anchor_targets",
 }
 
 
@@ -2412,14 +2410,28 @@ def _checkpoint_restored_state(
         and training_state[field].shape[0] == int(num_envs)
         for field in lane_fields
     )
+    config = checkpoint.get("config")
+    effective_recipe = config.get("effective_recipe") if isinstance(config, Mapping) else None
+    precision = effective_recipe.get("precision") if isinstance(effective_recipe, Mapping) else None
+    anchor_coefficient = (
+        effective_recipe.get("encoder_anchor_coef")
+        if isinstance(effective_recipe, Mapping)
+        else None
+    )
+    scaler_complete = isinstance(training_state.get("precision_scaler_state"), Mapping) or (
+        precision == "fp32"
+    )
+    anchors_complete = isinstance(training_state.get("encoder_anchor_targets"), list) or (
+        type(anchor_coefficient) in (int, float) and float(anchor_coefficient) == 0.0
+    )
     progress_complete = (
         set(training_state) >= _CONTINUOUS_PROGRESS_FIELDS
         and environment_complete
         and lanes_complete
         and isinstance(training_state.get("reward_shaper_state"), Mapping)
         and training_state["reward_shaper_state"].get("format") == "gradoom-live-component-v1"
-        and isinstance(training_state.get("precision_scaler_state"), Mapping)
-        and isinstance(training_state.get("encoder_anchor_targets"), list)
+        and scaler_complete
+        and anchors_complete
     )
     return {
         "policy": "policy_state_dict" in checkpoint,
@@ -3053,9 +3065,10 @@ def _train(
             raise ValueError("checkpoint training_state must be a mapping")
         if resume_payload is not None:
             scaler_state = saved_training_state.get("precision_scaler_state")
-            if not isinstance(scaler_state, Mapping):
+            if isinstance(scaler_state, Mapping):
+                precision.scaler.load_state_dict(dict(scaler_state))
+            elif str(args.precision) != "fp32":
                 raise ValueError("checkpoint precision scaler state is missing")
-            precision.scaler.load_state_dict(dict(scaler_state))
         encoder_anchors = _encoder_anchors_from_state(
             policy,
             saved_training_state.get("encoder_anchor_targets")

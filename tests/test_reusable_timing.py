@@ -14,6 +14,7 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+from gradoom.evidence import benchmark as benchmark_module
 from gradoom.evidence.benchmark import (
     _attempt_journal_payload,
     build_development_benchmark_report,
@@ -47,9 +48,11 @@ def _manifest(
     trainer_code_root: Path | None = None,
     declared_inputs: list[dict[str, object]] | None = None,
     elapsed_time_anchor: bool = True,
+    training_seeds: list[int] | None = None,
 ) -> Path:
+    effective_training_seeds = training_seeds or [123]
     benchmark: dict[str, object] = {
-        "training_seeds": [123],
+        "training_seeds": effective_training_seeds,
         "failure_budget_steps": 10,
         "checkpoint_steps": [10],
         "evaluation_episode_seeds": EVALUATION_SEEDS,
@@ -70,26 +73,30 @@ def _manifest(
     }
     if bootstrap_artifacts is not None:
         benchmark["bootstrap_artifacts"] = bootstrap_artifacts
-    anchor_payload = {
-        "schema_version": 1,
-        "authority": "gradoom-fixture-independent-anchor-v1",
-        "seed": 123,
-        "started_unix_ns": time.time_ns(),
-    }
-    anchor_bytes = json.dumps(anchor_payload, sort_keys=True, separators=(",", ":")).encode()
     if elapsed_time_anchor:
-        benchmark["elapsed_time_anchors"] = [
-            {
-                "payload": anchor_payload,
-                "public_key": base64.b64encode(
-                    ANCHOR_PRIVATE_KEY.public_key().public_bytes(
-                        serialization.Encoding.Raw,
-                        serialization.PublicFormat.Raw,
-                    )
-                ).decode(),
-                "signature": base64.b64encode(ANCHOR_PRIVATE_KEY.sign(anchor_bytes)).decode(),
+        benchmark["elapsed_time_anchors"] = []
+        for seed in effective_training_seeds:
+            anchor_payload = {
+                "schema_version": 1,
+                "authority": "gradoom-fixture-independent-anchor-v1",
+                "seed": seed,
+                "started_unix_ns": time.time_ns(),
             }
-        ]
+            anchor_bytes = json.dumps(
+                anchor_payload, sort_keys=True, separators=(",", ":")
+            ).encode()
+            benchmark["elapsed_time_anchors"].append(
+                {
+                    "payload": anchor_payload,
+                    "public_key": base64.b64encode(
+                        ANCHOR_PRIVATE_KEY.public_key().public_bytes(
+                            serialization.Encoding.Raw,
+                            serialization.PublicFormat.Raw,
+                        )
+                    ).decode(),
+                    "signature": base64.b64encode(ANCHOR_PRIVATE_KEY.sign(anchor_bytes)).decode(),
+                }
+            )
     manifest = {
         "schema_version": 1,
         "workflow": "development_training_benchmark",
@@ -135,6 +142,12 @@ def _bootstrap_artifact(
     )
     artifact.chmod(stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
     artifact_sha256 = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    artifact_stat = artifact.stat()
+    artifact_identity = {
+        "resolved_path": str(artifact.resolve()),
+        "device": artifact_stat.st_dev,
+        "inode": artifact_stat.st_ino,
+    }
     reuse_conditions = [
         "exact compiler and target identity",
         "read-only bytes reused without transformation",
@@ -161,6 +174,16 @@ def _bootstrap_artifact(
         "creation_protocol": declaration["creation_protocol"],
         "immutable_inputs": declaration["immutable_inputs"],
         "reuse_conditions": declaration["reuse_conditions"],
+        "artifact_identity": artifact_identity,
+        "creation_event": {
+            "event_id": "fixture-creation-event",
+            "artifact_sha256": declaration["sha256"],
+        },
+        "prior_reuse_event": {
+            "event_id": "fixture-prior-reuse-event",
+            "artifact_sha256": declaration["sha256"],
+            "artifact_identity": artifact_identity,
+        },
     }
     declaration["eligibility_attestation"] = {
         "payload": attestation_payload,
@@ -262,6 +285,70 @@ def test_public_command_rejects_signed_seed_specific_bootstrap_input(tmp_path: P
     assert "compiler-target input has unsupported fields" in result.stderr
 
 
+def test_public_command_rejects_bootstrap_without_prior_reuse_event(tmp_path: Path) -> None:
+    _artifact, declaration = _bootstrap_artifact(tmp_path)
+    attestation = declaration["eligibility_attestation"]
+    assert isinstance(attestation, dict)
+    payload = attestation["payload"]
+    assert isinstance(payload, dict)
+    payload.pop("prior_reuse_event")
+    attestation["signature"] = base64.b64encode(
+        ANCHOR_PRIVATE_KEY.sign(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode())
+    ).decode()
+    manifest = _manifest(
+        tmp_path,
+        outcomes={"10": [30.0, 0.0]},
+        bootstrap_artifacts=[declaration],
+        declared_inputs=_bootstrap_declared_inputs(tmp_path),
+    )
+
+    result = _run_evidence("--manifest", str(manifest), "--output", str(tmp_path / "report.json"))
+
+    assert result.returncode == 2
+    assert "prior unchanged reuse event" in result.stderr
+
+
+def test_public_command_rejects_bootstrap_signature_replayed_at_new_location(
+    tmp_path: Path,
+) -> None:
+    artifact, declaration = _bootstrap_artifact(tmp_path)
+    copied = tmp_path / "copied-kernel.json"
+    shutil.copyfile(artifact, copied)
+    copied.chmod(stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
+    declaration["path"] = copied.name
+    manifest = _manifest(
+        tmp_path,
+        outcomes={"10": [30.0, 0.0]},
+        bootstrap_artifacts=[declaration],
+        declared_inputs=_bootstrap_declared_inputs(tmp_path),
+    )
+
+    result = _run_evidence("--manifest", str(manifest), "--output", str(tmp_path / "report.json"))
+
+    assert result.returncode == 2
+    assert "externally attested artifact object identity" in result.stderr
+
+
+def test_public_command_rejects_deleted_and_recreated_bootstrap_object(tmp_path: Path) -> None:
+    artifact, declaration = _bootstrap_artifact(tmp_path)
+    payload = artifact.read_bytes()
+    artifact.unlink()
+    (tmp_path / "inode-occupier").write_text("occupy old object\n", encoding="utf-8")
+    artifact.write_bytes(payload)
+    artifact.chmod(stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
+    manifest = _manifest(
+        tmp_path,
+        outcomes={"10": [30.0, 0.0]},
+        bootstrap_artifacts=[declaration],
+        declared_inputs=_bootstrap_declared_inputs(tmp_path),
+    )
+
+    result = _run_evidence("--manifest", str(manifest), "--output", str(tmp_path / "report.json"))
+
+    assert result.returncode == 2
+    assert "externally attested artifact object identity" in result.stderr
+
+
 def test_public_command_accepts_only_disclosed_immutable_bootstrap_exclusion(
     tmp_path: Path,
 ) -> None:
@@ -340,6 +427,52 @@ def test_reusable_timer_starts_before_recurring_manifest_and_identity_setup(
     )
 
 
+def test_reusable_setup_time_is_included_for_every_active_seed(tmp_path: Path) -> None:
+    manifest = _manifest(
+        tmp_path,
+        outcomes={"10": [30.0, 0.0]},
+        training_seeds=[123, 124],
+    )
+
+    report = build_development_benchmark_report(
+        manifest,
+        invocation_started=10.0,
+        clock=lambda: 42.5,
+    )
+
+    assert [attempt["reusable_elapsed_seconds"] for attempt in report["attempts"]] == [32.5, 32.5]
+
+
+def test_terminal_elapsed_includes_durable_journal_and_authority_delay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest = _manifest(tmp_path, outcomes={"10": [30.0, 0.0]})
+    now = [10.0]
+    original_write = benchmark_module._write_durable_json
+    original_sign = benchmark_module._sign_generation_attestation
+
+    def delayed_write(*args: object, **kwargs: object) -> str:
+        result = original_write(*args, **kwargs)
+        if kwargs.get("field") == "benchmark attempt journal":
+            now[0] += 40.0
+        return result
+
+    def delayed_sign(*args: object, **kwargs: object) -> dict[str, object]:
+        now[0] += 60.0
+        return original_sign(*args, **kwargs)
+
+    monkeypatch.setattr(benchmark_module, "_write_durable_json", delayed_write)
+    monkeypatch.setattr(benchmark_module, "_sign_generation_attestation", delayed_sign)
+
+    report = build_development_benchmark_report(
+        manifest,
+        invocation_started=10.0,
+        clock=lambda: now[0],
+    )
+
+    assert report["attempts"][0]["reusable_elapsed_seconds"] >= 100.0
+
+
 @pytest.mark.parametrize(
     ("mutation", "error"),
     [
@@ -350,7 +483,7 @@ def test_reusable_timer_starts_before_recurring_manifest_and_identity_setup(
         ),
         (
             lambda artifact, declaration: declaration.update(sha256="0" * 64),
-            "eligibility_attestation does not bind canonical claims",
+            "eligibility_attestation has no valid creation event",
         ),
         (
             lambda artifact, declaration: declaration.update(
@@ -1158,3 +1291,59 @@ def test_public_command_binds_from_package_import_submodule(tmp_path: Path) -> N
 
     assert result.returncode == 2
     assert "unlike run identity" in result.stderr
+
+
+def test_public_command_binds_executed_parent_package_initializers(tmp_path: Path) -> None:
+    code_root = tmp_path / "code"
+    package = code_root / "pkg"
+    package.mkdir(parents=True)
+    initializer = package / "__init__.py"
+    initializer.write_text("PACKAGE_VALUE = 1\n", encoding="utf-8")
+    worker = package / "worker.py"
+    shutil.copyfile(FIXTURE_PROCESS, worker)
+    launcher = code_root / "launcher.py"
+    launcher.write_text(
+        "import pkg.worker as worker\nraise SystemExit(worker.main())\n", encoding="utf-8"
+    )
+    manifest = _manifest(
+        tmp_path,
+        outcomes={"10": [30.0, 0.0]},
+        trainer_script=launcher,
+        trainer_code_root=code_root,
+        extra_arguments=["--fixture-interrupt-once-at-step", "10"],
+    )
+    interrupted = tmp_path / "interrupted.json"
+    first = _run_evidence("--manifest", str(manifest), "--output", str(interrupted))
+    assert first.returncode == 0, first.stderr
+    initializer.write_text("PACKAGE_VALUE = 2\n", encoding="utf-8")
+
+    result = _run_evidence(
+        "--manifest",
+        str(manifest),
+        "--output",
+        str(tmp_path / "next.json"),
+        "--merge",
+        str(interrupted),
+    )
+
+    assert result.returncode == 2
+    assert "unlike run identity" in result.stderr
+
+
+def test_public_command_rejects_os_exec_trainer_indirection(tmp_path: Path) -> None:
+    launcher = tmp_path / "launcher.py"
+    launcher.write_text(
+        "import os\nos.execv('/tmp/hidden-trainer', ['/tmp/hidden-trainer'])\n",
+        encoding="utf-8",
+    )
+    manifest = _manifest(
+        tmp_path,
+        outcomes={"10": [30.0, 0.0]},
+        trainer_script=launcher,
+        trainer_code_root=tmp_path,
+    )
+
+    result = _run_evidence("--manifest", str(manifest), "--output", str(tmp_path / "report.json"))
+
+    assert result.returncode == 2
+    assert "opaque trainer indirection" in result.stderr
