@@ -15,6 +15,12 @@ import numpy as np
 import torch
 
 from gradoom.actions import DEATHMATCH_ACTION_MEANINGS, DEATHMATCH_ACTIONS, DEATHMATCH_BUTTONS
+from gradoom.diagnostics import (
+    ActorAttributionDiagnostics,
+    ActorAttributionStage,
+    ActorKillEvent,
+    ActorSnapshot,
+)
 
 RUNNER_PROTOCOL_VERSION = 1
 _SIGNALS = ("health", "killcount", "player_killcount", "episode_return")
@@ -357,43 +363,69 @@ def _fixture_attribution_oracle(
     )
 
 
-def _observation_lane_sha256(value: Any, *, lane: int) -> str:
-    if isinstance(value, torch.Tensor):
-        value = value.detach().to("cpu").contiguous().numpy()
-    array = np.asarray(value)
-    if array.dtype != np.uint8 or array.ndim < 2 or not 0 <= lane < array.shape[0]:
-        raise RuntimeError("staged attribution requires public uint8 vector observations")
-    selected = np.ascontiguousarray(array[lane])
-    descriptor = json.dumps(
-        {"dtype": str(selected.dtype), "shape": list(selected.shape)},
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("ascii")
-    return hashlib.sha256(descriptor + b"\0" + selected.tobytes()).hexdigest()
+def _validated_attribution_event(
+    *,
+    behavior: str,
+    stage: ActorAttributionStage,
+    events: tuple[ActorKillEvent, ...],
+    actors: tuple[ActorSnapshot, ...],
+) -> dict[str, str]:
+    if not isinstance(stage, ActorAttributionStage) or not stage.token:
+        raise RuntimeError("actor attribution stage is invalid")
+    if behavior not in {
+        "player_killcount",
+        "player_killcount.enemy_on_enemy_exclusion",
+    }:
+        raise RuntimeError(f"unsupported staged attribution behavior {behavior!r}")
+    expected_enemy_count = 1 if behavior == "player_killcount" else 2
+    staged_by_id = {actor.actor_id: actor for actor in stage.actors}
+    if (
+        len(staged_by_id) != len(stage.actors)
+        or sum(actor.kind == "player" and actor.alive for actor in stage.actors) != 1
+        or sum(actor.kind == "enemy" and actor.alive for actor in stage.actors)
+        != expected_enemy_count
+    ):
+        raise RuntimeError("staged actor population is not causally isolated")
+    if len(events) != 1:
+        raise RuntimeError("staged attribution requires exactly one kill event")
+    event = events[0]
+    if not isinstance(event, ActorKillEvent) or event.stage_token != stage.token:
+        raise RuntimeError("kill attribution event does not belong to the current stage")
+    if event.attacker_id == event.target_id:
+        raise RuntimeError("kill attribution requires distinct attacker and target actors")
+    attacker = staged_by_id.get(event.attacker_id)
+    target = staged_by_id.get(event.target_id)
+    if (
+        attacker is None
+        or target is None
+        or attacker.kind != event.attacker_kind
+        or target.kind != event.target_kind
+    ):
+        raise RuntimeError("kill attribution references an actor outside the staged population")
+    expected_attacker = "player" if behavior == "player_killcount" else "enemy"
+    if event.attacker_kind != expected_attacker or event.target_kind != "enemy":
+        raise RuntimeError(
+            f"actor/target attribution oracle did not observe {expected_attacker}-to-enemy"
+        )
+    remaining_by_id = {actor.actor_id: actor for actor in actors if actor.alive}
+    expected_remaining = set(staged_by_id) - {event.target_id}
+    if (
+        len(remaining_by_id) != len(actors)
+        or set(remaining_by_id) != expected_remaining
+        or event.attacker_id not in remaining_by_id
+    ):
+        raise RuntimeError("post-kill actor population is ambiguous")
+    return {"attacker": event.attacker_kind, "target": event.target_kind}
 
 
-def _real_attribution_oracle(
-    provider: str,
-    binding: Mapping[str, Any],
-) -> Callable[..., _AttributionProof]:
-    if provider not in {"gradoom", "env-vizdoom-turbo"}:
-        raise ValueError(f"unsupported attribution provider {provider!r}")
-    expected_assets = {
-        asset: (Path(str(binding[f"{asset}_path"])), str(binding[f"{asset}_sha256"]))
-        for asset in ("iwad", "pwad")
-    }
+@dataclass
+class _RealAttributionOracle:
+    provider: str
+    expected_assets: dict[str, tuple[Path, str]]
+    stages: dict[int, tuple[ActorAttributionStage, ...]]
 
-    def observe(
-        env: Any,
-        *,
-        lane: int,
-        behavior: str,
-        initial_observation: Any,
-        event_observation: Any,
-        action_history: list[list[int]],
-        event_step: int,
-    ) -> _AttributionProof:
-        for asset, (path, expected_sha256) in expected_assets.items():
+    def _verify_assets(self) -> None:
+        for asset, (path, expected_sha256) in self.expected_assets.items():
             if (
                 not path.is_file()
                 or hashlib.sha256(path.read_bytes()).hexdigest() != expected_sha256
@@ -401,64 +433,93 @@ def _real_attribution_oracle(
                 raise RuntimeError(
                     f"staged attribution {asset.upper()} binding changed during execution"
                 )
-        if provider == "gradoom" and (
-            getattr(env, "iwad_sha256", None) != expected_assets["iwad"][1]
-            or getattr(env, "scenario_sha256", None) != expected_assets["pwad"][1]
+
+    def _verify_provider(self, env: Any) -> None:
+        if not isinstance(env, ActorAttributionDiagnostics):
+            label = "GraDOOM" if self.provider == "gradoom" else "reference"
+            raise RuntimeError(f"staged attribution requires the real {label} diagnostic provider")
+        if self.provider == "gradoom":
+            from gradoom import GraDoomVecEnv
+
+            if type(env) is not GraDoomVecEnv:
+                raise RuntimeError(
+                    "staged attribution requires the real GraDOOM diagnostic provider"
+                )
+        elif not bool(getattr(type(env), "_gradoom_reference_attribution_adapter", False)):
+            raise RuntimeError("staged attribution requires the real reference diagnostic provider")
+        actual_assets = env.diagnostic_asset_sha256()
+        if actual_assets != {
+            asset: expected_sha256
+            for asset, (_path, expected_sha256) in self.expected_assets.items()
+        }:
+            raise RuntimeError("staged attribution provider assets do not match the bound profile")
+
+    def prepare(self, env: Any, *, behavior: str) -> None:
+        self._verify_assets()
+        self._verify_provider(env)
+        stages = env.diagnostic_stage_actor_attribution(behavior)
+        if (
+            not isinstance(stages, tuple)
+            or len(stages) != int(env.num_envs)
+            or not all(isinstance(stage, ActorAttributionStage) for stage in stages)
         ):
-            raise RuntimeError(
-                "staged attribution environment does not expose the bound GraDOOM assets"
-            )
-        if event_step < 0 or len(action_history) != event_step + 1:
-            raise RuntimeError("staged attribution action history is incomplete")
+            raise RuntimeError("diagnostic provider returned invalid attribution stages")
+        self.stages[id(env)] = stages
+
+    def __call__(
+        self,
+        env: Any,
+        *,
+        lane: int,
+        behavior: str,
+        **_ignored: Any,
+    ) -> _AttributionProof:
+        self._verify_assets()
+        self._verify_provider(env)
         try:
-            lane_actions = [row[lane] for row in action_history]
-            action_buttons = [DEATHMATCH_ACTIONS[index] for index in lane_actions]
-        except (IndexError, TypeError) as error:
-            raise RuntimeError("staged attribution action history is invalid") from error
-        if behavior == "player_killcount":
-            attacker = "player"
-            if "ATTACK" not in action_buttons[-1]:
-                raise RuntimeError(
-                    "staged player attribution did not observe a pinned player attack action"
-                )
-        elif behavior == "player_killcount.enemy_on_enemy_exclusion":
-            attacker = "enemy"
-            if any("ATTACK" in buttons for buttons in action_buttons):
-                raise RuntimeError(
-                    "staged enemy attribution observed a player attack before the event"
-                )
-        else:
-            raise RuntimeError(f"unsupported staged attribution behavior {behavior!r}")
-        initial_sha256 = _observation_lane_sha256(initial_observation, lane=lane)
-        event_sha256 = _observation_lane_sha256(event_observation, lane=lane)
-        if initial_sha256 == event_sha256:
-            raise RuntimeError(
-                "staged attribution requires an observed public state transition; "
-                "counters alone are insufficient"
-            )
+            stage = self.stages[id(env)][lane]
+        except (KeyError, IndexError) as error:
+            raise RuntimeError("staged attribution was not prepared for this execution") from error
+        events = env.diagnostic_kill_events(lane)
+        actors = env.diagnostic_actor_snapshot(lane)
+        attribution = _validated_attribution_event(
+            behavior=behavior,
+            stage=stage,
+            events=events,
+            actors=actors,
+        )
         evidence = {
-            "action_history": lane_actions,
-            "attacker": attacker,
-            "behavior": behavior,
-            "event_observation_sha256": event_sha256,
-            "event_step": event_step,
-            "initial_observation_sha256": initial_sha256,
-            "iwad_sha256": expected_assets["iwad"][1],
-            "lane": lane,
-            "provider": provider,
-            "pwad_sha256": expected_assets["pwad"][1],
-            "target": "enemy",
+            "actors": [actor.__dict__ for actor in actors],
+            "assets": {asset: digest for asset, (_path, digest) in self.expected_assets.items()},
+            "event": events[0].__dict__,
+            "stage": {
+                "actors": [actor.__dict__ for actor in stage.actors],
+                "token": stage.token,
+            },
         }
-        evidence_sha256 = hashlib.sha256(
-            json.dumps(evidence, separators=(",", ":"), sort_keys=True).encode("ascii")
-        ).hexdigest()
         return _AttributionProof(
-            attacker=attacker,
-            target="enemy",
-            evidence_sha256=evidence_sha256,
+            attacker=attribution["attacker"],
+            target=attribution["target"],
+            evidence_sha256=hashlib.sha256(
+                json.dumps(evidence, separators=(",", ":"), sort_keys=True).encode("ascii")
+            ).hexdigest(),
         )
 
-    return observe
+
+def _real_attribution_oracle(
+    provider: str,
+    binding: Mapping[str, Any],
+) -> _RealAttributionOracle:
+    if provider not in {"gradoom", "env-vizdoom-turbo"}:
+        raise ValueError(f"unsupported attribution provider {provider!r}")
+    return _RealAttributionOracle(
+        provider=provider,
+        expected_assets={
+            asset: (Path(str(binding[f"{asset}_path"])), str(binding[f"{asset}_sha256"]))
+            for asset in ("iwad", "pwad")
+        },
+        stages={},
+    )
 
 
 def _verified_attribution(
@@ -512,6 +573,11 @@ def _semantic_probe(
     env = factory()
     try:
         initial_observation, initial_infos = env.reset(seed=probe["seeds"])
+        if behavior in {
+            "player_killcount",
+            "player_killcount.enemy_on_enemy_exclusion",
+        } and isinstance(attribution_oracle, _RealAttributionOracle):
+            attribution_oracle.prepare(env, behavior=behavior)
         initial_observation = _snapshot(initial_observation)
         initial_kills = [
             _kill_signals(initial_infos, kill_signal_reader=kill_signal_reader, lane=lane)
@@ -1054,6 +1120,7 @@ def _real_contracts(request: dict[str, Any]) -> tuple[list[dict[str, Any]], list
     def reference_factory() -> Any:
         return provider.make_env(
             str(reference_config),
+            actor_diagnostics=True,
             rom_path=reference_binding["iwad_path"],
             num_threads=2,
             doom_map=profile_configuration["map"],

@@ -129,6 +129,19 @@ timeout, player mode, the complete pinned button set, and the native `HEALTH`, `
 settings, or different values fail before provider construction. `episode_return` remains a derived
 report signal selected through `info_filter`; it is never passed as a native game variable.
 
+Real kill probes use an additional diagnostic-only actor stage under the same bound IWAD, PWAD,
+map, skill, action table, and provider configuration. The player-kill stage contains exactly the
+controlled player and one enemy. The infighting stage contains exactly the controlled player and
+two enemies; a harmless west-facing shot during setup wakes the east-side actors without damaging
+them. GraDOOM records source and target actor IDs where engine damage becomes a death. The pinned
+reference provider enables native object information before initialization and proves the same
+death from stable object IDs and the distinct surviving actor in the isolated stage. A passing
+event must have exactly one death, retain the independently observed attacker, remove the target,
+and contain no additional actors. Counters, rewards, requested actions, provider labels, and pixel
+changes never supply actor identity. Missing object support, changed assets, replayed stages,
+self-attribution, multiple sources, or ambiguous populations produce a named failed invariant.
+This instrumentation is inactive during ordinary reset, step, policy evaluation, and benchmarks.
+
 The repository fixture is the executable example of this schema:
 [`tests/fixtures/evidence/readiness-manifest.json`](../tests/fixtures/evidence/readiness-manifest.json).
 The independently versioned two-provider invariant example is

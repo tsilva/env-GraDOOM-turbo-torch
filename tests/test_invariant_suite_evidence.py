@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 import torch
 
+from gradoom.diagnostics import ActorAttributionStage, ActorKillEvent, ActorSnapshot
 from gradoom.evidence import invariant_runner, invariant_suite
 
 FIXTURES = Path(__file__).parent / "fixtures" / "evidence"
@@ -748,62 +749,71 @@ def test_semantic_kill_probe_rejects_counter_only_provider() -> None:
         )
 
 
-@pytest.mark.parametrize("provider", ["gradoom", "env-vizdoom-turbo"])
 @pytest.mark.parametrize(
-    ("behavior", "action", "expected"),
+    ("behavior", "stage", "event", "remaining", "expected"),
     [
-        ("player_killcount", 1, {"attacker": "player", "target": "enemy"}),
+        (
+            "player_killcount",
+            ActorAttributionStage(
+                token="player-stage",
+                actors=(
+                    ActorSnapshot(actor_id=0, kind="player", alive=True),
+                    ActorSnapshot(actor_id=41, kind="enemy", alive=True),
+                ),
+            ),
+            ActorKillEvent(
+                stage_token="player-stage",
+                attacker_id=0,
+                attacker_kind="player",
+                target_id=41,
+                target_kind="enemy",
+            ),
+            (ActorSnapshot(actor_id=0, kind="player", alive=True),),
+            {"attacker": "player", "target": "enemy"},
+        ),
         (
             "player_killcount.enemy_on_enemy_exclusion",
-            0,
+            ActorAttributionStage(
+                token="infighting-stage",
+                actors=(
+                    ActorSnapshot(actor_id=0, kind="player", alive=True),
+                    ActorSnapshot(actor_id=71, kind="enemy", alive=True),
+                    ActorSnapshot(actor_id=83, kind="enemy", alive=True),
+                ),
+            ),
+            ActorKillEvent(
+                stage_token="infighting-stage",
+                attacker_id=83,
+                attacker_kind="enemy",
+                target_id=71,
+                target_kind="enemy",
+            ),
+            (
+                ActorSnapshot(actor_id=0, kind="player", alive=True),
+                ActorSnapshot(actor_id=83, kind="enemy", alive=True),
+            ),
             {"attacker": "enemy", "target": "enemy"},
         ),
     ],
 )
-def test_real_attribution_oracle_grounds_both_provider_events_in_public_stages(
-    tmp_path: Path,
-    provider: str,
+def test_attribution_requires_a_distinct_staged_source_and_target(
     behavior: str,
-    action: int,
+    stage: ActorAttributionStage,
+    event: ActorKillEvent,
+    remaining: tuple[ActorSnapshot, ...],
     expected: dict[str, str],
 ) -> None:
-    iwad = tmp_path / "freedoom2.wad"
-    pwad = tmp_path / "deathmatch.wad"
-    iwad.write_bytes(b"iwad")
-    pwad.write_bytes(b"pwad")
-    binding = {
-        "iwad_path": str(iwad),
-        "iwad_sha256": hashlib.sha256(iwad.read_bytes()).hexdigest(),
-        "pwad_path": str(pwad),
-        "pwad_sha256": hashlib.sha256(pwad.read_bytes()).hexdigest(),
-    }
-    env = type(
-        "PublicStage",
-        (),
-        {
-            "iwad_sha256": binding["iwad_sha256"],
-            "scenario_sha256": binding["pwad_sha256"],
-        },
-    )()
-    initial = np.zeros((2, 4, 84, 84), dtype=np.uint8)
-    event = initial.copy()
-    event[0, 0, 0, 0] = 1
-
-    result = invariant_runner._verified_attribution(
-        invariant_runner._real_attribution_oracle(provider, binding),
-        env,
-        lane=0,
+    result = invariant_runner._validated_attribution_event(
         behavior=behavior,
-        initial_observation=initial,
-        event_observation=event,
-        action_history=[[action, 0]],
-        event_step=0,
+        stage=stage,
+        events=(event,),
+        actors=remaining,
     )
 
     assert result == expected
 
 
-def test_real_attribution_oracle_rejects_counter_only_and_changed_assets(tmp_path: Path) -> None:
+def test_real_attribution_oracle_rejects_counter_only_and_one_pixel_fakes(tmp_path: Path) -> None:
     iwad = tmp_path / "freedoom2.wad"
     pwad = tmp_path / "deathmatch.wad"
     iwad.write_bytes(b"iwad")
@@ -814,7 +824,7 @@ def test_real_attribution_oracle_rejects_counter_only_and_changed_assets(tmp_pat
         "pwad_path": str(pwad),
         "pwad_sha256": hashlib.sha256(pwad.read_bytes()).hexdigest(),
     }
-    env = type(
+    fake = type(
         "PublicStage",
         (),
         {
@@ -823,33 +833,99 @@ def test_real_attribution_oracle_rejects_counter_only_and_changed_assets(tmp_pat
         },
     )()
     observation = np.zeros((2, 4, 84, 84), dtype=np.uint8)
-    oracle = invariant_runner._real_attribution_oracle("gradoom", binding)
-
-    with pytest.raises(RuntimeError, match="counters alone are insufficient"):
-        invariant_runner._verified_attribution(
-            oracle,
-            env,
-            lane=0,
-            behavior="player_killcount",
-            initial_observation=observation,
-            event_observation=observation.copy(),
-            action_history=[[1, 0]],
-            event_step=0,
-        )
-
     changed_observation = observation.copy()
     changed_observation[0, 0, 0, 0] = 1
-    pwad.write_bytes(b"substituted")
-    with pytest.raises(RuntimeError, match="PWAD binding changed"):
+
+    with pytest.raises(RuntimeError, match="real GraDOOM diagnostic provider"):
         invariant_runner._verified_attribution(
-            oracle,
-            env,
+            invariant_runner._real_attribution_oracle("gradoom", binding),
+            fake,
             lane=0,
             behavior="player_killcount",
             initial_observation=observation,
             event_observation=changed_observation,
             action_history=[[1, 0]],
             event_step=0,
+        )
+
+
+def test_real_attribution_oracle_rejects_changed_assets(tmp_path: Path) -> None:
+    iwad = tmp_path / "freedoom2.wad"
+    pwad = tmp_path / "deathmatch.wad"
+    iwad.write_bytes(b"iwad")
+    pwad.write_bytes(b"pwad")
+    binding = {
+        "iwad_path": str(iwad),
+        "iwad_sha256": hashlib.sha256(iwad.read_bytes()).hexdigest(),
+        "pwad_path": str(pwad),
+        "pwad_sha256": hashlib.sha256(pwad.read_bytes()).hexdigest(),
+    }
+    pwad.write_bytes(b"substituted")
+    with pytest.raises(RuntimeError, match="PWAD binding changed"):
+        invariant_runner._verified_attribution(
+            invariant_runner._real_attribution_oracle("gradoom", binding),
+            object(),
+            lane=0,
+            behavior="player_killcount",
+            initial_observation=np.zeros((2, 4, 84, 84), dtype=np.uint8),
+            event_observation=np.zeros((2, 4, 84, 84), dtype=np.uint8),
+            action_history=[[1, 0]],
+            event_step=0,
+        )
+
+
+@pytest.mark.parametrize(
+    ("events", "actors", "message"),
+    [
+        ((), (), "exactly one"),
+        (
+            (
+                ActorKillEvent("stage", 2, "enemy", 1, "enemy"),
+                ActorKillEvent("stage", 3, "enemy", 1, "enemy"),
+            ),
+            (),
+            "exactly one",
+        ),
+        (
+            (ActorKillEvent("old-stage", 2, "enemy", 1, "enemy"),),
+            (),
+            "current stage",
+        ),
+        (
+            (ActorKillEvent("stage", 1, "enemy", 1, "enemy"),),
+            (),
+            "distinct",
+        ),
+        (
+            (ActorKillEvent("stage", 2, "enemy", 1, "enemy"),),
+            (
+                ActorSnapshot(0, "player", True),
+                ActorSnapshot(2, "enemy", True),
+                ActorSnapshot(3, "enemy", True),
+            ),
+            "population",
+        ),
+    ],
+)
+def test_infighting_attribution_rejects_missing_multi_replay_self_and_ambiguous_events(
+    events: tuple[ActorKillEvent, ...],
+    actors: tuple[ActorSnapshot, ...],
+    message: str,
+) -> None:
+    stage = ActorAttributionStage(
+        token="stage",
+        actors=(
+            ActorSnapshot(0, "player", True),
+            ActorSnapshot(1, "enemy", True),
+            ActorSnapshot(2, "enemy", True),
+        ),
+    )
+    with pytest.raises(RuntimeError, match=message):
+        invariant_runner._validated_attribution_event(
+            behavior="player_killcount.enemy_on_enemy_exclusion",
+            stage=stage,
+            events=events,
+            actors=actors,
         )
 
 

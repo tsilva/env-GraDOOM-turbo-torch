@@ -140,6 +140,81 @@ def test_player_killcount_excludes_infighting_and_resets_per_lane(square_scenari
     assert engine.player_killcount.tolist() == [0, 1]
 
 
+def test_damage_site_records_distinct_player_and_third_party_kill_provenance(
+    square_scenario,
+) -> None:
+    engine = _engine(square_scenario)
+    engine.actor_attribution_diagnostics_active = True
+    engine.enemy_alive[:, :2] = True
+    engine.enemy_type[:, :2] = 0
+    engine.enemy_health[:, :2] = 1
+    player_damage = torch.zeros_like(engine.enemy_health)
+    player_damage[0, 0] = 1
+
+    engine._apply_enemy_damage(player_damage)
+
+    assert engine.actor_kill_event_count.tolist() == [1, 0]
+    assert engine.actor_kill_attacker_kind.tolist() == [0, -1]
+    assert engine.actor_kill_attacker_id.tolist() == [0, -1]
+    assert engine.actor_kill_target_id.tolist() == [1, -1]
+
+    monster_damage = torch.zeros((engine.num_envs, engine.enemy_slots, engine.enemy_slots))
+    monster_damage[1, 1, 0] = 1
+    aggregate = monster_damage.sum(dim=1)
+    engine._apply_enemy_damage(
+        aggregate,
+        credit_player=False,
+        attacker_is_player=False,
+        monster_damage_by_source=monster_damage,
+    )
+
+    assert engine.actor_kill_event_count.tolist() == [1, 1]
+    assert engine.actor_kill_attacker_kind.tolist() == [0, 1]
+    assert engine.actor_kill_attacker_id.tolist() == [0, 2]
+    assert engine.actor_kill_target_id.tolist() == [1, 1]
+
+
+def test_damage_site_marks_multi_source_kill_as_ambiguous(square_scenario) -> None:
+    engine = _engine(square_scenario)
+    engine.actor_attribution_diagnostics_active = True
+    engine.enemy_alive[0, :3] = True
+    engine.enemy_type[0, :3] = 0
+    engine.enemy_health[0, :3] = 1
+    sources = torch.zeros((engine.num_envs, engine.enemy_slots, engine.enemy_slots))
+    sources[0, 1, 0] = 1
+    sources[0, 2, 0] = 1
+
+    engine._apply_enemy_damage(
+        sources.sum(dim=1),
+        credit_player=False,
+        attacker_is_player=False,
+        monster_damage_by_source=sources,
+    )
+
+    assert engine.actor_kill_event_count.tolist() == [1, 0]
+    assert engine.actor_kill_attacker_kind.tolist() == [-1, -1]
+    assert engine.actor_kill_attacker_id.tolist() == [-1, -1]
+    assert engine.actor_kill_target_id.tolist() == [1, -1]
+
+
+def test_reset_deactivates_and_clears_staged_attribution(square_scenario) -> None:
+    engine = _engine(square_scenario)
+    engine.actor_attribution_diagnostics_active = True
+    engine.enemy_alive[0, 0] = True
+    engine.enemy_type[0, 0] = 0
+    engine.enemy_health[0, 0] = 1
+    damage = torch.zeros_like(engine.enemy_health)
+    damage[0, 0] = 1
+    engine._apply_enemy_damage(damage)
+
+    engine.reset(torch.tensor([True, False]), torch.tensor([789, 0]))
+
+    assert engine.actor_attribution_diagnostics_active is False
+    assert engine.actor_kill_event_count.tolist() == [0, 0]
+    assert engine.actor_kill_attacker_id.tolist() == [-1, -1]
+    assert engine.actor_kill_target_id.tolist() == [-1, -1]
+
+
 def test_player_damage_taken_counters_match_post_armor_health_damage(square_scenario) -> None:
     engine = _engine(square_scenario)
     engine.armor.copy_(torch.tensor([20.0, 4.0]))
