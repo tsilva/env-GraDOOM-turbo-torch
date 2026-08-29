@@ -6,7 +6,6 @@ import binascii
 import json
 import math
 import os
-import shlex
 import shutil
 import signal
 import stat
@@ -32,6 +31,7 @@ from .report import (
     _validate_schema_version,
     _validate_sha256,
 )
+from .time_authority import ReusableTimeAuthority, TimeAuthorityError
 from .wad_profile import validate_wad_profile
 
 _WORKFLOW = "development_training_benchmark"
@@ -42,8 +42,7 @@ _QUALITY_THRESHOLD = 30.0
 _EVALUATION_EPISODES = 100
 _FIXTURE_ELAPSED_ANCHOR_PUBLIC_KEY = "MfMyLUkj02xBwQm9sAmRkxh77ZmUIJbkkmokx379DS8="
 _FIXTURE_ELAPSED_ANCHOR_AUTHORITY = "gradoom-fixture-independent-anchor-v1"
-_ELAPSED_ANCHOR_PUBLIC_KEY = "6hsE1Q7qqE0NkWRgU7j35+l3WheLO4Tm3lAnkmiLWnc="
-_ELAPSED_ANCHOR_AUTHORITY = "gradoom-reusable-time-authority-v1"
+_AUTHORITY_STATE_ENV = "GRADOOM_REUSABLE_TIME_AUTHORITY_STATE"
 _CONTROLLED_ARGUMENTS = {
     "--checkpoint",
     "--checkpoint-every-rollouts",
@@ -69,6 +68,19 @@ _RESTORABLE_STATE = {
     "rng": True,
     "progress": True,
 }
+
+
+def _formal_time_authority() -> ReusableTimeAuthority:
+    raw_path = os.environ.get(_AUTHORITY_STATE_ENV)
+    if not raw_path:
+        raise EvidenceError(
+            f"formal benchmark evidence requires {_AUTHORITY_STATE_ENV} to name the "
+            "persistent repository-owned authority state directory"
+        )
+    try:
+        return ReusableTimeAuthority(Path(raw_path))
+    except TimeAuthorityError as error:
+        raise EvidenceError(f"reusable-time authority state is invalid: {error}") from error
 
 
 def _attempt_journal_payload(
@@ -190,7 +202,7 @@ def _validated_python_tree(path: Path) -> ast.AST:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     except (OSError, SyntaxError, UnicodeError) as error:
         raise EvidenceError(f"benchmark trainer Python source is unreadable: {path}") from error
-    forbidden_imports = {"ctypes", "importlib", "multiprocessing", "runpy", "subprocess"}
+    forbidden_imports = {"ctypes", "multiprocessing", "runpy", "subprocess"}
     forbidden_builtins = {"__import__", "eval", "exec", "compile"}
     forbidden_attributes = {
         "system",
@@ -213,16 +225,63 @@ def _validated_python_tree(path: Path) -> ast.AST:
         "spawnve",
         "spawnvp",
         "spawnvpe",
+        "import_module",
+        "find_spec",
+        "module_from_spec",
     }
+
+    def static_string(node: ast.AST) -> str | None:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            left = static_string(node.left)
+            right = static_string(node.right)
+            if left is not None and right is not None:
+                return left + right
+        return None
+
+    dangerous_module_names: set[str] = set()
+    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
     for node in ast.walk(tree):
-        if isinstance(node, ast.Import) and any(
-            alias.name.split(".", 1)[0] in forbidden_imports for alias in node.names
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                root = alias.name.split(".", 1)[0]
+                if root in {"os", "importlib", *forbidden_imports}:
+                    dangerous_module_names.add(alias.asname or root)
+        elif (
+            isinstance(node, ast.Assign)
+            and isinstance(node.value, ast.Name)
+            and node.value.id in dangerous_module_names
         ):
-            raise EvidenceError("shell, -c, eval, and opaque trainer indirection are forbidden")
+            dangerous_module_names.update(
+                target.id for target in node.targets if isinstance(target, ast.Name)
+            )
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            if any(alias.name.split(".", 1)[0] in forbidden_imports for alias in node.names):
+                raise EvidenceError("shell, -c, eval, and opaque trainer indirection are forbidden")
+            if any(
+                alias.name == "importlib"
+                or (
+                    alias.name.startswith("importlib.")
+                    and not alias.name.startswith("importlib.resources")
+                )
+                for alias in node.names
+            ):
+                raise EvidenceError("shell, -c, eval, and opaque trainer indirection are forbidden")
         if isinstance(node, ast.ImportFrom):
             root_module = (node.module or "").split(".", 1)[0]
-            if root_module in forbidden_imports or any(
-                alias.name in forbidden_attributes for alias in node.names
+            forbidden_importlib = root_module == "importlib" and not (
+                node.module == "importlib.resources"
+                or (
+                    node.module == "importlib"
+                    and all(alias.name == "resources" for alias in node.names)
+                )
+            )
+            if (
+                root_module in forbidden_imports
+                or forbidden_importlib
+                or any(alias.name in forbidden_attributes for alias in node.names)
             ):
                 raise EvidenceError("shell, -c, eval, and opaque trainer indirection are forbidden")
         if isinstance(node, ast.Call):
@@ -233,10 +292,22 @@ def _validated_python_tree(path: Path) -> ast.AST:
                 isinstance(node.func, ast.Name)
                 and node.func.id == "getattr"
                 and len(node.args) >= 2
-                and isinstance(node.args[1], ast.Constant)
-                and node.args[1].value in forbidden_attributes
             ):
-                forbidden_call = True
+                attribute = static_string(node.args[1])
+                dangerous_target = (
+                    isinstance(node.args[0], ast.Name) and node.args[0].id in dangerous_module_names
+                )
+                parent = parents.get(node)
+                dynamic_callable = attribute is None and (
+                    (isinstance(parent, ast.Call) and parent.func is node)
+                    or isinstance(parent, (ast.Assign, ast.AnnAssign, ast.NamedExpr))
+                )
+                if (
+                    attribute in forbidden_attributes
+                    or (dangerous_target and attribute is None)
+                    or dynamic_callable
+                ):
+                    forbidden_call = True
             if forbidden_call:
                 raise EvidenceError("shell, -c, eval, and opaque trainer indirection are forbidden")
     return tree
@@ -253,6 +324,7 @@ def _python_source_closure(script_path: Path, code_root: Path) -> list[Path]:
         tree = _validated_python_tree(path)
         modules: set[str] = set()
         relative_modules: list[tuple[int, str]] = []
+        relative_members: list[tuple[int, str, str]] = []
         imported_members: list[tuple[str, str]] = []
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
@@ -267,6 +339,12 @@ def _python_source_closure(script_path: Path, code_root: Path) -> list[Path]:
                         [node.module] if node.module else [alias.name for alias in node.names]
                     )
                 )
+                if node.module:
+                    relative_members.extend(
+                        (node.level, node.module, alias.name)
+                        for alias in node.names
+                        if alias.name != "*"
+                    )
         for module in modules:
             parts = module.split(".")
             candidates = (
@@ -311,6 +389,26 @@ def _python_source_closure(script_path: Path, code_root: Path) -> list[Path]:
             for _ in range(level - 1):
                 base = base.parent
             parts = module.split(".")
+            candidates = (
+                base.joinpath(*parts).with_suffix(".py"),
+                base.joinpath(*parts, "__init__.py"),
+            )
+            resolved = next((candidate for candidate in candidates if candidate.is_file()), None)
+            if resolved is None:
+                continue
+            pending.append(resolved)
+            relative = resolved.relative_to(code_root)
+            for parent in relative.parents:
+                if parent == Path("."):
+                    continue
+                initializer = code_root / parent / "__init__.py"
+                if initializer.is_file():
+                    pending.append(initializer)
+        for level, module, member in relative_members:
+            base = path.parent
+            for _ in range(level - 1):
+                base = base.parent
+            parts = [*module.split("."), *member.split(".")]
             candidates = (
                 base.joinpath(*parts).with_suffix(".py"),
                 base.joinpath(*parts, "__init__.py"),
@@ -476,12 +574,13 @@ def _validate_elapsed_time_anchors(
         if type(started_unix_ns) is not int or started_unix_ns <= 0:
             raise EvidenceError(f"{field}.payload.started_unix_ns must be positive")
         public_key_text = anchor.get("public_key")
-        expected_authority = (
-            _FIXTURE_ELAPSED_ANCHOR_AUTHORITY if fixture else _ELAPSED_ANCHOR_AUTHORITY
-        )
-        expected_public_key = (
-            _FIXTURE_ELAPSED_ANCHOR_PUBLIC_KEY if fixture else _ELAPSED_ANCHOR_PUBLIC_KEY
-        )
+        if fixture:
+            expected_authority = _FIXTURE_ELAPSED_ANCHOR_AUTHORITY
+            expected_public_key = _FIXTURE_ELAPSED_ANCHOR_PUBLIC_KEY
+        else:
+            identity = _formal_time_authority().identity
+            expected_authority = identity["authority"]
+            expected_public_key = identity["public_key"]
         if authority != expected_authority or public_key_text != expected_public_key:
             raise EvidenceError(f"{field} is not rooted in the pinned public authority")
         public_key = _decode_base64(public_key_text, f"{field}.public_key", length=32)
@@ -536,21 +635,12 @@ def _verify_generation_attestation(
     except InvalidSignature as error:
         raise EvidenceError("attempt journal authority attestation signature is invalid") from error
     if anchor["payload"]["authority"] != _FIXTURE_ELAPSED_ANCHOR_AUTHORITY:
-        raw_command = os.environ.get("GRADOOM_EVIDENCE_AUTHORITY")
-        if not raw_command:
+        try:
+            _formal_time_authority().verify_latest_journal_head(value)
+        except TimeAuthorityError as error:
             raise EvidenceError(
-                "formal benchmark continuation requires GRADOOM_EVIDENCE_AUTHORITY to "
-                "verify the externally maintained latest journal head"
-            )
-        result = subprocess.run(
-            [*shlex.split(raw_command), "verify-latest-journal-head"],
-            input=json.dumps(value, sort_keys=True, separators=(",", ":")),
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if result.returncode != 0 or result.stdout.strip() != "latest":
-            raise EvidenceError("external evidence authority rejected a stale journal head")
+                f"reusable-time authority rejected the journal head: {error}"
+            ) from error
 
 
 def _sign_generation_attestation(
@@ -574,34 +664,15 @@ def _sign_generation_attestation(
         private_key = Ed25519PrivateKey.from_private_bytes(b"\x19" * 32)
         signature = private_key.sign(_attestation_bytes(payload))
     else:
-        raw_command = os.environ.get("GRADOOM_EVIDENCE_AUTHORITY")
-        if not raw_command:
-            raise EvidenceError(
-                "formal benchmark outcomes require GRADOOM_EVIDENCE_AUTHORITY to obtain "
-                "an externally maintained signed journal head"
-            )
         request = {
             **payload,
             "prior_reusable_elapsed_seconds": prior_elapsed,
             "minimum_reusable_elapsed_seconds": minimum_elapsed,
         }
-        result = subprocess.run(
-            [*shlex.split(raw_command), "sign-journal-head"],
-            input=json.dumps(request, sort_keys=True, separators=(",", ":")),
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if result.returncode != 0:
-            raise EvidenceError("external evidence authority refused the journal generation")
         try:
-            attestation = _parse_json_document(
-                result.stdout.encode(), document="external authority journal seal"
-            )
-        except EvidenceError as error:
-            raise EvidenceError("external authority returned an invalid journal seal") from error
-        if not isinstance(attestation, dict):
-            raise EvidenceError("external authority returned an invalid journal seal")
+            attestation = _formal_time_authority().sign_journal_head(request)
+        except TimeAuthorityError as error:
+            raise EvidenceError(f"reusable-time authority refused journal seal: {error}") from error
         sealed_payload = attestation.get("payload")
         if not isinstance(sealed_payload, dict) or any(
             sealed_payload.get(key) != value for key, value in payload.items()
@@ -739,12 +810,13 @@ def _validate_bootstrap_artifacts(value: object, *, fixture: bool) -> list[dict[
         )
         if set(attestation) != {"payload", "public_key", "signature"}:
             raise EvidenceError(f"{field}.eligibility_attestation has an unsupported contract")
-        expected_authority = (
-            _FIXTURE_ELAPSED_ANCHOR_AUTHORITY if fixture else _ELAPSED_ANCHOR_AUTHORITY
-        )
-        expected_public_key = (
-            _FIXTURE_ELAPSED_ANCHOR_PUBLIC_KEY if fixture else _ELAPSED_ANCHOR_PUBLIC_KEY
-        )
+        if fixture:
+            expected_authority = _FIXTURE_ELAPSED_ANCHOR_AUTHORITY
+            expected_public_key = _FIXTURE_ELAPSED_ANCHOR_PUBLIC_KEY
+        else:
+            identity = _formal_time_authority().identity
+            expected_authority = identity["authority"]
+            expected_public_key = identity["public_key"]
         expected_attestation_payload = {
             "schema_version": 1,
             "authority": expected_authority,
@@ -875,21 +947,12 @@ def _validate_bootstrap_files(
                 "this artifact object"
             )
         if attestation["payload"]["authority"] != _FIXTURE_ELAPSED_ANCHOR_AUTHORITY:
-            raw_command = os.environ.get("GRADOOM_EVIDENCE_AUTHORITY")
-            if not raw_command:
+            try:
+                _formal_time_authority().verify_bootstrap_reuse(attestation)
+            except TimeAuthorityError as error:
                 raise EvidenceError(
-                    "formal bootstrap exclusion requires GRADOOM_EVIDENCE_AUTHORITY to verify "
-                    "external creation and prior-reuse ledger state"
-                )
-            authority_result = subprocess.run(
-                [*shlex.split(raw_command), "verify-bootstrap-reuse"],
-                input=json.dumps(attestation, sort_keys=True, separators=(",", ":")),
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            if authority_result.returncode != 0 or authority_result.stdout.strip() != "reused":
-                raise EvidenceError("external authority rejected bootstrap reuse history")
+                    f"reusable-time authority rejected bootstrap reuse history: {error}"
+                ) from error
         actual_sha256 = _sha256_bytes(payload)
         if actual_sha256 != declaration["sha256"]:
             raise EvidenceError(
@@ -1628,6 +1691,94 @@ def _failure(
     }
 
 
+def _execute_evaluation(
+    *,
+    base_command: list[str],
+    protocol: dict[str, Any],
+    seed: int,
+    checkpoint: Path,
+    checkpoint_sha256: str,
+    checkpoint_step: int,
+    seed_file: Path,
+    evaluation_metrics: Path,
+    manifest_directory: Path,
+    wad_profile: dict[str, Any] | None,
+    heartbeat: Callable[[], None] | None,
+) -> tuple[str, dict[str, Any] | None, dict[str, Any] | None, str | None]:
+    evaluation_command = [
+        *base_command,
+        "--evaluate-checkpoint",
+        str(checkpoint),
+        "--evaluation-episodes",
+        str(_EVALUATION_EPISODES),
+        "--evaluation-seeds-file",
+        str(seed_file),
+        "--evaluation-seed",
+        str(protocol["evaluation_action_seed"]),
+        "--evaluation-stochastic",
+        "--metrics-jsonl",
+        str(evaluation_metrics),
+    ]
+    evaluation_process = _run_process(
+        evaluation_command,
+        cwd=manifest_directory,
+        heartbeat=heartbeat,
+    )
+    if evaluation_process.returncode == 130:
+        return "interrupted", None, None, None
+    if evaluation_process.returncode != 0:
+        return (
+            "evaluation_failed",
+            None,
+            _failure(
+                seed=seed,
+                phase="evaluation",
+                checkpoint_step=checkpoint_step,
+                process=evaluation_process,
+            ),
+            None,
+        )
+    try:
+        evaluation_records = _read_jsonl(evaluation_metrics, phase="evaluation")
+        evaluation, episodes, mean_player, mean_compatibility = _validate_evaluation_records(
+            evaluation_records,
+            checkpoint=checkpoint,
+            checkpoint_sha256=checkpoint_sha256,
+            episode_seeds=protocol["evaluation_episode_seeds"],
+            evaluation_action_seed=protocol["evaluation_action_seed"],
+            manifest_directory=manifest_directory,
+            wad_profile=wad_profile,
+        )
+        evaluation_metrics_sha256 = _fsync_file(
+            evaluation_metrics,
+            field="evaluation metrics",
+        )
+    except EvidenceError as error:
+        return (
+            "evidence_failed",
+            None,
+            {
+                "seed": seed,
+                "phase": "evaluation_evidence",
+                "checkpoint_step": checkpoint_step,
+                "message": str(error),
+            },
+            None,
+        )
+    passed = mean_player >= _QUALITY_THRESHOLD
+    outcome = {
+        "checkpoint_step": checkpoint_step,
+        "checkpoint": str(checkpoint),
+        "checkpoint_sha256": checkpoint_sha256,
+        "mean_player_killcount": mean_player,
+        "mean_killcount": mean_compatibility,
+        "passed": passed,
+        "evaluation": evaluation,
+        "episodes": episodes,
+    }
+    return ("succeeded" if passed else "exhausted"), outcome, None, evaluation_metrics_sha256
+
+
 def _load_live_interrupted_attempt(
     attempt_directory: Path,
     *,
@@ -1668,6 +1819,9 @@ def _load_live_interrupted_attempt(
             or journal.get("continuation_identity") != expected_identity
         ):
             raise EvidenceError(f"seed {seed} live attempt journal has unlike identity")
+        phase = journal.get("phase", "training")
+        if phase not in {"training", "evaluation"}:
+            raise EvidenceError(f"seed {seed} live attempt journal has an invalid phase")
         checkpoint = _resolve_evidence_path(
             Path(journal.get("checkpoint", "")), base_directory=manifest_directory
         )
@@ -1703,7 +1857,7 @@ def _load_live_interrupted_attempt(
             wad_profile=wad_profile,
             run_identity=run_identity,
             attempt_identity=attempt_identity,
-            interrupted=True,
+            interrupted=phase == "training",
         )
         checkpoint_sha256 = _fsync_file(checkpoint, field="live recovery checkpoint")
         metrics_sha256 = _fsync_file(training_metrics, field="live recovery metrics")
@@ -1755,6 +1909,7 @@ def _load_live_interrupted_attempt(
             "outcomes": journal["outcomes"],
             "failures": journal["failures"],
             "recovery": {
+                "phase": phase,
                 "checkpoint": str(checkpoint),
                 "checkpoint_sha256": checkpoint_sha256,
                 "progress_step": summary["train/global_step"],
@@ -1762,6 +1917,11 @@ def _load_live_interrupted_attempt(
                 "run_identity": run_identity,
                 "attempt_identity": attempt_identity,
                 "accumulated_reusable_elapsed_seconds": float(elapsed),
+                "checkpoint_step": requested_step,
+                "training_metrics": str(training_metrics),
+                "checkpoint_evidence_name": journal["checkpoint_evidence_name"],
+                "metrics_evidence_name": journal["metrics_evidence_name"],
+                "previous_checkpoint": journal.get("previous_checkpoint"),
             },
             "recovery_history": journal["recovery_history"],
             "recovery_journal": None,
@@ -1879,7 +2039,168 @@ def _run_attempt(
         (existing_attempt or {}).get("generated_artifacts", [])
     )
     status = "exhausted"
+    cold_start = (existing_attempt or {}).get(
+        "cold_start",
+        {
+            "policy_state": "fresh_random",
+            "optimizer_state": "fresh",
+            "learned_initialization": False,
+        },
+    )
+
+    def evaluation_heartbeat(
+        *,
+        checkpoint_step: int,
+        checkpoint: Path,
+        training_metrics: Path,
+        previous_checkpoint_payload: dict[str, Any] | None,
+        checkpoint_evidence_name: str,
+        metrics_evidence_name: str,
+        evaluation_live_path: Path,
+        evaluation_journal_name: str,
+    ) -> Callable[[], None]:
+        reusable_elapsed_at_launch = prior_elapsed + clock() - started
+        live_started_unix_ns = time.time_ns()
+
+        def persist() -> None:
+            live_payload = {
+                "schema_version": 1,
+                "status": "running",
+                "phase": "evaluation",
+                "run_identity": run_identity,
+                "attempt_identity": attempt_identity,
+                "seed": seed,
+                "continuation_identity": protocol["continuation_identity"],
+                "checkpoint_step": checkpoint_step,
+                "checkpoint": str(checkpoint),
+                "training_metrics": str(training_metrics),
+                "previous_checkpoint": previous_checkpoint_payload,
+                "cold_start": cold_start,
+                "outcomes": outcomes,
+                "failures": failures,
+                "recovery_history": recovery_history,
+                "reusable_elapsed_seconds": prior_elapsed + clock() - started,
+                "reusable_elapsed_seconds_at_launch": reusable_elapsed_at_launch,
+                "started_unix_ns": live_started_unix_ns,
+                "checkpoint_evidence_name": checkpoint_evidence_name,
+                "metrics_evidence_name": metrics_evidence_name,
+                "journal_evidence_name": evaluation_journal_name,
+            }
+            live_payload["payload_sha256"] = _canonical_sha256(
+                live_payload,
+                document="live benchmark attempt journal",
+            )
+            _write_durable_json(
+                evaluation_live_path,
+                live_payload,
+                field="live benchmark evaluation journal",
+            )
+
+        persist()
+        return persist
+
+    if isinstance(existing_recovery, dict) and existing_recovery.get("phase") == "evaluation":
+        checkpoint_step = existing_recovery["checkpoint_step"]
+        checkpoint = _resolve_evidence_path(
+            Path(existing_recovery["checkpoint"]), base_directory=manifest_directory
+        )
+        training_metrics = _resolve_evidence_path(
+            Path(existing_recovery["training_metrics"]), base_directory=manifest_directory
+        )
+        training_records = _read_jsonl(training_metrics, phase="recovered training")
+        serialized_previous = existing_recovery.get("previous_checkpoint")
+        validation_previous = serialized_previous
+        if isinstance(validation_previous, dict):
+            validation_previous = {
+                **validation_previous,
+                "path": _resolve_evidence_path(
+                    Path(validation_previous["path"]), base_directory=manifest_directory
+                ),
+            }
+        training_summary, _resumed = _validate_training_records(
+            training_records,
+            checkpoint=checkpoint,
+            requested_step=checkpoint_step,
+            previous_checkpoint=validation_previous,
+            manifest_directory=manifest_directory,
+            wad_profile=wad_profile,
+            run_identity=run_identity,
+            attempt_identity=attempt_identity,
+        )
+        checkpoint_sha256 = _fsync_file(checkpoint, field="recovered evaluation checkpoint")
+        if checkpoint_sha256 != existing_recovery["checkpoint_sha256"]:
+            raise EvidenceError("recovered evaluation checkpoint SHA-256 mismatch")
+        recovery_history.append(
+            {
+                "checkpoint": str(checkpoint),
+                "checkpoint_sha256": checkpoint_sha256,
+                "progress_step": checkpoint_step,
+                "restored_state": dict(_RESTORABLE_STATE),
+                "resumed_phase": "evaluation",
+                "prior_reusable_elapsed_seconds": prior_elapsed,
+            }
+        )
+        evaluation_metrics = attempt_directory / f"evaluation-step-{checkpoint_step}.jsonl"
+        evaluation_live_path = attempt_directory / (
+            f"attempt-live-evaluation-step-{checkpoint_step}-recovery.json"
+        )
+        evaluation_journal_name = f"seed-{seed}-step-{checkpoint_step}-evaluation-live-recovery"
+        heartbeat = evaluation_heartbeat(
+            checkpoint_step=checkpoint_step,
+            checkpoint=checkpoint,
+            training_metrics=training_metrics,
+            previous_checkpoint_payload=serialized_previous,
+            checkpoint_evidence_name=existing_recovery["checkpoint_evidence_name"],
+            metrics_evidence_name=existing_recovery["metrics_evidence_name"],
+            evaluation_live_path=evaluation_live_path,
+            evaluation_journal_name=evaluation_journal_name,
+        )
+        evaluation_status, outcome, failure, evaluation_sha256 = _execute_evaluation(
+            base_command=base_command,
+            protocol=protocol,
+            seed=seed,
+            checkpoint=checkpoint,
+            checkpoint_sha256=checkpoint_sha256,
+            checkpoint_step=checkpoint_step,
+            seed_file=seed_file,
+            evaluation_metrics=evaluation_metrics,
+            manifest_directory=manifest_directory,
+            wad_profile=wad_profile,
+            heartbeat=heartbeat,
+        )
+        evaluation_live_sha256 = _fsync_file(
+            evaluation_live_path, field="live benchmark evaluation recovery journal"
+        )
+        if evaluation_journal_name not in {entry["name"] for entry in evidence_entries}:
+            evidence_entries.append(
+                {"name": evaluation_journal_name, "sha256": evaluation_live_sha256}
+            )
+        generated_artifacts.append(
+            {"name": evaluation_journal_name, "path": str(evaluation_live_path)}
+        )
+        if failure is not None:
+            failures.append(failure)
+        if outcome is not None:
+            outcome["training"] = training_summary
+            outcomes.append(outcome)
+            assert evaluation_sha256 is not None
+            evaluation_name = f"seed-{seed}-step-{checkpoint_step}-evaluation-metrics"
+            if evaluation_name not in {entry["name"] for entry in evidence_entries}:
+                evidence_entries.append({"name": evaluation_name, "sha256": evaluation_sha256})
+            generated_artifacts.append({"name": evaluation_name, "path": str(evaluation_metrics)})
+        status = evaluation_status
+        previous_checkpoint = {
+            "path": checkpoint,
+            "progress_step": checkpoint_step,
+            "kind": "checkpoint",
+            "checkpoint_sha256": checkpoint_sha256,
+        }
+        final_checkpoint = checkpoint
+        final_checkpoint_sha256 = checkpoint_sha256
+        recovery = None
     for checkpoint_step in protocol["checkpoint_steps"]:
+        if status in {"succeeded", "evaluation_failed", "evidence_failed", "interrupted"}:
+            break
         if any(outcome["checkpoint_step"] == checkpoint_step for outcome in outcomes):
             continue
         generation = 0
@@ -1920,14 +2241,6 @@ def _run_attempt(
                 **previous_checkpoint,
                 "path": str(previous_checkpoint["path"]),
             }
-        cold_start = (existing_attempt or {}).get(
-            "cold_start",
-            {
-                "policy_state": "fresh_random",
-                "optimizer_state": "fresh",
-                "learned_initialization": False,
-            },
-        )
 
         def persist_live_attempt(
             *,
@@ -2091,85 +2404,75 @@ def _run_attempt(
             status = "interrupted"
             break
         evaluation_metrics = attempt_directory / f"evaluation-step-{checkpoint_step}.jsonl"
-        evaluation_command = [
-            *base_command,
-            "--evaluate-checkpoint",
-            str(checkpoint),
-            "--evaluation-episodes",
-            str(_EVALUATION_EPISODES),
-            "--evaluation-seeds-file",
-            str(seed_file),
-            "--evaluation-seed",
-            str(protocol["evaluation_action_seed"]),
-            "--evaluation-stochastic",
-            "--metrics-jsonl",
-            str(evaluation_metrics),
-        ]
-        evaluation_process = _run_process(evaluation_command, cwd=manifest_directory)
-        if evaluation_process.returncode != 0:
-            failures.append(
-                _failure(
-                    seed=seed,
-                    phase="evaluation",
-                    checkpoint_step=checkpoint_step,
-                    process=evaluation_process,
-                )
+        evaluation_live_path = attempt_directory / (
+            f"attempt-live-evaluation-step-{checkpoint_step}.json"
+        )
+        evaluation_journal_name = f"seed-{seed}-step-{checkpoint_step}-evaluation-live"
+        heartbeat = evaluation_heartbeat(
+            checkpoint_step=checkpoint_step,
+            checkpoint=checkpoint,
+            training_metrics=training_metrics,
+            previous_checkpoint_payload=serialized_previous,
+            checkpoint_evidence_name=checkpoint_evidence_name,
+            metrics_evidence_name=metrics_evidence_name,
+            evaluation_live_path=evaluation_live_path,
+            evaluation_journal_name=evaluation_journal_name,
+        )
+        evaluation_status, outcome, failure, evaluation_metrics_sha256 = _execute_evaluation(
+            base_command=base_command,
+            protocol=protocol,
+            seed=seed,
+            checkpoint=checkpoint,
+            checkpoint_sha256=checkpoint_sha256,
+            checkpoint_step=checkpoint_step,
+            seed_file=seed_file,
+            evaluation_metrics=evaluation_metrics,
+            manifest_directory=manifest_directory,
+            wad_profile=wad_profile,
+            heartbeat=heartbeat,
+        )
+        evaluation_live_sha256 = _fsync_file(
+            evaluation_live_path, field="live benchmark evaluation journal"
+        )
+        if evaluation_journal_name not in {entry["name"] for entry in evidence_entries}:
+            evidence_entries.append(
+                {"name": evaluation_journal_name, "sha256": evaluation_live_sha256}
             )
-            status = "evaluation_failed"
-            final_checkpoint = checkpoint
-            final_checkpoint_sha256 = checkpoint_sha256
-            break
-        try:
-            evaluation_records = _read_jsonl(evaluation_metrics, phase="evaluation")
-            evaluation, episodes, mean_player, mean_compatibility = _validate_evaluation_records(
-                evaluation_records,
-                checkpoint=checkpoint,
-                checkpoint_sha256=checkpoint_sha256,
-                episode_seeds=protocol["evaluation_episode_seeds"],
-                evaluation_action_seed=protocol["evaluation_action_seed"],
-                manifest_directory=manifest_directory,
-                wad_profile=wad_profile,
-            )
-            evaluation_metrics_sha256 = _fsync_file(
-                evaluation_metrics,
-                field="evaluation metrics",
-            )
-        except EvidenceError as error:
-            failures.append(
+        generated_artifacts.append(
+            {"name": evaluation_journal_name, "path": str(evaluation_live_path)}
+        )
+        if failure is not None:
+            failures.append(failure)
+        if outcome is not None:
+            outcome["training"] = training_summary
+            outcomes.append(outcome)
+            assert evaluation_metrics_sha256 is not None
+            evidence_entries.append(
                 {
-                    "seed": seed,
-                    "phase": "evaluation_evidence",
-                    "checkpoint_step": checkpoint_step,
-                    "message": str(error),
+                    "name": f"seed-{seed}-step-{checkpoint_step}-evaluation-metrics",
+                    "sha256": evaluation_metrics_sha256,
                 }
             )
-            status = "evidence_failed"
-            final_checkpoint = checkpoint
-            final_checkpoint_sha256 = checkpoint_sha256
-            break
-        evidence_entries.append(
-            {
-                "name": f"seed-{seed}-step-{checkpoint_step}-evaluation-metrics",
-                "sha256": evaluation_metrics_sha256,
-            }
-        )
-        generated_artifacts.append(
-            {"name": evidence_entries[-1]["name"], "path": str(evaluation_metrics)}
-        )
-        passed = mean_player >= _QUALITY_THRESHOLD
-        outcomes.append(
-            {
-                "checkpoint_step": checkpoint_step,
+            generated_artifacts.append(
+                {"name": evidence_entries[-1]["name"], "path": str(evaluation_metrics)}
+            )
+        if evaluation_status == "interrupted":
+            recovery = {
+                "phase": "evaluation",
                 "checkpoint": str(checkpoint),
                 "checkpoint_sha256": checkpoint_sha256,
-                "mean_player_killcount": mean_player,
-                "mean_killcount": mean_compatibility,
-                "passed": passed,
-                "training": training_summary,
-                "evaluation": evaluation,
-                "episodes": episodes,
+                "progress_step": checkpoint_step,
+                "checkpoint_step": checkpoint_step,
+                "training_metrics": str(training_metrics),
+                "checkpoint_evidence_name": checkpoint_evidence_name,
+                "metrics_evidence_name": metrics_evidence_name,
+                "previous_checkpoint": serialized_previous,
+                "restorable_state": dict(_RESTORABLE_STATE),
+                "run_identity": run_identity,
+                "attempt_identity": attempt_identity,
+                "accumulated_reusable_elapsed_seconds": 0.0,
             }
-        )
+        status = evaluation_status
         previous_checkpoint = {
             "path": checkpoint,
             "progress_step": checkpoint_step,
@@ -2178,8 +2481,7 @@ def _run_attempt(
         }
         final_checkpoint = checkpoint
         final_checkpoint_sha256 = checkpoint_sha256
-        if passed:
-            status = "succeeded"
+        if status != "exhausted":
             break
     elapsed = prior_elapsed + clock() - started
     if recovery is not None and elapsed_time_anchor is not None:
@@ -2299,6 +2601,13 @@ def _run_attempt(
         "sha256": attempt_journal_sha256,
         "authority_attestation": authority_attestation,
     }
+    attempt["_terminal_timing"] = {
+        "started": started,
+        "prior_elapsed": prior_elapsed,
+        "anchor": elapsed_time_anchor,
+        "journal_payload": attempt_journal_payload,
+        "journal_sha256": attempt_journal_sha256,
+    }
     return attempt
 
 
@@ -2308,6 +2617,7 @@ def build_development_benchmark_report(
     merge_path: Path | None = None,
     invocation_started: float | None = None,
     clock: Callable[[], float] = time.perf_counter,
+    report_writer: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     if invocation_started is None:
         invocation_started = clock()
@@ -2326,6 +2636,16 @@ def build_development_benchmark_report(
         Path(validated["artifacts_directory"]),
         base_directory=manifest_path.parent,
     )
+    if not manifest["fixture"]:
+        authority_root = _formal_time_authority().state_directory
+        if (
+            authority_root == artifacts_root
+            or authority_root.is_relative_to(artifacts_root)
+            or artifacts_root.is_relative_to(authority_root)
+        ):
+            raise EvidenceError(
+                "formal reusable-time authority state must not overlap benchmark artifacts"
+            )
     bootstrap_exclusions = _validate_bootstrap_files(
         validated["bootstrap_artifacts"],
         base_directory=manifest_path.parent,
@@ -2412,6 +2732,9 @@ def build_development_benchmark_report(
             "training",
             "checkpoint_evaluation",
             "durable_checkpoint_write",
+            "terminal_evidence_verification",
+            "report_validation_serialization_replacement_and_fsync",
+            "durable_authority_elapsed_seal",
         ],
         "timer_boundaries": {
             "start": (
@@ -2419,7 +2742,7 @@ def build_development_benchmark_report(
                 "and_continuation_verification"
             ),
             "resume": "add_prior_hashed_recovery_elapsed_before_recurring_recovery_work",
-            "stop": "after_durable_checkpoint_or_terminal_attempt_state",
+            "stop": "after_final_durable_report_contains_a_conservative_authority_elapsed_seal",
         },
         "trainer": validated["trainer"],
         "parity_certificate": validated["parity_certificate"],
@@ -2544,8 +2867,6 @@ def build_development_benchmark_report(
         )
         actual_generated_artifacts.extend(attempt.pop("generated_artifacts", []))
         attempts.append(attempt)
-    _reverify_bootstrap_files(bootstrap_exclusions)
-    _reverify_trainer_files(validated["trainer"])
     generated_artifacts: list[dict[str, str]] = list(
         (continuation or {}).get("generated_artifacts", [])
     )
@@ -2601,7 +2922,7 @@ def build_development_benchmark_report(
                 "message": certificate["reason"],
             }
         )
-    return {
+    report = {
         "schema_version": 1,
         "workflow": _WORKFLOW,
         "evidence_level": "development",
@@ -2625,3 +2946,67 @@ def build_development_benchmark_report(
             "sha256": _canonical_sha256(evidence_entries, document="manifest"),
         },
     }
+    terminal_timing: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for attempt in attempts:
+        timing = attempt.pop("_terminal_timing", None)
+        if isinstance(timing, dict):
+            terminal_timing.append((attempt, timing))
+    _reverify_bootstrap_files(bootstrap_exclusions)
+    _reverify_trainer_files(validated["trainer"])
+    if report_writer is not None:
+        write_started = clock()
+        report_writer(report)
+        write_finished = clock()
+        if not terminal_timing:
+            return report
+        allowance = max(0.001, 2.0 * max(0.0, write_finished - write_started))
+        for _iteration in range(8):
+            for attempt, timing in terminal_timing:
+                minimum_elapsed = max(
+                    float(attempt["reusable_elapsed_seconds"]),
+                    float(timing["prior_elapsed"])
+                    + max(0.0, clock() - float(timing["started"]))
+                    + allowance,
+                )
+                attestation = _sign_generation_attestation(
+                    _journal_attestation_payload(
+                        timing["journal_payload"],
+                        anchor=timing["anchor"],
+                        journal_sha256=timing["journal_sha256"],
+                    ),
+                    anchor=timing["anchor"],
+                    prior_elapsed=(
+                        float(timing["prior_elapsed"])
+                        if timing["anchor"]["payload"]["authority"]
+                        == _FIXTURE_ELAPSED_ANCHOR_AUTHORITY
+                        else float(attempt["reusable_elapsed_seconds"])
+                    ),
+                    minimum_elapsed=minimum_elapsed,
+                    started=float(timing["started"]),
+                    clock=clock,
+                )
+                elapsed = float(attestation["payload"]["reusable_elapsed_seconds"])
+                attempt["reusable_elapsed_seconds"] = elapsed
+                recovery = attempt.get("recovery")
+                if isinstance(recovery, dict):
+                    recovery["accumulated_reusable_elapsed_seconds"] = elapsed
+                attempt["attempt_journal"]["authority_attestation"] = attestation
+            write_started = clock()
+            report_writer(report)
+            write_finished = clock()
+            if all(
+                float(attempt["reusable_elapsed_seconds"])
+                >= float(timing["prior_elapsed"])
+                + max(0.0, write_finished - float(timing["started"]))
+                for attempt, timing in terminal_timing
+            ):
+                break
+            allowance = max(
+                allowance * 2.0,
+                2.0 * max(0.0, write_finished - write_started),
+            )
+        else:
+            raise EvidenceError(
+                "could not conservatively seal reusable elapsed time through durable report write"
+            )
+    return report

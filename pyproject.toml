@@ -21,6 +21,7 @@ dependencies = [
 
 [project.scripts]
 gradoom-evidence = "gradoom.evidence.cli:main"
+gradoom-time-authority = "gradoom.evidence.time_authority:main"
 
 [project.urls]
 Homepage = "https://github.com/tsilva/env-GraDOOM-turbo-torch"

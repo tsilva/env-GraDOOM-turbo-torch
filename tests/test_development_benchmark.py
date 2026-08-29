@@ -137,6 +137,9 @@ def test_development_benchmark_defaults_to_one_cold_seed_and_stops_at_first_pass
         "training",
         "checkpoint_evaluation",
         "durable_checkpoint_write",
+        "terminal_evidence_verification",
+        "report_validation_serialization_replacement_and_fsync",
+        "durable_authority_elapsed_seal",
     ]
     assert report["attempts"][0]["status"] == "succeeded"
     assert [candidate["checkpoint_step"] for candidate in report["attempts"][0]["outcomes"]] == [

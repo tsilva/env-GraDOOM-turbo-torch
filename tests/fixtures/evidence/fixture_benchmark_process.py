@@ -38,6 +38,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--fixture-hard-crash-once-at-step", type=int)
     parser.add_argument("--fixture-hold-after-recovery-checkpoint-marker", type=Path)
     parser.add_argument("--fixture-recovery-child-exited-marker", type=Path)
+    parser.add_argument("--fixture-hold-evaluation-once-marker", type=Path)
+    parser.add_argument("--fixture-evaluation-child-exited-marker", type=Path)
     parser.add_argument("--evidence-run-identity")
     parser.add_argument("--evidence-attempt-identity")
     return parser
@@ -230,6 +232,24 @@ def main() -> int:
             os._exit(17)
         return 130 if should_interrupt else 0
 
+    if (
+        args.fixture_hold_evaluation_once_marker is not None
+        and not args.fixture_hold_evaluation_once_marker.exists()
+    ):
+        args.fixture_hold_evaluation_once_marker.write_text(
+            "evaluation-started\n", encoding="utf-8"
+        )
+
+        def stop_evaluation(_signum: int, _frame: object) -> None:
+            if args.fixture_evaluation_child_exited_marker is not None:
+                args.fixture_evaluation_child_exited_marker.write_text(
+                    "evaluation-child-exited\n", encoding="utf-8"
+                )
+            raise SystemExit(130)
+
+        signal.signal(signal.SIGINT, stop_evaluation)
+        signal.signal(signal.SIGTERM, stop_evaluation)
+        time.sleep(30.0)
     checkpoint = json.loads(args.evaluate_checkpoint.read_text(encoding="utf-8"))
     step = int(checkpoint["step"])
     if args.fixture_fail_evaluation_step == step:
