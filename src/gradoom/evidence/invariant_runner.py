@@ -4,6 +4,7 @@ import hashlib
 import inspect
 import json
 import re
+import subprocess
 import sys
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -12,10 +13,11 @@ from typing import Any
 import numpy as np
 import torch
 
-from gradoom.actions import DEATHMATCH_ACTION_MEANINGS, DEATHMATCH_ACTIONS
+from gradoom.actions import DEATHMATCH_ACTION_MEANINGS, DEATHMATCH_ACTIONS, DEATHMATCH_BUTTONS
 
 RUNNER_PROTOCOL_VERSION = 1
 _SIGNALS = ("health", "killcount", "player_killcount", "episode_return")
+_NATIVE_GAME_VARIABLES = ("health", "killcount", "player_killcount")
 
 
 class _FixtureTurboEnv:
@@ -57,6 +59,7 @@ class _FixtureTurboEnv:
         fixture_transport: str = "numpy",
         fixture_missing_signal: str | None = None,
         fixture_masked_reset: str = "respect",
+        fixture_terminal_reset: str = "respect",
     ) -> None:
         del (
             game,
@@ -95,6 +98,7 @@ class _FixtureTurboEnv:
         self.fixture_transport = fixture_transport
         self.fixture_missing_signal = fixture_missing_signal
         self.fixture_masked_reset = fixture_masked_reset
+        self.fixture_terminal_reset = fixture_terminal_reset
         self.device = torch.device("cpu")
         self.action_meanings = DEATHMATCH_ACTION_MEANINGS
         self._initialized = np.zeros(num_envs, dtype=np.bool_)
@@ -103,6 +107,7 @@ class _FixtureTurboEnv:
         self._killcount = np.zeros(num_envs, dtype=np.float64)
         self._player_killcount = np.zeros(num_envs, dtype=np.float64)
         self._episode_return = np.zeros(num_envs, dtype=np.float64)
+        self._last_attributions: list[list[dict[str, str]]] = [[] for _ in range(num_envs)]
 
     def _array(self, value: np.ndarray) -> Any:
         return torch.from_numpy(value.copy()) if self.fixture_transport == "torch" else value.copy()
@@ -136,7 +141,30 @@ class _FixtureTurboEnv:
             mask = raw_mask.detach().cpu().numpy().astype(np.bool_, copy=False)
         else:
             mask = np.asarray(raw_mask, dtype=np.bool_)
-        if raw_mask is not None and self.fixture_masked_reset == "ignore":
+        forge_reset = raw_mask is not None and (
+            (self.fixture_masked_reset == "forge" and not bool(np.any(self._pending_reset & mask)))
+            or (
+                self.fixture_terminal_reset == "broken" and bool(np.any(self._pending_reset & mask))
+            )
+        )
+        saved = None
+        if forge_reset:
+            saved = tuple(
+                value.copy()
+                for value in (
+                    self._initialized,
+                    self._pending_reset,
+                    self._state,
+                    self._killcount,
+                    self._player_killcount,
+                    self._episode_return,
+                )
+            )
+        if (
+            raw_mask is not None
+            and self.fixture_masked_reset == "ignore"
+            and not bool(np.any(self._pending_reset & mask))
+        ):
             mask = np.zeros(self.num_envs, dtype=np.bool_)
         elif raw_mask is not None and self.fixture_masked_reset == "leak":
             mask = np.ones(self.num_envs, dtype=np.bool_)
@@ -146,7 +174,17 @@ class _FixtureTurboEnv:
         self._killcount[mask] = 0
         self._player_killcount[mask] = 0
         self._episode_return[mask] = 0
-        return self._observation(), self._infos()
+        result = self._observation(), self._infos()
+        if saved is not None:
+            (
+                self._initialized,
+                self._pending_reset,
+                self._state,
+                self._killcount,
+                self._player_killcount,
+                self._episode_return,
+            ) = saved
+        return result
 
     def step(self, actions: Any) -> tuple[Any, Any, Any, Any, dict[str, Any]]:
         if not bool(np.all(self._initialized)):
@@ -163,6 +201,16 @@ class _FixtureTurboEnv:
         truncated = indices == 2
         player_kills = indices == 3
         enemy_kills = indices == 4
+        self._last_attributions = [
+            (
+                [{"attacker": "player", "target": "enemy"}]
+                if bool(player_kills[lane])
+                else [{"attacker": "enemy", "target": "enemy"}]
+                if bool(enemy_kills[lane])
+                else []
+            )
+            for lane in range(self.num_envs)
+        ]
         self._killcount += player_kills + enemy_kills
         self._player_killcount += player_kills
         self._episode_return += rewards
@@ -276,6 +324,42 @@ def _kill_signals(
     )
 
 
+def _fixture_attribution_oracle(
+    env: Any,
+    *,
+    lane: int,
+    behavior: str,
+) -> dict[str, str]:
+    del behavior
+    events = env._last_attributions[lane]
+    if len(events) != 1:
+        raise RuntimeError("staged fixture did not observe exactly one attribution event")
+    return dict(events[0])
+
+
+def _verified_attribution(
+    oracle: Callable[..., Mapping[str, str]] | None,
+    env: Any,
+    *,
+    lane: int,
+    behavior: str,
+) -> dict[str, str]:
+    if oracle is None:
+        raise RuntimeError(
+            "kill semantics require an independent actor/target attribution oracle; "
+            "compatibility counters alone are insufficient"
+        )
+    event = oracle(env, lane=lane, behavior=behavior)
+    if not isinstance(event, Mapping) or set(event) != {"attacker", "target"}:
+        raise RuntimeError("actor/target attribution oracle returned an invalid event")
+    expected_attacker = "player" if behavior == "player_killcount" else "enemy"
+    if event["attacker"] != expected_attacker or event["target"] != "enemy":
+        raise RuntimeError(
+            f"actor/target attribution oracle did not observe {expected_attacker}-to-enemy"
+        )
+    return dict(event)
+
+
 def _semantic_probe(
     *,
     behavior: str,
@@ -284,6 +368,7 @@ def _semantic_probe(
     probe: Mapping[str, Any],
     requested_device: torch.device | None,
     kill_signal_reader: Callable[..., dict[str, float]] | None,
+    attribution_oracle: Callable[..., Mapping[str, str]] | None = None,
 ) -> dict[str, Any]:
     env = factory()
     try:
@@ -340,7 +425,40 @@ def _semantic_probe(
                 requires_reset = True
             else:
                 requires_reset = False
-            return {"reported_separately": True, "requires_reset": requires_reset}
+            terminal_mask = [
+                bool(terminated_values[index]) or bool(truncated_values[index])
+                for index in range(2)
+            ]
+            reset_seeds = [
+                probe["seeds"][index] if selected else None
+                for index, selected in enumerate(terminal_mask)
+            ]
+            try:
+                reset_result = env.reset(
+                    seed=reset_seeds,
+                    options={"reset_mask": _mask(provider, terminal_mask, requested_device)},
+                )
+                if not isinstance(reset_result, tuple) or len(reset_result) != 2:
+                    raise RuntimeError("terminal reset did not return observation and signals")
+                resumed = env.step(_actions(provider, actions[0], requested_device))
+                if not isinstance(resumed, tuple) or len(resumed) != 5:
+                    raise RuntimeError("resumed step did not return the public five-tuple")
+            except Exception as error:
+                raise RuntimeError(
+                    f"terminal lane reset did not resume stepping: {error}"
+                ) from error
+            return {
+                "reported_separately": True,
+                "requires_reset": requires_reset,
+                "terminal_lane_reset": True,
+                "stepping_resumed": True,
+            }
+        attribution = _verified_attribution(
+            attribution_oracle,
+            env,
+            lane=lane,
+            behavior=behavior,
+        )
         player, compatibility = _kill_signals(
             transition[4],
             kill_signal_reader=kill_signal_reader,
@@ -349,10 +467,15 @@ def _semantic_probe(
         player_delta = player - initial_kills[lane][0]
         compatibility_delta = compatibility - initial_kills[lane][1]
         if behavior == "player_killcount":
-            return {"present": True, "player_kill_delta": player_delta}
+            return {
+                "present": True,
+                "player_kill_delta": player_delta,
+                "attribution": attribution,
+            }
         return {
             "enemy_on_enemy_delta": player_delta,
             "compatibility_kill_delta": compatibility_delta,
+            "attribution": attribution,
         }
     finally:
         env.close()
@@ -368,6 +491,7 @@ def _capture_contract(
     semantic_probes: Mapping[str, Mapping[str, Any]],
     requested_device: torch.device | None = None,
     kill_signal_reader: Callable[..., dict[str, float]] | None = None,
+    attribution_oracle: Callable[..., Mapping[str, str]] | None = None,
 ) -> dict[str, Any]:
     signature = inspect.signature(env_class).parameters
     common = list(signature.values())[:32]
@@ -437,6 +561,17 @@ def _capture_contract(
                 raise RuntimeError("step signals are not a mapping")
             step_observation_snapshot = _snapshot(step_observation)
             step_signal_snapshots = _snapshot_signals(step_infos)
+            control_env = factory()
+            try:
+                control_env.reset(seed=[7, 8])
+                control_first = control_env.step(step_actions)
+                control_second = control_env.step(step_actions)
+                control_first_observation = _snapshot(control_first[0])
+                control_first_signals = _snapshot_signals(control_first[4])
+                control_second_observation = _snapshot(control_second[0])
+                control_second_signals = _snapshot_signals(control_second[4])
+            finally:
+                control_env.close()
             behaviors["signal_shapes"] = {
                 operation: {name: _descriptor(infos[name]) for name in _SIGNALS if name in infos}
                 for operation, infos in (("reset", reset_infos), ("step", step_infos))
@@ -474,10 +609,25 @@ def _capture_contract(
                 and _lane_equal(step_observation_snapshot, masked_observation_snapshot, 1)
                 and _lane_signals_equal(step_signal_snapshots, masked_signal_snapshots, 1)
             )
+            continued_result = env.step(step_actions)
+            if not isinstance(continued_result, tuple) or len(continued_result) != 5:
+                raise RuntimeError("post-masked-reset step did not return the public five-tuple")
+            continued_observation = _snapshot(continued_result[0])
+            if not isinstance(continued_result[4], Mapping):
+                raise RuntimeError("post-masked-reset step signals are not a mapping")
+            continued_signals = _snapshot_signals(continued_result[4])
+            selected_lane_continues_from_reset = _lane_equal(
+                control_first_observation, continued_observation, 0
+            ) and _lane_signals_equal(control_first_signals, continued_signals, 0)
+            unselected_lane_continues = _lane_equal(
+                control_second_observation, continued_observation, 1
+            ) and _lane_signals_equal(control_second_signals, continued_signals, 1)
             behaviors["masked_reset"] = {
                 "supported": True,
                 "selected_lane_state_and_signals_reset": selected_lane_reset,
                 "unselected_lane_state_and_signals_unchanged": unselected_lane_unchanged,
+                "selected_lane_continues_from_reset_state": selected_lane_continues_from_reset,
+                "unselected_lane_continues_without_reset": unselected_lane_continues,
             }
             behaviors["episode"] = {
                 "step_before_reset_rejected": step_before_reset_rejected,
@@ -512,6 +662,7 @@ def _capture_contract(
                     probe=semantic_probes[behavior],
                     requested_device=requested_device,
                     kill_signal_reader=kill_signal_reader,
+                    attribution_oracle=attribution_oracle,
                 )
             except Exception as error:
                 behaviors[behavior] = _probe_error(error)
@@ -568,6 +719,9 @@ def _fixture_contracts(case: str) -> list[dict[str, Any]]:
         "missing_termination",
         "ignored_masked_reset",
         "leaky_masked_reset",
+        "forged_masked_reset",
+        "broken_terminal_reset",
+        "counter_only_kills",
     }:
         raise ValueError(f"unsupported fixture_case {case!r}")
     contracts = []
@@ -591,27 +745,47 @@ def _fixture_contracts(case: str) -> list[dict[str, Any]]:
             if case == "ignored_masked_reset" and provider == "env-vizdoom-turbo"
             else "leak"
             if case == "leaky_masked_reset" and provider == "env-vizdoom-turbo"
+            else "forge"
+            if case == "forged_masked_reset" and provider == "env-vizdoom-turbo"
             else "respect"
         )
+        fixture_terminal_reset = (
+            "broken"
+            if case == "broken_terminal_reset" and provider == "env-vizdoom-turbo"
+            else "respect"
+        )
+
+        def factory(
+            transport: str = transport,
+            fixture_masked_reset: str = fixture_masked_reset,
+            fixture_terminal_reset: str = fixture_terminal_reset,
+            fixture_missing_signal: str | None = (
+                "player_killcount" if case == "missing_player_killcount" else None
+            ),
+        ) -> _FixtureTurboEnv:
+            return _FixtureTurboEnv(
+                "VizdoomDeathmatch-v1",
+                num_envs=2,
+                fixture_transport=transport,
+                fixture_missing_signal=fixture_missing_signal,
+                fixture_masked_reset=fixture_masked_reset,
+                fixture_terminal_reset=fixture_terminal_reset,
+            )
+
         contracts.append(
             _capture_contract(
                 provider=provider,
                 revision=f"fixture-{provider}-revision",
                 env_class=_FixtureTurboEnv,
-                factory=lambda transport=transport, fixture_masked_reset=fixture_masked_reset: (
-                    _FixtureTurboEnv(
-                        "VizdoomDeathmatch-v1",
-                        num_envs=2,
-                        fixture_transport=transport,
-                        fixture_missing_signal=(
-                            "player_killcount" if case == "missing_player_killcount" else None
-                        ),
-                        fixture_masked_reset=fixture_masked_reset,
-                    )
-                ),
+                factory=factory,
                 fixture_case=case,
                 semantic_probes=semantic_probes,
                 requested_device=torch.device("cpu") if provider == "gradoom" else None,
+                attribution_oracle=(
+                    None
+                    if case == "counter_only_kills" and provider == "env-vizdoom-turbo"
+                    else _fixture_attribution_oracle
+                ),
             )
         )
     return contracts
@@ -685,22 +859,7 @@ def _real_contracts(request: dict[str, Any]) -> tuple[list[dict[str, Any]], list
     ):
         raise ValueError("real invariant provider configurations do not match")
     scenario_configuration = profile_configuration["scenario"]
-    assignments = {
-        key.replace("_", "").casefold(): raw_value.strip().casefold()
-        for key, raw_value in re.findall(
-            r"(?m)^\s*([A-Za-z_]+)\s*=\s*([^#\r\n{]+)",
-            reference_config.read_text(encoding="utf-8"),
-        )
-    }
-    expected_assignments = {
-        "doomscenariopath": "deathmatch.wad",
-        "screenresolution": "res_"
-        + "x".join(map(str, scenario_configuration["screen_resolution"])),
-        "episodestarttime": str(scenario_configuration["episode_start_time"]),
-        "mode": str(scenario_configuration["mode"]).casefold(),
-    }
-    if any(assignments.get(key) != expected for key, expected in expected_assignments.items()):
-        raise ValueError("reference scenario config differs from the validated scenario binding")
+    _validate_reference_scenario_config(reference_config, profile_configuration)
     observation = profile_configuration["observation"]
     crop = observation["crop_or_mask"]
     resize = observation["resize"]
@@ -719,7 +878,7 @@ def _real_contracts(request: dict[str, Any]) -> tuple[list[dict[str, Any]], list
         "reward_clip": False,
         "info": "data",
         "info_filter": {"mode": "all", "keys": list(_SIGNALS)},
-        "game_variables": tuple(name.upper() for name in _SIGNALS),
+        "game_variables": tuple(name.upper() for name in _NATIVE_GAME_VARIABLES),
         "treat_episode_timeout_as_truncation": scenario_configuration[
             "episode_timeout_as_truncation"
         ],
@@ -755,10 +914,21 @@ def _real_contracts(request: dict[str, Any]) -> tuple[list[dict[str, Any]], list
             **common,
         )
 
+    try:
+        gradoom_revision = _installed_gradoom_revision()
+    except RuntimeError as error:
+        return [], [
+            {
+                "code": "provider_contract_failure",
+                "provider": "gradoom",
+                "behavior": "gradoom.revision",
+                "message": str(error),
+            }
+        ]
     contracts = [
         _capture_contract(
             provider="gradoom",
-            revision=request["gradoom_revision"],
+            revision=gradoom_revision,
             env_class=GraDoomVecEnv,
             factory=gradoom_factory,
             fixture_case="pass",
@@ -776,6 +946,107 @@ def _real_contracts(request: dict[str, Any]) -> tuple[list[dict[str, Any]], list
         ),
     ]
     return contracts, []
+
+
+def _installed_gradoom_revision() -> str:
+    repository = Path(__file__).resolve().parents[3]
+    relative_source = Path(__file__).resolve().relative_to(repository)
+    try:
+        top_level = subprocess.run(
+            ["git", "-C", str(repository), "rev-parse", "--show-toplevel"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        ).stdout.strip()
+        revision = subprocess.run(
+            ["git", "-C", str(repository), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        ).stdout.strip()
+        subprocess.run(
+            ["git", "-C", str(repository), "ls-files", "--error-unmatch", str(relative_source)],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        source_status = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repository),
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--",
+                "src/gradoom",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        ).stdout
+    except (OSError, subprocess.SubprocessError) as error:
+        raise RuntimeError("cannot prove the executed GraDOOM checkout revision") from error
+    if (
+        Path(top_level).resolve() != repository
+        or not re.fullmatch(r"[0-9a-f]{40}", revision)
+        or source_status
+    ):
+        raise RuntimeError("cannot prove the executed GraDOOM checkout revision")
+    return revision
+
+
+def _validate_reference_scenario_config(
+    path: Path,
+    profile_configuration: Mapping[str, Any],
+) -> None:
+    text = re.sub(r"(?m)#.*$", "", path.read_text(encoding="utf-8"))
+    assignment_pattern = re.compile(
+        r"\s*([A-Za-z_]+)\s*=\s*(?:\{([^}]*)\}|([^\r\n{]+))",
+    )
+    position = 0
+    assignments: dict[str, str | tuple[str, ...]] = {}
+    while position < len(text):
+        match = assignment_pattern.match(text, position)
+        if match is None:
+            if not text[position:].strip():
+                break
+            raise ValueError(
+                "reference scenario config is not an exact validated scenario configuration"
+            )
+        key = match.group(1).replace("_", "").casefold()
+        if key in assignments:
+            raise ValueError(
+                "reference scenario config is not an exact validated scenario configuration"
+            )
+        block, scalar = match.group(2), match.group(3)
+        assignments[key] = (
+            tuple(token.casefold() for token in block.split())
+            if block is not None
+            else scalar.strip().casefold()
+        )
+        position = match.end()
+    scenario = profile_configuration["scenario"]
+    expected: dict[str, str | tuple[str, ...]] = {
+        "doomscenariopath": "deathmatch.wad",
+        "doomskill": str(profile_configuration["skill"]),
+        "screenresolution": "res_" + "x".join(map(str, scenario["screen_resolution"])),
+        "renderhud": str(scenario["render_hud"]).casefold(),
+        "renderscreenflashes": str(scenario["render_screen_flashes"]).casefold(),
+        "episodestarttime": str(scenario["episode_start_time"]),
+        "episodetimeout": str(profile_configuration["episode_horizon_tics"]),
+        "availablebuttons": tuple(name.casefold() for name in DEATHMATCH_BUTTONS),
+        "availablegamevariables": tuple(name.casefold() for name in _NATIVE_GAME_VARIABLES),
+        "mode": str(scenario["mode"]).casefold(),
+    }
+    if assignments != expected:
+        raise ValueError(
+            "reference scenario config is not an exact validated scenario configuration"
+        )
 
 
 def _runner_sha256() -> str:

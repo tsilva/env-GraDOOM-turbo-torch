@@ -102,12 +102,15 @@ The v1 readiness manifest is a JSON object with these fields:
   `reward_mismatch`, `missing_player_killcount`, and `missing_termination` cases are retained
   adversarial test inputs.
 - `invariant_suite.real_configuration` (required in real mode): a requested `device` (`cpu`,
-  `cuda`, or `cuda:N`), a `reference_scenario_config_input` naming a hashed declared input, and
-  `semantic_probes` for `termination`, `truncation`, `player_killcount`, and
+  `cuda`, or canonical ASCII `cuda:N`), a predeclared `timeout_seconds`, a
+  `reference_scenario_config_input` naming a hashed declared input, and `semantic_probes` for
+  `termination`, `truncation`, `player_killcount`, and
   `player_killcount.enemy_on_enemy_exclusion`. Each probe declares exactly two uint32 `seeds`, a
   non-empty cycle of two-lane pinned action-index rows under `actions`, and a positive
-  `max_steps`. The action rows retain their published action meanings; success comes only from an
-  event observed in public step results.
+  `max_steps` no greater than 100,000. The timeout must be at least 120 seconds and at least 0.05
+  seconds per total declared probe step, and cannot exceed 86,400 seconds. The action rows retain
+  their published action meanings; success comes only from an event observed in public step
+  results.
 - `wad_profile` (required when `certified_freedoom2_wad_profile` is declared available): the
   `freedoom2-deathmatch-v1` profile ID and exactly one `gradoom` and one `env-vizdoom-turbo`
   provider binding. Each binding declares `iwad_path`, `pwad_path`, and the complete policy-facing
@@ -118,6 +121,13 @@ command derives both providers' IWAD/PWAD paths, hashes, map, skill, scenario, a
 skip, horizon, and preprocessing directly from that validated binding rather than accepting a
 second copy in `real_configuration`. The reference scenario config must sit beside, and therefore
 load, the exact validated reference `deathmatch.wad`; a substitute PWAD fails before provider work.
+
+The reference config is an exact allowlisted part of the shared scenario configuration. It must
+declare only the bound PWAD, skill, resolution, HUD and screen-flash settings, episode start and
+timeout, player mode, the complete pinned button set, and the native `HEALTH`, `KILLCOUNT`, and
+`PLAYER_KILLCOUNT` variables. Extra provider-only behavior settings, missing settings, duplicate
+settings, or different values fail before provider construction. `episode_return` remains a derived
+report signal selected through `info_filter`; it is never passed as a native game variable.
 
 The repository fixture is the executable example of this schema:
 [`tests/fixtures/evidence/readiness-manifest.json`](../tests/fixtures/evidence/readiness-manifest.json).
@@ -197,18 +207,28 @@ operations. The command requires the complete common constructor signature and d
 action meanings, exact observation, signal, and reward shapes and dtypes, lifecycle operations,
 termination, truncation, manual episode-reset semantics, and `player_killcount`. It additionally
 requires every GraDOOM reset-mask and action input plus reset and step output to be a Torch tensor on
-the declared device. The player-attributed kill probes perform a player kill and an enemy-on-enemy
-kill: the former must increment `player_killcount`, while the latter must increment only compatibility
-`killcount`.
+the declared device. A terminal event passes only after the terminal lanes reset and public stepping
+resumes. Masked reset is checked both at its immediate return and on the following transition against
+deterministic one-step and two-step controls, proving selected-lane reset and unselected-lane
+continuation in provider state. The player-attributed kill probes require staged actor/target
+attribution in addition to counters: the former must observe a player-to-enemy event and increment
+`player_killcount`, while the latter must observe an enemy-to-enemy event and increment only
+compatibility `killcount`. Counter-only providers fail closed.
 
 Real execution loads GraDOOM and the immutable reference revision independently through the pinned
 reference adapter. An absent optional provider runtime is unavailable; changed assets, an invalid
-binding, or a mismatched scenario config fail closed. Once the runtime is present, missing signals,
+binding, a non-exact scenario config, or an unprovable executed GraDOOM Git checkout fail closed.
+The GraDOOM revision is derived from the clean checkout containing the executed module rather than
+copied from manifest provenance. Once the runtime is present, missing signals,
 malformed transitions, runtime errors, and unobserved lifecycle or kill events become named failed
 invariants rather than generic unavailability. Non-fixture execution also requires the GraDOOM
 provider revision to match `code_provenance.revision`. The fixture runner provides deterministic
 public-operation probes only when the manifest itself is `fixture: true`; fixture evidence can never
 support a real claim.
+
+Real runner timeout uses the accepted predeclared timeout rather than an unconditional process
+timeout. Exhaustion is retained as a named unavailable result and cannot produce readiness or a
+claim; incoherent timeout/probe budgets are rejected before execution.
 
 The report records every check under `invariant_suite.checks`. A mismatch sets both the suite and
 readiness status to `failed` and names the public `behavior`; missing, unconfigured, or unavailable

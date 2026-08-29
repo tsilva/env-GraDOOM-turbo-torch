@@ -12,7 +12,7 @@
     {
       "name": "invariant_runner",
       "path": "../../../src/gradoom/evidence/invariant_runner.py",
-      "sha256": "ec8b7ac987528a05db02122de45e638637e0568362f234a645bcab9f70e86559"
+      "sha256": "a8b5a28a39b45f791602b71a7c04613212938d4c10b7a27746d69f8e95dad6d7"
     }
   ],
   "prerequisites": [

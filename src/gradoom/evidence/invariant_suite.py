@@ -252,16 +252,36 @@ def _execute_runner(
         "gradoom_revision": gradoom_revision,
         "real_configuration": real_configuration,
     }
+    timeout_seconds = 60
+    if mode == "real" and isinstance(real_configuration, dict):
+        timeout_seconds = int(real_configuration["timeout_seconds"])
     try:
         completed = subprocess.run(
             [sys.executable, "-m", "gradoom.evidence.invariant_runner"],
             check=False,
             capture_output=True,
             text=True,
-            timeout=60,
+            timeout=timeout_seconds,
             input=json.dumps(request, allow_nan=False),
         )
-    except (OSError, subprocess.TimeoutExpired, UnicodeError) as error:
+    except subprocess.TimeoutExpired:
+        return {
+            "protocol_version": invariant_runner.RUNNER_PROTOCOL_VERSION,
+            "challenge": challenge,
+            "runner_sha256": runner_sha256,
+            "status": "unavailable",
+            "contracts": [],
+            "unavailable_reasons": [
+                {
+                    "code": "invariant_runner_timeout",
+                    "message": (
+                        "Authenticated invariant execution exhausted its predeclared "
+                        f"{timeout_seconds}-second timeout."
+                    ),
+                }
+            ],
+        }
+    except (OSError, UnicodeError) as error:
         raise InvariantSuiteError(
             f"authenticated invariant runner could not execute: {error}"
         ) from error
@@ -348,21 +368,36 @@ def _prepare_real_configuration(
 ) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != {
         "device",
+        "timeout_seconds",
         "reference_scenario_config_input",
         "semantic_probes",
     }:
         raise InvariantSuiteError(
-            "invariant_suite.real_configuration must declare device, "
+            "invariant_suite.real_configuration must declare device, timeout_seconds, "
             "reference_scenario_config_input, and semantic_probes"
         )
     device = _required_string(value["device"], "invariant_suite.real_configuration.device")
     if (
-        device != "cpu"
-        and device != "cuda"
-        and not (device.startswith("cuda:") and device.removeprefix("cuda:").isdigit())
+        device not in {"cpu", "cuda"}
+        and re.fullmatch(r"cuda:(0|[1-9][0-9]*)", device, flags=re.ASCII) is None
     ):
         raise InvariantSuiteError(
             "invariant_suite.real_configuration.device must be 'cpu', 'cuda', or 'cuda:N'"
+        )
+    probes = _validated_semantic_probes(value["semantic_probes"])
+    timeout_seconds = value["timeout_seconds"]
+    minimum_timeout = max(
+        120,
+        math.ceil(sum(probe["max_steps"] for probe in probes.values()) * 0.05),
+    )
+    if (
+        type(timeout_seconds) is not int
+        or timeout_seconds < minimum_timeout
+        or timeout_seconds > 86_400
+    ):
+        raise InvariantSuiteError(
+            "invariant_suite.real_configuration.timeout_seconds must be an integer in "
+            f"[{minimum_timeout}, 86400] for the declared probe budget"
         )
     reference_config = _resolved_declared_input(
         value["reference_scenario_config_input"],
@@ -409,28 +444,20 @@ def _prepare_real_configuration(
     profile_configuration = providers["env-vizdoom-turbo"]["configuration"]
     if not isinstance(profile_configuration, dict):
         raise InvariantSuiteError("matched wad_profile has invalid reference configuration")
-    assignments = {
-        key.replace("_", "").casefold(): raw_value.strip().casefold()
-        for key, raw_value in re.findall(
-            r"(?m)^\s*([A-Za-z_]+)\s*=\s*([^#\r\n{]+)",
-            reference_config.read_text(encoding="utf-8"),
+    try:
+        invariant_runner._validate_reference_scenario_config(
+            reference_config,
+            profile_configuration,
         )
-    }
-    scenario = profile_configuration["scenario"]
-    expected_assignments = {
-        "doomscenariopath": "deathmatch.wad",
-        "screenresolution": "res_" + "x".join(map(str, scenario["screen_resolution"])),
-        "episodestarttime": str(scenario["episode_start_time"]),
-        "mode": str(scenario["mode"]).casefold(),
-    }
-    if any(assignments.get(key) != expected for key, expected in expected_assignments.items()):
+    except (OSError, UnicodeError, ValueError) as error:
         raise InvariantSuiteError(
-            "reference scenario configuration does not match the validated scenario binding"
-        )
+            "reference scenario configuration is not the exact validated scenario configuration"
+        ) from error
     return {
         "device": device,
+        "timeout_seconds": timeout_seconds,
         "reference_scenario_config_path": str(reference_config),
-        "semantic_probes": _validated_semantic_probes(value["semantic_probes"]),
+        "semantic_probes": probes,
         "wad_binding_sha256": wad_profile.get("binding_sha256"),
         "providers": providers,
     }
@@ -460,12 +487,17 @@ def _constructor_valid(value: object) -> bool:
 def _common_value(behavior: str, value: object) -> object:
     if behavior == "player_killcount":
         assert isinstance(value, dict)
-        return {"present": value["present"], "player_kill_observed": value["player_kill_delta"] > 0}
+        return {
+            "present": value["present"],
+            "player_kill_observed": value["player_kill_delta"] > 0,
+            "attribution": value["attribution"],
+        }
     if behavior == "player_killcount.enemy_on_enemy_exclusion":
         assert isinstance(value, dict)
         return {
             "enemy_on_enemy_delta": value["enemy_on_enemy_delta"],
             "compatibility_kill_observed": value["compatibility_kill_delta"] > 0,
+            "attribution": value["attribution"],
         }
     if behavior in {"observation_shapes", "signal_shapes", "rewards"}:
         assert isinstance(value, dict)
@@ -541,22 +573,24 @@ def _valid_common_behavior(behavior: str, value: object) -> bool:
     if behavior == "player_killcount":
         return (
             isinstance(value, dict)
-            and set(value) == {"present", "player_kill_delta"}
+            and set(value) == {"present", "player_kill_delta", "attribution"}
             and value["present"] is True
             and isinstance(value["player_kill_delta"], (int, float))
             and not isinstance(value["player_kill_delta"], bool)
             and math.isfinite(value["player_kill_delta"])
             and value["player_kill_delta"] > 0
+            and value["attribution"] == {"attacker": "player", "target": "enemy"}
         )
     if behavior == "player_killcount.enemy_on_enemy_exclusion":
         return (
             isinstance(value, dict)
-            and set(value) == {"enemy_on_enemy_delta", "compatibility_kill_delta"}
+            and set(value) == {"enemy_on_enemy_delta", "compatibility_kill_delta", "attribution"}
             and value["enemy_on_enemy_delta"] == 0
             and isinstance(value["compatibility_kill_delta"], (int, float))
             and not isinstance(value["compatibility_kill_delta"], bool)
             and math.isfinite(value["compatibility_kill_delta"])
             and value["compatibility_kill_delta"] > 0
+            and value["attribution"] == {"attacker": "enemy", "target": "enemy"}
         )
     expected = {
         "reset": {"returns_observation_and_signals": True},
@@ -565,9 +599,21 @@ def _valid_common_behavior(behavior: str, value: object) -> bool:
             "supported": True,
             "selected_lane_state_and_signals_reset": True,
             "unselected_lane_state_and_signals_unchanged": True,
+            "selected_lane_continues_from_reset_state": True,
+            "unselected_lane_continues_without_reset": True,
         },
-        "termination": {"reported_separately": True, "requires_reset": True},
-        "truncation": {"reported_separately": True, "requires_reset": True},
+        "termination": {
+            "reported_separately": True,
+            "requires_reset": True,
+            "terminal_lane_reset": True,
+            "stepping_resumed": True,
+        },
+        "truncation": {
+            "reported_separately": True,
+            "requires_reset": True,
+            "terminal_lane_reset": True,
+            "stepping_resumed": True,
+        },
         "episode": {"step_before_reset_rejected": True, "autoreset": False},
     }
     return value == expected[behavior]
@@ -790,6 +836,9 @@ def run_invariant_suite(
         "missing_termination",
         "ignored_masked_reset",
         "leaky_masked_reset",
+        "forged_masked_reset",
+        "broken_terminal_reset",
+        "counter_only_kills",
     }:
         raise InvariantSuiteError("invariant_suite.fixture_case is invalid")
     if mode == "real" and "fixture_case" in declaration:

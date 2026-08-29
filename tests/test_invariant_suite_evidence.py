@@ -22,8 +22,21 @@ PROFILE = json.loads(
 )
 REFERENCE_CONFIG = """\
 doom_scenario_path = deathmatch.wad
+doom_skill = 1
 screen_resolution = RES_320X240
+render_hud = false
+render_screen_flashes = false
 episode_start_time = 1
+episode_timeout = 4200
+available_buttons =
+    {
+        ATTACK SPEED STRAFE MOVE_RIGHT MOVE_LEFT MOVE_BACKWARD MOVE_FORWARD
+        TURN_RIGHT TURN_LEFT SELECT_WEAPON1 SELECT_WEAPON2 SELECT_WEAPON3
+        SELECT_WEAPON4 SELECT_WEAPON5 SELECT_WEAPON6 SELECT_NEXT_WEAPON
+        SELECT_PREV_WEAPON LOOK_UP_DOWN_DELTA TURN_LEFT_RIGHT_DELTA
+        MOVE_LEFT_RIGHT_DELTA
+    }
+available_game_variables = { HEALTH KILLCOUNT PLAYER_KILLCOUNT }
 mode = PLAYER
 """
 
@@ -142,7 +155,10 @@ def test_failed_public_behavior_blocks_readiness_and_is_named(tmp_path: Path) ->
     )
 
 
-@pytest.mark.parametrize("fixture_case", ["ignored_masked_reset", "leaky_masked_reset"])
+@pytest.mark.parametrize(
+    "fixture_case",
+    ["ignored_masked_reset", "leaky_masked_reset", "forged_masked_reset"],
+)
 def test_invalid_masked_reset_behavior_is_named_through_the_public_command(
     tmp_path: Path,
     fixture_case: str,
@@ -166,6 +182,45 @@ def test_invalid_masked_reset_behavior_is_named_through_the_public_command(
             "provider": "env-vizdoom-turbo",
         }
     ]
+
+
+def test_broken_terminal_reset_is_named_through_the_public_command(tmp_path: Path) -> None:
+    output = tmp_path / "report.json"
+
+    result = run_evidence(
+        "--manifest",
+        str(write_manifest(tmp_path, mismatch="broken_terminal_reset")),
+        "--output",
+        str(output),
+    )
+
+    assert result.returncode == 0, result.stderr
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert report["status"] == "failed"
+    failures = report["invariant_suite"]["failures"]
+    assert {failure["behavior"] for failure in failures} == {"termination", "truncation"}
+    assert all("did not resume stepping" in failure["message"] for failure in failures)
+
+
+def test_counter_only_kills_are_named_through_the_public_command(tmp_path: Path) -> None:
+    output = tmp_path / "report.json"
+
+    result = run_evidence(
+        "--manifest",
+        str(write_manifest(tmp_path, mismatch="counter_only_kills")),
+        "--output",
+        str(output),
+    )
+
+    assert result.returncode == 0, result.stderr
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert report["status"] == "failed"
+    failures = report["invariant_suite"]["failures"]
+    assert {failure["behavior"] for failure in failures} == {
+        "player_killcount",
+        "player_killcount.enemy_on_enemy_exclusion",
+    }
+    assert all("actor/target attribution oracle" in failure["message"] for failure in failures)
 
 
 def test_missing_public_signal_is_a_named_failed_invariant(tmp_path: Path) -> None:
@@ -239,6 +294,7 @@ def test_real_runner_handles_an_absent_optional_runtime_honestly(tmp_path: Path)
         gradoom_revision="revision",
         real_configuration={
             "device": "cpu",
+            "timeout_seconds": 120,
             "reference_scenario_config_path": str(config),
             "semantic_probes": semantic_probes(),
             "wad_binding_sha256": "b" * 64,
@@ -255,6 +311,156 @@ def test_real_runner_handles_an_absent_optional_runtime_honestly(tmp_path: Path)
         assert response["unavailable_reasons"] == []
 
 
+def test_real_runner_separates_native_variables_and_observes_checkout_revision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import gradoom
+    from gradoom.evidence import reference_provider
+
+    iwad = tmp_path / "freedoom2.wad"
+    pwad = tmp_path / "deathmatch.wad"
+    config = tmp_path / "deathmatch.cfg"
+    iwad.write_bytes(b"iwad")
+    pwad.write_bytes(b"pwad")
+    config.write_text(REFERENCE_CONFIG, encoding="utf-8")
+    observed: dict[str, object] = {}
+
+    class FakeGraDoom:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            del args
+            observed["gradoom_game_variables"] = kwargs["game_variables"]
+            observed["gradoom_info_filter"] = kwargs["info_filter"]
+
+        def close(self) -> None:
+            pass
+
+    class FakeReference:
+        revision = reference_provider.REFERENCE_REVISION
+        env_class = invariant_runner._FixtureTurboEnv
+
+        @staticmethod
+        def make_env(*args: object, **kwargs: object) -> object:
+            del args
+            observed["reference_game_variables"] = kwargs["game_variables"]
+            observed["reference_info_filter"] = kwargs["info_filter"]
+            return type("Closable", (), {"close": lambda self: None})()
+
+        @staticmethod
+        def episode_kill_signals(*args: object, **kwargs: object) -> dict[str, float]:
+            del args, kwargs
+            return {"player_killcount": 0.0, "compatibility_killcount": 0.0}
+
+    def capture_contract(**kwargs: object) -> dict[str, object]:
+        env = kwargs["factory"]()  # type: ignore[operator]
+        env.close()
+        return {
+            "provider": kwargs["provider"],
+            "revision": kwargs["revision"],
+        }
+
+    monkeypatch.setattr(gradoom, "GraDoomVecEnv", FakeGraDoom)
+    monkeypatch.setattr(reference_provider, "load_reference_provider", FakeReference)
+    monkeypatch.setattr(invariant_runner, "_capture_contract", capture_contract)
+    monkeypatch.setattr(invariant_runner, "_installed_gradoom_revision", lambda: "a" * 40)
+    binding = {
+        "iwad_path": str(iwad),
+        "iwad_sha256": hashlib.sha256(iwad.read_bytes()).hexdigest(),
+        "pwad_path": str(pwad),
+        "pwad_sha256": hashlib.sha256(pwad.read_bytes()).hexdigest(),
+        "configuration": PROFILE["configuration"],
+    }
+
+    contracts, unavailable = invariant_runner._real_contracts(
+        {
+            "gradoom_revision": "self-attested-manifest-value",
+            "real_configuration": {
+                "device": "cpu",
+                "timeout_seconds": 120,
+                "reference_scenario_config_path": str(config),
+                "semantic_probes": semantic_probes(),
+                "providers": {
+                    "gradoom": dict(binding),
+                    "env-vizdoom-turbo": dict(binding),
+                },
+            },
+        }
+    )
+
+    assert unavailable == []
+    assert contracts[0]["revision"] == "a" * 40
+    assert contracts[0]["revision"] != "self-attested-manifest-value"
+    expected_native = ("HEALTH", "KILLCOUNT", "PLAYER_KILLCOUNT")
+    assert observed["gradoom_game_variables"] == expected_native
+    assert observed["reference_game_variables"] == expected_native
+    for provider in ("gradoom", "reference"):
+        assert observed[f"{provider}_info_filter"] == {
+            "mode": "all",
+            "keys": ["health", "killcount", "player_killcount", "episode_return"],
+        }
+
+
+def test_real_runner_fails_closed_when_gradoom_revision_cannot_be_proven(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gradoom.evidence import reference_provider
+
+    iwad = tmp_path / "freedoom2.wad"
+    pwad = tmp_path / "deathmatch.wad"
+    config = tmp_path / "deathmatch.cfg"
+    iwad.write_bytes(b"iwad")
+    pwad.write_bytes(b"pwad")
+    config.write_text(REFERENCE_CONFIG, encoding="utf-8")
+    monkeypatch.setattr(
+        reference_provider,
+        "load_reference_provider",
+        lambda: type(
+            "Provider",
+            (),
+            {"revision": reference_provider.REFERENCE_REVISION},
+        )(),
+    )
+    monkeypatch.setattr(
+        invariant_runner,
+        "_installed_gradoom_revision",
+        lambda: (_ for _ in ()).throw(RuntimeError("cannot prove checkout")),
+    )
+    binding = {
+        "iwad_path": str(iwad),
+        "iwad_sha256": hashlib.sha256(iwad.read_bytes()).hexdigest(),
+        "pwad_path": str(pwad),
+        "pwad_sha256": hashlib.sha256(pwad.read_bytes()).hexdigest(),
+        "configuration": PROFILE["configuration"],
+    }
+
+    contracts, unavailable = invariant_runner._real_contracts(
+        {
+            "gradoom_revision": "declared",
+            "real_configuration": {
+                "device": "cpu",
+                "timeout_seconds": 120,
+                "reference_scenario_config_path": str(config),
+                "semantic_probes": semantic_probes(),
+                "providers": {
+                    "gradoom": dict(binding),
+                    "env-vizdoom-turbo": dict(binding),
+                },
+            },
+        }
+    )
+
+    assert contracts == []
+    assert unavailable == [
+        {
+            "code": "provider_contract_failure",
+            "provider": "gradoom",
+            "behavior": "gradoom.revision",
+            "message": "cannot prove checkout",
+        }
+    ]
+
+
 def test_real_invariants_require_the_validated_wad_profile_binding(tmp_path: Path) -> None:
     manifest_path = write_manifest(tmp_path)
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -265,6 +471,7 @@ def test_real_invariants_require_the_validated_wad_profile_binding(tmp_path: Pat
         "runner_input": "invariant_runner",
         "real_configuration": {
             "device": "cpu",
+            "timeout_seconds": 120,
             "reference_scenario_config_input": "reference_scenario_config",
             "semantic_probes": semantic_probes(),
         },
@@ -335,6 +542,7 @@ def test_real_runner_receives_only_the_validated_wad_profile_binding(
         "runner_input": "invariant_runner",
         "real_configuration": {
             "device": "cpu",
+            "timeout_seconds": 120,
             "reference_scenario_config_input": "reference_scenario_config",
             "semantic_probes": semantic_probes(),
         },
@@ -364,6 +572,7 @@ def test_real_runner_receives_only_the_validated_wad_profile_binding(
     assert report["status"] == "unavailable"
     assert captured["real_configuration"] == {
         "device": "cpu",
+        "timeout_seconds": 120,
         "reference_scenario_config_path": str(config),
         "semantic_probes": semantic_probes(),
         "wad_binding_sha256": "b" * 64,
@@ -475,6 +684,222 @@ def test_requested_cuda_shorthand_rejects_mixed_concrete_indices() -> None:
     }
 
 
+@pytest.mark.parametrize("device", ["cuda:00", "cuda:01", "cuda:\u0661", "cuda:\uff11"])
+def test_real_configuration_rejects_noncanonical_cuda_indices(
+    tmp_path: Path,
+    device: str,
+) -> None:
+    config = tmp_path / "deathmatch.cfg"
+    config.write_text(REFERENCE_CONFIG, encoding="utf-8")
+    with pytest.raises(
+        invariant_suite.InvariantSuiteError,
+        match="device must be 'cpu', 'cuda', or 'cuda:N'",
+    ):
+        invariant_suite._prepare_real_configuration(
+            {
+                "device": device,
+                "timeout_seconds": 120,
+                "reference_scenario_config_input": "reference_scenario_config",
+                "semantic_probes": semantic_probes(),
+            },
+            declared_inputs=[
+                {
+                    "name": "reference_scenario_config",
+                    "path": str(config),
+                    "sha256": hashlib.sha256(config.read_bytes()).hexdigest(),
+                }
+            ],
+            base_directory=tmp_path,
+            wad_profile={"providers": []},
+        )
+
+
+def test_reference_config_rejects_extra_provider_only_behavior(tmp_path: Path) -> None:
+    config = tmp_path / "deathmatch.cfg"
+    config.write_text(REFERENCE_CONFIG + "window_visible = true\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="exact validated scenario configuration"):
+        invariant_runner._validate_reference_scenario_config(
+            config,
+            PROFILE["configuration"],
+        )
+
+
+def test_semantic_kill_probe_rejects_counter_only_provider() -> None:
+    env = invariant_runner._FixtureTurboEnv(
+        "VizdoomDeathmatch-v1",
+        num_envs=2,
+        fixture_transport="numpy",
+    )
+
+    with pytest.raises(RuntimeError, match="actor/target attribution oracle"):
+        invariant_runner._semantic_probe(
+            behavior="player_killcount",
+            provider="env-vizdoom-turbo",
+            factory=lambda: env,
+            probe={"seeds": [1, 2], "actions": [[3, 0]], "max_steps": 1},
+            requested_device=None,
+            kill_signal_reader=None,
+            attribution_oracle=None,
+        )
+
+
+def test_lifecycle_probe_rejects_a_broken_terminal_reset() -> None:
+    env = invariant_runner._FixtureTurboEnv(
+        "VizdoomDeathmatch-v1",
+        num_envs=2,
+        fixture_transport="numpy",
+        fixture_terminal_reset="broken",
+    )
+
+    with pytest.raises(RuntimeError, match="resume stepping"):
+        invariant_runner._semantic_probe(
+            behavior="termination",
+            provider="env-vizdoom-turbo",
+            factory=lambda: env,
+            probe={"seeds": [1, 2], "actions": [[1, 0]], "max_steps": 1},
+            requested_device=None,
+            kill_signal_reader=None,
+            attribution_oracle=None,
+        )
+
+
+def test_masked_reset_rejects_forged_snapshots_without_internal_reset() -> None:
+    contract = invariant_runner._capture_contract(
+        provider="env-vizdoom-turbo",
+        revision="fixture",
+        env_class=invariant_runner._FixtureTurboEnv,
+        factory=lambda: invariant_runner._FixtureTurboEnv(
+            "VizdoomDeathmatch-v1",
+            num_envs=2,
+            fixture_transport="numpy",
+            fixture_masked_reset="forge",
+        ),
+        fixture_case="pass",
+        semantic_probes={
+            "termination": {"seeds": [1, 2], "actions": [[1, 0]], "max_steps": 1},
+            "truncation": {"seeds": [1, 2], "actions": [[0, 2]], "max_steps": 1},
+            "player_killcount": {"seeds": [1, 2], "actions": [[3, 0]], "max_steps": 1},
+            "player_killcount.enemy_on_enemy_exclusion": {
+                "seeds": [1, 2],
+                "actions": [[4, 0]],
+                "max_steps": 1,
+            },
+        },
+        attribution_oracle=invariant_runner._fixture_attribution_oracle,
+    )
+
+    assert contract["behaviors"]["masked_reset"] == {
+        "supported": True,
+        "selected_lane_state_and_signals_reset": True,
+        "unselected_lane_state_and_signals_unchanged": True,
+        "selected_lane_continues_from_reset_state": False,
+        "unselected_lane_continues_without_reset": True,
+    }
+
+
+def test_accepted_probe_budget_controls_runner_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        del args
+        captured.update(kwargs)
+        request = json.loads(str(kwargs["input"]))
+        return subprocess.CompletedProcess(
+            [],
+            0,
+            json.dumps(
+                {
+                    "protocol_version": invariant_runner.RUNNER_PROTOCOL_VERSION,
+                    "challenge": request["challenge"],
+                    "runner_sha256": "a" * 64,
+                    "status": "unavailable",
+                    "contracts": [],
+                    "unavailable_reasons": [{"code": "test", "message": "test"}],
+                }
+            ),
+            "",
+        )
+
+    monkeypatch.setattr(invariant_suite.subprocess, "run", fake_run)
+    invariant_suite._execute_runner(
+        runner_sha256="a" * 64,
+        mode="real",
+        fixture_case="pass",
+        gradoom_revision="revision",
+        real_configuration={
+            "timeout_seconds": 321,
+            "semantic_probes": semantic_probes(),
+        },
+    )
+
+    assert captured["timeout"] == 321
+
+
+def test_probe_budget_rejects_an_incoherent_runner_timeout(tmp_path: Path) -> None:
+    config = tmp_path / "deathmatch.cfg"
+    config.write_text(REFERENCE_CONFIG, encoding="utf-8")
+    probes = semantic_probes()
+    for probe in probes.values():  # type: ignore[union-attr]
+        probe["max_steps"] = 100_000  # type: ignore[index]
+
+    with pytest.raises(
+        invariant_suite.InvariantSuiteError,
+        match=r"timeout_seconds must be an integer in \[20000, 86400\]",
+    ):
+        invariant_suite._prepare_real_configuration(
+            {
+                "device": "cpu",
+                "timeout_seconds": 19_999,
+                "reference_scenario_config_input": "reference_scenario_config",
+                "semantic_probes": probes,
+            },
+            declared_inputs=[
+                {
+                    "name": "reference_scenario_config",
+                    "path": str(config),
+                    "sha256": hashlib.sha256(config.read_bytes()).hexdigest(),
+                }
+            ],
+            base_directory=tmp_path,
+            wad_profile={"providers": []},
+        )
+
+
+def test_runner_timeout_becomes_a_named_fail_closed_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def time_out(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise subprocess.TimeoutExpired(["runner"], 120)
+
+    monkeypatch.setattr(invariant_suite.subprocess, "run", time_out)
+
+    result = invariant_suite._execute_runner(
+        runner_sha256="a" * 64,
+        mode="real",
+        fixture_case="pass",
+        gradoom_revision="revision",
+        real_configuration={
+            "timeout_seconds": 120,
+            "semantic_probes": semantic_probes(),
+        },
+    )
+
+    assert result["status"] == "unavailable"
+    assert result["contracts"] == []
+    assert result["unavailable_reasons"] == [
+        {
+            "code": "invariant_runner_timeout",
+            "message": (
+                "Authenticated invariant execution exhausted its predeclared 120-second timeout."
+            ),
+        }
+    ]
+
+
 def test_semantic_probe_forwards_published_action_indices_without_reinterpretation() -> None:
     class ProgrammedPublicEnv:
         def __init__(self) -> None:
@@ -519,8 +944,13 @@ def test_semantic_probe_forwards_published_action_indices_without_reinterpretati
         kill_signal_reader=None,
     )
 
-    assert result == {"reported_separately": True, "requires_reset": False}
-    assert env.actions == [[7, 8], [7, 8], [7, 8]]
+    assert result == {
+        "reported_separately": True,
+        "requires_reset": False,
+        "terminal_lane_reset": True,
+        "stepping_resumed": True,
+    }
+    assert env.actions == [[7, 8], [7, 8], [7, 8], [7, 8]]
 
 
 def test_reference_config_cannot_substitute_an_unbound_pwad(tmp_path: Path) -> None:
@@ -561,6 +991,7 @@ def test_reference_config_cannot_substitute_an_unbound_pwad(tmp_path: Path) -> N
                 "runner_input": "invariant_runner",
                 "real_configuration": {
                     "device": "cpu",
+                    "timeout_seconds": 120,
                     "reference_scenario_config_input": "reference_scenario_config",
                     "semantic_probes": semantic_probes(),
                 },
