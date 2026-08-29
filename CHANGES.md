@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add a matching fixed-time training diagnostic to the public evidence command, with exact
+  100-episode player quality, end-to-end simulated-tic and transition throughput, and explicit
+  separation from benchmark passage.
 - Rename the project and distribution to `env-GraDOOM-turbo-torch` and
   `env-gradoom-turbo-torch` while restoring the published `gradoom`,
   `GraDoomVecEnv`, and `GraDOOM-v0` public API names.

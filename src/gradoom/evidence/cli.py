@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .benchmark import build_development_benchmark_report
+from .diagnostic import build_fixed_time_diagnostic_report
 from .report import (
     EvidenceError,
     _load_manifest,
@@ -217,6 +218,10 @@ def main(argv: list[str] | None = None) -> int:
                     "development training benchmark continuation is not supported yet"
                 )
             report = build_development_benchmark_report(args.manifest)
+        elif workflow == "fixed_time_training_diagnostic":
+            if args.merge is not None:
+                raise EvidenceError("fixed-time diagnostic continuation is not supported yet")
+            report = build_fixed_time_diagnostic_report(args.manifest)
         else:
             raise EvidenceError(f"unsupported manifest workflow {workflow!r}")
         _validate_output_path(

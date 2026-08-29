@@ -75,6 +75,20 @@ def test_training_command_rejects_ten_step_budget_without_overshoot(tmp_path: Pa
     assert not metrics.exists()
 
 
+def test_fixed_time_budget_is_positive_and_bound_into_trainer_audit() -> None:
+    args = _args("--reusable-time-budget-seconds", "12.5")
+
+    train._validate_args(args)
+    audit = train._audit_config(args)
+
+    assert audit["reusable_time_budget_seconds"] == 12.5
+    assert audit["effective_recipe"]["reusable_time_budget_seconds"] == 12.5
+    with pytest.raises(
+        ValueError, match="reusable-time-budget-seconds must be finite and positive"
+    ):
+        train._validate_args(_args("--reusable-time-budget-seconds", "0"))
+
+
 def test_checkpoint_evaluation_accepts_exact_predeclared_episode_seed_grid(
     tmp_path: Path,
 ) -> None:

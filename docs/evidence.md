@@ -82,6 +82,52 @@ uint32 game seeds. Its emitted config binds the complete ordered seed list, file
 action setting, `player_killcount` gate signal, and separate compatibility signal into the retained
 evaluation evidence.
 
+Every development report includes `diagnostics.fixed_time`. When the separate diagnostic has not
+been run, that field has `status: unavailable`, an explicit reason, and `affects_passage: false`.
+The report also marks `public_performance_evidence.complete: false`; omission is allowed for cheap
+development iteration but cannot be silently promoted into a complete public evidence bundle.
+
+## Fixed-time training diagnostic
+
+The `fixed_time_training_diagnostic` workflow compares final policy quality at one common reusable
+wall-clock budget without extending or changing the matched benchmark's time-to-threshold run. Its
+manifest uses the common envelope fields and a `diagnostic` object containing:
+
+- `reusable_time_budget_seconds`: one finite positive budget used by every predeclared seed;
+- `training_seeds`, `evaluation_episode_seeds`, and `evaluation_action_seed`: the same ordered seed
+  declarations as the matched benchmark; the held-out grid contains exactly 100 unique uint32 game
+  seeds;
+- `recipe`: the exact standalone trainer `command` and fixed `arguments` used by the benchmark;
+- `timing_rules`: the fixed reusable-run boundary: monotonic wall clock from before recurring
+  initialization through the durable final checkpoint write, with device synchronization around
+  measured GPU work; recurring compilation, warm-up, and training are included, while the final
+  held-out evaluation is outside the fixed training budget;
+- `matching_benchmark_report`: the path and SHA-256 of the existing development or primary report;
+- `artifacts_directory`: the immutable run-identity directory for seed grids, final checkpoints,
+  training metrics, and evaluation metrics; and
+- `wad_profile`: required for non-fixture runs and required to have the same binding identity as the
+  matched benchmark.
+
+Before starting training, the command verifies the matched report's digest, evidence index, run
+identity, evidence level, fixture status, code provenance, recipe, training seeds, evaluation seeds,
+action seed, and WAD-profile binding. Any mismatch fails before creating diagnostic artifacts. The
+trainer starts every diagnostic seed from fresh policy and optimizer state, stops only at the first
+complete rollout at or beyond the common budget, durably writes the final checkpoint, and evaluates
+that checkpoint through the same stochastic 100-episode GraDOOM evaluator used by the benchmark.
+
+Completed attempts retain all 100 episode records and report `final_mean_player_killcount`.
+Throughput is computed from the measured training workload as both transitions per second and
+simulated tics per second; the report retains transition count, frame skip, simulated tic count,
+elapsed time, and the complete workload/timer boundary. Compatibility `killcount` may be retained as
+a diagnostic but is not final policy quality.
+
+All fixed-time results live under `diagnostics.fixed_time`, are non-authoritative on their own, have
+`affects_passage: false`, and repeat the matched benchmark passage status as `unchanged: true`.
+Process and evidence failures remain explicit failed attempts. A complete public performance bundle
+requires a completed, matching non-fixture diagnostic and a separately claim-eligible benchmark;
+development and fixture reports remain incomplete regardless of diagnostic quality or throughput.
+`--merge` is not supported for this workflow version.
+
 ## Manifest schema version 1
 
 The v1 readiness manifest is a JSON object with these fields:

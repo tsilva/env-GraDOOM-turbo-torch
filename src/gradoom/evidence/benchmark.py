@@ -41,6 +41,7 @@ _CONTROLLED_ARGUMENTS = {
     "--metrics-jsonl",
     "--no-evaluation-stochastic",
     "--resume",
+    "--reusable-time-budget-seconds",
     "--seed",
     "--timesteps",
 }
@@ -811,6 +812,17 @@ def build_development_benchmark_report(manifest_path: Path) -> dict[str, Any]:
         "wad_profile": wad_profile,
         "attempts": attempts,
         "failures": failures,
+        "diagnostics": {
+            "fixed_time": {
+                "status": "unavailable",
+                "reason": "No matching fixed-time diagnostic was supplied.",
+                "affects_passage": False,
+            }
+        },
+        "public_performance_evidence": {
+            "complete": False,
+            "reason": "matching_fixed_time_diagnostic_unavailable",
+        },
         "generated_artifacts": generated_artifacts,
         "evidence_index": {
             "algorithm": "sha256",

@@ -14,6 +14,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--timesteps", type=int)
+    parser.add_argument("--reusable-time-budget-seconds", type=float)
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--evaluate-checkpoint", type=Path)
@@ -28,6 +29,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--fixture-omit-player-killcount", action="store_true")
     parser.add_argument("--fixture-training-step-offset", type=int, default=0)
     parser.add_argument("--fixture-hardlink-checkpoint-to", type=Path)
+    parser.add_argument("--fixture-diagnostic-quality", type=float, default=0.0)
+    parser.add_argument("--fixture-diagnostic-transitions", type=int, default=1000)
+    parser.add_argument("--fixture-diagnostic-elapsed-seconds", type=float, default=1.0)
     return parser
 
 
@@ -51,7 +55,12 @@ def main() -> int:
             return 17
         assert args.checkpoint is not None
         assert args.timesteps is not None
-        actual_step = args.timesteps + args.fixture_training_step_offset
+        diagnostic = args.reusable_time_budget_seconds is not None
+        actual_step = (
+            args.fixture_diagnostic_transitions
+            if diagnostic
+            else args.timesteps + args.fixture_training_step_offset
+        )
         args.checkpoint.parent.mkdir(parents=True, exist_ok=True)
         args.checkpoint.write_text(
             json.dumps(
@@ -60,6 +69,7 @@ def main() -> int:
                     "seed": args.seed,
                     "step": actual_step,
                     "resumed": args.resume is not None,
+                    "fixed_time": diagnostic,
                 },
                 sort_keys=True,
             ),
@@ -86,6 +96,7 @@ def main() -> int:
                     "policy_state": "resumed" if args.resume is not None else "fresh_random",
                     "optimizer_state": "resumed" if args.resume is not None else "fresh",
                 },
+                "reusable_time_budget_seconds": args.reusable_time_budget_seconds,
             }
         ]
         if args.resume is not None:
@@ -105,6 +116,13 @@ def main() -> int:
                 "execution_timesteps": actual_step,
                 "checkpoint": str(args.checkpoint),
                 "training_transitions_per_second": 1000.0,
+                "training_transitions": actual_step,
+                "frame_skip": 2,
+                "reusable_time_budget_seconds": args.reusable_time_budget_seconds,
+                "reusable_time_elapsed_seconds": (
+                    args.fixture_diagnostic_elapsed_seconds if diagnostic else None
+                ),
+                "stop_reason": "reusable_time_budget" if diagnostic else "timestep_budget",
             }
         )
         _emit(args.metrics_jsonl, *records)
@@ -117,10 +135,13 @@ def main() -> int:
     assert args.evaluation_seeds_file is not None
     episode_seeds = json.loads(args.evaluation_seeds_file.read_text(encoding="utf-8"))
     assert args.evaluation_episodes == len(episode_seeds)
-    player_quality, compatibility_quality = outcomes.get(
-        f"{checkpoint['seed']}:{step}",
-        outcomes.get(str(step), [0.0, 0.0]),
-    )
+    if checkpoint.get("fixed_time"):
+        player_quality, compatibility_quality = args.fixture_diagnostic_quality, 0.0
+    else:
+        player_quality, compatibility_quality = outcomes.get(
+            f"{checkpoint['seed']}:{step}",
+            outcomes.get(str(step), [0.0, 0.0]),
+        )
     episodes = []
     for index, game_seed in enumerate(episode_seeds):
         episode = {

@@ -102,6 +102,12 @@ standalone trainer and exact 100-episode stochastic GraDOOM evaluation path. Its
 non-authoritative and claim-ineligible, including passes made before a current parity certificate
 exists.
 
+The separate `fixed_time_training_diagnostic` path binds an existing benchmark report, then runs the
+same recipe and seeds to one predeclared reusable-time budget. It reports final mean
+`player_killcount` over the same 100 held-out stochastic episodes plus simulated tics/s and
+transitions/s, without changing benchmark passage. Development evidence may leave this diagnostic
+explicitly unavailable; complete public performance evidence may not.
+
 ## Notes
 
 - `env-GraDOOM-turbo-torch` is under active construction and is not yet parity-certified. No current release supports a public quality- or speed-leadership claim.
