@@ -62,6 +62,11 @@ def _write_report(path: Path, report: dict[str, object]) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary_path, path)
+        directory_descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
     finally:
         temporary_path.unlink(missing_ok=True)
 
@@ -180,6 +185,16 @@ def _validate_document_paths(
         resolved_merge = _resolve_evidence_path(merge_path, base_directory=working_directory)
         if _paths_alias(resolved_output, resolved_merge):
             raise EvidenceError("output path aliases the merge report")
+    if manifest.get("fixture") is False:
+        authority_state = os.environ.get("GRADOOM_REUSABLE_TIME_AUTHORITY_STATE")
+        if authority_state:
+            resolved_authority_state = _resolve_evidence_path(
+                Path(authority_state), base_directory=working_directory
+            )
+            if resolved_output == resolved_authority_state or resolved_output.is_relative_to(
+                resolved_authority_state
+            ):
+                raise EvidenceError("output path aliases reusable-time authority state")
     manifest_directory = _resolve_evidence_path(
         manifest_path.parent,
         base_directory=working_directory,
@@ -263,22 +278,37 @@ def main(argv: list[str] | None = None) -> int:
             merge_path=args.merge,
         )
         workflow = manifest.get("workflow")
+        report_already_written = False
         if workflow == "parity_readiness":
             report = build_readiness_report(args.manifest)
         elif workflow == "development_training_benchmark":
+
+            def write_benchmark_report(candidate: dict[str, Any]) -> None:
+                _validate_output_path(
+                    args.output,
+                    manifest_path=args.manifest,
+                    report=candidate,
+                    merge_path=args.merge,
+                )
+                _write_report(args.output, candidate)
+
             report = build_development_benchmark_report(
                 args.manifest,
                 merge_path=args.merge,
                 invocation_started=invocation_started,
+                clock=time.perf_counter,
+                report_writer=write_benchmark_report,
             )
+            report_already_written = True
         else:
             raise EvidenceError(f"unsupported manifest workflow {workflow!r}")
-        _validate_output_path(
-            args.output,
-            manifest_path=args.manifest,
-            report=report,
-            merge_path=args.merge,
-        )
+        if not report_already_written:
+            _validate_output_path(
+                args.output,
+                manifest_path=args.manifest,
+                report=report,
+                merge_path=args.merge,
+            )
         if args.merge is not None and workflow == "parity_readiness":
             evidence_index = report["evidence_index"]
             assert isinstance(evidence_index, dict)
@@ -310,7 +340,8 @@ def main(argv: list[str] | None = None) -> int:
                     }
                 ],
             )
-        _write_report(args.output, report)
+        if not report_already_written:
+            _write_report(args.output, report)
     except (EvidenceError, OSError) as error:
         print(f"gradoom-evidence: error: {error}", file=sys.stderr)
         return 2

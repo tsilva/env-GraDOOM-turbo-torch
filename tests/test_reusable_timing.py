@@ -15,6 +15,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from gradoom.evidence import benchmark as benchmark_module
+from gradoom.evidence import cli as cli_module
 from gradoom.evidence.benchmark import (
     _attempt_journal_payload,
     build_development_benchmark_report,
@@ -378,6 +379,9 @@ def test_public_command_accepts_only_disclosed_immutable_bootstrap_exclusion(
         "training",
         "checkpoint_evaluation",
         "durable_checkpoint_write",
+        "terminal_evidence_verification",
+        "report_validation_serialization_replacement_and_fsync",
+        "durable_authority_elapsed_seal",
     ]
     assert report["bootstrap_exclusions"] == [
         {
@@ -471,6 +475,45 @@ def test_terminal_elapsed_includes_durable_journal_and_authority_delay(
     )
 
     assert report["attempts"][0]["reusable_elapsed_seconds"] >= 100.0
+
+
+def test_terminal_elapsed_seal_covers_final_verification_and_report_fsync(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest = _manifest(tmp_path, outcomes={"10": [30.0, 0.0]})
+    output = tmp_path / "report.json"
+    now = [10.0]
+    original_verify = benchmark_module._reverify_trainer_files
+    original_write = cli_module._write_report
+
+    def delayed_verify(trainer: dict[str, object]) -> None:
+        original_verify(trainer)
+        now[0] += 20.0
+
+    def delayed_write(path: Path, report: dict[str, object]) -> None:
+        original_write(path, report)
+        now[0] += 30.0
+
+    monkeypatch.setattr(benchmark_module, "_reverify_trainer_files", delayed_verify)
+    monkeypatch.setattr(cli_module, "_write_report", delayed_write)
+    monkeypatch.setattr(cli_module.time, "perf_counter", lambda: now[0])
+    monkeypatch.setitem(
+        benchmark_module.build_development_benchmark_report.__kwdefaults__,
+        "clock",
+        lambda: now[0],
+    )
+
+    result = cli_module.main(["--manifest", str(manifest), "--output", str(output)])
+
+    assert result == 0
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert report["attempts"][0]["reusable_elapsed_seconds"] >= now[0] - 10.0
+    assert (
+        report["attempts"][0]["attempt_journal"]["authority_attestation"]["payload"][
+            "reusable_elapsed_seconds"
+        ]
+        == report["attempts"][0]["reusable_elapsed_seconds"]
+    )
 
 
 @pytest.mark.parametrize(
@@ -771,6 +814,56 @@ def test_public_command_recovers_after_parent_process_interruption(
     prior_elapsed = attempt["recovery_history"][0]["prior_reusable_elapsed_seconds"]
     assert prior_elapsed > 0.0
     assert attempt["reusable_elapsed_seconds"] >= prior_elapsed
+
+
+def test_public_command_forwards_and_recovers_parent_signal_during_evaluation(
+    tmp_path: Path,
+) -> None:
+    evaluation_started = tmp_path / "evaluation-started"
+    child_exited = tmp_path / "evaluation-child-exited"
+    manifest = _manifest(
+        tmp_path,
+        outcomes={"10": [30.0, 0.0]},
+        extra_arguments=[
+            "--fixture-hold-evaluation-once-marker",
+            str(evaluation_started),
+            "--fixture-evaluation-child-exited-marker",
+            str(child_exited),
+        ],
+    )
+    command = shutil.which("gradoom-evidence")
+    assert command is not None
+    lost_output = tmp_path / "lost-report.json"
+    parent = subprocess.Popen(
+        [command, "--manifest", str(manifest), "--output", str(lost_output)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    deadline = time.monotonic() + 10.0
+    while not evaluation_started.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert evaluation_started.exists()
+    parent.terminate()
+    assert parent.wait(timeout=5.0) != 0
+    deadline = time.monotonic() + 5.0
+    while not child_exited.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert child_exited.exists()
+    assert not lost_output.exists()
+
+    recovered_output = tmp_path / "recovered-report.json"
+    recovered = _run_evidence(
+        "--manifest",
+        str(manifest),
+        "--output",
+        str(recovered_output),
+    )
+
+    assert recovered.returncode == 0, recovered.stderr
+    attempt = json.loads(recovered_output.read_text(encoding="utf-8"))["attempts"][0]
+    assert attempt["status"] == "succeeded"
+    assert attempt["recovery_history"][-1]["resumed_phase"] == "evaluation"
+    assert attempt["recovery_history"][-1]["prior_reusable_elapsed_seconds"] > 0.0
 
 
 def test_public_command_does_not_replace_a_failed_seed_during_continuation(
@@ -1330,6 +1423,45 @@ def test_public_command_binds_executed_parent_package_initializers(tmp_path: Pat
     assert "unlike run identity" in result.stderr
 
 
+def test_public_command_binds_relative_from_import_submodule(tmp_path: Path) -> None:
+    code_root = tmp_path / "code"
+    package = code_root / "pkg"
+    helpers = package / "helpers"
+    helpers.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (helpers / "__init__.py").write_text("", encoding="utf-8")
+    worker = helpers / "worker.py"
+    shutil.copyfile(FIXTURE_PROCESS, worker)
+    launcher = package / "launcher.py"
+    launcher.write_text(
+        "from .helpers import worker\nraise SystemExit(worker.main())\n",
+        encoding="utf-8",
+    )
+    manifest = _manifest(
+        tmp_path,
+        outcomes={"10": [30.0, 0.0]},
+        trainer_script=launcher,
+        trainer_code_root=code_root,
+        extra_arguments=["--fixture-interrupt-once-at-step", "10"],
+    )
+    interrupted = tmp_path / "interrupted.json"
+    first = _run_evidence("--manifest", str(manifest), "--output", str(interrupted))
+    assert first.returncode == 0, first.stderr
+    worker.write_text(worker.read_text(encoding="utf-8") + "\n# changed\n", encoding="utf-8")
+
+    result = _run_evidence(
+        "--manifest",
+        str(manifest),
+        "--output",
+        str(tmp_path / "continued.json"),
+        "--merge",
+        str(interrupted),
+    )
+
+    assert result.returncode == 2
+    assert "unlike run identity" in result.stderr
+
+
 def test_public_command_rejects_os_exec_trainer_indirection(tmp_path: Path) -> None:
     launcher = tmp_path / "launcher.py"
     launcher.write_text(
@@ -1347,3 +1479,31 @@ def test_public_command_rejects_os_exec_trainer_indirection(tmp_path: Path) -> N
 
     assert result.returncode == 2
     assert "opaque trainer indirection" in result.stderr
+
+
+def test_public_command_rejects_nonliteral_dynamic_exec_indirection(tmp_path: Path) -> None:
+    launcher = tmp_path / "launcher.py"
+    launcher.write_text(
+        "import os\nname = 'exec' + 'v'\nrunners = [os]\n"
+        "getattr(runners[0], name)('/tmp/hidden', ['/tmp/hidden'])\n",
+        encoding="utf-8",
+    )
+    manifest = _manifest(
+        tmp_path,
+        outcomes={"10": [30.0, 0.0]},
+        trainer_script=launcher,
+        trainer_code_root=tmp_path,
+    )
+
+    result = _run_evidence("--manifest", str(manifest), "--output", str(tmp_path / "report.json"))
+
+    assert result.returncode == 2
+    assert "opaque trainer indirection" in result.stderr
+
+
+def test_documented_train_python_closure_allows_importlib_resources() -> None:
+    repository = Path(__file__).resolve().parents[1]
+
+    closure = benchmark_module._python_source_closure(repository / "train.py", repository)
+
+    assert repository / "src/gradoom/scenario.py" in closure

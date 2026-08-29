@@ -54,29 +54,35 @@ contains:
 - `bootstrap_artifacts`: optional one-time exclusions declared before the cohort. Every entry names
   a persistent read-only regular file outside the benchmark artifact directory, its SHA-256,
   creation elapsed seconds, and exact canonical reuse conditions. Eligibility is not established by
-  those operator-authored fields: a pinned external authority must sign the artifact hash, creation
-  cost, canonical protocol, constrained `compiler-target` input, reuse conditions, persistent
-  object identity, creation event, and a distinct prior unchanged-reuse event. Formal validation
-  queries the authority's private ledger; first creation, deletion/recreation, copied paths, and
-  replayed signatures are ineligible. Eligible
+  those operator-authored fields. The packaged `gradoom-time-authority create-bootstrap` operation
+  exclusively creates and fsyncs the canonical artifact, measures its creation cost, and records its
+  persistent object identity in a signed ledger. A later, separate
+  `record-bootstrap-reuse` observation must see the same read-only object and bytes before
+  `attest-bootstrap-reuse` can issue eligibility evidence. Formal validation reads that repository-
+  owned authority's private ledger; first creation, deletion/recreation, copied paths, ledger
+  rollback, state reset, and replayed signatures are ineligible. Eligible
   bytes use only the `gradoom-declarative-bootstrap-v1` canonical JSON contract. Compiler-target
   inputs reject seed, candidate, policy, optimizer, rollout, and learned state, and opaque outputs
   remain ineligible. Files are verified before and after the cohort.
 - `elapsed_time_anchors`: required for every training seed before a run. Each training seed
   has a pre-attempt Ed25519-signed start record from an independently controlled authority. Fixture
-  anchors are pinned to the public fixture key and real anchors are pinned to the
-  `gradoom-reusable-time-authority-v1` package key; caller-selected keys and authorities are
-  rejected. Every terminal or interrupted attempt generation receives a second authority signature
+  anchors are pinned to the public fixture key. Formal anchors must match the identity in the
+  persistent state directory named by `GRADOOM_REUSABLE_TIME_AUTHORITY_STATE`; arbitrary signer
+  executables and caller-selected declarations are not accepted. Every terminal or interrupted
+  attempt generation receives a second authority signature
   over its status, cumulative elapsed time, generation, predecessor hash, and durable journal hash.
   The command first writes and fsyncs an elapsed-neutral terminal journal, then asks the authority to
-  issue the final elapsed seal. Thus journal persistence and signing are timed without requiring a
-  journal to contain its own eventual digest. The authority seal is the terminal boundary; the
-  report's local copy of that externally retained seal is transport rather than a new benchmark
-  operation.
-  For formal evidence, `GRADOOM_EVIDENCE_AUTHORITY` identifies the independently controlled signer;
-  it enforces wall-clock floors and an external monotonic latest-head ledger, and continuation asks
-  it to reject rollback. Signing private keys and ledger state never enter the manifest, report, or
-  benchmark artifact directory. Fixture signing is pinned separately and remains claim-ineligible.
+  issue an elapsed seal. Final artifact verification, output-path validation, report serialization,
+  atomic replacement, file and directory fsync, and the seal made durable inside that report are
+  also recurring work. The writer therefore measures an initial durable write, requests a
+  conservative future-charged seal, and repeats only when the signed elapsed floor did not cover the
+  completed write. Thus the final durable report contains a signed elapsed value no lower than its
+  actual terminal boundary without requiring a journal or report to contain its own digest.
+  The packaged authority maintains a signed append-only event chain plus a separately signed durable
+  high-water head. It verifies registered starts, monotonic journal generations and elapsed floors,
+  chronological bootstrap creation/reuse, latest-head continuity, ledger rollback, and authority
+  identity resets. Signing private keys and ledger state never enter the manifest, report, or
+  benchmark artifact directory. Fixture signing remains pinned separately and claim-ineligible.
 - `parity_certificate`: the current certificate availability and, when unavailable, its reason.
   An unavailable certificate is recorded as a claim-ineligibility reason but does not prevent a
   development run.
@@ -127,10 +133,13 @@ recomputing those public hashes. A merge must name the latest on-disk chained ge
 continuation also verifies that head against the authority's external monotonic ledger.
 
 Before every trainer launch, the command writes and periodically refreshes a durable, checksummed
-live-attempt journal. If the public command itself is interrupted before it can write a report, a
-later invocation with the identical manifest discovers the live journal and its completed recovery
-checkpoint, verifies every bound identity and artifact, and continues the same attempt without
-requiring a missing report. A crash that produces no complete recovery checkpoint remains terminal.
+live-attempt journal. Training and 100-episode evaluation subprocesses both receive forwarded
+SIGINT/SIGTERM only after that journal is refreshed. If the public command itself is interrupted
+before it can write a report, a later invocation with the identical manifest discovers whether the
+durable phase was training or evaluation. It verifies every bound identity and artifact, resumes
+training state when needed, or reruns only the interrupted evaluator against the already-durable
+checkpoint without replacing the attempt. A crash that produces no complete recovery checkpoint
+remains terminal.
 The real environment exposes a deterministic live-snapshot codec. Evidence checkpoints retain and
 restore every direct environment and engine tensor, host reset RNG state, current observation and
 context, episode start/done flags, in-progress returns and lengths, stable lane identities, reward
@@ -145,6 +154,23 @@ state; mixed-precision evidence checkpoints remain required to carry it.
 recipe, assets and bootstrap bytes, training/evaluation seeds, and timer phases/boundaries. Any
 recipe, asset, seed, timer, schema, code provenance, WAD binding, evidence index, or artifact mismatch
 fails before additional training work begins.
+
+### Reusable-time authority operations
+
+Provision formal authority state once on independently controlled persistent storage:
+
+```bash
+gradoom-time-authority --state-directory /secure/gradoom-time init
+export GRADOOM_REUSABLE_TIME_AUTHORITY_STATE=/secure/gradoom-time
+```
+
+`start-attempt` reads `{"seed": 123}` on standard input and returns the signed anchor used in the
+manifest. Bootstrap setup uses `create-bootstrap`, then a later invocation of
+`record-bootstrap-reuse`, and finally `attest-bootstrap-reuse`; each accepts and emits canonical JSON
+on standard input. The evidence command calls the same installed implementation directly for
+journal sealing and latest-head/bootstrap verification. Copying an old ledger under a newer durable
+head is detected as rollback; deleting and reinitializing the directory creates a different public
+identity, so old anchors and attestations are rejected.
 
 The standalone trainer's `--evaluation-seeds-file` accepts a UTF-8 JSON array of exactly 100 unique
 uint32 game seeds. Its emitted config binds the complete ordered seed list, file hash, stochastic
