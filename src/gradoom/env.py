@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import math
 import operator
 import os
@@ -220,8 +221,8 @@ class GraDoomVecEnv(VectorEnv):
         "transition_transport": "torch",
         "gradoom_device_api_version": 1,
     }
-    supports_live_snapshots = False
-    live_snapshots_deterministic = False
+    supports_live_snapshots = True
+    live_snapshots_deterministic = True
     parity_certified = False
     device_signal_names = DEVICE_SIGNAL_NAMES
 
@@ -625,12 +626,12 @@ class GraDoomVecEnv(VectorEnv):
                 "supports_enemy_variants": False,
                 "supports_fire_reset": False,
                 "supports_info_frame_stack": True,
-                "supports_live_snapshots": False,
+                "supports_live_snapshots": True,
                 "supports_maxpool_last_two": False,
                 "supports_noop_reset": False,
                 "supports_per_lane_rgb": render_mode == "rgb_array",
                 "supports_reward_clipping": True,
-                "supports_snapshot_codec": False,
+                "supports_snapshot_codec": True,
                 "supports_state_catalog": True,
                 "supports_sticky_action_prob": False,
                 "supports_surface_variants": False,
@@ -1024,6 +1025,88 @@ class GraDoomVecEnv(VectorEnv):
         if self._cuda_graph_transition is None:  # pragma: no cover - defensive invariant
             raise RuntimeError("CUDA graph capture did not produce a transition")
         return self._cuda_graph_transition
+
+    @staticmethod
+    def _snapshot_direct_tensors(owner: object) -> dict[str, torch.Tensor]:
+        return {
+            name: value.detach().cpu().clone()
+            for name, value in vars(owner).items()
+            if isinstance(value, torch.Tensor)
+        }
+
+    @staticmethod
+    def _restore_direct_tensors(
+        owner: object,
+        saved: Mapping[str, torch.Tensor],
+        *,
+        owner_name: str,
+    ) -> None:
+        current = {
+            name: value for name, value in vars(owner).items() if isinstance(value, torch.Tensor)
+        }
+        if set(saved) != set(current):
+            raise ValueError(f"live snapshot {owner_name} tensor inventory mismatch")
+        for name, destination in current.items():
+            source = saved[name]
+            if not isinstance(source, torch.Tensor):
+                raise ValueError(f"live snapshot {owner_name}.{name} is not a tensor")
+            if source.shape != destination.shape or source.dtype != destination.dtype:
+                raise ValueError(f"live snapshot {owner_name}.{name} tensor contract mismatch")
+            destination.copy_(source.to(device=destination.device))
+
+    def capture_live_snapshot(self) -> dict[str, Any]:
+        """Capture every mutable lane tensor and host reset RNG at a rollout boundary."""
+
+        if self.closed:
+            raise RuntimeError("cannot snapshot a closed environment")
+        if self._pending_actions is not None:
+            raise RuntimeError("cannot snapshot while an asynchronous step is pending")
+        return {
+            "format": "gradoom-live-snapshot-v1",
+            "lane_count": self.num_envs,
+            "environment_tensors": self._snapshot_direct_tensors(self),
+            "engine_tensors": self._snapshot_direct_tensors(self._engine),
+            "seed_values": list(self._seed_values),
+            "reset_rng_states": [
+                copy.deepcopy(generator.bit_generator.state) for generator in self._reset_rngs
+            ],
+            "safe_observation_index": self._safe_obs_index,
+            "transaction_graph_captured": self._cuda_graph is not None,
+        }
+
+    def restore_live_snapshot(self, snapshot: Mapping[str, Any]) -> None:
+        """Restore a snapshot into the existing device buffers without changing lane identity."""
+
+        if snapshot.get("format") != "gradoom-live-snapshot-v1":
+            raise ValueError("unsupported GraDOOM live snapshot")
+        if snapshot.get("lane_count") != self.num_envs:
+            raise ValueError("live snapshot lane count mismatch")
+        environment_tensors = snapshot.get("environment_tensors")
+        engine_tensors = snapshot.get("engine_tensors")
+        if not isinstance(environment_tensors, Mapping) or not isinstance(engine_tensors, Mapping):
+            raise ValueError("live snapshot tensor state is incomplete")
+        if self._use_transaction_cuda_graph and self._cuda_graph is None:
+            self._capture_step_and_reset_graph(
+                torch.zeros(self.num_envs, dtype=torch.int64, device=self.device),
+                self._latest_reset_seeds,
+            )
+        self._restore_direct_tensors(self._engine, engine_tensors, owner_name="engine")
+        self._restore_direct_tensors(self, environment_tensors, owner_name="environment")
+        seed_values = snapshot.get("seed_values")
+        reset_rng_states = snapshot.get("reset_rng_states")
+        safe_observation_index = snapshot.get("safe_observation_index")
+        if not isinstance(seed_values, list) or len(seed_values) != self.num_envs:
+            raise ValueError("live snapshot seed values are incomplete")
+        if not isinstance(reset_rng_states, list) or len(reset_rng_states) != self.num_envs:
+            raise ValueError("live snapshot reset RNG states are incomplete")
+        if type(safe_observation_index) is not int or not 0 <= safe_observation_index < max(
+            len(self._safe_obs_buffers), 1
+        ):
+            raise ValueError("live snapshot observation buffer identity is invalid")
+        self._seed_values = list(seed_values)
+        for generator, state in zip(self._reset_rngs, reset_rng_states, strict=True):
+            generator.bit_generator.state = copy.deepcopy(state)
+        self._safe_obs_index = safe_observation_index
 
     def device_signals(self) -> torch.Tensor:
         return self._engine.signal_buffer

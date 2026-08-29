@@ -723,6 +723,50 @@ def test_evidence_resume_rejects_checkpoint_without_live_lane_progress() -> None
         train._validate_evidence_recovery_checkpoint(checkpoint, num_envs=2)
 
 
+def test_evidence_resume_accepts_full_live_lane_progress() -> None:
+    lanes = 2
+    checkpoint = {
+        "policy_state_dict": {},
+        "optimizer_state_dict": {},
+        "training_state": {
+            "completed_episodes": 4,
+            "executed_rollouts": 2,
+            "episode_index": torch.tensor([2, 3]),
+            "lane_identity": torch.arange(lanes),
+            "rolling_returns": [1.0],
+            "rolling_kills": [2.0],
+            "rolling_lengths": [3.0],
+            "rolling_success": [1.0],
+            "environment_state": {
+                "format": "gradoom-live-snapshot-v1",
+                "lane_count": lanes,
+            },
+            "observations": torch.zeros((lanes, 4, 84, 84), dtype=torch.uint8),
+            "context": torch.zeros((lanes, train.CONTEXT_FEATURES)),
+            "episode_starts": torch.tensor([False, True]),
+            "dones": torch.tensor([False, True]),
+            "episode_returns": torch.tensor([4.0, 0.0]),
+            "episode_lengths": torch.tensor([7, 0], dtype=torch.int32),
+            "reward_shaper_state": {
+                "format": "gradoom-live-component-v1",
+                "tensors": {},
+            },
+            "python_rng_state": object(),
+            "numpy_rng_state": object(),
+            "torch_rng_state": torch.zeros(1, dtype=torch.uint8),
+            "cuda_rng_state": [torch.zeros(1, dtype=torch.uint8)],
+        },
+    }
+
+    assert train._checkpoint_restored_state(checkpoint, num_envs=lanes) == {
+        "policy": True,
+        "optimizer": True,
+        "rng": True,
+        "progress": True,
+    }
+    train._validate_evidence_recovery_checkpoint(checkpoint, num_envs=lanes)
+
+
 def test_native_death_reward_is_explicitly_audited() -> None:
     args = _args("--config-only", "--reward-shape", "native-death-v1", "--death-penalty", "3")
 

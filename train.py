@@ -2327,7 +2327,48 @@ _CONTINUOUS_PROGRESS_FIELDS = {
     "dones",
     "episode_returns",
     "episode_lengths",
+    "lane_identity",
+    "reward_shaper_state",
 }
+
+
+def _capture_live_component_state(component: object | None) -> dict[str, Any]:
+    if component is None:
+        return {"format": "gradoom-live-component-v1", "tensors": {}}
+    return {
+        "format": "gradoom-live-component-v1",
+        "tensors": {
+            name: value.detach().cpu().clone()
+            for name, value in vars(component).items()
+            if isinstance(value, torch.Tensor)
+        },
+    }
+
+
+def _restore_live_component_state(component: object | None, state: Mapping[str, Any]) -> None:
+    if state.get("format") != "gradoom-live-component-v1":
+        raise ValueError("checkpoint reward-shaper state has an unsupported format")
+    saved = state.get("tensors")
+    if not isinstance(saved, Mapping):
+        raise ValueError("checkpoint reward-shaper tensor state is incomplete")
+    current = (
+        {}
+        if component is None
+        else {
+            name: value
+            for name, value in vars(component).items()
+            if isinstance(value, torch.Tensor)
+        }
+    )
+    if set(saved) != set(current):
+        raise ValueError("checkpoint reward-shaper tensor inventory mismatch")
+    for name, destination in current.items():
+        source = saved[name]
+        if not isinstance(source, torch.Tensor):
+            raise ValueError(f"checkpoint reward-shaper state {name!r} is not a tensor")
+        if source.shape != destination.shape or source.dtype != destination.dtype:
+            raise ValueError(f"checkpoint reward-shaper state {name!r} has a shape mismatch")
+        destination.copy_(source.to(device=destination.device))
 
 
 def _checkpoint_restored_state(
@@ -2361,6 +2402,7 @@ def _checkpoint_restored_state(
         "dones",
         "episode_returns",
         "episode_lengths",
+        "lane_identity",
     )
     lanes_complete = all(
         isinstance(training_state.get(field), torch.Tensor)
@@ -2372,6 +2414,8 @@ def _checkpoint_restored_state(
         set(training_state) >= _CONTINUOUS_PROGRESS_FIELDS
         and environment_complete
         and lanes_complete
+        and isinstance(training_state.get("reward_shaper_state"), Mapping)
+        and training_state["reward_shaper_state"].get("format") == "gradoom-live-component-v1"
     )
     return {
         "policy": "policy_state_dict" in checkpoint,
@@ -3063,16 +3107,46 @@ def _train(
                         "new_lanes_start_at_episode": 0,
                     }
                 )
-            episode_seeds.ensure(int(episode_index.max().item()))
-            observations, _signals = env.reset_device(
-                reset_mask,
-                episode_seeds.lookup(episode_index),
+            environment_state = saved_training_state.get("environment_state")
+            live_state_available = isinstance(environment_state, Mapping) and all(
+                isinstance(saved_training_state.get(field), torch.Tensor)
+                for field in (
+                    "observations",
+                    "context",
+                    "episode_starts",
+                    "dones",
+                    "episode_returns",
+                    "episode_lengths",
+                    "lane_identity",
+                )
             )
-            context = context_encoder.encode(env.device_info_histories())
-            episode_starts.fill_(True)
-            dones.zero_()
-            episode_returns.zero_()
-            episode_lengths.zero_()
+            if live_state_available:
+                lane_identity = saved_training_state["lane_identity"]
+                expected_lanes = torch.arange(int(args.num_envs), dtype=torch.int64)
+                if not torch.equal(lane_identity.detach().cpu().to(torch.int64), expected_lanes):
+                    raise ValueError("checkpoint lane identity does not match the live environment")
+                env.restore_live_snapshot(environment_state)
+                observations.copy_(saved_training_state["observations"].to(device=device))
+                context.copy_(saved_training_state["context"].to(device=device))
+                episode_starts.copy_(saved_training_state["episode_starts"].to(device=device))
+                dones.copy_(saved_training_state["dones"].to(device=device))
+                episode_returns.copy_(saved_training_state["episode_returns"].to(device=device))
+                episode_lengths.copy_(saved_training_state["episode_lengths"].to(device=device))
+                reward_state = saved_training_state.get("reward_shaper_state")
+                if not isinstance(reward_state, Mapping):
+                    raise ValueError("checkpoint reward-shaper state is missing")
+                _restore_live_component_state(reward_shaper, reward_state)
+            else:
+                episode_seeds.ensure(int(episode_index.max().item()))
+                observations, _signals = env.reset_device(
+                    reset_mask,
+                    episode_seeds.lookup(episode_index),
+                )
+                context = context_encoder.encode(env.device_info_histories())
+                episode_starts.fill_(True)
+                dones.zero_()
+                episode_returns.zero_()
+                episode_lengths.zero_()
             python_rng_state = saved_training_state.get("python_rng_state")
             numpy_rng_state = saved_training_state.get("numpy_rng_state")
             torch_rng_state = saved_training_state.get("torch_rng_state")
@@ -3114,6 +3188,7 @@ def _train(
                 "completed_episodes": completed_episodes,
                 "executed_rollouts": executed_rollouts,
                 "episode_index": episode_index.detach().cpu(),
+                "lane_identity": torch.arange(int(args.num_envs), dtype=torch.int64),
                 "rolling_returns": list(rolling_returns),
                 "rolling_kills": list(rolling_kills),
                 "rolling_lengths": list(rolling_lengths),
@@ -3122,6 +3197,14 @@ def _train(
                 "numpy_rng_state": np.random.get_state(),
                 "torch_rng_state": torch.get_rng_state(),
                 "cuda_rng_state": torch.cuda.get_rng_state_all(),
+                "environment_state": env.capture_live_snapshot(),
+                "observations": observations.detach().cpu().clone(),
+                "context": context.detach().cpu().clone(),
+                "episode_starts": episode_starts.detach().cpu().clone(),
+                "dones": dones.detach().cpu().clone(),
+                "episode_returns": episode_returns.detach().cpu().clone(),
+                "episode_lengths": episode_lengths.detach().cpu().clone(),
+                "reward_shaper_state": _capture_live_component_state(reward_shaper),
             }
 
         while global_step < _execution_timesteps(args) and not interrupted:

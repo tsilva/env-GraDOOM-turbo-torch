@@ -12,6 +12,7 @@ license = "MIT AND GPL-3.0-only"
 license-files = ["LICENSE", "LICENSES/GPL-3.0-only.txt", "THIRD_PARTY_NOTICES.md"]
 authors = [{name = "Tiago Silva"}]
 dependencies = [
+  "cryptography>=50,<51",
   "gymnasium>=1.2,<2",
   "numpy>=1.26,<3",
   "torch>=2.13,<2.14",
