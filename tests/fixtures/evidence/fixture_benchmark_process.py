@@ -26,11 +26,13 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--fixture-outcomes", required=True)
     parser.add_argument("--fixture-fail-training-seed", type=int)
     parser.add_argument("--fixture-fail-training-once-marker", type=Path)
+    parser.add_argument("--fixture-fail-after-resume-once-marker", type=Path)
     parser.add_argument("--fixture-fail-evaluation-step", type=int)
     parser.add_argument("--fixture-omit-player-killcount", action="store_true")
     parser.add_argument("--fixture-training-step-offset", type=int, default=0)
     parser.add_argument("--fixture-hardlink-checkpoint-to", type=Path)
     parser.add_argument("--fixture-mutate-bootstrap", type=Path)
+    parser.add_argument("--fixture-mutate-trainer-code", type=Path)
     parser.add_argument("--fixture-interrupt-once-at-step", type=int)
     parser.add_argument("--fixture-hard-crash-once-at-step", type=int)
     parser.add_argument("--fixture-hold-after-recovery-checkpoint-marker", type=Path)
@@ -64,6 +66,13 @@ def main() -> int:
     args, _unknown = _parser().parse_known_args()
     outcomes = json.loads(args.fixture_outcomes)
     if args.evaluate_checkpoint is None:
+        if (
+            args.resume is not None
+            and args.fixture_fail_after_resume_once_marker is not None
+            and not args.fixture_fail_after_resume_once_marker.exists()
+        ):
+            args.fixture_fail_after_resume_once_marker.write_text("failed\n", encoding="utf-8")
+            return 23
         if (
             args.fixture_fail_training_once_marker is not None
             and not args.fixture_fail_training_once_marker.exists()
@@ -194,6 +203,9 @@ def main() -> int:
         )
         _emit(args.metrics_jsonl, *records)
         _mutate_bootstrap(args.fixture_mutate_bootstrap)
+        if args.fixture_mutate_trainer_code is not None:
+            with args.fixture_mutate_trainer_code.open("a", encoding="utf-8") as stream:
+                stream.write("\n# mutated during cohort\n")
         if should_interrupt and args.fixture_hold_after_recovery_checkpoint_marker is not None:
             args.fixture_hold_after_recovery_checkpoint_marker.write_text(
                 "checkpoint-ready\n", encoding="utf-8"

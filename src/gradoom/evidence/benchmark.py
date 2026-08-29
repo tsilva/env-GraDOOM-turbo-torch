@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import ast
+import base64
+import binascii
 import json
 import math
 import os
@@ -12,6 +15,9 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from .report import (
     EvidenceError,
@@ -33,6 +39,10 @@ _DEFAULT_TRAINING_SEED = 123
 _UINT32_MAX = (1 << 32) - 1
 _QUALITY_THRESHOLD = 30.0
 _EVALUATION_EPISODES = 100
+_FIXTURE_ELAPSED_ANCHOR_PUBLIC_KEY = "MfMyLUkj02xBwQm9sAmRkxh77ZmUIJbkkmokx379DS8="
+_FIXTURE_ELAPSED_ANCHOR_AUTHORITY = "gradoom-fixture-independent-anchor-v1"
+_ELAPSED_ANCHOR_PUBLIC_KEY = "6hsE1Q7qqE0NkWRgU7j35+l3WheLO4Tm3lAnkmiLWnc="
+_ELAPSED_ANCHOR_AUTHORITY = "gradoom-reusable-time-authority-v1"
 _CONTROLLED_ARGUMENTS = {
     "--checkpoint",
     "--checkpoint-every-rollouts",
@@ -131,8 +141,14 @@ def _string_array(value: object, field: str, *, non_empty: bool = False) -> list
 
 def _validate_trainer(value: object) -> dict[str, Any]:
     trainer = _required_mapping(value, "benchmark.trainer")
+    unknown = sorted(set(trainer) - {"command", "arguments", "code_root"})
+    if unknown:
+        raise EvidenceError(f"benchmark.trainer has undeclared fields: {', '.join(unknown)}")
     command = _string_array(trainer.get("command"), "benchmark.trainer.command", non_empty=True)
     arguments = _string_array(trainer.get("arguments", []), "benchmark.trainer.arguments")
+    code_root = trainer.get("code_root")
+    if code_root is not None and (not isinstance(code_root, str) or not code_root.strip()):
+        raise EvidenceError("benchmark.trainer.code_root must be a non-whitespace path")
     for argument in arguments:
         controlled = next(
             (
@@ -147,7 +163,83 @@ def _validate_trainer(value: object) -> dict[str, Any]:
                 f"benchmark.trainer.arguments must not control {controlled!r}; "
                 "the evidence command owns cold-start, timing, checkpoint, and evaluation flags"
             )
-    return {"command": command, "arguments": arguments}
+    return {"command": command, "arguments": arguments, "code_root": code_root}
+
+
+def _validated_python_tree(path: Path) -> ast.AST:
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    except (OSError, SyntaxError, UnicodeError) as error:
+        raise EvidenceError(f"benchmark trainer Python source is unreadable: {path}") from error
+    forbidden_imports = {"importlib", "runpy", "subprocess"}
+    forbidden_builtins = {"__import__", "eval", "exec", "compile"}
+    forbidden_attributes = {"system", "popen"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import) and any(
+            alias.name in forbidden_imports for alias in node.names
+        ):
+            raise EvidenceError("shell, -c, eval, and opaque trainer indirection are forbidden")
+        if isinstance(node, ast.ImportFrom) and (node.module or "") in forbidden_imports:
+            raise EvidenceError("shell, -c, eval, and opaque trainer indirection are forbidden")
+        if isinstance(node, ast.Call):
+            forbidden_call = (
+                isinstance(node.func, ast.Name) and node.func.id in forbidden_builtins
+            ) or (isinstance(node.func, ast.Attribute) and node.func.attr in forbidden_attributes)
+            if forbidden_call:
+                raise EvidenceError("shell, -c, eval, and opaque trainer indirection are forbidden")
+    return tree
+
+
+def _python_source_closure(script_path: Path, code_root: Path) -> list[Path]:
+    pending = [script_path]
+    closure: set[Path] = set()
+    while pending:
+        path = pending.pop()
+        if path in closure:
+            continue
+        closure.add(path)
+        tree = _validated_python_tree(path)
+        modules: set[str] = set()
+        relative_modules: list[tuple[int, str]] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                modules.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                modules.add(node.module)
+            elif isinstance(node, ast.ImportFrom) and node.level > 0:
+                relative_modules.extend(
+                    (node.level, module)
+                    for module in (
+                        [node.module] if node.module else [alias.name for alias in node.names]
+                    )
+                )
+        for module in modules:
+            parts = module.split(".")
+            candidates = (
+                code_root.joinpath(*parts).with_suffix(".py"),
+                code_root.joinpath(*parts, "__init__.py"),
+                code_root.joinpath("src", *parts).with_suffix(".py"),
+                code_root.joinpath("src", *parts, "__init__.py"),
+                path.parent.joinpath(*parts).with_suffix(".py"),
+            )
+            resolved = next((candidate for candidate in candidates if candidate.is_file()), None)
+            if resolved is None:
+                continue
+            pending.append(resolved)
+        for level, module in relative_modules:
+            base = path.parent
+            for _ in range(level - 1):
+                base = base.parent
+            parts = module.split(".")
+            candidates = (
+                base.joinpath(*parts).with_suffix(".py"),
+                base.joinpath(*parts, "__init__.py"),
+            )
+            resolved = next((candidate for candidate in candidates if candidate.is_file()), None)
+            if resolved is None:
+                continue
+            pending.append(resolved)
+    return sorted(closure)
 
 
 def _bind_trainer_files(
@@ -162,6 +254,14 @@ def _bind_trainer_files(
         executable_path = candidate
     else:
         executable_path = Path(executable).resolve()
+    executable_name = executable_path.name.lower()
+    if executable_name in {"sh", "bash", "dash", "zsh", "fish", "cmd", "powershell", "pwsh"}:
+        raise EvidenceError("shell, -c, eval, and opaque trainer indirection are forbidden")
+    is_python = executable_name.startswith(("python", "pypy"))
+    if is_python and (len(command) != 2 or command[1].startswith("-")):
+        raise EvidenceError("shell, -c, eval, and opaque trainer indirection are forbidden")
+    if not is_python and len(command) != 1:
+        raise EvidenceError("benchmark trainer executable commands cannot use opaque indirection")
     bound_files = [
         {
             "role": "executable",
@@ -171,24 +271,44 @@ def _bind_trainer_files(
             ),
         }
     ]
-    for token in command[1:]:
-        if token.startswith("-"):
-            continue
-        candidate = _resolve_evidence_path(Path(token), base_directory=base_directory)
-        if candidate.is_file():
+    if is_python:
+        script_path = _resolve_evidence_path(Path(command[1]), base_directory=base_directory)
+        if not script_path.is_file() or script_path.suffix != ".py":
+            raise EvidenceError("benchmark trainer Python command must name one source file")
+        raw_root = trainer.get("code_root")
+        code_root = _resolve_evidence_path(
+            Path(raw_root) if raw_root is not None else script_path.parent,
+            base_directory=base_directory,
+        )
+        if not code_root.is_dir() or not script_path.is_relative_to(code_root):
+            raise EvidenceError("benchmark trainer script must be inside its code_root")
+        code_files = _python_source_closure(script_path, code_root)
+        for path in code_files:
             bound_files.append(
                 {
-                    "role": "script",
-                    "path": str(candidate),
-                    "sha256": _sha256_bytes(candidate.read_bytes()),
+                    "role": "python-source",
+                    "path": str(path),
+                    "relative_path": str(path.relative_to(code_root)),
+                    "sha256": _sha256_bytes(path.read_bytes()),
                 }
             )
-    executable_name = executable_path.name.lower()
-    if executable_name.startswith(("python", "pypy")) and len(bound_files) == 1:
-        raise EvidenceError(
-            "benchmark trainer interpreter commands must bind a script file by path"
-        )
-    return {**trainer, "bound_files": bound_files}
+        resolved_root: str | None = str(code_root)
+    else:
+        resolved_root = None
+    return {**trainer, "code_root": resolved_root, "bound_files": bound_files}
+
+
+def _reverify_trainer_files(trainer: dict[str, Any]) -> None:
+    for bound in trainer["bound_files"]:
+        path = Path(bound["path"])
+        if bound["sha256"] is None and not path.exists():
+            continue
+        try:
+            digest = _sha256_bytes(path.read_bytes())
+        except OSError as error:
+            raise EvidenceError(f"bound trainer file changed during the cohort: {path}") from error
+        if digest != bound["sha256"]:
+            raise EvidenceError(f"bound trainer file changed during the cohort: {path}")
 
 
 def _validate_certificate(value: object) -> dict[str, Any]:
@@ -209,26 +329,89 @@ def _validate_certificate(value: object) -> dict[str, Any]:
     return certificate
 
 
-_BOOTSTRAP_STATE_FIELDS = {
-    "learned",
-    "optimizer",
-    "rollout",
-    "seed_specific",
-    "candidate_specific",
-}
+def _decode_base64(value: object, field: str, *, length: int) -> bytes:
+    if not isinstance(value, str):
+        raise EvidenceError(f"{field} must be base64 text")
+    try:
+        decoded = base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise EvidenceError(f"{field} must be valid base64") from error
+    if len(decoded) != length:
+        raise EvidenceError(f"{field} has the wrong byte length")
+    return decoded
 
-_BOOTSTRAP_REPRODUCTION_INPUTS = {
-    "candidate_identity",
-    "run_identity",
-    "training_seed",
-}
-_BOOTSTRAP_STATE_MARKERS = {
-    "learned": (b"policy_state", b"learned_parameters", b"model_weights"),
-    "optimizer": (b"optimizer_state", b"momentum_buffer"),
-    "rollout": (b"rollout_state", b"rollout_buffer"),
-    "seed_specific": (b"training_seed", b"episode_seed", b"rng_state"),
-    "candidate_specific": (b"candidate_identity", b"recipe_candidate"),
-}
+
+def _validate_elapsed_time_anchors(
+    value: object,
+    *,
+    training_seeds: list[int],
+    fixture: bool,
+) -> list[dict[str, Any]]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise EvidenceError("benchmark.elapsed_time_anchors must be an array")
+    anchors: list[dict[str, Any]] = []
+    for index, raw in enumerate(value):
+        field = f"benchmark.elapsed_time_anchors[{index}]"
+        anchor = _required_mapping(raw, field)
+        if set(anchor) != {"payload", "public_key", "signature"}:
+            raise EvidenceError(f"{field} has an unsupported contract")
+        payload = _required_mapping(anchor.get("payload"), f"{field}.payload")
+        if set(payload) != {"schema_version", "authority", "seed", "started_unix_ns"}:
+            raise EvidenceError(f"{field}.payload has an unsupported contract")
+        if payload.get("schema_version") != 1:
+            raise EvidenceError(f"{field}.payload schema is unsupported")
+        authority = payload.get("authority")
+        seed = payload.get("seed")
+        started_unix_ns = payload.get("started_unix_ns")
+        if not isinstance(authority, str) or not authority.strip():
+            raise EvidenceError(f"{field}.payload.authority must identify an external signer")
+        if type(seed) is not int or seed not in training_seeds:
+            raise EvidenceError(f"{field}.payload.seed is not a declared training seed")
+        if type(started_unix_ns) is not int or started_unix_ns <= 0:
+            raise EvidenceError(f"{field}.payload.started_unix_ns must be positive")
+        public_key_text = anchor.get("public_key")
+        expected_authority = (
+            _FIXTURE_ELAPSED_ANCHOR_AUTHORITY if fixture else _ELAPSED_ANCHOR_AUTHORITY
+        )
+        expected_public_key = (
+            _FIXTURE_ELAPSED_ANCHOR_PUBLIC_KEY if fixture else _ELAPSED_ANCHOR_PUBLIC_KEY
+        )
+        if authority != expected_authority or public_key_text != expected_public_key:
+            raise EvidenceError(f"{field} is not rooted in the pinned public authority")
+        public_key = _decode_base64(public_key_text, f"{field}.public_key", length=32)
+        signature = _decode_base64(anchor.get("signature"), f"{field}.signature", length=64)
+        signed = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        try:
+            Ed25519PublicKey.from_public_bytes(public_key).verify(signature, signed)
+        except InvalidSignature as error:
+            raise EvidenceError(f"{field} signature is invalid") from error
+        anchors.append(
+            {
+                "payload": dict(payload),
+                "public_key": public_key_text,
+                "signature": anchor["signature"],
+            }
+        )
+    if [item["payload"]["seed"] for item in anchors] != training_seeds:
+        raise EvidenceError("benchmark.elapsed_time_anchors must cover each training seed in order")
+    return anchors
+
+
+def _signed_elapsed_floor(anchor: dict[str, Any], checkpoint: Path) -> float:
+    try:
+        checkpoint_ctime_ns = checkpoint.stat().st_ctime_ns
+    except OSError as error:
+        raise EvidenceError("signed elapsed-time floor checkpoint is unavailable") from error
+    return max(
+        0.0,
+        (checkpoint_ctime_ns - anchor["payload"]["started_unix_ns"]) / 1_000_000_000,
+    )
+
+
+_BOOTSTRAP_CONTRACT = "gradoom-declarative-bootstrap-v1"
+_BOOTSTRAP_PROTOCOL = "canonical-declared-input-binding-v1"
 
 
 def _validate_bootstrap_artifacts(value: object) -> list[dict[str, Any]]:
@@ -246,13 +429,13 @@ def _validate_bootstrap_artifacts(value: object) -> list[dict[str, Any]]:
             "path",
             "sha256",
             "creation_elapsed_seconds",
+            "contract",
+            "immutable_inputs",
             "creation_protocol",
-            "creation_receipt",
             "reuse_conditions",
             "persistent",
             "run_independent",
             "reused_unchanged",
-            "contains_state",
         }
         undeclared_fields = sorted(set(artifact) - expected_fields)
         if undeclared_fields:
@@ -276,19 +459,32 @@ def _validate_bootstrap_artifacts(value: object) -> list[dict[str, Any]]:
         ):
             raise EvidenceError(f"{field}.creation_elapsed_seconds must be finite and non-negative")
         creation_protocol = artifact.get("creation_protocol")
-        if not isinstance(creation_protocol, str) or not creation_protocol.strip():
-            raise EvidenceError(f"{field}.creation_protocol must be a non-whitespace string")
-        creation_receipt = _required_mapping(
-            artifact.get("creation_receipt"), f"{field}.creation_receipt"
-        )
-        if set(creation_receipt) != {"path", "sha256"}:
-            raise EvidenceError(f"{field}.creation_receipt must contain exactly path and sha256")
-        receipt_path = creation_receipt.get("path")
-        if not isinstance(receipt_path, str) or not receipt_path.strip():
-            raise EvidenceError(f"{field}.creation_receipt.path must be a non-whitespace path")
-        receipt_sha256 = _validate_sha256(
-            creation_receipt.get("sha256"), f"{field}.creation_receipt.sha256"
-        )
+        if artifact.get("contract") != _BOOTSTRAP_CONTRACT:
+            raise EvidenceError(f"{field}.contract must use {_BOOTSTRAP_CONTRACT}")
+        if creation_protocol != _BOOTSTRAP_PROTOCOL:
+            raise EvidenceError(f"{field} must use the canonical declarative bootstrap protocol")
+        immutable_inputs = artifact.get("immutable_inputs")
+        if not isinstance(immutable_inputs, list) or not immutable_inputs:
+            raise EvidenceError(f"{field}.immutable_inputs must contain at least one input")
+        normalized_inputs: list[dict[str, str]] = []
+        input_names: set[str] = set()
+        for input_index, item in enumerate(immutable_inputs):
+            if not isinstance(item, dict) or set(item) != {"name", "sha256"}:
+                raise EvidenceError(f"{field}.immutable_inputs[{input_index}] is malformed")
+            input_name = item.get("name")
+            if not isinstance(input_name, str) or not input_name or input_name in input_names:
+                raise EvidenceError(f"{field}.immutable_inputs names must be unique strings")
+            input_names.add(input_name)
+            normalized_inputs.append(
+                {
+                    "name": input_name,
+                    "sha256": _validate_sha256(
+                        item.get("sha256"), f"{field}.immutable_inputs[{input_index}].sha256"
+                    ),
+                }
+            )
+        if normalized_inputs != sorted(normalized_inputs, key=lambda item: item["name"]):
+            raise EvidenceError(f"{field}.immutable_inputs must be sorted by name")
         reuse_conditions = _string_array(
             artifact.get("reuse_conditions"),
             f"{field}.reuse_conditions",
@@ -297,157 +493,22 @@ def _validate_bootstrap_artifacts(value: object) -> list[dict[str, Any]]:
         for required_true in ("persistent", "run_independent", "reused_unchanged"):
             if artifact.get(required_true) is not True:
                 raise EvidenceError(f"{field}.{required_true} must be true for excluded work")
-        contains_state = _required_mapping(
-            artifact.get("contains_state"), f"{field}.contains_state"
-        )
-        missing_state = sorted(_BOOTSTRAP_STATE_FIELDS - set(contains_state))
-        undeclared_state = sorted(set(contains_state) - _BOOTSTRAP_STATE_FIELDS)
-        if missing_state or undeclared_state:
-            details = []
-            if missing_state:
-                details.append(f"missing {', '.join(missing_state)}")
-            if undeclared_state:
-                details.append(f"unknown {', '.join(undeclared_state)}")
-            raise EvidenceError(
-                f"{field}.contains_state must disclose every state class: {'; '.join(details)}"
-            )
-        forbidden = sorted(key for key, present in contains_state.items() if present is not False)
-        if forbidden:
-            raise EvidenceError(
-                f"{field} cannot exclude an artifact containing state: {', '.join(forbidden)}"
-            )
         artifacts.append(
             {
                 "name": name,
                 "path": path,
                 "sha256": sha256,
                 "creation_elapsed_seconds": float(creation_elapsed),
+                "contract": _BOOTSTRAP_CONTRACT,
+                "immutable_inputs": normalized_inputs,
                 "creation_protocol": creation_protocol,
-                "creation_receipt": {
-                    "path": receipt_path,
-                    "sha256": receipt_sha256,
-                },
                 "reuse_conditions": reuse_conditions,
                 "persistent": True,
                 "run_independent": True,
                 "reused_unchanged": True,
-                "contains_state": {key: False for key in sorted(_BOOTSTRAP_STATE_FIELDS)},
             }
         )
     return artifacts
-
-
-def _bootstrap_state_classes(payload: bytes) -> list[str]:
-    normalized = payload.lower()
-    return sorted(
-        state_class
-        for state_class, markers in _BOOTSTRAP_STATE_MARKERS.items()
-        if any(marker in normalized for marker in markers)
-    )
-
-
-def _validate_bootstrap_creation_receipt(
-    declaration: dict[str, Any],
-    *,
-    base_directory: Path,
-    artifacts_root: Path,
-) -> tuple[dict[str, str], dict[str, Any]]:
-    declared_receipt = declaration["creation_receipt"]
-    receipt_path = _resolve_evidence_path(
-        Path(declared_receipt["path"]), base_directory=base_directory
-    )
-    if receipt_path == artifacts_root or receipt_path.is_relative_to(artifacts_root):
-        raise EvidenceError(
-            f"bootstrap artifact {declaration['name']!r} creation receipt must predate the cohort"
-        )
-    try:
-        metadata = receipt_path.lstat()
-        receipt_bytes = receipt_path.read_bytes()
-    except OSError as error:
-        raise EvidenceError(
-            f"bootstrap artifact {declaration['name']!r} creation receipt is missing or unreadable"
-        ) from error
-    if (
-        receipt_path.is_symlink()
-        or not stat.S_ISREG(metadata.st_mode)
-        or metadata.st_nlink != 1
-        or metadata.st_mode & 0o222
-    ):
-        raise EvidenceError(
-            f"bootstrap artifact {declaration['name']!r} creation receipt is mutable"
-        )
-    actual_receipt_sha256 = _sha256_bytes(receipt_bytes)
-    if actual_receipt_sha256 != declared_receipt["sha256"]:
-        raise EvidenceError(
-            f"bootstrap artifact {declaration['name']!r} creation receipt SHA-256 mismatch"
-        )
-    receipt = _parse_json_document(receipt_bytes, document="bootstrap creation receipt")
-    if not isinstance(receipt, dict):
-        raise EvidenceError("bootstrap creation receipt must be a JSON object")
-    expected_receipt_fields = {
-        "schema_version",
-        "artifact_sha256",
-        "creation_elapsed_seconds",
-        "creation_protocol",
-        "reuse_conditions",
-        "reproduction",
-    }
-    if set(receipt) != expected_receipt_fields or receipt.get("schema_version") != 1:
-        raise EvidenceError("bootstrap creation receipt has an unsupported contract")
-    for field in (
-        "artifact_sha256",
-        "creation_elapsed_seconds",
-        "creation_protocol",
-        "reuse_conditions",
-    ):
-        if receipt.get(field) != declaration[field if field != "artifact_sha256" else "sha256"]:
-            raise EvidenceError(
-                f"bootstrap creation receipt does not corroborate {field.replace('_', ' ')}"
-            )
-    reproduction = _required_mapping(
-        receipt.get("reproduction"), "bootstrap creation receipt reproduction"
-    )
-    if set(reproduction) != {"varied_inputs", "independent_builds"}:
-        raise EvidenceError("bootstrap creation receipt reproduction has undeclared fields")
-    varied_inputs = reproduction.get("varied_inputs")
-    if not isinstance(varied_inputs, list) or set(varied_inputs) != _BOOTSTRAP_REPRODUCTION_INPUTS:
-        raise EvidenceError(
-            "bootstrap creation receipt must vary run, training-seed, and candidate identities"
-        )
-    builds = reproduction.get("independent_builds")
-    if not isinstance(builds, list) or len(builds) < 2:
-        raise EvidenceError("bootstrap creation receipt requires two independent builds")
-    contexts: set[str] = set()
-    for index, build in enumerate(builds):
-        if not isinstance(build, dict) or set(build) != {
-            "context",
-            "artifact_sha256",
-            "elapsed_seconds",
-        }:
-            raise EvidenceError(f"bootstrap creation receipt build {index} is malformed")
-        context = build.get("context")
-        elapsed = build.get("elapsed_seconds")
-        if not isinstance(context, str) or not context or context in contexts:
-            raise EvidenceError("bootstrap creation receipt build contexts must be unique")
-        contexts.add(context)
-        if build.get("artifact_sha256") != declaration["sha256"]:
-            raise EvidenceError("bootstrap artifact was not reproduced unchanged")
-        if (
-            type(elapsed) not in (int, float)
-            or not math.isfinite(float(elapsed))
-            or float(elapsed) < 0.0
-        ):
-            raise EvidenceError("bootstrap creation receipt build elapsed time is invalid")
-    return (
-        {"path": str(receipt_path), "sha256": actual_receipt_sha256},
-        {
-            "contract": "deterministic-run-independence-v1",
-            "receipt_sha256": actual_receipt_sha256,
-            "independent_builds": len(builds),
-            "varied_inputs": sorted(_BOOTSTRAP_REPRODUCTION_INPUTS),
-            "content_scan": "prohibited-benchmark-state-markers-v1",
-        },
-    )
 
 
 def _validate_bootstrap_files(
@@ -455,8 +516,10 @@ def _validate_bootstrap_files(
     *,
     base_directory: Path,
     artifacts_root: Path,
+    declared_inputs: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     validated: list[dict[str, Any]] = []
+    declared_by_name = {item["name"]: item["sha256"] for item in declared_inputs}
     for declaration in declarations:
         path = _resolve_evidence_path(Path(declaration["path"]), base_directory=base_directory)
         if path == artifacts_root or path.is_relative_to(artifacts_root):
@@ -483,23 +546,38 @@ def _validate_bootstrap_files(
                 f"bootstrap artifact {declaration['name']!r} SHA-256 mismatch: "
                 f"expected {declaration['sha256']}, got {actual_sha256}"
             )
-        prohibited_state = _bootstrap_state_classes(payload)
-        if prohibited_state:
-            raise EvidenceError(
-                f"bootstrap artifact {declaration['name']!r} contains prohibited benchmark state: "
-                f"{', '.join(prohibited_state)}"
+        for immutable_input in declaration["immutable_inputs"]:
+            if declared_by_name.get(immutable_input["name"]) != immutable_input["sha256"]:
+                raise EvidenceError(
+                    f"bootstrap artifact {declaration['name']!r} references an undeclared or "
+                    "mismatched immutable input"
+                )
+        expected_payload = (
+            json.dumps(
+                {
+                    "contract": _BOOTSTRAP_CONTRACT,
+                    "immutable_inputs": declaration["immutable_inputs"],
+                    "protocol": _BOOTSTRAP_PROTOCOL,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
             )
-        creation_receipt, eligibility_evidence = _validate_bootstrap_creation_receipt(
-            declaration,
-            base_directory=base_directory,
-            artifacts_root=artifacts_root,
-        )
+            + "\n"
+        ).encode()
+        if payload != expected_payload:
+            raise EvidenceError(
+                f"bootstrap artifact {declaration['name']!r} does not match the canonical "
+                "declarative bootstrap contract; opaque payloads are ineligible"
+            )
         validated.append(
             {
                 **declaration,
                 "path": str(path),
-                "creation_receipt": creation_receipt,
-                "eligibility_evidence": eligibility_evidence,
+                "eligibility_evidence": {
+                    "contract": _BOOTSTRAP_CONTRACT,
+                    "derivation": _BOOTSTRAP_PROTOCOL,
+                    "opaque_payload_allowed": False,
+                },
                 "validated_before_cohort": True,
                 "reverified_unchanged_after_cohort": False,
             }
@@ -526,26 +604,6 @@ def _reverify_bootstrap_files(artifacts: list[dict[str, Any]]) -> None:
         ):
             raise EvidenceError(
                 f"bootstrap artifact {artifact['name']!r} changed during the cohort"
-            )
-        receipt_path = Path(artifact["creation_receipt"]["path"])
-        try:
-            receipt_metadata = receipt_path.lstat()
-            receipt_sha256 = _sha256_bytes(receipt_path.read_bytes())
-        except OSError as error:
-            raise EvidenceError(
-                f"bootstrap artifact {artifact['name']!r} creation receipt changed "
-                "during the cohort"
-            ) from error
-        if (
-            receipt_path.is_symlink()
-            or not stat.S_ISREG(receipt_metadata.st_mode)
-            or receipt_metadata.st_nlink != 1
-            or receipt_metadata.st_mode & 0o222
-            or receipt_sha256 != artifact["creation_receipt"]["sha256"]
-        ):
-            raise EvidenceError(
-                f"bootstrap artifact {artifact['name']!r} creation receipt changed "
-                "during the cohort"
             )
         artifact["reverified_unchanged_after_cohort"] = True
 
@@ -760,6 +818,11 @@ def _validate_benchmark(manifest: dict[str, Any]) -> dict[str, Any]:
         raise EvidenceError("benchmark.artifacts_directory must be a non-whitespace path")
     certificate = _validate_certificate(benchmark.get("parity_certificate"))
     bootstrap_artifacts = _validate_bootstrap_artifacts(benchmark.get("bootstrap_artifacts"))
+    elapsed_time_anchors = _validate_elapsed_time_anchors(
+        benchmark.get("elapsed_time_anchors"),
+        training_seeds=training_seeds,
+        fixture=manifest["fixture"],
+    )
     return {
         "code_provenance": code_provenance,
         "training_seeds": training_seeds,
@@ -771,6 +834,7 @@ def _validate_benchmark(manifest: dict[str, Any]) -> dict[str, Any]:
         "artifacts_directory": artifacts_directory,
         "parity_certificate": certificate,
         "bootstrap_artifacts": bootstrap_artifacts,
+        "elapsed_time_anchors": elapsed_time_anchors,
     }
 
 
@@ -1082,6 +1146,15 @@ def _write_seed_file(path: Path, seeds: list[int]) -> str:
     return _fsync_file(path, field="evaluation seed file")
 
 
+def _next_append_only_generation(directory: Path, pattern: str, prefix: str) -> int:
+    generations: list[int] = []
+    for path in directory.glob(pattern):
+        suffix = path.stem.removeprefix(prefix)
+        if suffix.isdigit():
+            generations.append(int(suffix))
+    return max(generations, default=-1) + 1
+
+
 def _failure(
     *,
     seed: int,
@@ -1109,6 +1182,7 @@ def _load_live_interrupted_attempt(
     manifest_directory: Path,
     evidence_entries: list[dict[str, str]],
     wad_profile: dict[str, Any] | None,
+    elapsed_time_anchor: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
     journals = sorted(
         attempt_directory.glob("attempt-live-*.json"),
@@ -1211,6 +1285,9 @@ def _load_live_interrupted_attempt(
             float(elapsed),
             float(launch_elapsed) + elapsed_to_checkpoint,
         )
+        if elapsed_time_anchor is None:
+            raise EvidenceError("live benchmark recovery is missing a signed elapsed-time floor")
+        elapsed = max(elapsed, _signed_elapsed_floor(elapsed_time_anchor, checkpoint))
         return {
             "seed": seed,
             "attempt_identity": attempt_identity,
@@ -1246,6 +1323,7 @@ def _run_attempt(
     manifest_directory: Path,
     evidence_entries: list[dict[str, str]],
     wad_profile: dict[str, Any] | None,
+    elapsed_time_anchor: dict[str, Any] | None,
     existing_attempt: dict[str, Any] | None = None,
     started: float | None = None,
     clock: Callable[[], float] = time.perf_counter,
@@ -1268,6 +1346,7 @@ def _run_attempt(
                 manifest_directory=manifest_directory,
                 evidence_entries=evidence_entries,
                 wad_profile=wad_profile,
+                elapsed_time_anchor=elapsed_time_anchor,
             )
             if existing_attempt is None:
                 raise EvidenceError(
@@ -1316,6 +1395,10 @@ def _run_attempt(
             "checkpoint_sha256"
         ):
             raise EvidenceError(f"seed {seed} recovery checkpoint SHA-256 mismatch")
+        if elapsed_time_anchor is None:
+            raise EvidenceError("benchmark recovery is missing a signed elapsed-time floor")
+        if prior_elapsed + 1e-9 < _signed_elapsed_floor(elapsed_time_anchor, recovery_path):
+            raise EvidenceError("benchmark recovery is below its signed elapsed-time floor")
         previous_checkpoint = {
             "path": recovery_path,
             "progress_step": existing_recovery["progress_step"],
@@ -1529,6 +1612,17 @@ def _run_attempt(
         if was_interrupted:
             final_checkpoint = checkpoint
             final_checkpoint_sha256 = checkpoint_sha256
+            if elapsed_time_anchor is None:
+                failures.append(
+                    {
+                        "seed": seed,
+                        "phase": "recovery_trust",
+                        "checkpoint_step": checkpoint_step,
+                        "message": "interruption has no pre-attempt signed elapsed-time floor",
+                    }
+                )
+                status = "evidence_failed"
+                break
             recovery = {
                 "checkpoint": str(checkpoint),
                 "checkpoint_sha256": checkpoint_sha256,
@@ -1632,10 +1726,20 @@ def _run_attempt(
             status = "succeeded"
             break
     elapsed = prior_elapsed + clock() - started
+    if recovery is not None and elapsed_time_anchor is not None:
+        elapsed = max(
+            elapsed,
+            _signed_elapsed_floor(elapsed_time_anchor, Path(recovery["checkpoint"])),
+        )
     if recovery is not None:
         recovery["accumulated_reusable_elapsed_seconds"] = elapsed
+        recovery_generation = _next_append_only_generation(
+            attempt_directory,
+            f"recovery-step-{recovery['progress_step']}-*.json",
+            f"recovery-step-{recovery['progress_step']}-",
+        )
         recovery_journal_path = attempt_directory / (
-            f"recovery-step-{recovery['progress_step']}-{len(recovery_history)}.json"
+            f"recovery-step-{recovery['progress_step']}-{recovery_generation}.json"
         )
         recovery_journal_payload = {
             "schema_version": 1,
@@ -1661,7 +1765,7 @@ def _run_attempt(
             "sha256": recovery_journal_sha256,
         }
         recovery_evidence_name = (
-            f"seed-{seed}-recovery-step-{recovery['progress_step']}-{len(recovery_history)}"
+            f"seed-{seed}-recovery-step-{recovery['progress_step']}-{recovery_generation}"
         )
         evidence_entries.append({"name": recovery_evidence_name, "sha256": recovery_journal_sha256})
         generated_artifacts.append(
@@ -1686,7 +1790,11 @@ def _run_attempt(
         "recovery_journal": recovery_journal,
         "generated_artifacts": generated_artifacts,
     }
-    attempt_journal_generation = len(recovery_history)
+    attempt_journal_generation = _next_append_only_generation(
+        attempt_directory,
+        "attempt-state-*.json",
+        "attempt-state-",
+    )
     attempt_journal_path = attempt_directory / (f"attempt-state-{attempt_journal_generation}.json")
     attempt_journal_path.write_text(
         json.dumps(
@@ -1739,16 +1847,10 @@ def build_development_benchmark_report(
         validated["bootstrap_artifacts"],
         base_directory=manifest_path.parent,
         artifacts_root=artifacts_root,
+        declared_inputs=declared_inputs,
     )
     evidence_entries.extend(
         {"name": f"bootstrap-{item['name']}", "sha256": item["sha256"]}
-        for item in bootstrap_exclusions
-    )
-    evidence_entries.extend(
-        {
-            "name": f"bootstrap-{item['name']}-creation-receipt",
-            "sha256": item["creation_receipt"]["sha256"],
-        }
         for item in bootstrap_exclusions
     )
     wad_profile = None
@@ -1849,6 +1951,7 @@ def build_development_benchmark_report(
             }
             for artifact in bootstrap_exclusions
         ],
+        "elapsed_time_anchors": validated["elapsed_time_anchors"],
     }
     protocol["continuation_identity"] = {
         "schema_sha256": _canonical_sha256(
@@ -1937,6 +2040,9 @@ def build_development_benchmark_report(
     attempts = []
     actual_generated_artifacts: list[dict[str, str]] = []
     setup_time_assigned = False
+    anchors_by_seed = {
+        anchor["payload"]["seed"]: anchor for anchor in validated["elapsed_time_anchors"]
+    }
     for seed in validated["training_seeds"]:
         existing_attempt = existing_by_seed.get(seed)
         active_attempt = existing_attempt is None or existing_attempt.get("status") == "interrupted"
@@ -1948,6 +2054,7 @@ def build_development_benchmark_report(
             manifest_directory=manifest_path.parent,
             evidence_entries=evidence_entries,
             wad_profile=wad_profile,
+            elapsed_time_anchor=anchors_by_seed.get(seed),
             existing_attempt=existing_attempt,
             started=(invocation_started if active_attempt and not setup_time_assigned else None),
             clock=clock,
@@ -1957,6 +2064,7 @@ def build_development_benchmark_report(
         actual_generated_artifacts.extend(attempt.pop("generated_artifacts", []))
         attempts.append(attempt)
     _reverify_bootstrap_files(bootstrap_exclusions)
+    _reverify_trainer_files(validated["trainer"])
     generated_artifacts: list[dict[str, str]] = list(
         (continuation or {}).get("generated_artifacts", [])
     )

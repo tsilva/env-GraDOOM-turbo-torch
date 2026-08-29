@@ -269,8 +269,9 @@ def test_public_surface_matches_turbo_vector_api_v2(square_scenario) -> None:
         assert env.num_threads is None
         assert env.state_catalog == ("default",)
         assert env.info_frame_stack_keys == ()
-        assert env.supports_live_snapshots is False
-        assert env.live_snapshots_deterministic is False
+        assert env.supports_live_snapshots is True
+        assert env.live_snapshots_deterministic is True
+        assert env.capabilities["supports_snapshot_codec"] is True
         assert isinstance(env.signal_schema, type(MappingProxyType({})))
         assert all(
             isinstance(spec, type(MappingProxyType({}))) for spec in env.signal_schema.values()
@@ -461,6 +462,54 @@ def test_safe_view_uses_two_device_buffers(square_scenario) -> None:
         assert torch.equal(first, first_value)
         third = env.step(torch.zeros(2, dtype=torch.int64))[0]
         assert first.data_ptr() == third.data_ptr()
+    finally:
+        env.close()
+
+
+def test_live_snapshot_restores_exact_device_transition(square_scenario) -> None:
+    env = _env(square_scenario, render_mode=None)
+    try:
+        mask = torch.ones(env.num_envs, dtype=torch.bool)
+        seeds = torch.tensor([41, 42], dtype=torch.int64)
+        env.reset_device(mask, seeds)
+        env.step_and_reset_device(torch.tensor([1, 2]), torch.tensor([51, 52]))
+        snapshot = env.capture_live_snapshot()
+        actions = torch.tensor([3, 4], dtype=torch.int64)
+        reset_seeds = torch.tensor([61, 62], dtype=torch.int64)
+        expected = env.step_and_reset_device(actions, reset_seeds)
+        expected_tensors = tuple(
+            value.clone()
+            for value in (
+                expected.observations,
+                expected.rewards,
+                expected.terminated,
+                expected.truncated,
+                expected.signals,
+                expected.info_histories,
+                expected.final_observations,
+                expected.final_signals,
+                expected.final_info_histories,
+            )
+        )
+
+        env.restore_live_snapshot(snapshot)
+        actual = env.step_and_reset_device(actions, reset_seeds)
+
+        actual_tensors = (
+            actual.observations,
+            actual.rewards,
+            actual.terminated,
+            actual.truncated,
+            actual.signals,
+            actual.info_histories,
+            actual.final_observations,
+            actual.final_signals,
+            actual.final_info_histories,
+        )
+        assert all(
+            torch.equal(left, right)
+            for left, right in zip(actual_tensors, expected_tensors, strict=True)
+        )
     finally:
         env.close()
 
