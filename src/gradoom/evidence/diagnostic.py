@@ -38,15 +38,18 @@ _WORKFLOW = "fixed_time_training_diagnostic"
 _MAX_TRAINING_STEPS = (1 << 63) - 1
 _TIMING_RULES = {
     "clock": "monotonic_wall_clock",
-    "start": "before_recurring_initialization",
-    "stop": "after_durable_final_checkpoint_write",
+    "start": "before_attempt_setup_and_public_subprocess_start",
+    "stop": "after_trainer_exit_and_durable_training_evidence_write",
     "device_synchronization": "before_and_after_measured_gpu_work",
     "includes": [
+        "evaluation_seed_manifest_write",
+        "interpreter_and_module_import_startup",
         "recurring_initialization",
         "per_process_or_uncached_compilation",
         "warmup",
         "training",
         "durable_checkpoint_write",
+        "durable_training_metrics_write",
     ],
     "excludes": ["final_held_out_evaluation"],
 }
@@ -246,9 +249,10 @@ def _validate_training(
     *,
     checkpoint: Path,
     budget: float,
+    deadline: float,
     manifest_directory: Path,
     wad_profile: dict[str, Any] | None,
-) -> tuple[dict[str, Any], int, int, float]:
+) -> tuple[dict[str, Any], int, int]:
     configs = [record for record in records if record.get("type") == "config"]
     summaries = [record for record in records if record.get("type") == "summary"]
     if len(configs) != 1 or len(summaries) != 1:
@@ -270,18 +274,16 @@ def _validate_training(
         raise EvidenceError("fixed-time training must use fresh policy and optimizer state")
     if float(config.get("reusable_time_budget_seconds", -1.0)) != budget:
         raise EvidenceError("training config did not bind the reusable-time budget")
+    if float(config.get("reusable_time_deadline_monotonic", -1.0)) != deadline:
+        raise EvidenceError("training config did not bind the outer monotonic deadline")
     if summary.get("status") != "completed" or summary.get("stop_reason") != (
         "reusable_time_budget"
     ):
         raise EvidenceError("training did not complete at the reusable-time budget")
     if float(summary.get("reusable_time_budget_seconds", -1.0)) != budget:
         raise EvidenceError("training summary did not bind the reusable-time budget")
-    elapsed = _positive_finite(
-        summary.get("reusable_time_elapsed_seconds"),
-        "training summary reusable_time_elapsed_seconds",
-    )
-    if elapsed < budget:
-        raise EvidenceError("training stopped before the predeclared reusable-time budget")
+    if float(summary.get("reusable_time_deadline_monotonic", -1.0)) != deadline:
+        raise EvidenceError("training summary did not bind the outer monotonic deadline")
     transitions = summary.get("training_transitions")
     frame_skip = summary.get("frame_skip")
     if type(transitions) is not int or transitions < 0:
@@ -295,7 +297,7 @@ def _validate_training(
     ):
         raise EvidenceError("fixed-time training reported a different checkpoint path")
     _validate_runtime_assets(summary, phase="training", wad_profile=wad_profile)
-    return summary, transitions, frame_skip, elapsed
+    return summary, transitions, frame_skip
 
 
 def _run_diagnostic_attempt(
@@ -307,7 +309,8 @@ def _run_diagnostic_attempt(
     evidence_entries: list[dict[str, str]],
     wad_profile: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    attempt_started = time.perf_counter()
+    attempt_started = time.monotonic()
+    reusable_time_deadline = attempt_started + protocol["reusable_time_budget_seconds"]
     attempt_directory = run_directory / f"seed-{seed}"
     attempt_directory.mkdir()
     seed_file = attempt_directory / "evaluation-seeds.json"
@@ -324,6 +327,8 @@ def _run_diagnostic_attempt(
         str(_MAX_TRAINING_STEPS),
         "--reusable-time-budget-seconds",
         str(protocol["reusable_time_budget_seconds"]),
+        "--reusable-time-deadline-monotonic",
+        str(reusable_time_deadline),
         "--checkpoint",
         str(checkpoint),
         "--metrics-jsonl",
@@ -339,14 +344,15 @@ def _run_diagnostic_attempt(
             "episodes": [],
             "throughput": None,
             "failures": [failure],
-            "process_elapsed_seconds": time.perf_counter() - attempt_started,
+            "process_elapsed_seconds": time.monotonic() - attempt_started,
         }
     try:
         training_records = _read_jsonl(training_metrics, phase="fixed-time training")
-        training, transitions, frame_skip, elapsed = _validate_training(
+        training, transitions, frame_skip = _validate_training(
             training_records,
             checkpoint=checkpoint,
             budget=protocol["reusable_time_budget_seconds"],
+            deadline=reusable_time_deadline,
             manifest_directory=manifest_directory,
             wad_profile=wad_profile,
         )
@@ -355,6 +361,9 @@ def _run_diagnostic_attempt(
             training_metrics,
             field="fixed-time training metrics",
         )
+        reusable_time_elapsed = time.monotonic() - attempt_started
+        if reusable_time_elapsed < protocol["reusable_time_budget_seconds"]:
+            raise EvidenceError("training stopped before the outer reusable-time budget")
     except (EvidenceError, TypeError, ValueError) as error:
         failure = {"seed": seed, "phase": "training_evidence", "message": str(error)}
         return {
@@ -364,7 +373,7 @@ def _run_diagnostic_attempt(
             "episodes": [],
             "throughput": None,
             "failures": [failure],
-            "process_elapsed_seconds": time.perf_counter() - attempt_started,
+            "process_elapsed_seconds": time.monotonic() - attempt_started,
         }
     evidence_entries.extend(
         (
@@ -405,7 +414,7 @@ def _run_diagnostic_attempt(
             "episodes": [],
             "throughput": None,
             "failures": [failure],
-            "process_elapsed_seconds": time.perf_counter() - attempt_started,
+            "process_elapsed_seconds": time.monotonic() - attempt_started,
         }
     try:
         evaluation_records = _read_jsonl(evaluation_metrics, phase="fixed-time evaluation")
@@ -433,7 +442,7 @@ def _run_diagnostic_attempt(
             "episodes": [],
             "throughput": None,
             "failures": [failure],
-            "process_elapsed_seconds": time.perf_counter() - attempt_started,
+            "process_elapsed_seconds": time.monotonic() - attempt_started,
         }
     evidence_entries.append(
         {"name": f"seed-{seed}-evaluation-metrics", "sha256": evaluation_metrics_sha256}
@@ -450,9 +459,13 @@ def _run_diagnostic_attempt(
         "evaluation": evaluation,
         "episodes": episodes,
         "throughput": {
-            "simulated_tics_per_second": simulated_tics / elapsed,
-            "transitions_per_second": transitions / elapsed,
-            "timer": {"elapsed_seconds": elapsed, "rules": protocol["timing_rules"]},
+            "simulated_tics_per_second": simulated_tics / reusable_time_elapsed,
+            "transitions_per_second": transitions / reusable_time_elapsed,
+            "timer": {
+                "elapsed_seconds": reusable_time_elapsed,
+                "source": "public_evidence_subprocess",
+                "rules": protocol["timing_rules"],
+            },
             "workload": {
                 "frame_skip": frame_skip,
                 "simulated_tics": simulated_tics,
@@ -460,8 +473,82 @@ def _run_diagnostic_attempt(
             },
         },
         "failures": [],
-        "process_elapsed_seconds": time.perf_counter() - attempt_started,
+        "process_elapsed_seconds": time.monotonic() - attempt_started,
     }
+
+
+def _generated_artifact_specs(
+    run_directory: Path,
+    seeds: list[int],
+) -> list[tuple[int, str, Path]]:
+    return [
+        (seed, f"seed-{seed}-{kind}", run_directory / f"seed-{seed}" / filename)
+        for seed in seeds
+        for kind, filename in (
+            ("evaluation-seeds", "evaluation-seeds.json"),
+            ("checkpoint", "final-checkpoint.pt"),
+            ("training-metrics", "training.jsonl"),
+            ("evaluation-metrics", "evaluation.jsonl"),
+        )
+    ]
+
+
+def _validate_unique_evidence_entries(entries: list[dict[str, str]]) -> None:
+    names: set[str] = set()
+    for index, entry in enumerate(entries):
+        name = entry.get("name")
+        if not isinstance(name, str) or not name:
+            raise EvidenceError(f"evidence entry {index} has an invalid name")
+        if name in names:
+            raise EvidenceError(f"evidence index contains duplicate name {name!r}")
+        names.add(name)
+        _validate_sha256(entry.get("sha256"), f"evidence entry {name!r}.sha256")
+
+
+def _reconcile_generated_artifacts(
+    *,
+    attempts: list[dict[str, Any]],
+    specs: list[tuple[int, str, Path]],
+    evidence_entries: list[dict[str, str]],
+) -> list[dict[str, Any]]:
+    _validate_unique_evidence_entries(evidence_entries)
+    entries = {entry["name"]: entry["sha256"] for entry in evidence_entries}
+    attempts_by_seed = {attempt["seed"]: attempt for attempt in attempts}
+    artifacts: list[dict[str, Any]] = []
+    for seed, name, path in specs:
+        if not path.is_file():
+            if attempts_by_seed[seed]["status"] == "completed":
+                failure = {
+                    "seed": seed,
+                    "phase": "artifact_evidence",
+                    "message": f"generated artifact {name} is missing",
+                }
+                attempts_by_seed[seed]["failures"].append(failure)
+                attempts_by_seed[seed]["status"] = "evidence_failed"
+            continue
+        actual_sha256 = _sha256_bytes(path.read_bytes())
+        indexed_sha256 = entries.get(name)
+        matched = actual_sha256 == indexed_sha256
+        artifacts.append(
+            {
+                "name": name,
+                "path": str(path),
+                "sha256": actual_sha256,
+                "evidence_entry_sha256": indexed_sha256,
+                "status": "matched" if matched else "mismatched",
+            }
+        )
+        if not matched:
+            failure = {
+                "seed": seed,
+                "phase": "artifact_evidence",
+                "message": (
+                    f"generated artifact {name} SHA-256 changed or has no unique evidence entry"
+                ),
+            }
+            attempts_by_seed[seed]["failures"].append(failure)
+            attempts_by_seed[seed]["status"] = "evidence_failed"
+    return artifacts
 
 
 def build_fixed_time_diagnostic_report(manifest_path: Path) -> dict[str, Any]:
@@ -474,13 +561,20 @@ def build_fixed_time_diagnostic_report(manifest_path: Path) -> dict[str, Any]:
         manifest.get("declared_inputs"),
         base_directory=manifest_path.parent,
     )
+    generated_specs = _generated_artifact_specs(Path(), validated["training_seeds"])
+    reserved_names = {
+        "manifest",
+        "matching-benchmark-report",
+        *(name for _seed, name, _path in generated_specs),
+    }
+    for declared_input in declared_inputs:
+        if declared_input["name"] in reserved_names:
+            raise EvidenceError(f"declared input name {declared_input['name']!r} is reserved")
     evidence_entries = [
         {"name": "manifest", "sha256": _sha256_bytes(manifest_payload)},
         {"name": "matching-benchmark-report", "sha256": benchmark_sha256},
     ]
     for declared_input in declared_inputs:
-        if declared_input["name"] == "matching-benchmark-report":
-            raise EvidenceError("declared input name 'matching-benchmark-report' is reserved")
         input_path = _resolve_evidence_path(
             Path(declared_input["path"]),
             base_directory=manifest_path.parent,
@@ -541,6 +635,11 @@ def build_fixed_time_diagnostic_report(manifest_path: Path) -> dict[str, Any]:
         base_directory=manifest_path.parent,
     )
     run_directory = artifacts_root / run_identity
+    generated_specs = _generated_artifact_specs(
+        run_directory,
+        validated["training_seeds"],
+    )
+    _validate_unique_evidence_entries(evidence_entries)
     try:
         run_directory.mkdir(parents=True, exist_ok=False)
     except FileExistsError as error:
@@ -558,18 +657,13 @@ def build_fixed_time_diagnostic_report(manifest_path: Path) -> dict[str, Any]:
         )
         for seed in validated["training_seeds"]
     ]
+    generated_artifacts = _reconcile_generated_artifacts(
+        attempts=attempts,
+        specs=generated_specs,
+        evidence_entries=evidence_entries,
+    )
     failures = [failure for attempt in attempts for failure in attempt["failures"]]
     completed = all(attempt["status"] == "completed" for attempt in attempts)
-    generated_artifacts = [
-        {"name": f"seed-{seed}-{kind}", "path": str(run_directory / f"seed-{seed}" / name)}
-        for seed in validated["training_seeds"]
-        for kind, name in (
-            ("evaluation-seeds", "evaluation-seeds.json"),
-            ("checkpoint", "final-checkpoint.pt"),
-            ("training-metrics", "training.jsonl"),
-            ("evaluation-metrics", "evaluation.jsonl"),
-        )
-    ]
     benchmark_claim_eligible = benchmark.get("claim_eligible") is True
     return {
         "schema_version": 1,

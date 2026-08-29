@@ -105,8 +105,10 @@ exists.
 The separate `fixed_time_training_diagnostic` path binds an existing benchmark report, then runs the
 same recipe and seeds to one predeclared reusable-time budget. It reports final mean
 `player_killcount` over the same 100 held-out stochastic episodes plus simulated tics/s and
-transitions/s, without changing benchmark passage. Development evidence may leave this diagnostic
-explicitly unavailable; complete public performance evidence may not.
+transitions/s, without changing benchmark passage. Its outer clock includes public-process startup
+and durable training evidence writes, and generated artifact digests are reconciled to unique
+evidence-index entries. Development evidence may leave this diagnostic explicitly unavailable;
+complete public performance evidence may not.
 
 ## Notes
 

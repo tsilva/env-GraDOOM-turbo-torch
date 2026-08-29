@@ -7,7 +7,20 @@ import argparse
 import hashlib
 import json
 import os
+import sys
+import time
 from pathlib import Path
+
+
+def _apply_startup_delay() -> None:
+    try:
+        index = sys.argv.index("--fixture-startup-delay-seconds")
+    except ValueError:
+        return
+    time.sleep(float(sys.argv[index + 1]))
+
+
+_apply_startup_delay()
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -15,6 +28,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--timesteps", type=int)
     parser.add_argument("--reusable-time-budget-seconds", type=float)
+    parser.add_argument("--reusable-time-deadline-monotonic", type=float)
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--evaluate-checkpoint", type=Path)
@@ -32,6 +46,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--fixture-diagnostic-quality", type=float, default=0.0)
     parser.add_argument("--fixture-diagnostic-transitions", type=int, default=1000)
     parser.add_argument("--fixture-diagnostic-elapsed-seconds", type=float, default=1.0)
+    parser.add_argument("--fixture-startup-delay-seconds", type=float, default=0.0)
+    parser.add_argument("--fixture-episode-length", type=int, default=10)
+    parser.add_argument(
+        "--fixture-terminal-mode",
+        choices=("terminated", "truncated", "neither", "both"),
+        default="terminated",
+    )
+    parser.add_argument("--fixture-mutate-checkpoint-after-evaluation", action="store_true")
     return parser
 
 
@@ -56,11 +78,19 @@ def main() -> int:
         assert args.checkpoint is not None
         assert args.timesteps is not None
         diagnostic = args.reusable_time_budget_seconds is not None
+        before_deadline = (
+            args.reusable_time_deadline_monotonic is None
+            or time.monotonic() < args.reusable_time_deadline_monotonic
+        )
         actual_step = (
             args.fixture_diagnostic_transitions
+            if diagnostic and before_deadline
+            else 0
             if diagnostic
             else args.timesteps + args.fixture_training_step_offset
         )
+        if diagnostic and args.reusable_time_deadline_monotonic is not None:
+            time.sleep(max(0.0, args.reusable_time_deadline_monotonic - time.monotonic()))
         args.checkpoint.parent.mkdir(parents=True, exist_ok=True)
         args.checkpoint.write_text(
             json.dumps(
@@ -97,6 +127,7 @@ def main() -> int:
                     "optimizer_state": "resumed" if args.resume is not None else "fresh",
                 },
                 "reusable_time_budget_seconds": args.reusable_time_budget_seconds,
+                "reusable_time_deadline_monotonic": args.reusable_time_deadline_monotonic,
             }
         ]
         if args.resume is not None:
@@ -123,6 +154,7 @@ def main() -> int:
                     args.fixture_diagnostic_elapsed_seconds if diagnostic else None
                 ),
                 "stop_reason": "reusable_time_budget" if diagnostic else "timestep_budget",
+                "reusable_time_deadline_monotonic": args.reusable_time_deadline_monotonic,
             }
         )
         _emit(args.metrics_jsonl, *records)
@@ -148,9 +180,9 @@ def main() -> int:
             "index": index,
             "game_seed": game_seed,
             "compatibility_killcount": float(compatibility_quality),
-            "length": 10,
-            "terminated": True,
-            "truncated": False,
+            "length": args.fixture_episode_length,
+            "terminated": args.fixture_terminal_mode in {"terminated", "both"},
+            "truncated": args.fixture_terminal_mode in {"truncated", "both"},
         }
         if args.fixture_omit_player_killcount:
             episode["kills"] = float(player_quality)
@@ -183,6 +215,9 @@ def main() -> int:
             "episodes": episodes,
         },
     )
+    if args.fixture_mutate_checkpoint_after_evaluation:
+        with args.evaluate_checkpoint.open("ab") as stream:
+            stream.write(b"mutated-after-evaluation")
     return 0
 
 

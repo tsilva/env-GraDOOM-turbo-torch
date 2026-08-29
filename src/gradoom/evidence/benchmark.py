@@ -41,6 +41,7 @@ _CONTROLLED_ARGUMENTS = {
     "--metrics-jsonl",
     "--no-evaluation-stochastic",
     "--resume",
+    "--reusable-time-deadline-monotonic",
     "--reusable-time-budget-seconds",
     "--seed",
     "--timesteps",
@@ -352,6 +353,19 @@ def _validate_evaluation_records(
             raise EvidenceError("evaluation episode indices do not match their declared order")
         if raw_episode.get("game_seed") != episode_seeds[index]:
             raise EvidenceError("evaluation episode seeds do not match the predeclared seed grid")
+        length = raw_episode.get("length")
+        if type(length) is not int or length <= 0:
+            raise EvidenceError(f"evaluation episodes[{index}].length must be a positive integer")
+        terminated = raw_episode.get("terminated")
+        truncated = raw_episode.get("truncated")
+        if type(terminated) is not bool or type(truncated) is not bool:
+            raise EvidenceError(f"evaluation episodes[{index}] completion flags must be booleans")
+        if not terminated and not truncated:
+            raise EvidenceError(f"evaluation episodes[{index}] must declare terminal completion")
+        if terminated and truncated:
+            raise EvidenceError(
+                f"evaluation episodes[{index}] cannot be both terminated and truncated"
+            )
         player_value = raw_episode.get("player_killcount")
         if type(player_value) not in (int, float) or not math.isfinite(float(player_value)):
             raise EvidenceError(f"evaluation episodes[{index}].player_killcount must be finite")

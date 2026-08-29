@@ -65,11 +65,13 @@ hardlink.
 
 Evaluation uses the same trainer executable with `--evaluate-checkpoint`,
 `--evaluation-episodes 100`, `--evaluation-seeds-file`, and stochastic actions. Every evaluator must
-return all 100 episode records in the predeclared order. Passage is computed solely from their mean
-`player_killcount` and requires at least `30.0`; separately reported `compatibility_killcount` is a
-diagnostic and cannot change the verdict. The passing checkpoint, metrics, all preceding checkpoint
-outcomes, all episode outcomes, and every process or evidence failure are retained and hashed in the
-report evidence index.
+return all 100 episode records in the predeclared order. Each record must have a positive episode
+length and exactly one true terminal flag (`terminated` or `truncated`); zero-length, unterminated,
+and contradictory records are evidence failures and cannot count toward the cohort. Passage is
+computed solely from the completed episodes' mean `player_killcount` and requires at least `30.0`;
+separately reported `compatibility_killcount` is a diagnostic and cannot change the verdict. The
+passing checkpoint, metrics, all preceding checkpoint outcomes, all episode outcomes, and every
+process or evidence failure are retained and hashed in the report evidence index.
 
 The report has `authoritative: false` and `claim_eligible: false` unconditionally. Its per-seed
 attempt states are `succeeded`, `exhausted`, `crashed`, `evaluation_failed`, or `evidence_failed`.
@@ -98,9 +100,11 @@ manifest uses the common envelope fields and a `diagnostic` object containing:
   declarations as the matched benchmark; the held-out grid contains exactly 100 unique uint32 game
   seeds;
 - `recipe`: the exact standalone trainer `command` and fixed `arguments` used by the benchmark;
-- `timing_rules`: the fixed reusable-run boundary: monotonic wall clock from before recurring
-  initialization through the durable final checkpoint write, with device synchronization around
-  measured GPU work; recurring compilation, warm-up, and training are included, while the final
+- `timing_rules`: the fixed reusable-run boundary: an outer monotonic wall clock starts before
+  attempt setup and public subprocess launch and stops after trainer exit and durable training
+  evidence writes. Seed-manifest creation, interpreter/module startup, recurring initialization,
+  per-process or uncached compilation, warm-up, training, checkpoint writing, and training-metrics
+  writing are included, with device synchronization around measured GPU work. Only the final
   held-out evaluation is outside the fixed training budget;
 - `matching_benchmark_report`: the path and SHA-256 of the existing development or primary report;
 - `artifacts_directory`: the immutable run-identity directory for seed grids, final checkpoints,
@@ -111,15 +115,25 @@ manifest uses the common envelope fields and a `diagnostic` object containing:
 Before starting training, the command verifies the matched report's digest, evidence index, run
 identity, evidence level, fixture status, code provenance, recipe, training seeds, evaluation seeds,
 action seed, and WAD-profile binding. Any mismatch fails before creating diagnostic artifacts. The
-trainer starts every diagnostic seed from fresh policy and optimizer state, stops only at the first
-complete rollout at or beyond the common budget, durably writes the final checkpoint, and evaluates
-that checkpoint through the same stochastic 100-episode GraDOOM evaluator used by the benchmark.
+trainer starts every diagnostic seed from fresh policy and optimizer state and receives the outer
+absolute monotonic deadline. It starts no rollout after that deadline; a deadline consumed by
+startup therefore produces zero training transitions, while an in-flight rollout may finish before
+the final checkpoint and training evidence are durably written. The command then evaluates that
+checkpoint through the same stochastic 100-episode GraDOOM evaluator used by the benchmark.
 
-Completed attempts retain all 100 episode records and report `final_mean_player_killcount`.
-Throughput is computed from the measured training workload as both transitions per second and
-simulated tics per second; the report retains transition count, frame skip, simulated tic count,
-elapsed time, and the complete workload/timer boundary. Compatibility `killcount` may be retained as
-a diagnostic but is not final policy quality.
+Completed attempts retain exactly 100 genuinely completed episode records and report
+`final_mean_player_killcount`. Throughput is computed as transitions per second and simulated tics
+per second using the actual outer public-command elapsed time, never a trainer-reported inner timer;
+the report retains transition count, frame skip, simulated tic count, elapsed time, timer source,
+and the complete workload boundary. Compatibility `killcount` may be retained as a diagnostic but
+is not final policy quality.
+
+Declared input names must not collide with manifest, matched-report, or generated-artifact evidence
+names. After every attempt, the command rehashes each generated seed manifest, checkpoint, training
+metrics file, and evaluation metrics file and reconciles it with one uniquely named evidence-index
+entry. The report retains both digests and a matched/mismatched status; a missing, ambiguous, or
+changed binding is retained as an `artifact_evidence` failure and makes the attempt
+`evidence_failed`.
 
 All fixed-time results live under `diagnostics.fixed_time`, are non-authoritative on their own, have
 `affects_passage: false`, and repeat the matched benchmark passage status as `unchanged: true`.
