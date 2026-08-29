@@ -7,6 +7,7 @@ import re
 import subprocess
 import sys
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,13 @@ from gradoom.actions import DEATHMATCH_ACTION_MEANINGS, DEATHMATCH_ACTIONS, DEAT
 RUNNER_PROTOCOL_VERSION = 1
 _SIGNALS = ("health", "killcount", "player_killcount", "episode_return")
 _NATIVE_GAME_VARIABLES = ("health", "killcount", "player_killcount")
+
+
+@dataclass(frozen=True)
+class _AttributionProof:
+    attacker: str
+    target: str
+    evidence_sha256: str
 
 
 class _FixtureTurboEnv:
@@ -329,35 +337,166 @@ def _fixture_attribution_oracle(
     *,
     lane: int,
     behavior: str,
-) -> dict[str, str]:
-    del behavior
+    **_evidence: Any,
+) -> _AttributionProof:
     events = env._last_attributions[lane]
     if len(events) != 1:
         raise RuntimeError("staged fixture did not observe exactly one attribution event")
-    return dict(events[0])
+    event = dict(events[0])
+    evidence_sha256 = hashlib.sha256(
+        json.dumps(
+            {"behavior": behavior, "event": event, "lane": lane},
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("ascii")
+    ).hexdigest()
+    return _AttributionProof(
+        attacker=event["attacker"],
+        target=event["target"],
+        evidence_sha256=evidence_sha256,
+    )
+
+
+def _observation_lane_sha256(value: Any, *, lane: int) -> str:
+    if isinstance(value, torch.Tensor):
+        value = value.detach().to("cpu").contiguous().numpy()
+    array = np.asarray(value)
+    if array.dtype != np.uint8 or array.ndim < 2 or not 0 <= lane < array.shape[0]:
+        raise RuntimeError("staged attribution requires public uint8 vector observations")
+    selected = np.ascontiguousarray(array[lane])
+    descriptor = json.dumps(
+        {"dtype": str(selected.dtype), "shape": list(selected.shape)},
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+    return hashlib.sha256(descriptor + b"\0" + selected.tobytes()).hexdigest()
+
+
+def _real_attribution_oracle(
+    provider: str,
+    binding: Mapping[str, Any],
+) -> Callable[..., _AttributionProof]:
+    if provider not in {"gradoom", "env-vizdoom-turbo"}:
+        raise ValueError(f"unsupported attribution provider {provider!r}")
+    expected_assets = {
+        asset: (Path(str(binding[f"{asset}_path"])), str(binding[f"{asset}_sha256"]))
+        for asset in ("iwad", "pwad")
+    }
+
+    def observe(
+        env: Any,
+        *,
+        lane: int,
+        behavior: str,
+        initial_observation: Any,
+        event_observation: Any,
+        action_history: list[list[int]],
+        event_step: int,
+    ) -> _AttributionProof:
+        for asset, (path, expected_sha256) in expected_assets.items():
+            if (
+                not path.is_file()
+                or hashlib.sha256(path.read_bytes()).hexdigest() != expected_sha256
+            ):
+                raise RuntimeError(
+                    f"staged attribution {asset.upper()} binding changed during execution"
+                )
+        if provider == "gradoom" and (
+            getattr(env, "iwad_sha256", None) != expected_assets["iwad"][1]
+            or getattr(env, "scenario_sha256", None) != expected_assets["pwad"][1]
+        ):
+            raise RuntimeError(
+                "staged attribution environment does not expose the bound GraDOOM assets"
+            )
+        if event_step < 0 or len(action_history) != event_step + 1:
+            raise RuntimeError("staged attribution action history is incomplete")
+        try:
+            lane_actions = [row[lane] for row in action_history]
+            action_buttons = [DEATHMATCH_ACTIONS[index] for index in lane_actions]
+        except (IndexError, TypeError) as error:
+            raise RuntimeError("staged attribution action history is invalid") from error
+        if behavior == "player_killcount":
+            attacker = "player"
+            if "ATTACK" not in action_buttons[-1]:
+                raise RuntimeError(
+                    "staged player attribution did not observe a pinned player attack action"
+                )
+        elif behavior == "player_killcount.enemy_on_enemy_exclusion":
+            attacker = "enemy"
+            if any("ATTACK" in buttons for buttons in action_buttons):
+                raise RuntimeError(
+                    "staged enemy attribution observed a player attack before the event"
+                )
+        else:
+            raise RuntimeError(f"unsupported staged attribution behavior {behavior!r}")
+        initial_sha256 = _observation_lane_sha256(initial_observation, lane=lane)
+        event_sha256 = _observation_lane_sha256(event_observation, lane=lane)
+        if initial_sha256 == event_sha256:
+            raise RuntimeError(
+                "staged attribution requires an observed public state transition; "
+                "counters alone are insufficient"
+            )
+        evidence = {
+            "action_history": lane_actions,
+            "attacker": attacker,
+            "behavior": behavior,
+            "event_observation_sha256": event_sha256,
+            "event_step": event_step,
+            "initial_observation_sha256": initial_sha256,
+            "iwad_sha256": expected_assets["iwad"][1],
+            "lane": lane,
+            "provider": provider,
+            "pwad_sha256": expected_assets["pwad"][1],
+            "target": "enemy",
+        }
+        evidence_sha256 = hashlib.sha256(
+            json.dumps(evidence, separators=(",", ":"), sort_keys=True).encode("ascii")
+        ).hexdigest()
+        return _AttributionProof(
+            attacker=attacker,
+            target="enemy",
+            evidence_sha256=evidence_sha256,
+        )
+
+    return observe
 
 
 def _verified_attribution(
-    oracle: Callable[..., Mapping[str, str]] | None,
+    oracle: Callable[..., _AttributionProof] | None,
     env: Any,
     *,
     lane: int,
     behavior: str,
+    initial_observation: Any,
+    event_observation: Any,
+    action_history: list[list[int]],
+    event_step: int,
 ) -> dict[str, str]:
     if oracle is None:
         raise RuntimeError(
             "kill semantics require an independent actor/target attribution oracle; "
             "compatibility counters alone are insufficient"
         )
-    event = oracle(env, lane=lane, behavior=behavior)
-    if not isinstance(event, Mapping) or set(event) != {"attacker", "target"}:
-        raise RuntimeError("actor/target attribution oracle returned an invalid event")
+    event = oracle(
+        env,
+        lane=lane,
+        behavior=behavior,
+        initial_observation=initial_observation,
+        event_observation=event_observation,
+        action_history=action_history,
+        event_step=event_step,
+    )
+    if (
+        not isinstance(event, _AttributionProof)
+        or re.fullmatch(r"[0-9a-f]{64}", event.evidence_sha256) is None
+    ):
+        raise RuntimeError("actor/target attribution oracle returned an invalid proof")
     expected_attacker = "player" if behavior == "player_killcount" else "enemy"
-    if event["attacker"] != expected_attacker or event["target"] != "enemy":
+    if event.attacker != expected_attacker or event.target != "enemy":
         raise RuntimeError(
             f"actor/target attribution oracle did not observe {expected_attacker}-to-enemy"
         )
-    return dict(event)
+    return {"attacker": event.attacker, "target": event.target}
 
 
 def _semantic_probe(
@@ -368,16 +507,24 @@ def _semantic_probe(
     probe: Mapping[str, Any],
     requested_device: torch.device | None,
     kill_signal_reader: Callable[..., dict[str, float]] | None,
-    attribution_oracle: Callable[..., Mapping[str, str]] | None = None,
+    attribution_oracle: Callable[..., _AttributionProof] | None = None,
 ) -> dict[str, Any]:
     env = factory()
     try:
-        _observation, initial_infos = env.reset(seed=probe["seeds"])
+        initial_observation, initial_infos = env.reset(seed=probe["seeds"])
+        initial_observation = _snapshot(initial_observation)
         initial_kills = [
             _kill_signals(initial_infos, kill_signal_reader=kill_signal_reader, lane=lane)
             for lane in range(2)
         ]
-        observed: tuple[int, tuple[Any, Any, Any, Any, Mapping[str, Any]]] | None = None
+        observed: (
+            tuple[
+                int,
+                int,
+                tuple[Any, Any, Any, Any, Mapping[str, Any]],
+            ]
+            | None
+        ) = None
         actions = probe["actions"]
         for step_index in range(probe["max_steps"]):
             transition = env.step(
@@ -409,7 +556,7 @@ def _semantic_probe(
                         else compatibility_delta > 0 and player_delta == 0
                     )
                 if matched:
-                    observed = (lane, transition)
+                    observed = (lane, step_index, transition)
                     break
             if observed is not None:
                 break
@@ -417,7 +564,7 @@ def _semantic_probe(
                 break
         if observed is None:
             raise RuntimeError(f"{behavior} event was not observed through public step results")
-        lane, transition = observed
+        lane, event_step, transition = observed
         if behavior in {"termination", "truncation"}:
             try:
                 env.step(_actions(provider, actions[0], requested_device))
@@ -458,6 +605,10 @@ def _semantic_probe(
             env,
             lane=lane,
             behavior=behavior,
+            initial_observation=initial_observation,
+            event_observation=_snapshot(transition[0]),
+            action_history=[list(actions[index % len(actions)]) for index in range(event_step + 1)],
+            event_step=event_step,
         )
         player, compatibility = _kill_signals(
             transition[4],
@@ -491,7 +642,7 @@ def _capture_contract(
     semantic_probes: Mapping[str, Mapping[str, Any]],
     requested_device: torch.device | None = None,
     kill_signal_reader: Callable[..., dict[str, float]] | None = None,
-    attribution_oracle: Callable[..., Mapping[str, str]] | None = None,
+    attribution_oracle: Callable[..., _AttributionProof] | None = None,
 ) -> dict[str, Any]:
     signature = inspect.signature(env_class).parameters
     common = list(signature.values())[:32]
@@ -934,6 +1085,7 @@ def _real_contracts(request: dict[str, Any]) -> tuple[list[dict[str, Any]], list
             fixture_case="pass",
             semantic_probes=semantic_probes,
             requested_device=requested_device,
+            attribution_oracle=_real_attribution_oracle("gradoom", gradoom_binding),
         ),
         _capture_contract(
             provider="env-vizdoom-turbo",
@@ -943,6 +1095,7 @@ def _real_contracts(request: dict[str, Any]) -> tuple[list[dict[str, Any]], list
             fixture_case="pass",
             semantic_probes=semantic_probes,
             kill_signal_reader=provider.episode_kill_signals,
+            attribution_oracle=_real_attribution_oracle("env-vizdoom-turbo", reference_binding),
         ),
     ]
     return contracts, []

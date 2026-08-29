@@ -7,6 +7,7 @@ import subprocess
 from collections.abc import Mapping
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 
@@ -352,6 +353,7 @@ def test_real_runner_separates_native_variables_and_observes_checkout_revision(
             return {"player_killcount": 0.0, "compatibility_killcount": 0.0}
 
     def capture_contract(**kwargs: object) -> dict[str, object]:
+        observed[f"{kwargs['provider']}_attribution_oracle"] = kwargs["attribution_oracle"]
         env = kwargs["factory"]()  # type: ignore[operator]
         env.close()
         return {
@@ -398,6 +400,8 @@ def test_real_runner_separates_native_variables_and_observes_checkout_revision(
             "mode": "all",
             "keys": ["health", "killcount", "player_killcount", "episode_return"],
         }
+    assert callable(observed["gradoom_attribution_oracle"])
+    assert callable(observed["env-vizdoom-turbo_attribution_oracle"])
 
 
 def test_real_runner_fails_closed_when_gradoom_revision_cannot_be_proven(
@@ -741,6 +745,129 @@ def test_semantic_kill_probe_rejects_counter_only_provider() -> None:
             requested_device=None,
             kill_signal_reader=None,
             attribution_oracle=None,
+        )
+
+
+@pytest.mark.parametrize("provider", ["gradoom", "env-vizdoom-turbo"])
+@pytest.mark.parametrize(
+    ("behavior", "action", "expected"),
+    [
+        ("player_killcount", 1, {"attacker": "player", "target": "enemy"}),
+        (
+            "player_killcount.enemy_on_enemy_exclusion",
+            0,
+            {"attacker": "enemy", "target": "enemy"},
+        ),
+    ],
+)
+def test_real_attribution_oracle_grounds_both_provider_events_in_public_stages(
+    tmp_path: Path,
+    provider: str,
+    behavior: str,
+    action: int,
+    expected: dict[str, str],
+) -> None:
+    iwad = tmp_path / "freedoom2.wad"
+    pwad = tmp_path / "deathmatch.wad"
+    iwad.write_bytes(b"iwad")
+    pwad.write_bytes(b"pwad")
+    binding = {
+        "iwad_path": str(iwad),
+        "iwad_sha256": hashlib.sha256(iwad.read_bytes()).hexdigest(),
+        "pwad_path": str(pwad),
+        "pwad_sha256": hashlib.sha256(pwad.read_bytes()).hexdigest(),
+    }
+    env = type(
+        "PublicStage",
+        (),
+        {
+            "iwad_sha256": binding["iwad_sha256"],
+            "scenario_sha256": binding["pwad_sha256"],
+        },
+    )()
+    initial = np.zeros((2, 4, 84, 84), dtype=np.uint8)
+    event = initial.copy()
+    event[0, 0, 0, 0] = 1
+
+    result = invariant_runner._verified_attribution(
+        invariant_runner._real_attribution_oracle(provider, binding),
+        env,
+        lane=0,
+        behavior=behavior,
+        initial_observation=initial,
+        event_observation=event,
+        action_history=[[action, 0]],
+        event_step=0,
+    )
+
+    assert result == expected
+
+
+def test_real_attribution_oracle_rejects_counter_only_and_changed_assets(tmp_path: Path) -> None:
+    iwad = tmp_path / "freedoom2.wad"
+    pwad = tmp_path / "deathmatch.wad"
+    iwad.write_bytes(b"iwad")
+    pwad.write_bytes(b"pwad")
+    binding = {
+        "iwad_path": str(iwad),
+        "iwad_sha256": hashlib.sha256(iwad.read_bytes()).hexdigest(),
+        "pwad_path": str(pwad),
+        "pwad_sha256": hashlib.sha256(pwad.read_bytes()).hexdigest(),
+    }
+    env = type(
+        "PublicStage",
+        (),
+        {
+            "iwad_sha256": binding["iwad_sha256"],
+            "scenario_sha256": binding["pwad_sha256"],
+        },
+    )()
+    observation = np.zeros((2, 4, 84, 84), dtype=np.uint8)
+    oracle = invariant_runner._real_attribution_oracle("gradoom", binding)
+
+    with pytest.raises(RuntimeError, match="counters alone are insufficient"):
+        invariant_runner._verified_attribution(
+            oracle,
+            env,
+            lane=0,
+            behavior="player_killcount",
+            initial_observation=observation,
+            event_observation=observation.copy(),
+            action_history=[[1, 0]],
+            event_step=0,
+        )
+
+    changed_observation = observation.copy()
+    changed_observation[0, 0, 0, 0] = 1
+    pwad.write_bytes(b"substituted")
+    with pytest.raises(RuntimeError, match="PWAD binding changed"):
+        invariant_runner._verified_attribution(
+            oracle,
+            env,
+            lane=0,
+            behavior="player_killcount",
+            initial_observation=observation,
+            event_observation=changed_observation,
+            action_history=[[1, 0]],
+            event_step=0,
+        )
+
+
+def test_attribution_rejects_self_attested_or_fabricated_event_labels() -> None:
+    observation = np.zeros((2, 4, 84, 84), dtype=np.uint8)
+    changed_observation = observation.copy()
+    changed_observation[0, 0, 0, 0] = 1
+
+    with pytest.raises(RuntimeError, match="invalid proof"):
+        invariant_runner._verified_attribution(
+            lambda *args, **kwargs: {"attacker": "player", "target": "enemy"},  # type: ignore[arg-type,return-value]
+            object(),
+            lane=0,
+            behavior="player_killcount",
+            initial_observation=observation,
+            event_observation=changed_observation,
+            action_history=[[1, 0]],
+            event_step=0,
         )
 
 

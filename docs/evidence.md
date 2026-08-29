@@ -213,7 +213,12 @@ deterministic one-step and two-step controls, proving selected-lane reset and un
 continuation in provider state. The player-attributed kill probes require staged actor/target
 attribution in addition to counters: the former must observe a player-to-enemy event and increment
 `player_killcount`, while the latter must observe an enemy-to-enemy event and increment only
-compatibility `killcount`. Counter-only providers fail closed.
+compatibility `killcount`. For real providers, the repository-owned oracle rehashes the validated
+IWAD and PWAD at the event boundary, hashes actual public reset and event observations, and derives
+the attacker from the pinned action history: a player-attributed event must coincide with a player
+attack, while an enemy-on-enemy event must have no preceding player attack. The public state must
+change at the observed kill event. Provider- or manifest-supplied attribution labels are not
+accepted, and unchanged counter-only observations fail closed.
 
 Real execution loads GraDOOM and the immutable reference revision independently through the pinned
 reference adapter. An absent optional provider runtime is unavailable; changed assets, an invalid
