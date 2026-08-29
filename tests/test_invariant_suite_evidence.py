@@ -142,6 +142,32 @@ def test_failed_public_behavior_blocks_readiness_and_is_named(tmp_path: Path) ->
     )
 
 
+@pytest.mark.parametrize("fixture_case", ["ignored_masked_reset", "leaky_masked_reset"])
+def test_invalid_masked_reset_behavior_is_named_through_the_public_command(
+    tmp_path: Path,
+    fixture_case: str,
+) -> None:
+    output = tmp_path / "report.json"
+
+    result = run_evidence(
+        "--manifest",
+        str(write_manifest(tmp_path, mismatch=fixture_case)),
+        "--output",
+        str(output),
+    )
+
+    assert result.returncode == 0, result.stderr
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert report["status"] == "failed"
+    assert report["invariant_suite"]["failures"] == [
+        {
+            "behavior": "masked_reset",
+            "message": "env-vizdoom-turbo public behavior is invalid for masked_reset.",
+            "provider": "env-vizdoom-turbo",
+        }
+    ]
+
+
 def test_missing_public_signal_is_a_named_failed_invariant(tmp_path: Path) -> None:
     output = tmp_path / "report.json"
 

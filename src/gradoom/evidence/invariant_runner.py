@@ -56,6 +56,7 @@ class _FixtureTurboEnv:
         state_catalog: Any = None,
         fixture_transport: str = "numpy",
         fixture_missing_signal: str | None = None,
+        fixture_masked_reset: str = "respect",
     ) -> None:
         del (
             game,
@@ -93,6 +94,7 @@ class _FixtureTurboEnv:
         self.num_envs = num_envs
         self.fixture_transport = fixture_transport
         self.fixture_missing_signal = fixture_missing_signal
+        self.fixture_masked_reset = fixture_masked_reset
         self.device = torch.device("cpu")
         self.action_meanings = DEATHMATCH_ACTION_MEANINGS
         self._initialized = np.zeros(num_envs, dtype=np.bool_)
@@ -134,6 +136,10 @@ class _FixtureTurboEnv:
             mask = raw_mask.detach().cpu().numpy().astype(np.bool_, copy=False)
         else:
             mask = np.asarray(raw_mask, dtype=np.bool_)
+        if raw_mask is not None and self.fixture_masked_reset == "ignore":
+            mask = np.zeros(self.num_envs, dtype=np.bool_)
+        elif raw_mask is not None and self.fixture_masked_reset == "leak":
+            mask = np.ones(self.num_envs, dtype=np.bool_)
         self._initialized[mask] = True
         self._pending_reset[mask] = False
         self._state[mask] = 0
@@ -224,6 +230,35 @@ def _actions(provider: str, values: list[int], device: torch.device | None = Non
 
 def _probe_error(error: BaseException | str) -> dict[str, str]:
     return {"probe_error": str(error)}
+
+
+def _snapshot(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.detach().clone()
+    return np.array(value, copy=True)
+
+
+def _snapshot_signals(infos: Mapping[str, Any]) -> dict[str, Any]:
+    missing = [name for name in _SIGNALS if name not in infos]
+    if missing:
+        raise RuntimeError(f"reset or step signals are missing {missing}")
+    return {name: _snapshot(infos[name]) for name in _SIGNALS}
+
+
+def _lane_equal(left: Any, right: Any, lane: int) -> bool:
+    if isinstance(left, torch.Tensor):
+        left = left.detach().cpu().numpy()
+    if isinstance(right, torch.Tensor):
+        right = right.detach().cpu().numpy()
+    return bool(np.array_equal(np.asarray(left)[lane], np.asarray(right)[lane]))
+
+
+def _lane_signals_equal(
+    left: Mapping[str, Any],
+    right: Mapping[str, Any],
+    lane: int,
+) -> bool:
+    return all(_lane_equal(left[name], right[name], lane) for name in _SIGNALS)
 
 
 def _kill_signals(
@@ -384,6 +419,10 @@ def _capture_contract(
             if not isinstance(reset_result, tuple) or len(reset_result) != 2:
                 raise RuntimeError("reset did not return observation and signals")
             reset_observation, reset_infos = reset_result
+            if not isinstance(reset_infos, Mapping):
+                raise RuntimeError("reset signals are not a mapping")
+            reset_observation_snapshot = _snapshot(reset_observation)
+            reset_signal_snapshots = _snapshot_signals(reset_infos)
             behaviors["reset"] = {"returns_observation_and_signals": True}
             step_result = env.step(step_actions)
             if not isinstance(step_result, tuple) or len(step_result) != 5:
@@ -394,8 +433,10 @@ def _capture_contract(
                 "reset": _descriptor(reset_observation),
                 "step": _descriptor(step_observation),
             }
-            if not isinstance(reset_infos, Mapping) or not isinstance(step_infos, Mapping):
-                raise RuntimeError("reset or step signals are not a mapping")
+            if not isinstance(step_infos, Mapping):
+                raise RuntimeError("step signals are not a mapping")
+            step_observation_snapshot = _snapshot(step_observation)
+            step_signal_snapshots = _snapshot_signals(step_infos)
             behaviors["signal_shapes"] = {
                 operation: {name: _descriptor(infos[name]) for name in _SIGNALS if name in infos}
                 for operation, infos in (("reset", reset_infos), ("step", step_infos))
@@ -404,21 +445,39 @@ def _capture_contract(
             if fixture_case == "reward_mismatch" and provider == "env-vizdoom-turbo":
                 reward_values = [9.0, 9.0]
             behaviors["rewards"] = {**_descriptor(rewards), "sample": reward_values}
-            before_masked = (
-                step_observation.clone()
-                if isinstance(step_observation, torch.Tensor)
-                else step_observation.copy()
+            masked_result = env.reset(
+                seed=[7, None],
+                options={"reset_mask": reset_mask},
             )
-            masked_observation, _masked_infos = env.reset(options={"reset_mask": reset_mask})
-            masked_selected_only = bool(
-                torch.equal(masked_observation[1], before_masked[1])
-                if isinstance(masked_observation, torch.Tensor)
-                and isinstance(before_masked, torch.Tensor)
-                else np.array_equal(masked_observation[1], before_masked[1])
+            if not isinstance(masked_result, tuple) or len(masked_result) != 2:
+                raise RuntimeError("masked reset did not return observation and signals")
+            masked_observation, masked_infos = masked_result
+            if not isinstance(masked_infos, Mapping):
+                raise RuntimeError("masked reset signals are not a mapping")
+            masked_observation_snapshot = _snapshot(masked_observation)
+            masked_signal_snapshots = _snapshot_signals(masked_infos)
+            selected_lane_was_advanced = not (
+                _lane_equal(reset_observation_snapshot, step_observation_snapshot, 0)
+                and _lane_signals_equal(reset_signal_snapshots, step_signal_snapshots, 0)
+            )
+            selected_lane_reset = (
+                selected_lane_was_advanced
+                and _lane_equal(reset_observation_snapshot, masked_observation_snapshot, 0)
+                and _lane_signals_equal(reset_signal_snapshots, masked_signal_snapshots, 0)
+            )
+            unselected_lane_was_advanced = not (
+                _lane_equal(reset_observation_snapshot, step_observation_snapshot, 1)
+                and _lane_signals_equal(reset_signal_snapshots, step_signal_snapshots, 1)
+            )
+            unselected_lane_unchanged = (
+                unselected_lane_was_advanced
+                and _lane_equal(step_observation_snapshot, masked_observation_snapshot, 1)
+                and _lane_signals_equal(step_signal_snapshots, masked_signal_snapshots, 1)
             )
             behaviors["masked_reset"] = {
                 "supported": True,
-                "selected_lane_only": masked_selected_only,
+                "selected_lane_state_and_signals_reset": selected_lane_reset,
+                "unselected_lane_state_and_signals_unchanged": unselected_lane_unchanged,
             }
             behaviors["episode"] = {
                 "step_before_reset_rejected": step_before_reset_rejected,
@@ -507,6 +566,8 @@ def _fixture_contracts(case: str) -> list[dict[str, Any]]:
         "reward_mismatch",
         "missing_player_killcount",
         "missing_termination",
+        "ignored_masked_reset",
+        "leaky_masked_reset",
     }:
         raise ValueError(f"unsupported fixture_case {case!r}")
     contracts = []
@@ -525,18 +586,28 @@ def _fixture_contracts(case: str) -> list[dict[str, Any]]:
         },
     }
     for provider, transport in (("gradoom", "torch"), ("env-vizdoom-turbo", "numpy")):
+        fixture_masked_reset = (
+            "ignore"
+            if case == "ignored_masked_reset" and provider == "env-vizdoom-turbo"
+            else "leak"
+            if case == "leaky_masked_reset" and provider == "env-vizdoom-turbo"
+            else "respect"
+        )
         contracts.append(
             _capture_contract(
                 provider=provider,
                 revision=f"fixture-{provider}-revision",
                 env_class=_FixtureTurboEnv,
-                factory=lambda transport=transport: _FixtureTurboEnv(
-                    "VizdoomDeathmatch-v1",
-                    num_envs=2,
-                    fixture_transport=transport,
-                    fixture_missing_signal=(
-                        "player_killcount" if case == "missing_player_killcount" else None
-                    ),
+                factory=lambda transport=transport, fixture_masked_reset=fixture_masked_reset: (
+                    _FixtureTurboEnv(
+                        "VizdoomDeathmatch-v1",
+                        num_envs=2,
+                        fixture_transport=transport,
+                        fixture_missing_signal=(
+                            "player_killcount" if case == "missing_player_killcount" else None
+                        ),
+                        fixture_masked_reset=fixture_masked_reset,
+                    )
                 ),
                 fixture_case=case,
                 semantic_probes=semantic_probes,

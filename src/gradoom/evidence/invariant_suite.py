@@ -561,7 +561,11 @@ def _valid_common_behavior(behavior: str, value: object) -> bool:
     expected = {
         "reset": {"returns_observation_and_signals": True},
         "step": {"returns_five_tuple": True},
-        "masked_reset": {"supported": True, "selected_lane_only": True},
+        "masked_reset": {
+            "supported": True,
+            "selected_lane_state_and_signals_reset": True,
+            "unselected_lane_state_and_signals_unchanged": True,
+        },
         "termination": {"reported_separately": True, "requires_reset": True},
         "truncation": {"reported_separately": True, "requires_reset": True},
         "episode": {"step_before_reset_rejected": True, "autoreset": False},
@@ -770,6 +774,8 @@ def run_invariant_suite(
         "reward_mismatch",
         "missing_player_killcount",
         "missing_termination",
+        "ignored_masked_reset",
+        "leaky_masked_reset",
     }:
         raise InvariantSuiteError("invariant_suite.fixture_case is invalid")
     if mode == "real" and "fixture_case" in declaration:
