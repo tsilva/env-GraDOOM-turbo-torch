@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -9,9 +10,16 @@ import pytest
 
 from gradoom.evidence.benchmark import _validate_elapsed_time_anchors
 from gradoom.evidence.report import EvidenceError
+from gradoom.evidence.time_authority import ReusableTimeAuthority
 
 
-def _authority(state: Path, operation: str, payload: dict[str, object] | None = None):
+def _authority(
+    state: Path,
+    operation: str,
+    payload: dict[str, object] | None = None,
+    *,
+    environment: dict[str, str] | None = None,
+):
     command = shutil.which("gradoom-time-authority")
     assert command is not None
     return subprocess.run(
@@ -20,6 +28,7 @@ def _authority(state: Path, operation: str, payload: dict[str, object] | None = 
         check=False,
         capture_output=True,
         text=True,
+        env=None if environment is None else {**os.environ, **environment},
     )
 
 
@@ -81,6 +90,10 @@ def test_repository_authority_rejects_ledger_replay_and_state_reset(tmp_path: Pa
     assert "rollback" in replay.stderr
 
     shutil.rmtree(state)
+    refused_reset = _authority(state, "init")
+    assert refused_reset.returncode == 2
+    assert "witness directory is not empty" in refused_reset.stderr
+    shutil.rmtree(ReusableTimeAuthority.default_witness_directory(state))
     assert _authority(state, "init").returncode == 0
     reset = _authority(state, "verify-bootstrap-reuse", attestation)
     assert reset.returncode == 2
@@ -140,6 +153,123 @@ def test_repository_authority_rejects_replayed_journal_head(tmp_path: Path) -> N
 
     assert replay.returncode == 2
     assert "stale journal head" in replay.stderr
+    recovery = _authority(state, "recover-latest-journal-head", first_attestation)
+    assert recovery.returncode == 2
+    assert "different generation" in recovery.stderr
+
+
+def test_repository_authority_rejects_coherent_state_directory_rollback(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "authority"
+    snapshot = tmp_path / "authority-snapshot"
+    assert _authority(state, "init").returncode == 0
+    anchor_result = _authority(state, "start-attempt", {"seed": 123})
+    assert anchor_result.returncode == 0, anchor_result.stderr
+    anchor = json.loads(anchor_result.stdout)
+    first_request = {
+        "schema_version": 1,
+        "authority": anchor["payload"]["authority"],
+        "seed": 123,
+        "started_unix_ns": anchor["payload"]["started_unix_ns"],
+        "generation": 0,
+        "previous_journal_sha256": None,
+        "journal_sha256": "2" * 64,
+        "status": "interrupted",
+        "prior_reusable_elapsed_seconds": 0.0,
+        "minimum_reusable_elapsed_seconds": 1.0,
+    }
+    first = _authority(state, "sign-journal-head", first_request)
+    assert first.returncode == 0, first.stderr
+    first_attestation = json.loads(first.stdout)
+    shutil.copytree(state, snapshot)
+    second_request = {
+        **first_request,
+        "generation": 1,
+        "previous_journal_sha256": "2" * 64,
+        "journal_sha256": "3" * 64,
+        "status": "succeeded",
+        "prior_reusable_elapsed_seconds": first_attestation["payload"]["reusable_elapsed_seconds"],
+        "minimum_reusable_elapsed_seconds": 10.0,
+    }
+    second = _authority(state, "sign-journal-head", second_request)
+    assert second.returncode == 0, second.stderr
+    shutil.rmtree(state)
+    shutil.copytree(snapshot, state)
+
+    replay = _authority(state, "verify-latest-journal-head", first_attestation)
+
+    assert replay.returncode == 2
+    assert "rollback" in replay.stderr
+
+
+def test_repository_authority_recovers_durable_report_after_same_head_reseal(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "authority"
+    assert _authority(state, "init").returncode == 0
+    anchor_result = _authority(state, "start-attempt", {"seed": 123})
+    assert anchor_result.returncode == 0, anchor_result.stderr
+    anchor = json.loads(anchor_result.stdout)
+    request = {
+        "schema_version": 1,
+        "authority": anchor["payload"]["authority"],
+        "seed": 123,
+        "started_unix_ns": anchor["payload"]["started_unix_ns"],
+        "generation": 0,
+        "previous_journal_sha256": None,
+        "journal_sha256": "2" * 64,
+        "status": "succeeded",
+        "prior_reusable_elapsed_seconds": 0.0,
+        "minimum_reusable_elapsed_seconds": 1.0,
+    }
+    first = _authority(state, "sign-journal-head", request)
+    assert first.returncode == 0, first.stderr
+    durable_report_attestation = json.loads(first.stdout)
+    resealed = _authority(
+        state,
+        "sign-journal-head",
+        {
+            **request,
+            "prior_reusable_elapsed_seconds": durable_report_attestation["payload"][
+                "reusable_elapsed_seconds"
+            ],
+            "minimum_reusable_elapsed_seconds": 10.0,
+        },
+    )
+    assert resealed.returncode == 0, resealed.stderr
+    latest_attestation = json.loads(resealed.stdout)
+
+    recovered = _authority(
+        state,
+        "recover-latest-journal-head",
+        durable_report_attestation,
+    )
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert json.loads(recovered.stdout) == latest_attestation
+
+
+@pytest.mark.parametrize("durable_step", ["ledger", "witness", "head"])
+def test_repository_authority_recovers_interrupted_state_transition(
+    tmp_path: Path, durable_step: str
+) -> None:
+    state = tmp_path / "authority"
+    assert _authority(state, "init").returncode == 0
+
+    interrupted = _authority(
+        state,
+        "start-attempt",
+        {"seed": 123},
+        environment={"GRADOOM_TIME_AUTHORITY_TEST_INTERRUPT_AFTER": durable_step},
+    )
+
+    assert interrupted.returncode == 91
+    reopened = _authority(state, "identity")
+    assert reopened.returncode == 0, reopened.stderr
+    next_attempt = _authority(state, "start-attempt", {"seed": 456})
+    assert next_attempt.returncode == 0, next_attempt.stderr
+    assert json.loads(next_attempt.stdout)["payload"]["seed"] == 456
 
 
 def test_formal_benchmark_binds_repository_authority_state_not_arbitrary_command(
@@ -151,11 +281,14 @@ def test_formal_benchmark_binds_repository_authority_state_not_arbitrary_command
     assert anchor_result.returncode == 0, anchor_result.stderr
     anchor = json.loads(anchor_result.stdout)
     monkeypatch.setenv("GRADOOM_REUSABLE_TIME_AUTHORITY_STATE", str(state))
+    witness = ReusableTimeAuthority.default_witness_directory(state)
+    monkeypatch.setenv("GRADOOM_REUSABLE_TIME_AUTHORITY_WITNESS", str(witness))
     monkeypatch.setenv("GRADOOM_EVIDENCE_AUTHORITY", "/tmp/operator-selected-signer")
 
     assert _validate_elapsed_time_anchors([anchor], training_seeds=[123], fixture=False) == [anchor]
 
     shutil.rmtree(state)
+    shutil.rmtree(witness)
     assert _authority(state, "init").returncode == 0
     with pytest.raises(EvidenceError, match="not rooted in the pinned public authority"):
         _validate_elapsed_time_anchors([anchor], training_seeds=[123], fixture=False)

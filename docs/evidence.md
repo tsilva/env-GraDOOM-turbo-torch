@@ -45,7 +45,10 @@ contains:
   checkpoint, timing, metrics, and evaluation arguments and rejects attempts to override them. The
   command must be one resolved Python interpreter plus one source file; native wrappers, shells,
   `-c`, `eval`/`exec`, dynamic runners, and subprocess indirection are rejected because their full
-  executed-code closure cannot be proven. Relative executables and scripts are resolved from the
+  executed-code closure cannot be proven. Capability-bearing modules use a positive access policy:
+  only the exact configuration and fixture operations needed by the documented trainer are allowed;
+  namespace dictionaries, reflection, computed attributes, container aliases, and equivalent
+  process-replacement paths fail closed. Relative executables and scripts are resolved from the
   manifest directory. The entry point and its
   transitive local Python import closure below the code root are hashed into the recipe identity and
   reverified after the cohort, so same-path helper mutation or mid-cohort replacement fails closed.
@@ -67,7 +70,8 @@ contains:
 - `elapsed_time_anchors`: required for every training seed before a run. Each training seed
   has a pre-attempt Ed25519-signed start record from an independently controlled authority. Fixture
   anchors are pinned to the public fixture key. Formal anchors must match the identity in the
-  persistent state directory named by `GRADOOM_REUSABLE_TIME_AUTHORITY_STATE`; arbitrary signer
+  persistent state directory named by `GRADOOM_REUSABLE_TIME_AUTHORITY_STATE` and the separately
+  retained monotonic witness named by `GRADOOM_REUSABLE_TIME_AUTHORITY_WITNESS`; arbitrary signer
   executables and caller-selected declarations are not accepted. Every terminal or interrupted
   attempt generation receives a second authority signature
   over its status, cumulative elapsed time, generation, predecessor hash, and durable journal hash.
@@ -78,10 +82,17 @@ contains:
   conservative future-charged seal, and repeats only when the signed elapsed floor did not cover the
   completed write. Thus the final durable report contains a signed elapsed value no lower than its
   actual terminal boundary without requiring a journal or report to contain its own digest.
-  The packaged authority maintains a signed append-only event chain plus a separately signed durable
-  high-water head. It verifies registered starts, monotonic journal generations and elapsed floors,
+  The packaged authority maintains a signed append-only event chain plus an independently keyed,
+  separately stored monotonic witness. The witness directory must live on a durability boundary
+  that operators cannot roll back with the authority state snapshot; formal evidence is not honest
+  if both directories can be restored together. It verifies registered starts, monotonic journal
+  generations and elapsed floors,
   chronological bootstrap creation/reuse, latest-head continuity, ledger rollback, and authority
-  identity resets. Signing private keys and ledger state never enter the manifest, report, or
+  identity resets. Ledger, witness, and authority-head transitions are interruption-recoverable: a
+  signed ledger intent is completed deterministically after a stop at either later durable boundary.
+  `benchmark_protocol.time_authority` discloses and binds the authority key, witness key, witness
+  identity, creation time, and witness location into the run identity.
+  Signing private keys and ledger state never enter the manifest, report, or
   benchmark artifact directory. Fixture signing remains pinned separately and claim-ineligible.
 - `parity_certificate`: the current certificate availability and, when unavailable, its reason.
   An unavailable certificate is recorded as a claim-ineligibility reason but does not prevent a
@@ -130,7 +141,11 @@ failed seeds are reused unchanged and are never rerun or replaced. Every attempt
 never-overwritten state-journal generation. Local hashes detect ordinary damage; the independently
 signed journal head prevents an operator from erasing time by rewriting all local JSON and
 recomputing those public hashes. A merge must name the latest on-disk chained generation; formal
-continuation also verifies that head against the authority's external monotonic ledger.
+continuation also verifies that head against the external monotonic witness. If interruption occurs
+after a final same-head reseal but before report replacement, the preceding durable report remains
+recoverable: `--merge` may upgrade it only to the authority's latest attestation for the exact same
+generation, predecessor, journal hash, and status. A different generation or journal remains stale
+and is rejected.
 
 Before every trainer launch, the command writes and periodically refreshes a durable, checksummed
 live-attempt journal. Training and 100-episode evaluation subprocesses both receive forwarded
@@ -157,20 +172,27 @@ fails before additional training work begins.
 
 ### Reusable-time authority operations
 
-Provision formal authority state once on independently controlled persistent storage:
+Provision authority state and its independently retained monotonic witness once. The witness must
+not be included in snapshots or rollback domains containing the authority state:
 
 ```bash
-gradoom-time-authority --state-directory /secure/gradoom-time init
+gradoom-time-authority \
+  --state-directory /secure/gradoom-time \
+  --witness-directory /independent-append-only/gradoom-time-witness \
+  init
 export GRADOOM_REUSABLE_TIME_AUTHORITY_STATE=/secure/gradoom-time
+export GRADOOM_REUSABLE_TIME_AUTHORITY_WITNESS=/independent-append-only/gradoom-time-witness
 ```
 
 `start-attempt` reads `{"seed": 123}` on standard input and returns the signed anchor used in the
 manifest. Bootstrap setup uses `create-bootstrap`, then a later invocation of
 `record-bootstrap-reuse`, and finally `attest-bootstrap-reuse`; each accepts and emits canonical JSON
 on standard input. The evidence command calls the same installed implementation directly for
-journal sealing and latest-head/bootstrap verification. Copying an old ledger under a newer durable
-head is detected as rollback; deleting and reinitializing the directory creates a different public
-identity, so old anchors and attestations are rejected.
+journal sealing and latest-head/bootstrap verification. Copying an old ledger or coherently restoring
+the whole authority-state directory under a newer witness is detected as rollback. The witness also
+prevents silently reinitializing only the state directory. Deleting both trust domains creates a
+different public identity, so old anchors and attestations are rejected, but doing so cannot support
+a continuity claim.
 
 The standalone trainer's `--evaluation-seeds-file` accepts a UTF-8 JSON array of exactly 100 unique
 uint32 game seeds. Its emitted config binds the complete ordered seed list, file hash, stochastic

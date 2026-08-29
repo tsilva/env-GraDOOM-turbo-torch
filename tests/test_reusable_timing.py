@@ -1501,6 +1501,37 @@ def test_public_command_rejects_nonliteral_dynamic_exec_indirection(tmp_path: Pa
     assert "opaque trainer indirection" in result.stderr
 
 
+@pytest.mark.parametrize(
+    "launcher_source",
+    [
+        "import os\nos.__dict__['exec' + 'v']('/tmp/hidden', ['/tmp/hidden'])\n",
+        "import os\nvars(os)['exec' + 'v']('/tmp/hidden', ['/tmp/hidden'])\n",
+        ("import os\ngetattr(os, '__dict__')['exec' + 'v']('/tmp/hidden', ['/tmp/hidden'])\n"),
+        (
+            "import os\nrunners = {'selected': os}\n"
+            "runners['selected'].__dict__['exec' + 'v']('/tmp/hidden', ['/tmp/hidden'])\n"
+        ),
+        ("import os\nglobals()['os'].__dict__['exec' + 'v']('/tmp/hidden', ['/tmp/hidden'])\n"),
+    ],
+)
+def test_public_command_rejects_computed_module_namespace_exec_indirection(
+    tmp_path: Path, launcher_source: str
+) -> None:
+    launcher = tmp_path / "launcher.py"
+    launcher.write_text(launcher_source, encoding="utf-8")
+    manifest = _manifest(
+        tmp_path,
+        outcomes={"10": [30.0, 0.0]},
+        trainer_script=launcher,
+        trainer_code_root=tmp_path,
+    )
+
+    result = _run_evidence("--manifest", str(manifest), "--output", str(tmp_path / "report.json"))
+
+    assert result.returncode == 2
+    assert "opaque trainer indirection" in result.stderr
+
+
 def test_documented_train_python_closure_allows_importlib_resources() -> None:
     repository = Path(__file__).resolve().parents[1]
 

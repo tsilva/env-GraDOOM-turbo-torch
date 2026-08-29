@@ -43,6 +43,7 @@ _EVALUATION_EPISODES = 100
 _FIXTURE_ELAPSED_ANCHOR_PUBLIC_KEY = "MfMyLUkj02xBwQm9sAmRkxh77ZmUIJbkkmokx379DS8="
 _FIXTURE_ELAPSED_ANCHOR_AUTHORITY = "gradoom-fixture-independent-anchor-v1"
 _AUTHORITY_STATE_ENV = "GRADOOM_REUSABLE_TIME_AUTHORITY_STATE"
+_AUTHORITY_WITNESS_ENV = "GRADOOM_REUSABLE_TIME_AUTHORITY_WITNESS"
 _CONTROLLED_ARGUMENTS = {
     "--checkpoint",
     "--checkpoint-every-rollouts",
@@ -72,13 +73,15 @@ _RESTORABLE_STATE = {
 
 def _formal_time_authority() -> ReusableTimeAuthority:
     raw_path = os.environ.get(_AUTHORITY_STATE_ENV)
-    if not raw_path:
+    raw_witness = os.environ.get(_AUTHORITY_WITNESS_ENV)
+    if not raw_path or not raw_witness:
         raise EvidenceError(
-            f"formal benchmark evidence requires {_AUTHORITY_STATE_ENV} to name the "
-            "persistent repository-owned authority state directory"
+            "formal benchmark evidence requires "
+            f"{_AUTHORITY_STATE_ENV} and {_AUTHORITY_WITNESS_ENV} to name the persistent "
+            "repository-owned authority state and independently retained monotonic witness"
         )
     try:
-        return ReusableTimeAuthority(Path(raw_path))
+        return ReusableTimeAuthority(Path(raw_path), Path(raw_witness))
     except TimeAuthorityError as error:
         raise EvidenceError(f"reusable-time authority state is invalid: {error}") from error
 
@@ -202,7 +205,7 @@ def _validated_python_tree(path: Path) -> ast.AST:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     except (OSError, SyntaxError, UnicodeError) as error:
         raise EvidenceError(f"benchmark trainer Python source is unreadable: {path}") from error
-    forbidden_imports = {"ctypes", "multiprocessing", "runpy", "subprocess"}
+    forbidden_imports = {"ctypes", "multiprocessing", "runpy", "subprocess", "sys"}
     forbidden_builtins = {"__import__", "eval", "exec", "compile"}
     forbidden_attributes = {
         "system",
@@ -228,6 +231,12 @@ def _validated_python_tree(path: Path) -> ast.AST:
         "import_module",
         "find_spec",
         "module_from_spec",
+        "__dict__",
+        "__getattribute__",
+        "__class__",
+        "__bases__",
+        "__mro__",
+        "__subclasses__",
     }
 
     def static_string(node: ast.AST) -> str | None:
@@ -240,22 +249,67 @@ def _validated_python_tree(path: Path) -> ast.AST:
                 return left + right
         return None
 
-    dangerous_module_names: set[str] = set()
+    restricted_names: dict[str, str] = {}
     parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 root = alias.name.split(".", 1)[0]
-                if root in {"os", "importlib", *forbidden_imports}:
-                    dangerous_module_names.add(alias.asname or root)
-        elif (
-            isinstance(node, ast.Assign)
-            and isinstance(node.value, ast.Name)
-            and node.value.id in dangerous_module_names
+                bound = alias.asname or root
+                if root == "os":
+                    restricted_names[bound] = "os"
+                elif alias.name == "importlib.resources" and alias.asname:
+                    restricted_names[bound] = "importlib-resources"
+                elif root == "importlib":
+                    restricted_names[bound] = "importlib"
+        elif isinstance(node, ast.ImportFrom):
+            if node.module == "os":
+                for alias in node.names:
+                    if alias.name == "environ":
+                        restricted_names[alias.asname or alias.name] = "os-environ"
+            elif node.module == "importlib" and all(
+                alias.name == "resources" for alias in node.names
+            ):
+                for alias in node.names:
+                    restricted_names[alias.asname or alias.name] = "importlib-resources"
+
+    def permitted_restricted_name(node: ast.Name) -> bool:
+        kind = restricted_names[node.id]
+        parent = parents.get(node)
+        if (
+            kind == "os"
+            and isinstance(parent, ast.Attribute)
+            and parent.value is node
+            and parent.attr in {"_exit", "link"}
         ):
-            dangerous_module_names.update(
-                target.id for target in node.targets if isinstance(target, ast.Name)
-            )
+            grandparent = parents.get(parent)
+            return isinstance(grandparent, ast.Call) and grandparent.func is parent
+        allowed_first_attribute = {
+            "os": "environ",
+            "os-environ": "get",
+            "importlib": "resources",
+            "importlib-resources": "files",
+        }[kind]
+        if (
+            not isinstance(parent, ast.Attribute)
+            or parent.value is not node
+            or parent.attr != allowed_first_attribute
+        ):
+            return False
+        if kind in {"os-environ", "importlib-resources"}:
+            grandparent = parents.get(parent)
+            return isinstance(grandparent, ast.Call) and grandparent.func is parent
+        grandparent = parents.get(parent)
+        final_attribute = "get" if kind == "os" else "files"
+        if (
+            not isinstance(grandparent, ast.Attribute)
+            or grandparent.value is not parent
+            or grandparent.attr != final_attribute
+        ):
+            return False
+        great_grandparent = parents.get(grandparent)
+        return isinstance(great_grandparent, ast.Call) and great_grandparent.func is grandparent
+
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             if any(alias.name.split(".", 1)[0] in forbidden_imports for alias in node.names):
@@ -281,10 +335,18 @@ def _validated_python_tree(path: Path) -> ast.AST:
             if (
                 root_module in forbidden_imports
                 or forbidden_importlib
+                or (root_module == "os" and any(alias.name != "environ" for alias in node.names))
                 or any(alias.name in forbidden_attributes for alias in node.names)
             ):
                 raise EvidenceError("shell, -c, eval, and opaque trainer indirection are forbidden")
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            if node.id in {"globals", "locals", "__builtins__"}:
+                raise EvidenceError("shell, -c, eval, and opaque trainer indirection are forbidden")
+            if node.id in restricted_names and not permitted_restricted_name(node):
+                raise EvidenceError("shell, -c, eval, and opaque trainer indirection are forbidden")
         if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name) and node.func.id == "vars" and not node.args:
+                raise EvidenceError("shell, -c, eval, and opaque trainer indirection are forbidden")
             forbidden_call = (
                 isinstance(node.func, ast.Name) and node.func.id in forbidden_builtins
             ) or (isinstance(node.func, ast.Attribute) and node.func.attr in forbidden_attributes)
@@ -294,8 +356,8 @@ def _validated_python_tree(path: Path) -> ast.AST:
                 and len(node.args) >= 2
             ):
                 attribute = static_string(node.args[1])
-                dangerous_target = (
-                    isinstance(node.args[0], ast.Name) and node.args[0].id in dangerous_module_names
+                dangerous_target = isinstance(node.args[0], ast.Name) and (
+                    node.args[0].id in restricted_names
                 )
                 parent = parents.get(node)
                 dynamic_callable = attribute is None and (
@@ -622,7 +684,8 @@ def _verify_generation_attestation(
     *,
     anchor: dict[str, Any],
     expected_payload: dict[str, Any],
-) -> None:
+    recover_same_head: bool = False,
+) -> dict[str, Any]:
     value = _required_mapping(attestation, "attempt journal authority_attestation")
     if set(value) != {"payload", "signature"} or value.get("payload") != expected_payload:
         raise EvidenceError("attempt journal authority attestation payload mismatch")
@@ -635,12 +698,19 @@ def _verify_generation_attestation(
     except InvalidSignature as error:
         raise EvidenceError("attempt journal authority attestation signature is invalid") from error
     if anchor["payload"]["authority"] != _FIXTURE_ELAPSED_ANCHOR_AUTHORITY:
+        authority = _formal_time_authority()
         try:
-            _formal_time_authority().verify_latest_journal_head(value)
+            authority.verify_latest_journal_head(value)
         except TimeAuthorityError as error:
+            if recover_same_head:
+                try:
+                    return authority.recover_latest_journal_head(value)
+                except TimeAuthorityError:
+                    pass
             raise EvidenceError(
                 f"reusable-time authority rejected the journal head: {error}"
             ) from error
+    return dict(value)
 
 
 def _sign_generation_attestation(
@@ -1215,11 +1285,32 @@ def _load_benchmark_continuation(
             journal_sha256=_sha256_bytes(attempt_journal_bytes),
         )
         attestation_payload["reusable_elapsed_seconds"] = attempt.get("reusable_elapsed_seconds")
-        _verify_generation_attestation(
+        verified_attestation = _verify_generation_attestation(
             attestation,
             anchor=anchor,
             expected_payload=attestation_payload,
+            recover_same_head=True,
         )
+        recovered_payload = verified_attestation["payload"]
+        if recovered_payload != attestation_payload:
+            recovered_elapsed = recovered_payload.get("reusable_elapsed_seconds")
+            if (
+                type(recovered_elapsed) not in (int, float)
+                or not math.isfinite(float(recovered_elapsed))
+                or float(recovered_elapsed) < float(attempt["reusable_elapsed_seconds"])
+            ):
+                raise EvidenceError("recovered authority attestation has invalid elapsed time")
+            attempt["reusable_elapsed_seconds"] = float(recovered_elapsed)
+            recovery = attempt.get("recovery")
+            if isinstance(recovery, dict):
+                recovery["accumulated_reusable_elapsed_seconds"] = float(recovered_elapsed)
+            attempt_journal["authority_attestation"] = verified_attestation
+            attempt["_recovered_terminal_timing"] = {
+                "prior_elapsed": float(recovered_elapsed),
+                "anchor": anchor,
+                "journal_payload": expected_stored,
+                "journal_sha256": _sha256_bytes(attempt_journal_bytes),
+            }
         if stored_attempt != expected_stored or attempt_journal.get("sha256") != _sha256_bytes(
             attempt_journal_bytes
         ):
@@ -2637,15 +2728,19 @@ def build_development_benchmark_report(
         base_directory=manifest_path.parent,
     )
     if not manifest["fixture"]:
-        authority_root = _formal_time_authority().state_directory
-        if (
-            authority_root == artifacts_root
-            or authority_root.is_relative_to(artifacts_root)
-            or artifacts_root.is_relative_to(authority_root)
+        authority = _formal_time_authority()
+        for authority_root, label in (
+            (authority.state_directory, "state"),
+            (authority.witness_directory, "monotonic witness"),
         ):
-            raise EvidenceError(
-                "formal reusable-time authority state must not overlap benchmark artifacts"
-            )
+            if (
+                authority_root == artifacts_root
+                or authority_root.is_relative_to(artifacts_root)
+                or artifacts_root.is_relative_to(authority_root)
+            ):
+                raise EvidenceError(
+                    f"formal reusable-time authority {label} must not overlap benchmark artifacts"
+                )
     bootstrap_exclusions = _validate_bootstrap_files(
         validated["bootstrap_artifacts"],
         base_directory=manifest_path.parent,
@@ -2758,6 +2853,16 @@ def build_development_benchmark_report(
             for artifact in bootstrap_exclusions
         ],
         "elapsed_time_anchors": validated["elapsed_time_anchors"],
+        "time_authority": (
+            {
+                "authority": _FIXTURE_ELAPSED_ANCHOR_AUTHORITY,
+                "public_key": _FIXTURE_ELAPSED_ANCHOR_PUBLIC_KEY,
+                "monotonic_witness": None,
+                "claim_eligible": False,
+            }
+            if manifest["fixture"]
+            else dict(_formal_time_authority().identity)
+        ),
     }
     protocol["continuation_identity"] = {
         "schema_sha256": _canonical_sha256(
@@ -2865,6 +2970,12 @@ def build_development_benchmark_report(
             started=(clock() - recurring_setup_elapsed if active_attempt else None),
             clock=clock,
         )
+        recovered_terminal_timing = attempt.pop("_recovered_terminal_timing", None)
+        if isinstance(recovered_terminal_timing, dict):
+            attempt["_terminal_timing"] = {
+                **recovered_terminal_timing,
+                "started": invocation_started,
+            }
         actual_generated_artifacts.extend(attempt.pop("generated_artifacts", []))
         attempts.append(attempt)
     generated_artifacts: list[dict[str, str]] = list(
