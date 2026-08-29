@@ -6,6 +6,7 @@ import binascii
 import json
 import math
 import os
+import shlex
 import shutil
 import signal
 import stat
@@ -17,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 
 from .report import (
     EvidenceError,
@@ -70,8 +71,14 @@ _RESTORABLE_STATE = {
 }
 
 
-def _attempt_journal_payload(attempt: dict[str, Any], *, run_identity: str) -> dict[str, Any]:
-    return {
+def _attempt_journal_payload(
+    attempt: dict[str, Any],
+    *,
+    run_identity: str,
+    generation: int | None = None,
+    previous_journal_sha256: str | None = None,
+) -> dict[str, Any]:
+    payload = {
         "schema_version": 1,
         "run_identity": run_identity,
         "attempt_identity": attempt.get("attempt_identity"),
@@ -98,6 +105,10 @@ def _attempt_journal_payload(attempt: dict[str, Any], *, run_identity: str) -> d
             document="benchmark attempt recovery",
         ),
     }
+    if generation is not None:
+        payload["generation"] = generation
+        payload["previous_journal_sha256"] = previous_journal_sha256
+    return payload
 
 
 def _required_mapping(value: object, field: str) -> dict[str, Any]:
@@ -201,11 +212,13 @@ def _python_source_closure(script_path: Path, code_root: Path) -> list[Path]:
         tree = _validated_python_tree(path)
         modules: set[str] = set()
         relative_modules: list[tuple[int, str]] = []
+        imported_members: list[tuple[str, str]] = []
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 modules.update(alias.name for alias in node.names)
             elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
                 modules.add(node.module)
+                imported_members.extend((node.module, alias.name) for alias in node.names)
             elif isinstance(node, ast.ImportFrom) and node.level > 0:
                 relative_modules.extend(
                     (node.level, module)
@@ -226,6 +239,18 @@ def _python_source_closure(script_path: Path, code_root: Path) -> list[Path]:
             if resolved is None:
                 continue
             pending.append(resolved)
+        for module, member in imported_members:
+            parts = [*module.split("."), *member.split(".")]
+            candidates = (
+                code_root.joinpath(*parts).with_suffix(".py"),
+                code_root.joinpath(*parts, "__init__.py"),
+                code_root.joinpath("src", *parts).with_suffix(".py"),
+                code_root.joinpath("src", *parts, "__init__.py"),
+                path.parent.joinpath(*parts).with_suffix(".py"),
+            )
+            resolved = next((candidate for candidate in candidates if candidate.is_file()), None)
+            if resolved is not None:
+                pending.append(resolved)
         for level, module in relative_modules:
             base = path.parent
             for _ in range(level - 1):
@@ -248,20 +273,27 @@ def _bind_trainer_files(
     base_directory: Path,
 ) -> dict[str, Any]:
     command = trainer["command"]
-    executable = shutil.which(command[0])
-    if executable is None:
-        candidate = _resolve_evidence_path(Path(command[0]), base_directory=base_directory)
-        executable_path = candidate
+    raw_executable = Path(command[0])
+    if raw_executable.is_absolute() or raw_executable.parent != Path("."):
+        executable_path = _resolve_evidence_path(raw_executable, base_directory=base_directory)
     else:
-        executable_path = Path(executable).resolve()
+        executable = shutil.which(command[0])
+        executable_path = (
+            _resolve_evidence_path(raw_executable, base_directory=base_directory)
+            if executable is None
+            else Path(executable).resolve()
+        )
     executable_name = executable_path.name.lower()
     if executable_name in {"sh", "bash", "dash", "zsh", "fish", "cmd", "powershell", "pwsh"}:
         raise EvidenceError("shell, -c, eval, and opaque trainer indirection are forbidden")
     is_python = executable_name.startswith(("python", "pypy"))
     if is_python and (len(command) != 2 or command[1].startswith("-")):
         raise EvidenceError("shell, -c, eval, and opaque trainer indirection are forbidden")
-    if not is_python and len(command) != 1:
-        raise EvidenceError("benchmark trainer executable commands cannot use opaque indirection")
+    if not is_python:
+        raise EvidenceError(
+            "non-Python trainer wrappers are ineligible because their executed-code closure "
+            "cannot be proven"
+        )
     bound_files = [
         {
             "role": "executable",
@@ -295,7 +327,15 @@ def _bind_trainer_files(
         resolved_root: str | None = str(code_root)
     else:
         resolved_root = None
-    return {**trainer, "code_root": resolved_root, "bound_files": bound_files}
+    bound_command = [str(executable_path)]
+    if is_python:
+        bound_command.append(str(script_path))
+    return {
+        **trainer,
+        "command": bound_command,
+        "code_root": resolved_root,
+        "bound_files": bound_files,
+    }
 
 
 def _reverify_trainer_files(trainer: dict[str, Any]) -> None:
@@ -348,7 +388,9 @@ def _validate_elapsed_time_anchors(
     fixture: bool,
 ) -> list[dict[str, Any]]:
     if value is None:
-        return []
+        raise EvidenceError(
+            "benchmark.elapsed_time_anchors are required for every externally anchored outcome"
+        )
     if not isinstance(value, list):
         raise EvidenceError("benchmark.elapsed_time_anchors must be an array")
     anchors: list[dict[str, Any]] = []
@@ -410,11 +452,104 @@ def _signed_elapsed_floor(anchor: dict[str, Any], checkpoint: Path) -> float:
     )
 
 
+def _attestation_bytes(payload: dict[str, Any]) -> bytes:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+
+
+def _verify_generation_attestation(
+    attestation: object,
+    *,
+    anchor: dict[str, Any],
+    expected_payload: dict[str, Any],
+) -> None:
+    value = _required_mapping(attestation, "attempt journal authority_attestation")
+    if set(value) != {"payload", "signature"} or value.get("payload") != expected_payload:
+        raise EvidenceError("attempt journal authority attestation payload mismatch")
+    public_key = _decode_base64(anchor["public_key"], "elapsed anchor public key", length=32)
+    signature = _decode_base64(value.get("signature"), "authority attestation signature", length=64)
+    try:
+        Ed25519PublicKey.from_public_bytes(public_key).verify(
+            signature, _attestation_bytes(expected_payload)
+        )
+    except InvalidSignature as error:
+        raise EvidenceError("attempt journal authority attestation signature is invalid") from error
+    if anchor["payload"]["authority"] != _FIXTURE_ELAPSED_ANCHOR_AUTHORITY:
+        raw_command = os.environ.get("GRADOOM_EVIDENCE_AUTHORITY")
+        if not raw_command:
+            raise EvidenceError(
+                "formal benchmark continuation requires GRADOOM_EVIDENCE_AUTHORITY to "
+                "verify the externally maintained latest journal head"
+            )
+        result = subprocess.run(
+            [*shlex.split(raw_command), "verify-latest-journal-head"],
+            input=json.dumps(value, sort_keys=True, separators=(",", ":")),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0 or result.stdout.strip() != "latest":
+            raise EvidenceError("external evidence authority rejected a stale journal head")
+
+
+def _sign_generation_attestation(
+    payload: dict[str, Any],
+    *,
+    anchor: dict[str, Any],
+) -> dict[str, Any]:
+    authority = anchor["payload"]["authority"]
+    if authority == _FIXTURE_ELAPSED_ANCHOR_AUTHORITY:
+        private_key = Ed25519PrivateKey.from_private_bytes(b"\x19" * 32)
+        signature = private_key.sign(_attestation_bytes(payload))
+    else:
+        raw_command = os.environ.get("GRADOOM_EVIDENCE_AUTHORITY")
+        if not raw_command:
+            raise EvidenceError(
+                "formal benchmark outcomes require GRADOOM_EVIDENCE_AUTHORITY to obtain "
+                "an externally maintained signed journal head"
+            )
+        result = subprocess.run(
+            [*shlex.split(raw_command), "sign-journal-head"],
+            input=json.dumps(payload, sort_keys=True, separators=(",", ":")),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise EvidenceError("external evidence authority refused the journal generation")
+        signature = _decode_base64(result.stdout.strip(), "authority signature", length=64)
+    attestation = {
+        "payload": payload,
+        "signature": base64.b64encode(signature).decode(),
+    }
+    _verify_generation_attestation(attestation, anchor=anchor, expected_payload=payload)
+    return attestation
+
+
+def _journal_attestation_payload(
+    journal_payload: dict[str, Any],
+    *,
+    anchor: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "authority": anchor["payload"]["authority"],
+        "seed": journal_payload["seed"],
+        "started_unix_ns": anchor["payload"]["started_unix_ns"],
+        "generation": journal_payload["generation"],
+        "previous_journal_sha256": journal_payload["previous_journal_sha256"],
+        "journal_payload_sha256": _canonical_sha256(
+            journal_payload, document="unsigned benchmark attempt journal"
+        ),
+        "status": journal_payload["status"],
+        "reusable_elapsed_seconds": journal_payload["reusable_elapsed_seconds"],
+    }
+
+
 _BOOTSTRAP_CONTRACT = "gradoom-declarative-bootstrap-v1"
 _BOOTSTRAP_PROTOCOL = "canonical-declared-input-binding-v1"
 
 
-def _validate_bootstrap_artifacts(value: object) -> list[dict[str, Any]]:
+def _validate_bootstrap_artifacts(value: object, *, fixture: bool) -> list[dict[str, Any]]:
     if value is None:
         return []
     if not isinstance(value, list):
@@ -436,6 +571,7 @@ def _validate_bootstrap_artifacts(value: object) -> list[dict[str, Any]]:
             "persistent",
             "run_independent",
             "reused_unchanged",
+            "eligibility_attestation",
         }
         undeclared_fields = sorted(set(artifact) - expected_fields)
         if undeclared_fields:
@@ -493,6 +629,58 @@ def _validate_bootstrap_artifacts(value: object) -> list[dict[str, Any]]:
         for required_true in ("persistent", "run_independent", "reused_unchanged"):
             if artifact.get(required_true) is not True:
                 raise EvidenceError(f"{field}.{required_true} must be true for excluded work")
+        if normalized_inputs != [
+            {"name": "compiler-target", "sha256": normalized_inputs[0]["sha256"]}
+        ]:
+            raise EvidenceError(
+                f"{field}.immutable_inputs must use the constrained compiler-target protocol"
+            )
+        canonical_reuse = [
+            "exact compiler and target identity",
+            "read-only bytes reused without transformation",
+        ]
+        if reuse_conditions != canonical_reuse:
+            raise EvidenceError(f"{field}.reuse_conditions are not the canonical protocol")
+        attestation = _required_mapping(
+            artifact.get("eligibility_attestation"), f"{field}.eligibility_attestation"
+        )
+        if set(attestation) != {"payload", "public_key", "signature"}:
+            raise EvidenceError(f"{field}.eligibility_attestation has an unsupported contract")
+        expected_authority = (
+            _FIXTURE_ELAPSED_ANCHOR_AUTHORITY if fixture else _ELAPSED_ANCHOR_AUTHORITY
+        )
+        expected_public_key = (
+            _FIXTURE_ELAPSED_ANCHOR_PUBLIC_KEY if fixture else _ELAPSED_ANCHOR_PUBLIC_KEY
+        )
+        expected_attestation_payload = {
+            "schema_version": 1,
+            "authority": expected_authority,
+            "artifact_name": name,
+            "artifact_sha256": sha256,
+            "creation_elapsed_seconds": float(creation_elapsed),
+            "creation_protocol": creation_protocol,
+            "immutable_inputs": normalized_inputs,
+            "reuse_conditions": reuse_conditions,
+        }
+        if (
+            attestation.get("payload") != expected_attestation_payload
+            or attestation.get("public_key") != expected_public_key
+        ):
+            raise EvidenceError(f"{field}.eligibility_attestation does not bind canonical claims")
+        public_key = _decode_base64(
+            attestation["public_key"], f"{field}.eligibility_attestation.public_key", length=32
+        )
+        signature = _decode_base64(
+            attestation.get("signature"),
+            f"{field}.eligibility_attestation.signature",
+            length=64,
+        )
+        try:
+            Ed25519PublicKey.from_public_bytes(public_key).verify(
+                signature, _attestation_bytes(expected_attestation_payload)
+            )
+        except InvalidSignature as error:
+            raise EvidenceError(f"{field}.eligibility_attestation signature is invalid") from error
         artifacts.append(
             {
                 "name": name,
@@ -506,6 +694,7 @@ def _validate_bootstrap_artifacts(value: object) -> list[dict[str, Any]]:
                 "persistent": True,
                 "run_independent": True,
                 "reused_unchanged": True,
+                "eligibility_attestation": dict(attestation),
             }
         )
     return artifacts
@@ -520,6 +709,7 @@ def _validate_bootstrap_files(
 ) -> list[dict[str, Any]]:
     validated: list[dict[str, Any]] = []
     declared_by_name = {item["name"]: item["sha256"] for item in declared_inputs}
+    declared_paths = {item["name"]: item["path"] for item in declared_inputs}
     for declaration in declarations:
         path = _resolve_evidence_path(Path(declaration["path"]), base_directory=base_directory)
         if path == artifacts_root or path.is_relative_to(artifacts_root):
@@ -551,6 +741,38 @@ def _validate_bootstrap_files(
                 raise EvidenceError(
                     f"bootstrap artifact {declaration['name']!r} references an undeclared or "
                     "mismatched immutable input"
+                )
+            input_path = _resolve_evidence_path(
+                Path(declared_paths[immutable_input["name"]]), base_directory=base_directory
+            )
+            try:
+                compiler_target = _parse_json_document(
+                    input_path.read_bytes(), document="canonical bootstrap compiler target"
+                )
+            except OSError as error:
+                raise EvidenceError("canonical bootstrap compiler target is unreadable") from error
+            if (
+                not isinstance(compiler_target, dict)
+                or not set(compiler_target)
+                <= {
+                    "target",
+                    "compiler",
+                    "compiler_version",
+                    "flags",
+                    "source_sha256",
+                }
+                or "target" not in compiler_target
+            ):
+                raise EvidenceError(
+                    "canonical bootstrap compiler-target input has unsupported fields"
+                )
+            serialized_target = json.dumps(compiler_target, sort_keys=True).lower()
+            if any(
+                forbidden in serialized_target
+                for forbidden in ("seed", "candidate", "policy", "optimizer", "rollout", "learned")
+            ):
+                raise EvidenceError(
+                    "canonical bootstrap compiler-target contains run-specific or learned state"
                 )
         expected_payload = (
             json.dumps(
@@ -723,9 +945,55 @@ def _load_benchmark_continuation(
             )
         except OSError as error:
             raise EvidenceError("benchmark attempt journal is missing") from error
-        if stored_attempt != _attempt_journal_payload(
-            attempt, run_identity=run_identity
-        ) or attempt_journal.get("sha256") != _sha256_bytes(attempt_journal_bytes):
+        if not isinstance(stored_attempt, dict):
+            raise EvidenceError("benchmark attempt journal must be an object")
+        raw_generation = stored_attempt.get("generation")
+        if type(raw_generation) is not int or raw_generation < 0:
+            raise EvidenceError("benchmark attempt journal generation is invalid")
+        latest_generation = (
+            _next_append_only_generation(
+                attempt_journal_path.parent, "attempt-state-*.json", "attempt-state-"
+            )
+            - 1
+        )
+        if raw_generation != latest_generation:
+            raise EvidenceError("stale attempt journal generation cannot be replayed")
+        previous_sha256 = stored_attempt.get("previous_journal_sha256")
+        if raw_generation == 0:
+            if previous_sha256 is not None:
+                raise EvidenceError("initial attempt journal has an invalid predecessor")
+        else:
+            previous_path = attempt_journal_path.parent / f"attempt-state-{raw_generation - 1}.json"
+            if (
+                _fsync_file(previous_path, field="previous benchmark attempt journal")
+                != previous_sha256
+            ):
+                raise EvidenceError("attempt journal generation continuity is broken")
+        attestation = stored_attempt.pop("authority_attestation", None)
+        expected_stored = _attempt_journal_payload(
+            attempt,
+            run_identity=run_identity,
+            generation=raw_generation,
+            previous_journal_sha256=previous_sha256,
+        )
+        anchor = next(
+            (
+                item
+                for item in protocol["elapsed_time_anchors"]
+                if item["payload"]["seed"] == attempt["seed"]
+            ),
+            None,
+        )
+        if anchor is None:
+            raise EvidenceError("benchmark attempt outcome has no external time authority")
+        _verify_generation_attestation(
+            attestation,
+            anchor=anchor,
+            expected_payload=_journal_attestation_payload(expected_stored, anchor=anchor),
+        )
+        if stored_attempt != expected_stored or attempt_journal.get("sha256") != _sha256_bytes(
+            attempt_journal_bytes
+        ):
             raise EvidenceError("attempt journal does not match completed unit")
         if attempt["status"] == "interrupted":
             recovery = attempt.get("recovery")
@@ -817,7 +1085,9 @@ def _validate_benchmark(manifest: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(artifacts_directory, str) or not artifacts_directory.strip():
         raise EvidenceError("benchmark.artifacts_directory must be a non-whitespace path")
     certificate = _validate_certificate(benchmark.get("parity_certificate"))
-    bootstrap_artifacts = _validate_bootstrap_artifacts(benchmark.get("bootstrap_artifacts"))
+    bootstrap_artifacts = _validate_bootstrap_artifacts(
+        benchmark.get("bootstrap_artifacts"), fixture=manifest["fixture"]
+    )
     elapsed_time_anchors = _validate_elapsed_time_anchors(
         benchmark.get("elapsed_time_anchors"),
         training_seeds=training_seeds,
@@ -1083,12 +1353,16 @@ def _run_process(
             stderr=f"cannot execute benchmark process {command[0]!r}: {error}",
         )
     previous_handlers: dict[int, Any] = {}
+    forwarded_signal: int | None = None
 
     def persist_before_termination(signum: int, _frame: Any) -> None:
+        nonlocal forwarded_signal
+        if forwarded_signal is not None:
+            return
+        forwarded_signal = signum
         if heartbeat is not None:
             heartbeat()
-        signal.signal(signum, signal.SIG_DFL)
-        os.kill(os.getpid(), signum)
+        process.send_signal(signum)
 
     try:
         if heartbeat is not None:
@@ -1097,7 +1371,7 @@ def _run_process(
         stdout, stderr = process.communicate()
         if heartbeat is not None:
             heartbeat()
-        return subprocess.CompletedProcess(
+        completed = subprocess.CompletedProcess(
             command,
             process.returncode,
             stdout=stdout,
@@ -1106,6 +1380,11 @@ def _run_process(
     finally:
         for signum, handler in previous_handlers.items():
             signal.signal(signum, handler)
+    if forwarded_signal is not None:
+        signal.signal(forwarded_signal, signal.SIG_DFL)
+        os.kill(os.getpid(), forwarded_signal)
+        raise AssertionError("termination signal did not terminate evidence parent")
+    return completed
 
 
 def _fsync_file(path: Path, *, field: str) -> str:
@@ -1796,14 +2075,28 @@ def _run_attempt(
         "attempt-state-",
     )
     attempt_journal_path = attempt_directory / (f"attempt-state-{attempt_journal_generation}.json")
-    attempt_journal_path.write_text(
-        json.dumps(
-            _attempt_journal_payload(attempt, run_identity=run_identity),
-            sort_keys=True,
-            separators=(",", ":"),
+    previous_journal_sha256 = None
+    if attempt_journal_generation:
+        previous_journal_sha256 = _fsync_file(
+            attempt_directory / f"attempt-state-{attempt_journal_generation - 1}.json",
+            field="previous benchmark attempt journal",
         )
-        + "\n",
-        encoding="utf-8",
+    attempt_journal_payload = _attempt_journal_payload(
+        attempt,
+        run_identity=run_identity,
+        generation=attempt_journal_generation,
+        previous_journal_sha256=previous_journal_sha256,
+    )
+    if elapsed_time_anchor is None:
+        raise EvidenceError("benchmark attempt outcome has no external time authority")
+    attempt_journal_payload["authority_attestation"] = _sign_generation_attestation(
+        _journal_attestation_payload(attempt_journal_payload, anchor=elapsed_time_anchor),
+        anchor=elapsed_time_anchor,
+    )
+    _write_durable_json(
+        attempt_journal_path,
+        attempt_journal_payload,
+        field="benchmark attempt journal",
     )
     attempt_journal_sha256 = _fsync_file(
         attempt_journal_path,

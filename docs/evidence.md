@@ -43,28 +43,32 @@ contains:
   and fixed recipe,
   asset, and runtime arguments. The evidence command owns all seed, initialization, resume,
   checkpoint, timing, metrics, and evaluation arguments and rejects attempts to override them. The
-  command is either one executable or one Python interpreter plus one source file; shells, `-c`,
-  `eval`/`exec`, dynamic runners, and subprocess indirection are rejected. The entry point and its
+  command must be one resolved Python interpreter plus one source file; native wrappers, shells,
+  `-c`, `eval`/`exec`, dynamic runners, and subprocess indirection are rejected because their full
+  executed-code closure cannot be proven. Relative executables and scripts are resolved from the
+  manifest directory. The entry point and its
   transitive local Python import closure below the code root are hashed into the recipe identity and
   reverified after the cohort, so same-path helper mutation or mid-cohort replacement fails closed.
 - `artifacts_directory`: the directory under which the run-identity and per-seed artifacts are
   durably retained.
 - `bootstrap_artifacts`: optional one-time exclusions declared before the cohort. Every entry names
   a persistent read-only regular file outside the benchmark artifact directory, its SHA-256,
-  creation elapsed seconds, exact reuse conditions, and true
-  `persistent`/`run_independent`/`reused_unchanged` assertions. Eligible bytes use only the
-  `gradoom-declarative-bootstrap-v1` canonical JSON contract: a fixed protocol plus sorted names and
-  hashes of already verified `declared_inputs`. No opaque payload or self-authored receipt is
-  accepted, so the artifact structurally has nowhere to store learned, optimizer, rollout, seed, or
-  candidate state. Missing, writable, linked, changed, non-canonical, undeclared-input, or opaque
-  artifacts are rejected.
-- `elapsed_time_anchors`: optional for a cold run and mandatory before recovery. Each training seed
+  creation elapsed seconds, and exact canonical reuse conditions. Eligibility is not established by
+  those operator-authored fields: a pinned external authority must sign the artifact hash, creation
+  cost, canonical protocol, constrained `compiler-target` input, and reuse conditions. Eligible
+  bytes use only the `gradoom-declarative-bootstrap-v1` canonical JSON contract. Compiler-target
+  inputs reject seed, candidate, policy, optimizer, rollout, and learned state, and opaque outputs
+  remain ineligible. Files are verified before and after the cohort.
+- `elapsed_time_anchors`: required for every training seed before a run. Each training seed
   has a pre-attempt Ed25519-signed start record from an independently controlled authority. Fixture
   anchors are pinned to the public fixture key and real anchors are pinned to the
   `gradoom-reusable-time-authority-v1` package key; caller-selected keys and authorities are
-  rejected. Signing private keys never enter the manifest, report, artifact directory, or package.
-  The signed start and checkpoint inode change time impose a minimum accumulated elapsed floor that
-  consistently rewritten report/journal/index JSON cannot reduce.
+  rejected. Every terminal or interrupted attempt generation receives a second authority signature
+  over its status, cumulative elapsed time, generation, predecessor hash, and journal payload hash.
+  For formal evidence, `GRADOOM_EVIDENCE_AUTHORITY` identifies the independently controlled signer;
+  it enforces wall-clock floors and an external monotonic latest-head ledger, and continuation asks
+  it to reject rollback. Signing private keys and ledger state never enter the manifest, report, or
+  benchmark artifact directory. Fixture signing is pinned separately and remains claim-ineligible.
 - `parity_certificate`: the current certificate availability and, when unavailable, its reason.
   An unavailable certificate is recorded as a claim-ineligibility reason but does not prevent a
   development run.
@@ -108,8 +112,9 @@ and accumulated reusable elapsed time. A later `--merge` resumes the same attemp
 time to the journaled elapsed time, and preserves the original cold-start identity. Completed and
 failed seeds are reused unchanged and are never rerun or replaced. Every attempt also has a durable,
 never-overwritten state-journal generation. Local hashes detect ordinary damage; the independently
-signed elapsed floor prevents an operator from erasing time by rewriting all local JSON and
-recomputing those public hashes.
+signed journal head prevents an operator from erasing time by rewriting all local JSON and
+recomputing those public hashes. A merge must name the latest on-disk chained generation; formal
+continuation also verifies that head against the authority's external monotonic ledger.
 
 Before every trainer launch, the command writes and periodically refreshes a durable, checksummed
 live-attempt journal. If the public command itself is interrupted before it can write a report, a
@@ -119,8 +124,11 @@ requiring a missing report. A crash that produces no complete recovery checkpoin
 The real environment exposes a deterministic live-snapshot codec. Evidence checkpoints retain and
 restore every direct environment and engine tensor, host reset RNG state, current observation and
 context, episode start/done flags, in-progress returns and lengths, stable lane identities, reward
-shaper state, policy, optimizer, and Python/NumPy/Torch/CUDA RNG states. Resume validation requires
-that complete inventory before the public command may advertise the interruption as restorable.
+shaper state, policy, optimizer, AMP GradScaler state, original encoder-anchor targets, and
+Python/NumPy/Torch/CUDA RNG states. Live restoration requires the exact saved lane count; an ordinary
+non-evidence resume with a different environment count uses the documented lane-migration reset
+path. Resume validation requires that complete inventory before the public command may advertise
+the interruption as restorable.
 
 `benchmark_protocol.continuation_identity` separately hashes the exact schema/trainer contract,
 recipe, assets and bootstrap bytes, training/evaluation seeds, and timer phases/boundaries. Any
