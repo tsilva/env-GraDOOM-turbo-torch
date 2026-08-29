@@ -124,6 +124,12 @@ def test_development_benchmark_defaults_to_one_cold_seed_and_stops_at_first_pass
     }
     assert report["benchmark_protocol"]["evaluation_episode_seeds"] == EVALUATION_SEEDS
     assert report["benchmark_protocol"]["evaluation_action_seed"] == 123
+    assert report["benchmark_protocol"]["time_authority"] == {
+        "authority": "gradoom-fixture-independent-anchor-v1",
+        "public_key": "MfMyLUkj02xBwQm9sAmRkxh77ZmUIJbkkmokx379DS8=",
+        "monotonic_witness": None,
+        "claim_eligible": False,
+    }
     assert report["benchmark_protocol"]["timer_includes"] == [
         "command_parsing",
         "manifest_and_configuration_validation",

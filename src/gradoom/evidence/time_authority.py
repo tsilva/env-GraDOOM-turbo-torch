@@ -74,14 +74,34 @@ def _verify_signature(public_key: Ed25519PublicKey, signature: object, payload: 
 class ReusableTimeAuthority:
     """Repository-owned persistent authority for reusable-time and bootstrap history."""
 
-    def __init__(self, state_directory: Path) -> None:
+    def __init__(self, state_directory: Path, witness_directory: Path | None = None) -> None:
         self.state_directory = state_directory.resolve()
+        self.witness_directory = (
+            witness_directory.resolve()
+            if witness_directory is not None
+            else self.default_witness_directory(self.state_directory)
+        )
+        if (
+            self.witness_directory == self.state_directory
+            or self.witness_directory.is_relative_to(self.state_directory)
+            or self.state_directory.is_relative_to(self.witness_directory)
+        ):
+            raise TimeAuthorityError(
+                "authority witness must use an independent directory outside authority state"
+            )
         try:
             state_mode = self.state_directory.stat().st_mode
             private_mode = (self.state_directory / "private-key.json").stat().st_mode
+            witness_mode = self.witness_directory.stat().st_mode
+            witness_private_mode = (self.witness_directory / "private-key.json").stat().st_mode
         except OSError as error:
             raise TimeAuthorityError("authority state permissions cannot be inspected") from error
-        if state_mode & 0o022 or private_mode & 0o077:
+        if (
+            state_mode & 0o022
+            or private_mode & 0o077
+            or witness_mode & 0o022
+            or witness_private_mode & 0o077
+        ):
             raise TimeAuthorityError("authority state or private key permissions are unsafe")
         identity = _read_json(self.state_directory / "identity.json", "authority identity")
         private_document = _read_json(
@@ -92,6 +112,9 @@ class ReusableTimeAuthority:
             "authority",
             "public_key",
             "created_unix_ns",
+            "witness",
+            "witness_public_key",
+            "witness_directory",
         }:
             raise TimeAuthorityError("authority identity has an unsupported schema")
         if identity.get("schema_version") != 1:
@@ -111,17 +134,81 @@ class ReusableTimeAuthority:
         expected_name = f"gradoom-reusable-time-authority-v1:{_sha256(public_bytes)[:32]}"
         if identity["authority"] != expected_name:
             raise TimeAuthorityError("authority identity does not match its public key")
+        if identity["witness_directory"] != str(self.witness_directory):
+            raise TimeAuthorityError("authority witness directory does not match its identity")
+        witness_identity = _read_json(
+            self.witness_directory / "identity.json", "authority monotonic witness identity"
+        )
+        witness_private_document = _read_json(
+            self.witness_directory / "private-key.json",
+            "authority monotonic witness private key",
+        )
+        if not isinstance(witness_identity, dict) or set(witness_identity) != {
+            "schema_version",
+            "witness",
+            "public_key",
+            "created_unix_ns",
+        }:
+            raise TimeAuthorityError("authority monotonic witness has an unsupported schema")
+        try:
+            witness_public_bytes = base64.b64decode(witness_identity["public_key"], validate=True)
+            witness_private_bytes = base64.b64decode(
+                witness_private_document["private_key"], validate=True
+            )
+            self.witness_public_key = Ed25519PublicKey.from_public_bytes(witness_public_bytes)
+            self.witness_private_key = Ed25519PrivateKey.from_private_bytes(witness_private_bytes)
+        except (KeyError, TypeError, ValueError) as error:
+            raise TimeAuthorityError(
+                "authority monotonic witness key material is invalid"
+            ) from error
+        derived_witness_public = self.witness_private_key.public_key().public_bytes(
+            serialization.Encoding.Raw, serialization.PublicFormat.Raw
+        )
+        expected_witness = f"gradoom-monotonic-witness-v1:{_sha256(witness_public_bytes)[:32]}"
+        if (
+            derived_witness_public != witness_public_bytes
+            or witness_identity["witness"] != expected_witness
+            or identity["witness"] != expected_witness
+            or identity["witness_public_key"] != witness_identity["public_key"]
+        ):
+            raise TimeAuthorityError("authority monotonic witness identity is invalid")
         self.identity = identity
+        self.witness_identity = witness_identity
         self.ledger = self._validated_ledger()
 
-    @classmethod
-    def initialize(cls, state_directory: Path) -> ReusableTimeAuthority:
+    @staticmethod
+    def default_witness_directory(state_directory: Path) -> Path:
         state_directory = state_directory.resolve()
+        return state_directory.parent / f".{state_directory.name}.monotonic-witness"
+
+    @classmethod
+    def initialize(
+        cls, state_directory: Path, witness_directory: Path | None = None
+    ) -> ReusableTimeAuthority:
+        state_directory = state_directory.resolve()
+        witness_directory = (
+            witness_directory.resolve()
+            if witness_directory is not None
+            else cls.default_witness_directory(state_directory)
+        )
+        if (
+            witness_directory == state_directory
+            or witness_directory.is_relative_to(state_directory)
+            or state_directory.is_relative_to(witness_directory)
+        ):
+            raise TimeAuthorityError(
+                "authority witness must use an independent directory outside authority state"
+            )
         if state_directory.exists() and any(state_directory.iterdir()):
             raise TimeAuthorityError("authority state directory is not empty")
+        if witness_directory.exists() and any(witness_directory.iterdir()):
+            raise TimeAuthorityError("authority monotonic witness directory is not empty")
         state_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         state_directory.chmod(0o700)
+        witness_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        witness_directory.chmod(0o700)
         private_key = Ed25519PrivateKey.generate()
+        witness_private_key = Ed25519PrivateKey.generate()
         private_bytes = private_key.private_bytes(
             serialization.Encoding.Raw,
             serialization.PrivateFormat.Raw,
@@ -130,12 +217,37 @@ class ReusableTimeAuthority:
         public_bytes = private_key.public_key().public_bytes(
             serialization.Encoding.Raw, serialization.PublicFormat.Raw
         )
+        witness_private_bytes = witness_private_key.private_bytes(
+            serialization.Encoding.Raw,
+            serialization.PrivateFormat.Raw,
+            serialization.NoEncryption(),
+        )
+        witness_public_bytes = witness_private_key.public_key().public_bytes(
+            serialization.Encoding.Raw, serialization.PublicFormat.Raw
+        )
+        witness_identity = {
+            "schema_version": 1,
+            "witness": f"gradoom-monotonic-witness-v1:{_sha256(witness_public_bytes)[:32]}",
+            "public_key": base64.b64encode(witness_public_bytes).decode(),
+            "created_unix_ns": time.time_ns(),
+        }
         identity = {
             "schema_version": 1,
             "authority": f"gradoom-reusable-time-authority-v1:{_sha256(public_bytes)[:32]}",
             "public_key": base64.b64encode(public_bytes).decode(),
             "created_unix_ns": time.time_ns(),
+            "witness": witness_identity["witness"],
+            "witness_public_key": witness_identity["public_key"],
+            "witness_directory": str(witness_directory),
         }
+        _atomic_json(
+            witness_directory / "private-key.json",
+            {
+                "schema_version": 1,
+                "private_key": base64.b64encode(witness_private_bytes).decode(),
+            },
+        )
+        _atomic_json(witness_directory / "identity.json", witness_identity)
         _atomic_json(
             state_directory / "private-key.json",
             {
@@ -155,7 +267,21 @@ class ReusableTimeAuthority:
             state_directory / "head.json",
             {"payload": empty_head, "signature": _signature(private_key, empty_head)},
         )
-        return cls(state_directory)
+        empty_witness_head = {
+            "schema_version": 1,
+            "witness": witness_identity["witness"],
+            "authority": identity["authority"],
+            "sequence": 0,
+            "event_sha256": None,
+        }
+        _atomic_json(
+            witness_directory / "head.json",
+            {
+                "payload": empty_witness_head,
+                "signature": _signature(witness_private_key, empty_witness_head),
+            },
+        )
+        return cls(state_directory, witness_directory)
 
     def _validated_ledger(self) -> list[dict[str, Any]]:
         ledger = _read_json(self.state_directory / "ledger.json", "authority ledger")
@@ -175,19 +301,99 @@ class ReusableTimeAuthority:
                 raise TimeAuthorityError("authority ledger chain is invalid")
             _verify_signature(self.public_key, envelope.get("signature"), payload)
             previous_sha256 = _sha256(_canonical_bytes(envelope))
+        event_hashes = [None, *(_sha256(_canonical_bytes(item)) for item in ledger)]
         head = _read_json(self.state_directory / "head.json", "authority durable head")
         if not isinstance(head, dict) or set(head) != {"payload", "signature"}:
             raise TimeAuthorityError("authority durable head is invalid")
+        _verify_signature(self.public_key, head.get("signature"), head.get("payload"))
+        head_payload = head.get("payload")
+        if not isinstance(head_payload, dict):
+            raise TimeAuthorityError("authority durable head is invalid")
+        head_sequence = head_payload.get("sequence")
+        if type(head_sequence) is not int or not 0 <= head_sequence <= len(ledger):
+            raise TimeAuthorityError("authority ledger rollback or incomplete commit detected")
         expected_head = {
             "schema_version": 1,
             "authority": self.identity["authority"],
-            "sequence": len(ledger),
-            "event_sha256": previous_sha256,
+            "sequence": head_sequence,
+            "event_sha256": event_hashes[head_sequence],
         }
-        _verify_signature(self.public_key, head.get("signature"), head.get("payload"))
-        if head.get("payload") != expected_head:
+        if head_payload != expected_head:
             raise TimeAuthorityError("authority ledger rollback or incomplete commit detected")
+
+        witness_head = _read_json(
+            self.witness_directory / "head.json", "authority monotonic witness head"
+        )
+        if not isinstance(witness_head, dict) or set(witness_head) != {"payload", "signature"}:
+            raise TimeAuthorityError("authority monotonic witness head is invalid")
+        _verify_signature(
+            self.witness_public_key,
+            witness_head.get("signature"),
+            witness_head.get("payload"),
+        )
+        witness_payload = witness_head.get("payload")
+        if not isinstance(witness_payload, dict):
+            raise TimeAuthorityError("authority monotonic witness head is invalid")
+        witness_sequence = witness_payload.get("sequence")
+        if type(witness_sequence) is not int or not 0 <= witness_sequence <= len(ledger):
+            raise TimeAuthorityError("authority monotonic witness detected ledger rollback")
+        expected_witness = {
+            "schema_version": 1,
+            "witness": self.witness_identity["witness"],
+            "authority": self.identity["authority"],
+            "sequence": witness_sequence,
+            "event_sha256": event_hashes[witness_sequence],
+        }
+        if witness_payload != expected_witness:
+            raise TimeAuthorityError("authority monotonic witness detected ledger rollback")
+
+        ledger_sequence = len(ledger)
+        if head_sequence == ledger_sequence and witness_sequence == ledger_sequence:
+            return ledger
+        if head_sequence != ledger_sequence - 1 or witness_sequence not in {
+            ledger_sequence - 1,
+            ledger_sequence,
+        }:
+            raise TimeAuthorityError("authority ledger rollback or incomplete commit detected")
+        # A signed final ledger event is the transaction intent. Complete either durable
+        # boundary left behind by an interrupted append instead of stranding valid state.
+        if witness_sequence == ledger_sequence - 1:
+            self._write_witness_head(ledger_sequence, event_hashes[ledger_sequence])
+        self._write_authority_head(ledger_sequence, event_hashes[ledger_sequence])
         return ledger
+
+    def _write_authority_head(self, sequence: int, event_sha256: str | None) -> None:
+        payload = {
+            "schema_version": 1,
+            "authority": self.identity["authority"],
+            "sequence": sequence,
+            "event_sha256": event_sha256,
+        }
+        _atomic_json(
+            self.state_directory / "head.json",
+            {"payload": payload, "signature": _signature(self.private_key, payload)},
+        )
+
+    def _write_witness_head(self, sequence: int, event_sha256: str | None) -> None:
+        payload = {
+            "schema_version": 1,
+            "witness": self.witness_identity["witness"],
+            "authority": self.identity["authority"],
+            "sequence": sequence,
+            "event_sha256": event_sha256,
+        }
+        _atomic_json(
+            self.witness_directory / "head.json",
+            {
+                "payload": payload,
+                "signature": _signature(self.witness_private_key, payload),
+            },
+        )
+
+    @staticmethod
+    def _test_interrupt_after(step: str) -> None:
+        if os.environ.get("GRADOOM_TIME_AUTHORITY_TEST_INTERRUPT_AFTER") == step:
+            os._exit(91)
 
     def _append(self, event_type: str, fields: dict[str, Any]) -> dict[str, Any]:
         previous = None if not self.ledger else _sha256(_canonical_bytes(self.ledger[-1]))
@@ -204,16 +410,12 @@ class ReusableTimeAuthority:
         envelope = {"payload": payload, "signature": _signature(self.private_key, payload)}
         updated = [*self.ledger, envelope]
         _atomic_json(self.state_directory / "ledger.json", updated)
-        head_payload = {
-            "schema_version": 1,
-            "authority": self.identity["authority"],
-            "sequence": payload["sequence"],
-            "event_sha256": _sha256(_canonical_bytes(envelope)),
-        }
-        _atomic_json(
-            self.state_directory / "head.json",
-            {"payload": head_payload, "signature": _signature(self.private_key, head_payload)},
-        )
+        self._test_interrupt_after("ledger")
+        event_sha256 = _sha256(_canonical_bytes(envelope))
+        self._write_witness_head(payload["sequence"], event_sha256)
+        self._test_interrupt_after("witness")
+        self._write_authority_head(payload["sequence"], event_sha256)
+        self._test_interrupt_after("head")
         self.ledger = updated
         return payload
 
@@ -350,6 +552,39 @@ class ReusableTimeAuthority:
         ]
         if not matches or matches[-1] != payload:
             raise TimeAuthorityError("stale journal head is not the latest durable seal")
+
+    def recover_latest_journal_head(self, attestation: dict[str, Any]) -> dict[str, Any]:
+        """Upgrade a durable report only when resealing preserved its exact journal head."""
+        payload = attestation.get("payload")
+        if not isinstance(payload, dict) or payload.get("authority") != self.identity["authority"]:
+            raise TimeAuthorityError("journal attestation has the wrong authority identity")
+        _verify_signature(self.public_key, attestation.get("signature"), payload)
+        matches = [
+            item["payload"]["attestation_payload"]
+            for item in self.ledger
+            if item["payload"].get("event_type") == "journal_sealed"
+            and item["payload"].get("seed") == payload.get("seed")
+            and item["payload"].get("started_unix_ns") == payload.get("started_unix_ns")
+        ]
+        if payload not in matches:
+            raise TimeAuthorityError("journal attestation is not durably recorded")
+        latest = matches[-1]
+        head_fields = {
+            "schema_version",
+            "authority",
+            "seed",
+            "started_unix_ns",
+            "generation",
+            "previous_journal_sha256",
+            "journal_sha256",
+            "status",
+        }
+        if any(payload.get(field) != latest.get(field) for field in head_fields):
+            raise TimeAuthorityError("stale journal head cannot recover a different generation")
+        return {
+            "payload": latest,
+            "signature": _signature(self.private_key, latest),
+        }
 
     @staticmethod
     def _artifact_state(path_value: object) -> tuple[Path, dict[str, Any], str]:
@@ -584,6 +819,14 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="gradoom-time-authority")
     parser.add_argument("--state-directory", type=Path, required=True)
     parser.add_argument(
+        "--witness-directory",
+        type=Path,
+        help=(
+            "independently retained monotonic witness directory; defaults to a sibling "
+            "directory for development use"
+        ),
+    )
+    parser.add_argument(
         "operation",
         choices=(
             "init",
@@ -591,6 +834,7 @@ def _parser() -> argparse.ArgumentParser:
             "start-attempt",
             "sign-journal-head",
             "verify-latest-journal-head",
+            "recover-latest-journal-head",
             "create-bootstrap",
             "record-bootstrap-reuse",
             "attest-bootstrap-reuse",
@@ -614,10 +858,12 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         if args.operation == "init":
-            authority = ReusableTimeAuthority.initialize(args.state_directory)
+            authority = ReusableTimeAuthority.initialize(
+                args.state_directory, args.witness_directory
+            )
             result: object = authority.identity
         else:
-            authority = ReusableTimeAuthority(args.state_directory)
+            authority = ReusableTimeAuthority(args.state_directory, args.witness_directory)
             if args.operation == "identity":
                 result = authority.identity
             elif args.operation == "start-attempt":
@@ -627,6 +873,8 @@ def main(argv: list[str] | None = None) -> int:
             elif args.operation == "verify-latest-journal-head":
                 authority.verify_latest_journal_head(_stdin_object())
                 result = {"status": "latest"}
+            elif args.operation == "recover-latest-journal-head":
+                result = authority.recover_latest_journal_head(_stdin_object())
             elif args.operation == "create-bootstrap":
                 result = authority.create_bootstrap(_stdin_object())
             elif args.operation == "record-bootstrap-reuse":

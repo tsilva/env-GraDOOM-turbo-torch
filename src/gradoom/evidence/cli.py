@@ -187,14 +187,20 @@ def _validate_document_paths(
             raise EvidenceError("output path aliases the merge report")
     if manifest.get("fixture") is False:
         authority_state = os.environ.get("GRADOOM_REUSABLE_TIME_AUTHORITY_STATE")
-        if authority_state:
-            resolved_authority_state = _resolve_evidence_path(
-                Path(authority_state), base_directory=working_directory
+        authority_witness = os.environ.get("GRADOOM_REUSABLE_TIME_AUTHORITY_WITNESS")
+        for authority_path, label in (
+            (authority_state, "reusable-time authority state"),
+            (authority_witness, "reusable-time authority witness"),
+        ):
+            if not authority_path:
+                continue
+            resolved_authority_path = _resolve_evidence_path(
+                Path(authority_path), base_directory=working_directory
             )
-            if resolved_output == resolved_authority_state or resolved_output.is_relative_to(
-                resolved_authority_state
+            if resolved_output == resolved_authority_path or resolved_output.is_relative_to(
+                resolved_authority_path
             ):
-                raise EvidenceError("output path aliases reusable-time authority state")
+                raise EvidenceError(f"output path aliases {label}")
     manifest_directory = _resolve_evidence_path(
         manifest_path.parent,
         base_directory=working_directory,
