@@ -27,3 +27,6 @@
   command, with deterministic nonclaiming subprocess fixtures.
 - Seal the policy runner and policy bytes used by corpus execution, revalidate
   resumed outcomes canonically, and durably checkpoint each completed batch.
+- Close corpus-resume and schema gaps by rejecting partial batches, unsupported
+  model contracts, undeclared override fields, tampered provenance, and unsafe
+  JSON numeric values through the public evidence command.

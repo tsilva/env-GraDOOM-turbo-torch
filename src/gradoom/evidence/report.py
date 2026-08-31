@@ -39,6 +39,8 @@ _READINESS_REPORT_FIELDS = (
 )
 
 _MAX_JSON_NESTING = 256
+_MIN_JSON_INTEGER = -(2**63)
+_MAX_JSON_INTEGER = 2**63 - 1
 _REQUIRED_READINESS_PREREQUISITES = ("real_pretrained_policy_corpus",)
 
 
@@ -59,9 +61,12 @@ def _parse_json_float(value: str) -> float:
 
 def _parse_json_integer(value: str) -> int:
     try:
-        return int(value)
+        parsed = int(value)
     except (OverflowError, ValueError) as error:
         raise _InvalidJsonNumber("integer value exceeds supported range") from error
+    if parsed < _MIN_JSON_INTEGER or parsed > _MAX_JSON_INTEGER:
+        raise _InvalidJsonNumber("integer value exceeds supported range")
+    return parsed
 
 
 def _validate_json_nesting(value: object, *, document: str) -> None:

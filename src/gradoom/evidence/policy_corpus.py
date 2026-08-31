@@ -47,8 +47,81 @@ _OUTCOME_FIELDS = frozenset(
 _RETAINED_OUTCOME_FIELDS = frozenset(
     {"unit_identity", "provider_id", "policy_id", "seed_index", *_OUTCOME_FIELDS}
 )
+_MODEL_RUNTIME_CONTRACT_FIELDS = frozenset(
+    {"contract_version", "artifact_format", "runtime", "architecture"}
+)
+_POLICY_FIELDS = frozenset(
+    {
+        "id",
+        "training_provider",
+        "artifact_path",
+        "artifact_sha256",
+        "model_runtime_contract",
+        "stochastic_actions",
+        "adapted",
+        "provider_specific_modifications",
+    }
+)
+_CORPUS_FIELDS = frozenset(
+    {
+        "schema_version",
+        "corpus_version",
+        "sealed",
+        "shared_preprocessing_identity",
+        "policies",
+    }
+)
+_SEED_MANIFEST_FIELDS = frozenset({"schema_version", "seed_set_id", "seeds"})
+_PROVIDER_FIELDS = frozenset({"id", "revision"})
+_POLICY_MANIFEST_FIELDS = frozenset(
+    {
+        "schema_version",
+        "workflow",
+        "evidence_level",
+        "fixture",
+        "code_provenance",
+        "declared_inputs",
+        "policy_evaluation",
+    }
+)
+_CODE_PROVENANCE_FIELDS = frozenset({"repository", "revision", "dirty"})
+_DECLARED_INPUT_FIELDS = frozenset({"name", "path", "sha256"})
+_POLICY_EVALUATION_FIELDS = frozenset(
+    {"protocol_version", "corpus_input", "seed_manifest_input", "runner_input", "providers"}
+)
+_POLICY_EVALUATION_OPTIONAL_FIELDS = frozenset({"timeout_seconds", "fixture_failure_seed"})
+_SUPPORTED_POLICY_ARCHITECTURES = frozenset(
+    {
+        "nature",
+        "nature-pyramid",
+        "nature-waist",
+        "nature-flat",
+        "nature-thin",
+        "nature-half",
+        "nature-quarter",
+    }
+)
+_POLICY_REPORT_FIELDS = frozenset(
+    {
+        "schema_version",
+        "workflow",
+        "evidence_level",
+        "fixture",
+        "status",
+        "claim_eligible",
+        "claim_reasons",
+        "run_identity",
+        "code_provenance",
+        "declared_inputs",
+        "policy_evaluation",
+        "evidence_index",
+    }
+)
+_EVIDENCE_INDEX_FIELDS = frozenset({"algorithm", "entries", "sha256"})
 _RUNNER_CAPTURE_LIMIT = 8 * 1024 * 1024
 _FAILURE_MESSAGE_LIMIT = 4096
+_MAX_OUTCOME_NUMBER = 2**63 - 1
+_MAX_TIMEOUT_SECONDS = 2**31 - 1
 _MFD_ALLOW_SEALING = 0x0002
 _F_ADD_SEALS = 1033
 _F_SEAL_SEAL = 0x0001
@@ -165,14 +238,15 @@ def _artifact_payload(path: Path, *, policy_id: str) -> tuple[bytes, str]:
 def _validate_contract(value: object, *, field: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise EvidenceError(f"{field} must be an object")
+    _exact_fields(value, _MODEL_RUNTIME_CONTRACT_FIELDS, document=field)
     if (
         value.get("contract_version") != 1
         or value.get("artifact_format") != CHECKPOINT_FORMAT
         or value.get("runtime") != "torch"
+        or value.get("architecture") not in _SUPPORTED_POLICY_ARCHITECTURES
     ):
         raise EvidenceError(f"{field} uses an unsupported model/runtime contract")
-    _required_string(value.get("architecture"), f"{field}.architecture")
-    return value
+    return {name: value[name] for name in _MODEL_RUNTIME_CONTRACT_FIELDS}
 
 
 def _load_corpus(
@@ -181,6 +255,7 @@ def _load_corpus(
     corpus = _parse_json_document(payload, document="policy corpus manifest")
     if not isinstance(corpus, dict):
         raise EvidenceError("policy corpus manifest must be a JSON object")
+    _exact_fields(corpus, _CORPUS_FIELDS, document="policy corpus manifest")
     _validate_string_content(corpus, document="policy corpus manifest")
     _validate_schema_version(corpus.get("schema_version"), document="policy corpus manifest")
     _required_string(corpus.get("corpus_version"), "policy corpus manifest corpus_version")
@@ -207,6 +282,7 @@ def _load_corpus(
         field = f"policy corpus manifest policies[{index}]"
         if not isinstance(raw_policy, dict):
             raise EvidenceError(f"{field} must be an object")
+        _exact_fields(raw_policy, _POLICY_FIELDS, document=field)
         policy_id = _required_string(raw_policy.get("id"), f"{field}.id")
         if policy_id in identifiers:
             raise EvidenceError(f"{field}.id {policy_id!r} is duplicated")
@@ -286,6 +362,7 @@ def _load_seeds(payload: bytes) -> dict[str, Any]:
     document = _parse_json_document(payload, document="episode seed manifest")
     if not isinstance(document, dict):
         raise EvidenceError("episode seed manifest must be a JSON object")
+    _exact_fields(document, _SEED_MANIFEST_FIELDS, document="episode seed manifest")
     _validate_string_content(document, document="episode seed manifest")
     _validate_schema_version(document.get("schema_version"), document="episode seed manifest")
     seed_set_id = _required_string(document.get("seed_set_id"), "episode seed manifest seed_set_id")
@@ -307,6 +384,7 @@ def _providers(value: object) -> list[dict[str, str]]:
         field = f"policy_evaluation.providers[{index}]"
         if not isinstance(provider, dict) or provider.get("id") not in PROVIDER_IDS:
             raise EvidenceError(f"{field}.id must name an approved provider")
+        _exact_fields(provider, _PROVIDER_FIELDS, document=field)
         provider_id = provider["id"]
         if provider_id in by_id:
             raise EvidenceError(f"{field}.id {provider_id!r} is duplicated")
@@ -347,9 +425,15 @@ def _failure_outcome(seed: int, *, code: str, message: str) -> dict[str, Any]:
     }
 
 
-def _exact_fields(value: dict[str, Any], expected: frozenset[str], *, document: str) -> None:
+def _exact_fields(
+    value: dict[str, Any],
+    expected: frozenset[str],
+    *,
+    document: str,
+    optional: frozenset[str] = frozenset(),
+) -> None:
     missing = sorted(expected - set(value))
-    extra = sorted(set(value) - expected)
+    extra = sorted(set(value) - expected - optional)
     if missing or extra:
         details = []
         if missing:
@@ -390,11 +474,19 @@ def _canonical_outcome(
     killcount = value["player_killcount"]
     length = value["episode_length"]
     termination = value["termination_state"]
-    if type(killcount) not in {int, float} or not math.isfinite(killcount) or killcount < 0:
-        raise EvidenceError(f"{document}.player_killcount must be finite and non-negative")
+    if (
+        type(killcount) not in {int, float}
+        or not math.isfinite(killcount)
+        or killcount < 0
+        or killcount > _MAX_OUTCOME_NUMBER
+    ):
+        raise EvidenceError(
+            f"{document}.player_killcount must be finite, non-negative, and within "
+            "the supported 64-bit range"
+        )
     if type(length) is not int or length < 0:
         raise EvidenceError(f"{document}.episode_length must be a non-negative integer")
-    if termination not in _TERMINATION_STATES:
+    if not isinstance(termination, str) or termination not in _TERMINATION_STATES:
         raise EvidenceError(f"{document}.termination_state must be 'terminated' or 'truncated'")
     return {
         "seed": seed,
@@ -539,17 +631,23 @@ def _load_reusable_outcomes(
     expected_units: dict[str, tuple[str, str, int, int]],
     expected_unit_order: list[str],
     expected_binding: dict[str, Any],
+    expected_report_binding: dict[str, Any],
+    expected_evidence_entries: list[dict[str, str]],
 ) -> dict[str, dict[str, Any]]:
     if merge_path is None:
         return {}
     report = _parse_json_document(merge_path.read_bytes(), document="merge report")
-    if not isinstance(report, dict) or report.get("workflow") != "parity_certification":
-        raise EvidenceError("merge report workflow must be parity_certification")
+    if not isinstance(report, dict):
+        raise EvidenceError("merge report must be an object")
+    _exact_fields(report, _POLICY_REPORT_FIELDS, document="merge report")
+    if report.get("run_identity") != evaluation_identity:
+        raise EvidenceError("cannot merge unlike policy evaluation identities")
+    for field, expected in expected_report_binding.items():
+        if report.get(field) != expected:
+            raise EvidenceError(f"merge report {field} does not match current evidence")
     status = report.get("status")
     if status not in {"evaluation_in_progress", "evaluation_complete"}:
         raise EvidenceError("merge report has an invalid policy evaluation status")
-    if report.get("run_identity") != evaluation_identity:
-        raise EvidenceError("cannot merge unlike policy evaluation identities")
     evaluation = report.get("policy_evaluation")
     if not isinstance(evaluation, dict):
         raise EvidenceError("merge report policy_evaluation must be an object")
@@ -578,18 +676,23 @@ def _load_reusable_outcomes(
     if not isinstance(evaluation.get("corpus"), dict):
         raise EvidenceError("merge report policy_evaluation.corpus must be an object")
     evidence_index = report.get("evidence_index")
-    if not isinstance(evidence_index, dict) or not isinstance(evidence_index.get("entries"), list):
+    if not isinstance(evidence_index, dict):
         raise EvidenceError("merge report evidence_index is invalid")
+    _exact_fields(evidence_index, _EVIDENCE_INDEX_FIELDS, document="merge evidence_index")
+    entries = evidence_index.get("entries")
+    if not isinstance(entries, list):
+        raise EvidenceError("merge report evidence_index is invalid")
+    if evidence_index.get("algorithm") != "sha256":
+        raise EvidenceError("merge report evidence_index algorithm is invalid")
     stored_index = evidence_index.get("sha256")
-    if stored_index != _canonical_sha256(evidence_index["entries"], document="merge report"):
+    if stored_index != _canonical_sha256(entries, document="merge report"):
         raise EvidenceError("merge report evidence_index SHA-256 mismatch")
     evaluation_digest = _canonical_sha256(evaluation, document="merge report policy evaluation")
-    indexed = [
-        entry
-        for entry in evidence_index["entries"]
-        if isinstance(entry, dict) and entry.get("name") == "policy_evaluation"
+    expected_entries = [
+        *expected_evidence_entries,
+        {"name": "policy_evaluation", "sha256": evaluation_digest},
     ]
-    if len(indexed) != 1 or indexed[0].get("sha256") != evaluation_digest:
+    if entries != expected_entries:
         raise EvidenceError("merge report policy_evaluation SHA-256 mismatch")
     outcomes = evaluation.get("outcomes")
     if not isinstance(outcomes, list):
@@ -635,6 +738,11 @@ def _load_reusable_outcomes(
         observed_order.append(identity)
     if observed_order != expected_unit_order[: len(observed_order)]:
         raise EvidenceError("completed policy outcomes must be an exact leading prefix")
+    batch_size = len(expected_binding["seed_manifest"]["seeds"])
+    if len(observed_order) % batch_size != 0:
+        raise EvidenceError(
+            "completed policy outcomes must contain complete provider-policy batches"
+        )
     if status == "evaluation_complete" and len(observed_order) != len(expected_unit_order):
         raise EvidenceError("complete policy evaluation is missing required outcomes")
     if status == "evaluation_in_progress" and len(observed_order) >= len(expected_unit_order):
@@ -653,6 +761,7 @@ def build_policy_evaluation_report(
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     manifest, manifest_payload = _load_manifest(manifest_path)
+    _exact_fields(manifest, _POLICY_MANIFEST_FIELDS, document="manifest")
     _validate_schema_version(manifest.get("schema_version"), document="manifest")
     if manifest.get("workflow") != "parity_certification":
         raise EvidenceError("this command path requires workflow parity_certification")
@@ -660,7 +769,21 @@ def build_policy_evaluation_report(
         raise EvidenceError("parity certification requires formal evidence")
     if type(manifest.get("fixture")) is not bool:
         raise EvidenceError("fixture is required and must be a boolean")
+    if isinstance(manifest.get("code_provenance"), dict):
+        _exact_fields(
+            manifest["code_provenance"],
+            _CODE_PROVENANCE_FIELDS,
+            document="code_provenance",
+        )
     code_provenance = _validate_code_provenance(manifest.get("code_provenance"))
+    if isinstance(manifest.get("declared_inputs"), list):
+        for index, declared_input in enumerate(manifest["declared_inputs"]):
+            if isinstance(declared_input, dict):
+                _exact_fields(
+                    declared_input,
+                    _DECLARED_INPUT_FIELDS,
+                    document=f"declared_inputs[{index}]",
+                )
     declared_inputs = _validate_declared_inputs(
         manifest.get("declared_inputs"), base_directory=manifest_path.parent
     )
@@ -668,6 +791,12 @@ def build_policy_evaluation_report(
     configuration = manifest.get("policy_evaluation")
     if not isinstance(configuration, dict):
         raise EvidenceError("policy_evaluation must be an object")
+    _exact_fields(
+        configuration,
+        _POLICY_EVALUATION_FIELDS,
+        optional=_POLICY_EVALUATION_OPTIONAL_FIELDS,
+        document="policy_evaluation",
+    )
     if configuration.get("protocol_version") != POLICY_RUNNER_PROTOCOL_VERSION:
         raise EvidenceError("policy_evaluation uses an unsupported protocol_version")
     corpus_input = _declared_input(
@@ -711,8 +840,12 @@ def build_policy_evaluation_report(
         type(timeout_seconds) not in {int, float}
         or not math.isfinite(timeout_seconds)
         or timeout_seconds <= 0
+        or timeout_seconds > _MAX_TIMEOUT_SECONDS
     ):
-        raise EvidenceError("policy_evaluation.timeout_seconds must be a positive finite number")
+        raise EvidenceError(
+            "policy_evaluation.timeout_seconds must be a positive finite number within "
+            "the supported range"
+        )
     fixture_failure_seed = configuration.get("fixture_failure_seed")
     if fixture_failure_seed is not None:
         if not manifest["fixture"] or type(fixture_failure_seed) is not int:
@@ -759,18 +892,12 @@ def build_policy_evaluation_report(
         "protocol_version": POLICY_RUNNER_PROTOCOL_VERSION,
         "evaluation_identity": evaluation_identity,
         "corpus_manifest_sha256": corpus_input["sha256"],
+        "corpus": corpus,
         "seed_manifest_sha256": seeds_input["sha256"],
         "seed_manifest": seeds,
         "providers": providers,
         "expected_outcome_count": len(expected_units),
     }
-    reusable = _load_reusable_outcomes(
-        merge_path,
-        evaluation_identity=evaluation_identity,
-        expected_units=expected_units,
-        expected_unit_order=expected_unit_order,
-        expected_binding=expected_binding,
-    )
     reasons = [
         {
             "code": "parity_verdict_pending",
@@ -787,40 +914,54 @@ def build_policy_evaluation_report(
                 "message": "Fixture evidence cannot support public claims.",
             },
         )
+    expected_report_binding = {
+        "schema_version": 1,
+        "workflow": "parity_certification",
+        "evidence_level": "formal",
+        "fixture": manifest["fixture"],
+        "claim_eligible": False,
+        "claim_reasons": reasons,
+        "run_identity": evaluation_identity,
+        "code_provenance": code_provenance,
+        "declared_inputs": declared_inputs,
+    }
+    expected_evidence_entries = [
+        {"name": "manifest", "sha256": _sha256_bytes(manifest_payload)},
+        *({"name": item["name"], "sha256": item["sha256"]} for item in declared_inputs),
+        *(
+            {
+                "name": f"policy_artifact.{policy['id']}",
+                "sha256": policy["artifact_sha256"],
+            }
+            for policy in policies
+        ),
+    ]
+    reusable = _load_reusable_outcomes(
+        merge_path,
+        evaluation_identity=evaluation_identity,
+        expected_units=expected_units,
+        expected_unit_order=expected_unit_order,
+        expected_binding=expected_binding,
+        expected_report_binding=expected_report_binding,
+        expected_evidence_entries=expected_evidence_entries,
+    )
 
     def build_report(outcomes: list[dict[str, Any]], *, complete: bool) -> dict[str, Any]:
         evaluation = {
             **expected_binding,
-            "corpus": corpus,
             "outcomes": outcomes,
             "failure_count": sum(item["execution_failure"] is not None for item in outcomes),
         }
         evidence_entries = [
-            {"name": "manifest", "sha256": _sha256_bytes(manifest_payload)},
-            *({"name": item["name"], "sha256": item["sha256"]} for item in declared_inputs),
-            *(
-                {
-                    "name": f"policy_artifact.{policy['id']}",
-                    "sha256": policy["artifact_sha256"],
-                }
-                for policy in policies
-            ),
+            *expected_evidence_entries,
             {
                 "name": "policy_evaluation",
                 "sha256": _canonical_sha256(evaluation, document="policy evaluation report"),
             },
         ]
         return {
-            "schema_version": 1,
-            "workflow": "parity_certification",
-            "evidence_level": "formal",
-            "fixture": manifest["fixture"],
+            **expected_report_binding,
             "status": "evaluation_complete" if complete else "evaluation_in_progress",
-            "claim_eligible": False,
-            "claim_reasons": reasons,
-            "run_identity": evaluation_identity,
-            "code_provenance": code_provenance,
-            "declared_inputs": declared_inputs,
             "policy_evaluation": evaluation,
             "evidence_index": {
                 "algorithm": "sha256",

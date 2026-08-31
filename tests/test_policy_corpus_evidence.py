@@ -11,10 +11,12 @@ import pytest
 
 RUNNER = Path(__file__).parent / "fixtures" / "evidence" / "fixture_policy_runner.py"
 INCOMPLETE_RUNNER = RUNNER.with_name("fixture_incomplete_policy_runner.py")
+INVALID_TYPE_RUNNER = RUNNER.with_name("fixture_invalid_type_policy_runner.py")
 MUTATING_RUNNER = RUNNER.with_name("fixture_mutating_policy_runner.py")
 TRANSIENT_RUNNER = RUNNER.with_name("fixture_transient_restore_runner.py")
 INTERRUPT_RUNNER = RUNNER.with_name("fixture_interrupt_once_runner.py")
 NOISY_RUNNER = RUNNER.with_name("fixture_noisy_policy_runner.py")
+OVERSIZED_NUMERIC_RUNNER = RUNNER.with_name("fixture_oversized_numeric_policy_runner.py")
 
 
 def _sha256(path: Path) -> str:
@@ -181,6 +183,25 @@ def test_public_command_executes_complete_sealed_fixture_corpus(tmp_path: Path) 
             ),
             "unsupported",
         ),
+        (
+            lambda corpus: corpus["policies"][0]["model_runtime_contract"].update(
+                architecture="definitely-unsupported"
+            ),
+            "unsupported",
+        ),
+        (
+            lambda corpus: corpus["policies"][0]["model_runtime_contract"].update(
+                provider_overrides={"gradoom": "compensated"}
+            ),
+            "invalid fields",
+        ),
+        (
+            lambda corpus: corpus["policies"][0].update(
+                provider_arguments={"gradoom": ["--compensate"]}
+            ),
+            "invalid fields",
+        ),
+        (lambda corpus: corpus.update(undeclared_corpus_field=True), "invalid fields"),
         (lambda corpus: corpus.update(sealed=False), "sealed"),
     ],
 )
@@ -198,6 +219,46 @@ def test_invalid_corpus_is_rejected_before_execution(
 
     assert result.returncode == 2
     assert message in result.stderr
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda manifest: manifest.update(undeclared_manifest_field=True),
+        lambda manifest: manifest["code_provenance"].update(build_id="undeclared"),
+        lambda manifest: manifest["declared_inputs"][0].update(role="undeclared"),
+        lambda manifest: manifest["policy_evaluation"].update(
+            provider_overrides={"gradoom": "compensated"}
+        ),
+        lambda manifest: manifest["policy_evaluation"]["providers"][0].update(
+            arguments=["--compensate"]
+        ),
+    ],
+)
+def test_undeclared_manifest_fields_are_rejected(tmp_path: Path, mutation: object) -> None:
+    manifest_path, _corpus_path, manifest = _documents(tmp_path)
+    mutation(manifest)  # type: ignore[operator]
+    _write_json(manifest_path, manifest)
+
+    result = _run("--manifest", str(manifest_path), "--output", str(tmp_path / "report.json"))
+
+    assert result.returncode == 2
+    assert "invalid fields" in result.stderr
+
+
+def test_undeclared_seed_manifest_fields_are_rejected(tmp_path: Path) -> None:
+    manifest_path, _corpus_path, manifest = _documents(tmp_path)
+    seeds_path = tmp_path / "seeds.json"
+    seeds = json.loads(seeds_path.read_text(encoding="utf-8"))
+    seeds["provider_seed_overrides"] = {"gradoom": [1]}
+    _write_json(seeds_path, seeds)
+    manifest["declared_inputs"][1]["sha256"] = _sha256(seeds_path)  # type: ignore[index]
+    _write_json(manifest_path, manifest)
+
+    result = _run("--manifest", str(manifest_path), "--output", str(tmp_path / "report.json"))
+
+    assert result.returncode == 2
+    assert "invalid fields" in result.stderr
 
 
 def test_changed_or_missing_artifact_is_rejected(tmp_path: Path) -> None:
@@ -267,6 +328,51 @@ def test_runner_output_is_bounded_and_retained_as_failures(tmp_path: Path) -> No
         item["execution_failure"]["code"] for item in report["policy_evaluation"]["outcomes"]
     } == {"runner_output_limit"}
     assert output.stat().st_size < 2 * 1024 * 1024
+
+
+def test_oversized_runner_numbers_are_retained_as_failures(tmp_path: Path) -> None:
+    manifest_path, _corpus_path, manifest = _documents(tmp_path)
+    _replace_runner(manifest_path, manifest, OVERSIZED_NUMERIC_RUNNER)
+    output = tmp_path / "report.json"
+
+    result = _run("--manifest", str(manifest_path), "--output", str(output))
+
+    assert result.returncode == 0, result.stderr
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert report["policy_evaluation"]["failure_count"] == 2 * 2 * 256
+    assert {
+        item["execution_failure"]["code"] for item in report["policy_evaluation"]["outcomes"]
+    } == {"invalid_runner_response"}
+
+
+def test_unhashable_runner_types_are_retained_as_failures(tmp_path: Path) -> None:
+    manifest_path, _corpus_path, manifest = _documents(tmp_path)
+    _replace_runner(manifest_path, manifest, INVALID_TYPE_RUNNER)
+    output = tmp_path / "report.json"
+
+    result = _run("--manifest", str(manifest_path), "--output", str(output))
+
+    assert result.returncode == 0, result.stderr
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert report["policy_evaluation"]["failure_count"] == 2 * 2 * 256
+    assert {
+        item["execution_failure"]["code"] for item in report["policy_evaluation"]["outcomes"]
+    } == {"invalid_runner_response"}
+
+
+@pytest.mark.parametrize("timeout_seconds", [10**400, 2**63 - 1])
+def test_oversized_manifest_timeout_fails_without_a_traceback(
+    tmp_path: Path, timeout_seconds: int
+) -> None:
+    manifest_path, _corpus_path, manifest = _documents(tmp_path)
+    manifest["policy_evaluation"]["timeout_seconds"] = timeout_seconds  # type: ignore[index]
+    _write_json(manifest_path, manifest)
+
+    result = _run("--manifest", str(manifest_path), "--output", str(tmp_path / "report.json"))
+
+    assert result.returncode == 2
+    assert "supported range" in result.stderr or "positive finite number" in result.stderr
+    assert "Traceback" not in result.stderr
 
 
 def test_execution_copy_rejects_policy_mutation(tmp_path: Path) -> None:
@@ -341,6 +447,38 @@ def test_merge_rejects_mismatched_corpus_identity(tmp_path: Path) -> None:
     assert "cannot merge unlike policy evaluation identities" in result.stderr
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda report: report.update(fixture=False),
+        lambda report: report.update(evidence_level="development"),
+        lambda report: report["code_provenance"].update(revision="tampered"),
+        lambda report: report.update(declared_inputs=[]),
+        lambda report: report.update(claim_eligible=True),
+        lambda report: report.update(undeclared_top_level_field=True),
+    ],
+)
+def test_merge_rejects_tampered_top_level_report(tmp_path: Path, mutation: object) -> None:
+    manifest_path, _corpus_path, _manifest = _documents(tmp_path)
+    initial = tmp_path / "initial.json"
+    assert _run("--manifest", str(manifest_path), "--output", str(initial)).returncode == 0
+    report = json.loads(initial.read_text(encoding="utf-8"))
+    mutation(report)  # type: ignore[operator]
+    _write_json(initial, report)
+
+    result = _run(
+        "--manifest",
+        str(manifest_path),
+        "--output",
+        str(tmp_path / "resumed.json"),
+        "--merge",
+        str(initial),
+    )
+
+    assert result.returncode == 2
+    assert "merge report" in result.stderr
+
+
 def test_merge_rejects_tampered_policy_evidence(tmp_path: Path) -> None:
     manifest_path, _corpus_path, _manifest = _documents(tmp_path)
     initial = tmp_path / "initial.json"
@@ -367,8 +505,11 @@ def test_merge_rejects_tampered_policy_evidence(tmp_path: Path) -> None:
     [
         lambda outcome: outcome.update(player_killcount=-1),
         lambda outcome: outcome.update(player_killcount=float("inf")),
+        lambda outcome: outcome.update(player_killcount=1e308),
+        lambda outcome: outcome.update(player_killcount=10**400),
         lambda outcome: outcome.update(episode_length=-1),
         lambda outcome: outcome.update(termination_state=""),
+        lambda outcome: outcome.update(termination_state=[]),
         lambda outcome: outcome.update(termination_state="finished"),
         lambda outcome: outcome.pop("termination_state"),
         lambda outcome: outcome.update(extra_evidence="undeclared"),
@@ -488,3 +629,27 @@ def test_merge_rejects_self_consistent_nonprefix_progress(tmp_path: Path) -> Non
 
     assert result.returncode == 2
     assert "completed policy outcomes must be an exact leading prefix" in result.stderr
+
+
+def test_merge_rejects_progress_inside_a_provider_policy_batch(tmp_path: Path) -> None:
+    manifest_path, _corpus_path, _manifest = _documents(tmp_path)
+    partial = tmp_path / "partial.json"
+    assert _run("--manifest", str(manifest_path), "--output", str(partial)).returncode == 0
+    report = json.loads(partial.read_text(encoding="utf-8"))
+    report["status"] = "evaluation_in_progress"
+    report["policy_evaluation"]["outcomes"] = report["policy_evaluation"]["outcomes"][:1]
+    report["policy_evaluation"]["failure_count"] = 0
+    _rehash_policy_report(report)
+    _write_json(partial, report)
+
+    result = _run(
+        "--manifest",
+        str(manifest_path),
+        "--output",
+        str(tmp_path / "resumed.json"),
+        "--merge",
+        str(partial),
+    )
+
+    assert result.returncode == 2
+    assert "complete provider-policy batches" in result.stderr

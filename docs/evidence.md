@@ -44,10 +44,13 @@ versions, `sealed: true`, the shared preprocessing SHA-256 identity, and a non-e
 Each policy records a unique ID, its `gradoom` or `env-vizdoom-turbo` training origin, immutable
 artifact path and SHA-256, model/runtime contract, `stochastic_actions: true`, `adapted: false`, and
 an empty `provider_specific_modifications` array. The v1 contract accepts Torch standalone GraDOOM
-PPO artifacts and requires at least one frozen policy from each training origin. Missing or changed
-artifacts, duplicate IDs or locations, unsupported contracts, deterministic-only policies,
-adaptation, provider compensation, and any artifact or declared-input mutation during execution
-fail closed.
+PPO artifacts using one of the audited `nature`, `nature-pyramid`, `nature-waist`, `nature-flat`,
+`nature-thin`, `nature-half`, or `nature-quarter` architectures and requires at least one frozen
+policy from each training origin. Every v1 manifest, corpus, policy, provider, seed set, and
+model/runtime object has an exact field set; undeclared fields and provider override channels are
+rejected. Missing or changed artifacts, duplicate IDs or locations, unsupported contracts,
+deterministic-only policies, adaptation, provider compensation, and any artifact or declared-input
+mutation during execution fail closed.
 
 Protocol v2 reads and hashes every declared file before evaluation, then executes the runner and
 each policy artifact through Linux sealed anonymous file descriptors. The runner receives only the
@@ -65,11 +68,13 @@ seed index, seed, stable unit identity, `player_killcount`, termination state, e
 an explicit execution failure or null.
 
 Successful and failed outcomes share one exact validator. A success permits only a finite,
-non-negative `player_killcount`, a non-negative integer episode length, and `terminated` or
-`truncated` termination. A failure permits only non-whitespace code/message fields and null outcome
-metrics. Missing or extra fields fail validation. The same rules are reapplied to resumed evidence,
-including evidence whose internal hashes were recomputed after tampering. Runner stdout and stderr
-are file-size bounded to 8 MiB per batch; reaching that boundary becomes retained execution failure
+non-negative 64-bit-range `player_killcount`, a non-negative 64-bit integer episode length, and
+`terminated` or `truncated` termination. All evidence JSON integers are limited to the signed
+64-bit range, and the runner timeout has an explicit positive upper bound. A failure permits only
+non-whitespace code/message fields and null outcome metrics. Missing, extra, unhashable, or
+out-of-range fields fail validation. The same rules are reapplied to resumed evidence, including
+evidence whose internal hashes were recomputed after tampering. Runner stdout and stderr are
+file-size bounded to 8 MiB per batch; reaching that boundary becomes retained execution failure
 evidence rather than unbounded host-memory growth.
 
 The report's `policy_evaluation` object binds the corpus and seed manifest hashes, normalized corpus,
@@ -81,7 +86,9 @@ runner protocol and timeout, provider revisions, and corpus and seed identities.
 Pass `--merge` with an earlier matching corpus report to reuse already completed unit identities.
 Completed failures are evidence and are reused exactly like successes. A changed corpus, seed set,
 runner, provider revision, code provenance, protocol, timeout, evidence level, or fixture state is
-an unlike evaluation and is rejected instead of combined.
+an unlike evaluation and is rejected instead of combined. Resume also revalidates the complete
+top-level report schema, provenance, declared inputs, claim state, evidence index, and normalized
+corpus instead of trusting a stored identity string.
 
 After each complete provider-policy batch, the command atomically replaces the requested output
 with an `evaluation_in_progress` report, fsyncs both file and containing directory, and only then
