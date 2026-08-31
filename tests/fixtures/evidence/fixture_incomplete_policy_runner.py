@@ -6,7 +6,7 @@ import sys
 request = json.load(sys.stdin)
 json.dump(
     {
-        "protocol_version": 1,
+        "protocol_version": 2,
         "outcomes": [
             {
                 "seed": seed,

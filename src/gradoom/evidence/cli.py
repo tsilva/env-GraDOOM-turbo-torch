@@ -62,6 +62,11 @@ def _write_report(path: Path, report: dict[str, object]) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary_path, path)
+        directory_descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
     finally:
         temporary_path.unlink(missing_ok=True)
 
@@ -239,7 +244,12 @@ def main(argv: list[str] | None = None) -> int:
                 )
             report = build_development_benchmark_report(args.manifest)
         elif workflow == "parity_certification":
-            report = build_policy_evaluation_report(args.manifest, merge_path=args.merge)
+            report = build_policy_evaluation_report(
+                args.manifest,
+                merge_path=args.merge,
+                output_path=args.output,
+                progress_callback=lambda progress: _write_report(args.output, progress),
+            )
         else:
             raise EvidenceError(f"unsupported manifest workflow {workflow!r}")
         _validate_output_path(

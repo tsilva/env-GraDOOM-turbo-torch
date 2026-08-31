@@ -34,7 +34,7 @@ incompatible. It writes the report only after all validation succeeds.
 
 A `parity_certification` manifest uses formal evidence and declares a `policy_evaluation` object.
 That object names three hash-verified `declared_inputs`: a corpus manifest, an episode-seed
-manifest, and one common policy-runner executable. It also binds protocol version `1` and exactly
+manifest, and one common policy-runner executable. It also binds protocol version `2` and exactly
 one revision for each provider, `gradoom` and `env-vizdoom-turbo`. An optional positive
 `timeout_seconds` applies independently to each provider-policy batch. Provider-specific runner
 commands or policy arguments are not accepted.
@@ -49,6 +49,13 @@ artifacts, duplicate IDs or locations, unsupported contracts, deterministic-only
 adaptation, provider compensation, and any artifact or declared-input mutation during execution
 fail closed.
 
+Protocol v2 reads and hashes every declared file before evaluation, then executes the runner and
+each policy artifact through Linux sealed anonymous file descriptors. The runner receives only the
+read-only sealed policy path, and the same sealed runner bytes are used for every batch. Replacing
+and restoring an original path during execution therefore cannot change the bytes actually used;
+an attempted write to an execution descriptor fails. Original paths are still checked between
+batches so a persistent post-seal mutation fails before more progress is committed.
+
 The seed manifest contains a versioned seed-set ID and exactly 256 unique, ordered, non-negative
 64-bit episode seeds. The evidence command passes that same complete ordered array to the same
 hash-pinned runner for every provider-policy pair. Runner success, process failure, timeout,
@@ -56,6 +63,14 @@ malformed output, or an omitted seed all produce one retained outcome for every 
 failed unit is never silently retried or replaced. Every record includes its provider, policy,
 seed index, seed, stable unit identity, `player_killcount`, termination state, episode length, and
 an explicit execution failure or null.
+
+Successful and failed outcomes share one exact validator. A success permits only a finite,
+non-negative `player_killcount`, a non-negative integer episode length, and `terminated` or
+`truncated` termination. A failure permits only non-whitespace code/message fields and null outcome
+metrics. Missing or extra fields fail validation. The same rules are reapplied to resumed evidence,
+including evidence whose internal hashes were recomputed after tampering. Runner stdout and stderr
+are file-size bounded to 8 MiB per batch; reaching that boundary becomes retained execution failure
+evidence rather than unbounded host-memory growth.
 
 The report's `policy_evaluation` object binds the corpus and seed manifest hashes, normalized corpus,
 provider revisions, exact seed list, expected outcome count, complete outcomes, and failure count.
@@ -67,6 +82,14 @@ Pass `--merge` with an earlier matching corpus report to reuse already completed
 Completed failures are evidence and are reused exactly like successes. A changed corpus, seed set,
 runner, provider revision, code provenance, protocol, timeout, evidence level, or fixture state is
 an unlike evaluation and is rejected instead of combined.
+
+After each complete provider-policy batch, the command atomically replaces the requested output
+with an `evaluation_in_progress` report, fsyncs both file and containing directory, and only then
+starts the next batch. The last batch durably writes `evaluation_complete`. After interruption,
+pass that progress report through `--merge` and use a distinct output path. Resume accepts only the
+exact leading prefix of the fixed provider-policy-seed order, revalidates every outcome, and never
+reruns a retained success or failure. Gaps, reordering, mismatched identities, corrupt hashes, or a
+complete status with missing units fail closed.
 
 ## Development training benchmark
 

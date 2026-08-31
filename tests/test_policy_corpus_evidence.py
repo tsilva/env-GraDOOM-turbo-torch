@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -11,10 +12,18 @@ import pytest
 RUNNER = Path(__file__).parent / "fixtures" / "evidence" / "fixture_policy_runner.py"
 INCOMPLETE_RUNNER = RUNNER.with_name("fixture_incomplete_policy_runner.py")
 MUTATING_RUNNER = RUNNER.with_name("fixture_mutating_policy_runner.py")
+TRANSIENT_RUNNER = RUNNER.with_name("fixture_transient_restore_runner.py")
+INTERRUPT_RUNNER = RUNNER.with_name("fixture_interrupt_once_runner.py")
+NOISY_RUNNER = RUNNER.with_name("fixture_noisy_policy_runner.py")
 
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _canonical_sha256(value: object) -> str:
+    payload = json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode()
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _write_json(path: Path, value: object) -> None:
@@ -82,7 +91,7 @@ def _documents(tmp_path: Path) -> tuple[Path, Path, dict[str, object]]:
             {"name": "policy_runner", "path": str(RUNNER), "sha256": _sha256(RUNNER)},
         ],
         "policy_evaluation": {
-            "protocol_version": 1,
+            "protocol_version": 2,
             "corpus_input": "policy_corpus",
             "seed_manifest_input": "episode_seeds",
             "runner_input": "policy_runner",
@@ -97,10 +106,16 @@ def _documents(tmp_path: Path) -> tuple[Path, Path, dict[str, object]]:
     return manifest_path, corpus_path, manifest
 
 
-def _run(*args: str) -> subprocess.CompletedProcess[str]:
+def _run(*args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     command = shutil.which("gradoom-evidence")
     assert command is not None
-    return subprocess.run([command, *args], check=False, capture_output=True, text=True)
+    return subprocess.run(
+        [command, *args],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={**os.environ, **(env or {})},
+    )
 
 
 def _replace_runner(manifest_path: Path, manifest: dict[str, object], runner: Path) -> None:
@@ -108,6 +123,14 @@ def _replace_runner(manifest_path: Path, manifest: dict[str, object], runner: Pa
     runner_input["path"] = str(runner)
     runner_input["sha256"] = _sha256(runner)
     _write_json(manifest_path, manifest)
+
+
+def _rehash_policy_report(report: dict[str, object]) -> None:
+    evaluation = report["policy_evaluation"]
+    evidence_index = report["evidence_index"]
+    entry = next(item for item in evidence_index["entries"] if item["name"] == "policy_evaluation")
+    entry["sha256"] = _canonical_sha256(evaluation)
+    evidence_index["sha256"] = _canonical_sha256(evidence_index["entries"])
 
 
 def test_public_command_executes_complete_sealed_fixture_corpus(tmp_path: Path) -> None:
@@ -230,15 +253,69 @@ def test_omitted_runner_outcomes_are_retained_as_failures(tmp_path: Path) -> Non
     assert all(item["execution_failure"]["code"] == "missing_runner_outcome" for item in omitted)
 
 
-def test_post_seal_artifact_mutation_is_rejected(tmp_path: Path) -> None:
+def test_runner_output_is_bounded_and_retained_as_failures(tmp_path: Path) -> None:
+    manifest_path, _corpus_path, manifest = _documents(tmp_path)
+    _replace_runner(manifest_path, manifest, NOISY_RUNNER)
+    output = tmp_path / "report.json"
+
+    result = _run("--manifest", str(manifest_path), "--output", str(output))
+
+    assert result.returncode == 0, result.stderr
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert report["policy_evaluation"]["failure_count"] == 2 * 2 * 256
+    assert {
+        item["execution_failure"]["code"] for item in report["policy_evaluation"]["outcomes"]
+    } == {"runner_output_limit"}
+    assert output.stat().st_size < 2 * 1024 * 1024
+
+
+def test_execution_copy_rejects_policy_mutation(tmp_path: Path) -> None:
     manifest_path, _corpus_path, manifest = _documents(tmp_path)
     _replace_runner(manifest_path, manifest, MUTATING_RUNNER)
 
     result = _run("--manifest", str(manifest_path), "--output", str(tmp_path / "report.json"))
 
-    assert result.returncode == 2
-    assert "artifact changed after the corpus was sealed" in result.stderr
-    assert not (tmp_path / "report.json").exists()
+    assert result.returncode == 0, result.stderr
+    report = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
+    assert report["policy_evaluation"]["failure_count"] == 2 * 2 * 256
+    assert {
+        item["execution_failure"]["code"] for item in report["policy_evaluation"]["outcomes"]
+    } == {"runner_process_failure"}
+
+
+def test_transient_changed_and_restored_paths_cannot_change_execution_bytes(
+    tmp_path: Path,
+) -> None:
+    manifest_path, corpus_path, manifest = _documents(tmp_path)
+    _replace_runner(manifest_path, manifest, TRANSIENT_RUNNER)
+    corpus = json.loads(corpus_path.read_text(encoding="utf-8"))
+    targets = [
+        str(corpus_path),
+        str(tmp_path / "seeds.json"),
+        str(TRANSIENT_RUNNER),
+        *(str(tmp_path / policy["artifact_path"]) for policy in corpus["policies"]),
+    ]
+    before = {path: Path(path).read_bytes() for path in targets}
+
+    result = _run(
+        "--manifest",
+        str(manifest_path),
+        "--output",
+        str(tmp_path / "report.json"),
+        env={"GRADOOM_TRANSIENT_MUTATION_TARGETS": json.dumps(targets)},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert {path: Path(path).read_bytes() for path in targets} == before
+    report = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
+    assert report["policy_evaluation"]["failure_count"] == 0
+    assert {item["player_killcount"] for item in report["policy_evaluation"]["outcomes"]} == {
+        0,
+        1,
+        2,
+        3,
+        4,
+    }
 
 
 def test_merge_rejects_mismatched_corpus_identity(tmp_path: Path) -> None:
@@ -283,3 +360,131 @@ def test_merge_rejects_tampered_policy_evidence(tmp_path: Path) -> None:
 
     assert result.returncode == 2
     assert "policy_evaluation SHA-256 mismatch" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda outcome: outcome.update(player_killcount=-1),
+        lambda outcome: outcome.update(player_killcount=float("inf")),
+        lambda outcome: outcome.update(episode_length=-1),
+        lambda outcome: outcome.update(termination_state=""),
+        lambda outcome: outcome.update(termination_state="finished"),
+        lambda outcome: outcome.pop("termination_state"),
+        lambda outcome: outcome.update(extra_evidence="undeclared"),
+        lambda outcome: outcome.update(
+            player_killcount=None,
+            termination_state=None,
+            episode_length=None,
+            execution_failure={"code": "missing-message"},
+        ),
+        lambda outcome: outcome.update(
+            player_killcount=None,
+            termination_state=None,
+            episode_length=None,
+            execution_failure={"code": "", "message": "bad"},
+        ),
+    ],
+)
+def test_merge_reapplies_canonical_outcome_validation(tmp_path: Path, mutation: object) -> None:
+    manifest_path, _corpus_path, _manifest = _documents(tmp_path)
+    initial = tmp_path / "initial.json"
+    assert _run("--manifest", str(manifest_path), "--output", str(initial)).returncode == 0
+    report = json.loads(initial.read_text(encoding="utf-8"))
+    mutation(report["policy_evaluation"]["outcomes"][0])  # type: ignore[operator]
+    _rehash_policy_report(report)
+    _write_json(initial, report)
+
+    result = _run(
+        "--manifest",
+        str(manifest_path),
+        "--output",
+        str(tmp_path / "resumed.json"),
+        "--merge",
+        str(initial),
+    )
+
+    assert result.returncode == 2
+    assert (
+        "merge report contains an invalid policy outcome" in result.stderr
+        or "merge report is not valid JSON" in result.stderr
+    )
+
+
+def test_interruption_durably_retains_and_resumes_completed_prefix(tmp_path: Path) -> None:
+    manifest_path, _corpus_path, manifest = _documents(tmp_path)
+    _replace_runner(manifest_path, manifest, INTERRUPT_RUNNER)
+    partial = tmp_path / "partial.json"
+    marker = tmp_path / "interrupt.marker"
+    invocation_log = tmp_path / "invocations.log"
+    env = {
+        "GRADOOM_INTERRUPT_MARKER": str(marker),
+        "GRADOOM_INVOCATION_LOG": str(invocation_log),
+    }
+
+    interrupted = _run(
+        "--manifest",
+        str(manifest_path),
+        "--output",
+        str(partial),
+        env=env,
+    )
+
+    assert interrupted.returncode < 0
+    progress = json.loads(partial.read_text(encoding="utf-8"))
+    assert progress["status"] == "evaluation_in_progress"
+    assert len(progress["policy_evaluation"]["outcomes"]) == 256
+    assert progress["policy_evaluation"]["expected_outcome_count"] == 2 * 2 * 256
+    assert progress["policy_evaluation"]["failure_count"] == 1
+    retained_failure = next(
+        outcome
+        for outcome in progress["policy_evaluation"]["outcomes"]
+        if outcome["execution_failure"] is not None
+    )
+    assert not list(tmp_path.glob(f".{partial.name}.*.tmp"))
+
+    completed = tmp_path / "completed.json"
+    resumed = _run(
+        "--manifest",
+        str(manifest_path),
+        "--output",
+        str(completed),
+        "--merge",
+        str(partial),
+        env=env,
+    )
+
+    assert resumed.returncode == 0, resumed.stderr
+    report = json.loads(completed.read_text(encoding="utf-8"))
+    assert report["status"] == "evaluation_complete"
+    assert len(report["policy_evaluation"]["outcomes"]) == 2 * 2 * 256
+    assert report["policy_evaluation"]["failure_count"] == 4
+    assert retained_failure in report["policy_evaluation"]["outcomes"]
+    invocations = invocation_log.read_text(encoding="utf-8").splitlines()
+    assert invocations.count("gradoom:gradoom-policy") == 1
+    assert invocations.count("gradoom:reference-policy") == 2
+    assert len(invocations) == 5
+
+
+def test_merge_rejects_self_consistent_nonprefix_progress(tmp_path: Path) -> None:
+    manifest_path, _corpus_path, _manifest = _documents(tmp_path)
+    initial = tmp_path / "initial.json"
+    assert _run("--manifest", str(manifest_path), "--output", str(initial)).returncode == 0
+    report = json.loads(initial.read_text(encoding="utf-8"))
+    report["status"] = "evaluation_in_progress"
+    del report["policy_evaluation"]["outcomes"][0]
+    report["policy_evaluation"]["failure_count"] = 0
+    _rehash_policy_report(report)
+    _write_json(initial, report)
+
+    result = _run(
+        "--manifest",
+        str(manifest_path),
+        "--output",
+        str(tmp_path / "resumed.json"),
+        "--merge",
+        str(initial),
+    )
+
+    assert result.returncode == 2
+    assert "completed policy outcomes must be an exact leading prefix" in result.stderr

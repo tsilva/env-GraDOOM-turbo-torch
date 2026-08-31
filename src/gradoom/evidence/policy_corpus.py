@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+import contextlib
+import ctypes
+import fcntl
 import json
 import math
+import os
+import resource
 import subprocess
 import sys
+import tempfile
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -25,8 +32,97 @@ from .report import (
     _validate_string_content,
 )
 
-POLICY_RUNNER_PROTOCOL_VERSION = 1
+POLICY_RUNNER_PROTOCOL_VERSION = 2
 PROVIDER_IDS = ("gradoom", "env-vizdoom-turbo")
+_TERMINATION_STATES = frozenset({"terminated", "truncated"})
+_OUTCOME_FIELDS = frozenset(
+    {
+        "seed",
+        "player_killcount",
+        "termination_state",
+        "episode_length",
+        "execution_failure",
+    }
+)
+_RETAINED_OUTCOME_FIELDS = frozenset(
+    {"unit_identity", "provider_id", "policy_id", "seed_index", *_OUTCOME_FIELDS}
+)
+_RUNNER_CAPTURE_LIMIT = 8 * 1024 * 1024
+_FAILURE_MESSAGE_LIMIT = 4096
+_MFD_ALLOW_SEALING = 0x0002
+_F_ADD_SEALS = 1033
+_F_SEAL_SEAL = 0x0001
+_F_SEAL_SHRINK = 0x0002
+_F_SEAL_GROW = 0x0004
+_F_SEAL_WRITE = 0x0008
+
+
+def _sealed_memfd(payload: bytes, *, name: str, stack: contextlib.ExitStack) -> int:
+    libc = ctypes.CDLL(None, use_errno=True)
+    memfd_create = getattr(libc, "memfd_create", None)
+    if memfd_create is None:
+        raise EvidenceError("sealed policy execution requires Linux memfd sealing support")
+    memfd_create.argtypes = (ctypes.c_char_p, ctypes.c_uint)
+    memfd_create.restype = ctypes.c_int
+    descriptor = memfd_create(name.encode(), _MFD_ALLOW_SEALING)
+    if descriptor < 0:
+        error_number = ctypes.get_errno()
+        raise EvidenceError(
+            "sealed policy execution could not create an anonymous file: "
+            f"{os.strerror(error_number)}"
+        )
+    stack.callback(os.close, descriptor)
+    view = memoryview(payload)
+    while view:
+        written = os.write(descriptor, view)
+        view = view[written:]
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    seals = _F_SEAL_SEAL | _F_SEAL_SHRINK | _F_SEAL_GROW | _F_SEAL_WRITE
+    try:
+        fcntl.fcntl(descriptor, _F_ADD_SEALS, seals)
+    except OSError as error:
+        raise EvidenceError("sealed policy execution could not seal an anonymous file") from error
+    return descriptor
+
+
+def _limit_runner_output_files() -> None:
+    resource.setrlimit(resource.RLIMIT_FSIZE, (_RUNNER_CAPTURE_LIMIT, _RUNNER_CAPTURE_LIMIT))
+
+
+def _bounded_failure_message(payload: bytes) -> str:
+    truncated = len(payload) > _FAILURE_MESSAGE_LIMIT
+    message = payload[:_FAILURE_MESSAGE_LIMIT].decode(errors="replace").strip()
+    if truncated:
+        message += "\n[runner stderr truncated]"
+    return message
+
+
+def _validate_sources_unchanged(
+    *,
+    declared_inputs: list[dict[str, Any]],
+    verified: dict[str, tuple[Path, bytes]],
+    policies: list[dict[str, Any]],
+) -> None:
+    for declared_input in declared_inputs:
+        try:
+            current_payload = verified[declared_input["name"]][0].read_bytes()
+        except OSError as error:
+            raise EvidenceError(
+                f"declared input {declared_input['name']!r} changed during policy evaluation: "
+                f"{error}"
+            ) from error
+        if _sha256_bytes(current_payload) != declared_input["sha256"]:
+            raise EvidenceError(
+                f"declared input {declared_input['name']!r} changed during policy evaluation"
+            )
+    for policy in policies:
+        _payload, current_sha256 = _artifact_payload(
+            Path(policy["resolved_artifact_path"]), policy_id=policy["id"]
+        )
+        if current_sha256 != policy["artifact_sha256"]:
+            raise EvidenceError(
+                f"policy {policy['id']!r} artifact changed after the corpus was sealed"
+            )
 
 
 def _read_verified_input(
@@ -58,11 +154,12 @@ def _declared_input(
         raise EvidenceError(f"{field} names undeclared input {input_name!r}") from error
 
 
-def _artifact_sha256(path: Path, *, policy_id: str) -> str:
+def _artifact_payload(path: Path, *, policy_id: str) -> tuple[bytes, str]:
     try:
-        return _sha256_bytes(path.read_bytes())
+        payload = path.read_bytes()
     except OSError as error:
         raise EvidenceError(f"policy {policy_id!r} artifact is unavailable: {error}") from error
+    return payload, _sha256_bytes(payload)
 
 
 def _validate_contract(value: object, *, field: str) -> dict[str, Any]:
@@ -78,7 +175,9 @@ def _validate_contract(value: object, *, field: str) -> dict[str, Any]:
     return value
 
 
-def _load_corpus(path: Path, payload: bytes) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+def _load_corpus(
+    path: Path, payload: bytes
+) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, bytes]]:
     corpus = _parse_json_document(payload, document="policy corpus manifest")
     if not isinstance(corpus, dict):
         raise EvidenceError("policy corpus manifest must be a JSON object")
@@ -103,6 +202,7 @@ def _load_corpus(path: Path, payload: bytes) -> tuple[dict[str, Any], list[dict[
     identifiers: set[str] = set()
     artifact_paths: list[Path] = []
     origins: set[str] = set()
+    artifact_payloads: dict[str, bytes] = {}
     for index, raw_policy in enumerate(raw_policies):
         field = f"policy corpus manifest policies[{index}]"
         if not isinstance(raw_policy, dict):
@@ -129,12 +229,13 @@ def _load_corpus(path: Path, payload: bytes) -> tuple[dict[str, Any], list[dict[
         expected_sha256 = _validate_sha256(
             raw_policy.get("artifact_sha256"), f"{field}.artifact_sha256"
         )
-        actual_sha256 = _artifact_sha256(artifact_path, policy_id=policy_id)
+        artifact_payload, actual_sha256 = _artifact_payload(artifact_path, policy_id=policy_id)
         if actual_sha256 != expected_sha256:
             raise EvidenceError(
                 f"policy {policy_id!r} artifact SHA-256 mismatch: "
                 f"expected {expected_sha256}, got {actual_sha256}"
             )
+        artifact_payloads[policy_id] = artifact_payload
         contract = _validate_contract(
             raw_policy.get("model_runtime_contract"),
             field=f"{field}.model_runtime_contract",
@@ -178,7 +279,7 @@ def _load_corpus(path: Path, payload: bytes) -> tuple[dict[str, Any], list[dict[
         "shared_preprocessing_identity": preprocessing,
         "policies": policies,
     }
-    return normalized, policies
+    return normalized, policies, artifact_payloads
 
 
 def _load_seeds(payload: bytes) -> dict[str, Any]:
@@ -246,12 +347,77 @@ def _failure_outcome(seed: int, *, code: str, message: str) -> dict[str, Any]:
     }
 
 
+def _exact_fields(value: dict[str, Any], expected: frozenset[str], *, document: str) -> None:
+    missing = sorted(expected - set(value))
+    extra = sorted(set(value) - expected)
+    if missing or extra:
+        details = []
+        if missing:
+            details.append(f"missing {', '.join(repr(field) for field in missing)}")
+        if extra:
+            details.append(f"undeclared {', '.join(repr(field) for field in extra)}")
+        raise EvidenceError(f"{document} has invalid fields: {'; '.join(details)}")
+
+
+def _canonical_outcome(
+    value: object,
+    *,
+    expected_seed: int,
+    document: str,
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise EvidenceError(f"{document} must be an object")
+    _exact_fields(value, _OUTCOME_FIELDS, document=document)
+    seed = value["seed"]
+    if type(seed) is not int or seed != expected_seed:
+        raise EvidenceError(f"{document}.seed does not match the requested seed")
+    failure = value["execution_failure"]
+    if failure is not None:
+        if not isinstance(failure, dict):
+            raise EvidenceError(f"{document}.execution_failure must be an object or null")
+        _exact_fields(failure, frozenset({"code", "message"}), document=f"{document}.failure")
+        code = _required_string(failure["code"], f"{document}.failure.code")
+        message = _required_string(failure["message"], f"{document}.failure.message")
+        if not code.strip() or not message.strip():
+            raise EvidenceError(f"{document}.execution_failure fields must be non-whitespace")
+        if any(
+            value[field] is not None
+            for field in ("player_killcount", "termination_state", "episode_length")
+        ):
+            raise EvidenceError(f"{document} failure metrics must be null")
+        return _failure_outcome(seed, code=code, message=message)
+
+    killcount = value["player_killcount"]
+    length = value["episode_length"]
+    termination = value["termination_state"]
+    if type(killcount) not in {int, float} or not math.isfinite(killcount) or killcount < 0:
+        raise EvidenceError(f"{document}.player_killcount must be finite and non-negative")
+    if type(length) is not int or length < 0:
+        raise EvidenceError(f"{document}.episode_length must be a non-negative integer")
+    if termination not in _TERMINATION_STATES:
+        raise EvidenceError(f"{document}.termination_state must be 'terminated' or 'truncated'")
+    return {
+        "seed": seed,
+        "player_killcount": killcount,
+        "termination_state": termination,
+        "episode_length": length,
+        "execution_failure": None,
+    }
+
+
 def _normalize_runner_outcomes(
     payload: bytes, *, requested_seeds: list[int]
 ) -> dict[int, dict[str, Any]]:
     try:
         response = _parse_json_document(payload, document="policy runner response")
-        if not isinstance(response, dict) or response.get("protocol_version") != 1:
+        if not isinstance(response, dict):
+            raise EvidenceError("policy runner response must be an object")
+        _exact_fields(
+            response,
+            frozenset({"protocol_version", "outcomes"}),
+            document="policy runner response",
+        )
+        if response.get("protocol_version") != POLICY_RUNNER_PROTOCOL_VERSION:
             raise EvidenceError("policy runner response uses an unsupported protocol")
         raw_outcomes = response.get("outcomes")
         if not isinstance(raw_outcomes, list):
@@ -266,34 +432,11 @@ def _normalize_runner_outcomes(
                 raise EvidenceError(
                     "policy runner response contains an unexpected or duplicate seed"
                 )
-            failure = raw.get("execution_failure")
-            if failure is not None:
-                if not isinstance(failure, dict):
-                    raise EvidenceError("policy runner execution_failure must be an object or null")
-                code = _required_string(failure.get("code"), "policy runner failure code")
-                message = _required_string(failure.get("message"), "policy runner failure message")
-                normalized[seed] = _failure_outcome(seed, code=code, message=message)
-                continue
-            killcount = raw.get("player_killcount")
-            length = raw.get("episode_length")
-            termination = raw.get("termination_state")
-            if (
-                type(killcount) not in {int, float}
-                or not math.isfinite(killcount)
-                or killcount < 0
-                or type(length) is not int
-                or length < 0
-                or not isinstance(termination, str)
-                or not termination
-            ):
-                raise EvidenceError("policy runner response contains an invalid successful outcome")
-            normalized[seed] = {
-                "seed": seed,
-                "player_killcount": killcount,
-                "termination_state": termination,
-                "episode_length": length,
-                "execution_failure": None,
-            }
+            normalized[seed] = _canonical_outcome(
+                raw,
+                expected_seed=seed,
+                document=f"policy runner response outcomes[{index}]",
+            )
         for seed in requested_seeds:
             normalized.setdefault(
                 seed,
@@ -316,7 +459,8 @@ def _normalize_runner_outcomes(
 
 
 def _execute_batch(
-    runner_path: Path,
+    runner_descriptor: int,
+    artifact_descriptor: int,
     *,
     provider: dict[str, str],
     policy: dict[str, Any],
@@ -329,36 +473,54 @@ def _execute_batch(
         "provider_id": provider["id"],
         "provider_revision": provider["revision"],
         "policy": {
-            key: policy[key]
-            for key in (
-                "id",
-                "training_provider",
-                "resolved_artifact_path",
-                "artifact_sha256",
-                "model_runtime_contract",
-                "stochastic_actions",
-                "execution_identity",
-            )
+            "id": policy["id"],
+            "training_provider": policy["training_provider"],
+            "resolved_artifact_path": f"/proc/self/fd/{artifact_descriptor}",
+            "artifact_sha256": policy["artifact_sha256"],
+            "model_runtime_contract": policy["model_runtime_contract"],
+            "stochastic_actions": policy["stochastic_actions"],
+            "execution_identity": policy["execution_identity"],
         },
         "seeds": seeds,
     }
     if fixture_failure_seed is not None:
         request["fixture_failure_seed"] = fixture_failure_seed
-    try:
-        result = subprocess.run(
-            [sys.executable, str(runner_path)],
-            input=json.dumps(request, allow_nan=False).encode(),
-            check=False,
-            capture_output=True,
-            timeout=timeout_seconds,
-        )
-    except (OSError, subprocess.TimeoutExpired) as error:
-        code = (
-            "runner_timeout" if isinstance(error, subprocess.TimeoutExpired) else "runner_failure"
-        )
-        return {seed: _failure_outcome(seed, code=code, message=str(error)) for seed in seeds}
+    with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+        try:
+            result = subprocess.run(
+                [sys.executable, f"/proc/self/fd/{runner_descriptor}"],
+                input=json.dumps(request, allow_nan=False).encode(),
+                check=False,
+                stdout=stdout,
+                stderr=stderr,
+                timeout=timeout_seconds,
+                pass_fds=(runner_descriptor, artifact_descriptor),
+                preexec_fn=_limit_runner_output_files,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            code = (
+                "runner_timeout"
+                if isinstance(error, subprocess.TimeoutExpired)
+                else "runner_failure"
+            )
+            return {seed: _failure_outcome(seed, code=code, message=str(error)) for seed in seeds}
+        stdout_size = stdout.tell()
+        stderr_size = stderr.tell()
+        stdout.seek(0)
+        stderr.seek(0)
+        stdout_payload = stdout.read(_RUNNER_CAPTURE_LIMIT)
+        stderr_payload = stderr.read(_RUNNER_CAPTURE_LIMIT)
+    if stdout_size >= _RUNNER_CAPTURE_LIMIT or stderr_size >= _RUNNER_CAPTURE_LIMIT:
+        return {
+            seed: _failure_outcome(
+                seed,
+                code="runner_output_limit",
+                message="Policy runner output reached the bounded capture limit.",
+            )
+            for seed in seeds
+        }
     if result.returncode != 0:
-        message = result.stderr.decode(errors="replace").strip()
+        message = _bounded_failure_message(stderr_payload)
         return {
             seed: _failure_outcome(
                 seed,
@@ -367,7 +529,7 @@ def _execute_batch(
             )
             for seed in seeds
         }
-    return _normalize_runner_outcomes(result.stdout, requested_seeds=seeds)
+    return _normalize_runner_outcomes(stdout_payload, requested_seeds=seeds)
 
 
 def _load_reusable_outcomes(
@@ -375,17 +537,46 @@ def _load_reusable_outcomes(
     *,
     evaluation_identity: str,
     expected_units: dict[str, tuple[str, str, int, int]],
+    expected_unit_order: list[str],
+    expected_binding: dict[str, Any],
 ) -> dict[str, dict[str, Any]]:
     if merge_path is None:
         return {}
     report = _parse_json_document(merge_path.read_bytes(), document="merge report")
     if not isinstance(report, dict) or report.get("workflow") != "parity_certification":
         raise EvidenceError("merge report workflow must be parity_certification")
+    status = report.get("status")
+    if status not in {"evaluation_in_progress", "evaluation_complete"}:
+        raise EvidenceError("merge report has an invalid policy evaluation status")
+    if report.get("run_identity") != evaluation_identity:
+        raise EvidenceError("cannot merge unlike policy evaluation identities")
     evaluation = report.get("policy_evaluation")
     if not isinstance(evaluation, dict):
         raise EvidenceError("merge report policy_evaluation must be an object")
     if evaluation.get("evaluation_identity") != evaluation_identity:
         raise EvidenceError("cannot merge unlike policy evaluation identities")
+    required_evaluation_fields = frozenset(
+        {
+            "protocol_version",
+            "evaluation_identity",
+            "corpus_manifest_sha256",
+            "corpus",
+            "seed_manifest_sha256",
+            "seed_manifest",
+            "providers",
+            "outcomes",
+            "expected_outcome_count",
+            "failure_count",
+        }
+    )
+    _exact_fields(evaluation, required_evaluation_fields, document="merge policy_evaluation")
+    for field, expected in expected_binding.items():
+        if evaluation.get(field) != expected:
+            raise EvidenceError(
+                f"merge report policy_evaluation.{field} does not match current evidence"
+            )
+    if not isinstance(evaluation.get("corpus"), dict):
+        raise EvidenceError("merge report policy_evaluation.corpus must be an object")
     evidence_index = report.get("evidence_index")
     if not isinstance(evidence_index, dict) or not isinstance(evidence_index.get("entries"), list):
         raise EvidenceError("merge report evidence_index is invalid")
@@ -404,9 +595,18 @@ def _load_reusable_outcomes(
     if not isinstance(outcomes, list):
         raise EvidenceError("merge report policy_evaluation.outcomes must be an array")
     reusable: dict[str, dict[str, Any]] = {}
-    for item in outcomes:
+    observed_order: list[str] = []
+    for index, item in enumerate(outcomes):
         if not isinstance(item, dict):
             raise EvidenceError("merge report contains an invalid policy outcome")
+        try:
+            _exact_fields(
+                item,
+                _RETAINED_OUTCOME_FIELDS,
+                document=f"merge policy outcome[{index}]",
+            )
+        except EvidenceError as error:
+            raise EvidenceError("merge report contains an invalid policy outcome") from error
         identity = item.get("unit_identity")
         expected = expected_units.get(identity)
         actual = (
@@ -417,12 +617,40 @@ def _load_reusable_outcomes(
         )
         if expected is None or actual != expected or identity in reusable:
             raise EvidenceError("merge report contains mismatched or duplicate policy evidence")
-        reusable[identity] = item
+        try:
+            normalized = _canonical_outcome(
+                {field: item[field] for field in _OUTCOME_FIELDS},
+                expected_seed=expected[3],
+                document=f"merge policy outcome[{index}]",
+            )
+        except EvidenceError as error:
+            raise EvidenceError("merge report contains an invalid policy outcome") from error
+        reusable[identity] = {
+            "unit_identity": identity,
+            "provider_id": expected[0],
+            "policy_id": expected[1],
+            "seed_index": expected[2],
+            **normalized,
+        }
+        observed_order.append(identity)
+    if observed_order != expected_unit_order[: len(observed_order)]:
+        raise EvidenceError("completed policy outcomes must be an exact leading prefix")
+    if status == "evaluation_complete" and len(observed_order) != len(expected_unit_order):
+        raise EvidenceError("complete policy evaluation is missing required outcomes")
+    if status == "evaluation_in_progress" and len(observed_order) >= len(expected_unit_order):
+        raise EvidenceError("in-progress policy evaluation cannot contain the complete grid")
+    failure_count = sum(item["execution_failure"] is not None for item in reusable.values())
+    if evaluation.get("failure_count") != failure_count:
+        raise EvidenceError("merge report policy_evaluation.failure_count is invalid")
     return reusable
 
 
 def build_policy_evaluation_report(
-    manifest_path: Path, *, merge_path: Path | None = None
+    manifest_path: Path,
+    *,
+    merge_path: Path | None = None,
+    output_path: Path | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     manifest, manifest_payload = _load_manifest(manifest_path)
     _validate_schema_version(manifest.get("schema_version"), document="manifest")
@@ -462,7 +690,7 @@ def build_policy_evaluation_report(
         for item in declared_inputs
     }
     corpus_path, corpus_payload = verified[corpus_input["name"]]
-    corpus, policies = _load_corpus(corpus_path, corpus_payload)
+    corpus, policies, artifact_payloads = _load_corpus(corpus_path, corpus_payload)
     evidence_document_paths = [manifest_path.resolve(strict=False)] + [
         item[0] for item in verified.values()
     ]
@@ -472,9 +700,12 @@ def build_policy_evaluation_report(
             raise EvidenceError(
                 f"policy {policy['id']!r} artifact aliases an evidence input document"
             )
+        if output_path is not None:
+            resolved_output = _resolve_evidence_path(output_path, base_directory=Path.cwd())
+            if _paths_alias(resolved_output, artifact_path):
+                raise EvidenceError(f"output path aliases policy artifact {policy['id']!r}")
     seeds = _load_seeds(verified[seeds_input["name"]][1])
     providers = _providers(configuration.get("providers"))
-    runner_path = verified[runner_input["name"]][0]
     timeout_seconds = configuration.get("timeout_seconds", 120)
     if (
         type(timeout_seconds) not in {int, float}
@@ -511,6 +742,7 @@ def build_policy_evaluation_report(
         document="policy evaluation manifest",
     )
     expected_units: dict[str, tuple[str, str, int, int]] = {}
+    expected_unit_order: list[str] = []
     for provider in providers:
         for policy in policies:
             for seed_index, seed in enumerate(seeds["seeds"]):
@@ -522,98 +754,23 @@ def build_policy_evaluation_report(
                     seed=seed,
                 )
                 expected_units[identity] = (provider["id"], policy["id"], seed_index, seed)
+                expected_unit_order.append(identity)
+    expected_binding = {
+        "protocol_version": POLICY_RUNNER_PROTOCOL_VERSION,
+        "evaluation_identity": evaluation_identity,
+        "corpus_manifest_sha256": corpus_input["sha256"],
+        "seed_manifest_sha256": seeds_input["sha256"],
+        "seed_manifest": seeds,
+        "providers": providers,
+        "expected_outcome_count": len(expected_units),
+    }
     reusable = _load_reusable_outcomes(
         merge_path,
         evaluation_identity=evaluation_identity,
         expected_units=expected_units,
+        expected_unit_order=expected_unit_order,
+        expected_binding=expected_binding,
     )
-    outcomes: list[dict[str, Any]] = []
-    for provider in providers:
-        for policy in policies:
-            pending_seeds = []
-            for seed_index, seed in enumerate(seeds["seeds"]):
-                identity = _unit_identity(
-                    evaluation_identity,
-                    provider_id=provider["id"],
-                    policy_id=policy["id"],
-                    seed_index=seed_index,
-                    seed=seed,
-                )
-                if identity not in reusable:
-                    pending_seeds.append(seed)
-            executed = (
-                _execute_batch(
-                    runner_path,
-                    provider=provider,
-                    policy=policy,
-                    seeds=pending_seeds,
-                    fixture_failure_seed=fixture_failure_seed,
-                    timeout_seconds=float(timeout_seconds),
-                )
-                if pending_seeds
-                else {}
-            )
-            if (
-                _artifact_sha256(Path(policy["resolved_artifact_path"]), policy_id=policy["id"])
-                != policy["artifact_sha256"]
-            ):
-                raise EvidenceError(
-                    f"policy {policy['id']!r} artifact changed after the corpus was sealed"
-                )
-            for seed_index, seed in enumerate(seeds["seeds"]):
-                identity = _unit_identity(
-                    evaluation_identity,
-                    provider_id=provider["id"],
-                    policy_id=policy["id"],
-                    seed_index=seed_index,
-                    seed=seed,
-                )
-                outcome = reusable[identity] if identity in reusable else executed[seed]
-                outcomes.append(
-                    {
-                        "unit_identity": identity,
-                        "provider_id": provider["id"],
-                        "policy_id": policy["id"],
-                        "seed_index": seed_index,
-                        **outcome,
-                    }
-                )
-    for declared_input in declared_inputs:
-        try:
-            current_payload = verified[declared_input["name"]][0].read_bytes()
-        except OSError as error:
-            raise EvidenceError(
-                f"declared input {declared_input['name']!r} changed during policy evaluation: "
-                f"{error}"
-            ) from error
-        if _sha256_bytes(current_payload) != declared_input["sha256"]:
-            raise EvidenceError(
-                f"declared input {declared_input['name']!r} changed during policy evaluation"
-            )
-    evaluation = {
-        "protocol_version": POLICY_RUNNER_PROTOCOL_VERSION,
-        "evaluation_identity": evaluation_identity,
-        "corpus_manifest_sha256": corpus_input["sha256"],
-        "corpus": corpus,
-        "seed_manifest_sha256": seeds_input["sha256"],
-        "seed_manifest": seeds,
-        "providers": providers,
-        "outcomes": outcomes,
-        "expected_outcome_count": len(expected_units),
-        "failure_count": sum(item["execution_failure"] is not None for item in outcomes),
-    }
-    evidence_entries = [
-        {"name": "manifest", "sha256": _sha256_bytes(manifest_payload)},
-        *({"name": item["name"], "sha256": item["sha256"]} for item in declared_inputs),
-        *(
-            {"name": f"policy_artifact.{policy['id']}", "sha256": policy["artifact_sha256"]}
-            for policy in policies
-        ),
-        {
-            "name": "policy_evaluation",
-            "sha256": _canonical_sha256(evaluation, document="policy evaluation report"),
-        },
-    ]
     reasons = [
         {
             "code": "parity_verdict_pending",
@@ -630,24 +787,126 @@ def build_policy_evaluation_report(
                 "message": "Fixture evidence cannot support public claims.",
             },
         )
-    return {
-        "schema_version": 1,
-        "workflow": "parity_certification",
-        "evidence_level": "formal",
-        "fixture": manifest["fixture"],
-        "status": "evaluation_complete",
-        "claim_eligible": False,
-        "claim_reasons": reasons,
-        "run_identity": evaluation_identity,
-        "code_provenance": code_provenance,
-        "declared_inputs": declared_inputs,
-        "policy_evaluation": evaluation,
-        "evidence_index": {
-            "algorithm": "sha256",
-            "entries": evidence_entries,
-            "sha256": _canonical_sha256(evidence_entries, document="policy evaluation report"),
-        },
-    }
+
+    def build_report(outcomes: list[dict[str, Any]], *, complete: bool) -> dict[str, Any]:
+        evaluation = {
+            **expected_binding,
+            "corpus": corpus,
+            "outcomes": outcomes,
+            "failure_count": sum(item["execution_failure"] is not None for item in outcomes),
+        }
+        evidence_entries = [
+            {"name": "manifest", "sha256": _sha256_bytes(manifest_payload)},
+            *({"name": item["name"], "sha256": item["sha256"]} for item in declared_inputs),
+            *(
+                {
+                    "name": f"policy_artifact.{policy['id']}",
+                    "sha256": policy["artifact_sha256"],
+                }
+                for policy in policies
+            ),
+            {
+                "name": "policy_evaluation",
+                "sha256": _canonical_sha256(evaluation, document="policy evaluation report"),
+            },
+        ]
+        return {
+            "schema_version": 1,
+            "workflow": "parity_certification",
+            "evidence_level": "formal",
+            "fixture": manifest["fixture"],
+            "status": "evaluation_complete" if complete else "evaluation_in_progress",
+            "claim_eligible": False,
+            "claim_reasons": reasons,
+            "run_identity": evaluation_identity,
+            "code_provenance": code_provenance,
+            "declared_inputs": declared_inputs,
+            "policy_evaluation": evaluation,
+            "evidence_index": {
+                "algorithm": "sha256",
+                "entries": evidence_entries,
+                "sha256": _canonical_sha256(evidence_entries, document="policy evaluation report"),
+            },
+        }
+
+    outcomes: list[dict[str, Any]] = []
+    with contextlib.ExitStack() as stack:
+        runner_descriptor = _sealed_memfd(
+            verified[runner_input["name"]][1],
+            name="gradoom-policy-runner",
+            stack=stack,
+        )
+        artifact_descriptors = {
+            policy["id"]: _sealed_memfd(
+                artifact_payloads[policy["id"]],
+                name="gradoom-policy-artifact",
+                stack=stack,
+            )
+            for policy in policies
+        }
+        for provider in providers:
+            for policy in policies:
+                pending_seeds = []
+                for seed_index, seed in enumerate(seeds["seeds"]):
+                    identity = _unit_identity(
+                        evaluation_identity,
+                        provider_id=provider["id"],
+                        policy_id=policy["id"],
+                        seed_index=seed_index,
+                        seed=seed,
+                    )
+                    if identity not in reusable:
+                        pending_seeds.append(seed)
+                executed = (
+                    _execute_batch(
+                        runner_descriptor,
+                        artifact_descriptors[policy["id"]],
+                        provider=provider,
+                        policy=policy,
+                        seeds=pending_seeds,
+                        fixture_failure_seed=fixture_failure_seed,
+                        timeout_seconds=float(timeout_seconds),
+                    )
+                    if pending_seeds
+                    else {}
+                )
+                if pending_seeds:
+                    _validate_sources_unchanged(
+                        declared_inputs=declared_inputs,
+                        verified=verified,
+                        policies=policies,
+                    )
+                for seed_index, seed in enumerate(seeds["seeds"]):
+                    identity = _unit_identity(
+                        evaluation_identity,
+                        provider_id=provider["id"],
+                        policy_id=policy["id"],
+                        seed_index=seed_index,
+                        seed=seed,
+                    )
+                    outcome = reusable[identity] if identity in reusable else executed[seed]
+                    outcomes.append(
+                        {
+                            "unit_identity": identity,
+                            "provider_id": provider["id"],
+                            "policy_id": policy["id"],
+                            "seed_index": seed_index,
+                            **outcome,
+                        }
+                    )
+                if pending_seeds and progress_callback is not None:
+                    progress_callback(
+                        build_report(
+                            outcomes,
+                            complete=len(outcomes) == len(expected_unit_order),
+                        )
+                    )
+    _validate_sources_unchanged(
+        declared_inputs=declared_inputs,
+        verified=verified,
+        policies=policies,
+    )
+    return build_report(outcomes, complete=True)
 
 
 __all__ = ["POLICY_RUNNER_PROTOCOL_VERSION", "build_policy_evaluation_report"]

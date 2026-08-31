@@ -25,3 +25,5 @@
 - Add sealed two-origin pretrained-policy corpus validation and exhaustive,
   restart-safe 256-seed execution in both providers through the public evidence
   command, with deterministic nonclaiming subprocess fixtures.
+- Seal the policy runner and policy bytes used by corpus execution, revalidate
+  resumed outcomes canonically, and durably checkpoint each completed batch.
