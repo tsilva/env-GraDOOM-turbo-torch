@@ -447,6 +447,31 @@ def test_reusable_setup_time_is_included_for_every_active_seed(tmp_path: Path) -
     assert [attempt["reusable_elapsed_seconds"] for attempt in report["attempts"]] == [32.5, 32.5]
 
 
+def test_public_command_does_not_charge_one_seed_for_another_seeds_work(
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest(
+        tmp_path,
+        outcomes={"10": [30.0, 0.0]},
+        training_seeds=[123, 124],
+        extra_arguments=[
+            "--fixture-training-delay-seed",
+            "123",
+            "--fixture-training-delay-seconds",
+            "0.5",
+        ],
+    )
+    output = tmp_path / "report.json"
+
+    result = _run_evidence("--manifest", str(manifest), "--output", str(output))
+
+    assert result.returncode == 0, result.stderr
+    attempts = json.loads(output.read_text(encoding="utf-8"))["attempts"]
+    elapsed = {attempt["seed"]: attempt["reusable_elapsed_seconds"] for attempt in attempts}
+    assert elapsed[123] >= 0.5
+    assert elapsed[124] < 0.4
+
+
 def test_terminal_elapsed_includes_durable_journal_and_authority_delay(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1530,6 +1555,98 @@ def test_public_command_rejects_computed_module_namespace_exec_indirection(
 
     assert result.returncode == 2
     assert "opaque trainer indirection" in result.stderr
+
+
+def test_public_command_binds_hidden_source_executed_through_builtins(
+    tmp_path: Path,
+) -> None:
+    hidden = tmp_path / "hidden_trainer"
+    shutil.copyfile(FIXTURE_PROCESS, hidden)
+    launcher = tmp_path / "launcher.py"
+    launcher.write_text(
+        "import builtins\n"
+        "from pathlib import Path\n"
+        "namespace = {'__name__': 'hidden_trainer'}\n"
+        "loader = getattr(builtins, 'ex' + 'ec')\n"
+        f"loader(Path({str(hidden)!r}).read_text(encoding='utf-8'), namespace)\n"
+        "raise SystemExit(namespace['main']())\n",
+        encoding="utf-8",
+    )
+    manifest = _manifest(
+        tmp_path,
+        outcomes={"10": [30.0, 0.0]},
+        trainer_script=launcher,
+        trainer_code_root=tmp_path,
+        extra_arguments=["--fixture-interrupt-once-at-step", "10"],
+    )
+    interrupted = tmp_path / "interrupted.json"
+    first = _run_evidence("--manifest", str(manifest), "--output", str(interrupted))
+    assert first.returncode == 0, first.stderr
+    bound_paths = {
+        Path(item["path"])
+        for item in json.loads(interrupted.read_text(encoding="utf-8"))[
+            "benchmark_protocol"
+        ]["trainer"]["bound_files"]
+    }
+    assert hidden in bound_paths
+    hidden.write_text(hidden.read_text(encoding="utf-8") + "\n# changed\n", encoding="utf-8")
+
+    result = _run_evidence(
+        "--manifest",
+        str(manifest),
+        "--output",
+        str(tmp_path / "continued.json"),
+        "--merge",
+        str(interrupted),
+    )
+
+    assert result.returncode == 2
+    assert "unlike run identity" in result.stderr
+
+
+def test_public_command_binds_hidden_trainer_launched_through_operator_and_posix(
+    tmp_path: Path,
+) -> None:
+    hidden = tmp_path / "hidden_trainer.py"
+    shutil.copyfile(FIXTURE_PROCESS, hidden)
+    launcher = tmp_path / "launcher.py"
+    launcher.write_text(
+        "import operator\n"
+        "import pathlib\n"
+        "launch = operator.attrgetter('os.posix.execv')(pathlib)\n"
+        f"launch({sys.executable!r}, [{sys.executable!r}, {str(hidden)!r}])\n",
+        encoding="utf-8",
+    )
+    manifest = _manifest(
+        tmp_path,
+        outcomes={"10": [30.0, 0.0]},
+        trainer_script=launcher,
+        trainer_code_root=tmp_path,
+        extra_arguments=["--fixture-interrupt-once-at-step", "10"],
+    )
+    interrupted = tmp_path / "interrupted.json"
+    first = _run_evidence("--manifest", str(manifest), "--output", str(interrupted))
+    assert first.returncode == 0, first.stderr
+    bound_paths = {
+        Path(item["path"])
+        for item in json.loads(interrupted.read_text(encoding="utf-8"))[
+            "benchmark_protocol"
+        ]["trainer"]["bound_files"]
+    }
+    assert hidden in bound_paths
+    hidden.write_text(hidden.read_text(encoding="utf-8") + "\n# changed\n", encoding="utf-8")
+
+    result = _run_evidence(
+        "--manifest",
+        str(manifest),
+        "--output",
+        str(tmp_path / "continued.json"),
+        "--merge",
+        str(interrupted),
+    )
+
+    assert result.returncode == 2
+    assert "unlike run identity" in result.stderr
 
 
 def test_documented_train_python_closure_allows_importlib_resources() -> None:

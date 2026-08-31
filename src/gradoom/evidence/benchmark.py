@@ -375,7 +375,13 @@ def _validated_python_tree(path: Path) -> ast.AST:
     return tree
 
 
-def _python_source_closure(script_path: Path, code_root: Path) -> list[Path]:
+def _python_source_closure(
+    script_path: Path,
+    code_root: Path,
+    *,
+    excluded_roots: tuple[Path, ...] = (),
+    excluded_files: tuple[Path, ...] = (),
+) -> list[Path]:
     pending = [script_path]
     closure: set[Path] = set()
     while pending:
@@ -486,13 +492,73 @@ def _python_source_closure(script_path: Path, code_root: Path) -> list[Path]:
                 initializer = code_root / parent / "__init__.py"
                 if initializer.is_file():
                     pending.append(initializer)
-    return sorted(closure)
+    # Static import closure is useful for rejecting known opaque launch primitives, but it
+    # cannot prove which local source a dynamic Python expression will eventually execute.
+    # Bind the complete declared Python source root as the security boundary.  This makes
+    # computed ``builtins.exec`` loaders, indirect ``posix.exec*`` calls, plugin discovery,
+    # and any equivalent indirection unable to select mutable local Python without that
+    # source participating in recipe identity and post-cohort verification.
+    normalized_roots = tuple(path.resolve() for path in excluded_roots)
+    normalized_files = {path.resolve() for path in excluded_files}
+    ignored_directories = {
+        ".git",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".tox",
+        ".venv",
+        "__pycache__",
+        "dist",
+    }
+
+    def excluded(candidate: Path) -> bool:
+        resolved = candidate.resolve()
+        return resolved in normalized_files or any(
+            resolved == root or resolved.is_relative_to(root) for root in normalized_roots
+        )
+
+    def is_local_executable_source(candidate: Path) -> bool:
+        if candidate.suffix.lower() in {".py", ".pyi", ".pyw", ".so", ".pyd"}:
+            return True
+        try:
+            metadata = candidate.stat()
+            if metadata.st_mode & 0o111:
+                return True
+            source = candidate.read_text(encoding="utf-8")
+            ast.parse(source, filename=str(candidate))
+        except (OSError, SyntaxError, UnicodeError, ValueError):
+            return False
+        return True
+
+    local_sources: set[Path] = set()
+    try:
+        for directory, names, filenames in os.walk(code_root):
+            directory_path = Path(directory)
+            names[:] = [
+                name
+                for name in names
+                if name not in ignored_directories
+                and not excluded(directory_path / name)
+            ]
+            for filename in filenames:
+                candidate = directory_path / filename
+                if not excluded(candidate) and candidate.is_file() and is_local_executable_source(
+                    candidate
+                ):
+                    local_sources.add(candidate)
+    except OSError as error:
+        raise EvidenceError(
+            f"benchmark trainer code_root cannot be inventoried: {code_root}"
+        ) from error
+    return sorted(closure | local_sources)
 
 
 def _bind_trainer_files(
     trainer: dict[str, Any],
     *,
     base_directory: Path,
+    excluded_roots: tuple[Path, ...] = (),
+    excluded_files: tuple[Path, ...] = (),
 ) -> dict[str, Any]:
     command = trainer["command"]
     raw_executable = Path(command[0])
@@ -536,7 +602,12 @@ def _bind_trainer_files(
         )
         if not code_root.is_dir() or not script_path.is_relative_to(code_root):
             raise EvidenceError("benchmark trainer script must be inside its code_root")
-        code_files = _python_source_closure(script_path, code_root)
+        code_files = _python_source_closure(
+            script_path,
+            code_root,
+            excluded_roots=excluded_roots,
+            excluded_files=excluded_files,
+        )
         for path in code_files:
             bound_files.append(
                 {
@@ -2033,6 +2104,7 @@ def _run_attempt(
     elapsed_time_anchor: dict[str, Any] | None,
     existing_attempt: dict[str, Any] | None = None,
     started: float | None = None,
+    recurring_setup_elapsed: float = 0.0,
     clock: Callable[[], float] = time.perf_counter,
 ) -> dict[str, Any]:
     if started is None:
@@ -2574,7 +2646,7 @@ def _run_attempt(
         final_checkpoint_sha256 = checkpoint_sha256
         if status != "exhausted":
             break
-    elapsed = prior_elapsed + clock() - started
+    elapsed = prior_elapsed + recurring_setup_elapsed + clock() - started
     if recovery is not None and elapsed_time_anchor is not None:
         elapsed = max(
             elapsed,
@@ -2693,8 +2765,8 @@ def _run_attempt(
         "authority_attestation": authority_attestation,
     }
     attempt["_terminal_timing"] = {
-        "started": started,
         "prior_elapsed": prior_elapsed,
+        "terminal_elapsed": elapsed,
         "anchor": elapsed_time_anchor,
         "journal_payload": attempt_journal_payload,
         "journal_sha256": attempt_journal_sha256,
@@ -2714,10 +2786,6 @@ def build_development_benchmark_report(
         invocation_started = clock()
     manifest, manifest_payload = _load_manifest(manifest_path)
     validated = _validate_benchmark(manifest)
-    validated["trainer"] = _bind_trainer_files(
-        validated["trainer"],
-        base_directory=manifest_path.parent,
-    )
     declared_inputs = _validate_declared_inputs(
         manifest.get("declared_inputs"),
         base_directory=manifest_path.parent,
@@ -2726,6 +2794,16 @@ def build_development_benchmark_report(
     artifacts_root = _resolve_evidence_path(
         Path(validated["artifacts_directory"]),
         base_directory=manifest_path.parent,
+    )
+    validated["trainer"] = _bind_trainer_files(
+        validated["trainer"],
+        base_directory=manifest_path.parent,
+        excluded_roots=(artifacts_root,),
+        excluded_files=tuple(
+            path.resolve()
+            for path in (manifest_path, merge_path)
+            if path is not None
+        ),
     )
     if not manifest["fixture"]:
         authority = _formal_time_authority()
@@ -2967,14 +3045,15 @@ def build_development_benchmark_report(
             wad_profile=wad_profile,
             elapsed_time_anchor=anchors_by_seed.get(seed),
             existing_attempt=existing_attempt,
-            started=(clock() - recurring_setup_elapsed if active_attempt else None),
+            started=(clock() if active_attempt else None),
+            recurring_setup_elapsed=(recurring_setup_elapsed if active_attempt else 0.0),
             clock=clock,
         )
         recovered_terminal_timing = attempt.pop("_recovered_terminal_timing", None)
         if isinstance(recovered_terminal_timing, dict):
             attempt["_terminal_timing"] = {
                 **recovered_terminal_timing,
-                "started": invocation_started,
+                "terminal_elapsed": attempt["reusable_elapsed_seconds"],
             }
         actual_generated_artifacts.extend(attempt.pop("generated_artifacts", []))
         attempts.append(attempt)
@@ -3062,21 +3141,27 @@ def build_development_benchmark_report(
         timing = attempt.pop("_terminal_timing", None)
         if isinstance(timing, dict):
             terminal_timing.append((attempt, timing))
+    finalization_started = clock()
     _reverify_bootstrap_files(bootstrap_exclusions)
     _reverify_trainer_files(validated["trainer"])
+    shared_finalization_elapsed = max(0.0, clock() - finalization_started)
     if report_writer is not None:
         write_started = clock()
         report_writer(report)
         write_finished = clock()
+        shared_finalization_elapsed += max(0.0, write_finished - write_started)
         if not terminal_timing:
             return report
         allowance = max(0.001, 2.0 * max(0.0, write_finished - write_started))
+        signing_elapsed = {id(attempt): 0.0 for attempt, _timing in terminal_timing}
         for _iteration in range(8):
             for attempt, timing in terminal_timing:
+                sign_started = clock()
                 minimum_elapsed = max(
                     float(attempt["reusable_elapsed_seconds"]),
-                    float(timing["prior_elapsed"])
-                    + max(0.0, clock() - float(timing["started"]))
+                    float(timing["terminal_elapsed"])
+                    + shared_finalization_elapsed
+                    + signing_elapsed[id(attempt)]
                     + allowance,
                 )
                 attestation = _sign_generation_attestation(
@@ -3093,9 +3178,10 @@ def build_development_benchmark_report(
                         else float(attempt["reusable_elapsed_seconds"])
                     ),
                     minimum_elapsed=minimum_elapsed,
-                    started=float(timing["started"]),
+                    started=sign_started,
                     clock=clock,
                 )
+                signing_elapsed[id(attempt)] += max(0.0, clock() - sign_started)
                 elapsed = float(attestation["payload"]["reusable_elapsed_seconds"])
                 attempt["reusable_elapsed_seconds"] = elapsed
                 recovery = attempt.get("recovery")
@@ -3105,10 +3191,12 @@ def build_development_benchmark_report(
             write_started = clock()
             report_writer(report)
             write_finished = clock()
+            shared_finalization_elapsed += max(0.0, write_finished - write_started)
             if all(
                 float(attempt["reusable_elapsed_seconds"])
-                >= float(timing["prior_elapsed"])
-                + max(0.0, write_finished - float(timing["started"]))
+                >= float(timing["terminal_elapsed"])
+                + shared_finalization_elapsed
+                + signing_elapsed[id(attempt)]
                 for attempt, timing in terminal_timing
             ):
                 break

@@ -31,6 +31,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--fixture-fail-evaluation-step", type=int)
     parser.add_argument("--fixture-omit-player-killcount", action="store_true")
     parser.add_argument("--fixture-training-step-offset", type=int, default=0)
+    parser.add_argument("--fixture-training-delay-seed", type=int)
+    parser.add_argument("--fixture-training-delay-seconds", type=float, default=0.0)
     parser.add_argument("--fixture-hardlink-checkpoint-to", type=Path)
     parser.add_argument("--fixture-mutate-bootstrap", type=Path)
     parser.add_argument("--fixture-mutate-trainer-code", type=Path)
@@ -79,6 +81,8 @@ def main() -> int:
     signal.signal(signal.SIGTERM, stop_after_checkpoint)
     outcomes = json.loads(args.fixture_outcomes)
     if args.evaluate_checkpoint is None:
+        if args.fixture_training_delay_seed == args.seed:
+            time.sleep(args.fixture_training_delay_seconds)
         if (
             args.resume is not None
             and args.fixture_fail_after_resume_once_marker is not None

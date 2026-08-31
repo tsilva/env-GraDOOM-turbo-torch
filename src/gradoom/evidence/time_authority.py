@@ -510,7 +510,6 @@ class ReusableTimeAuthority:
         elapsed = max(
             float(request["prior_reusable_elapsed_seconds"]),
             float(request["minimum_reusable_elapsed_seconds"]),
-            max(0.0, (time.time_ns() - request["started_unix_ns"]) / 1_000_000_000),
         )
         attestation_payload = {
             key: request[key]
