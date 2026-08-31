@@ -93,9 +93,11 @@ benchmark (and available to the primary benchmark through the same trainer contr
 only after `--steady-state-after-rollouts` and fails closed if no later rollout is checked. The
 record verifies one concrete CUDA device for observations, actions, rewards, reset selectors and
 state, rollout state, inference outputs, loss tensors, optimizer state, parameters, and gradients
-used for updates. Guarded inference, transition, loss, and parameter-update scopes reject an
-accelerator-to-CPU tensor copy before it executes, which also rejects a `.cpu().numpy()` transition
-round trip.
+used for updates. One continuous rollout scope covers observation augmentation and staging,
+transitions, reward shaping, rollout writes, context/reset updates, value bootstrap, and rollout
+finalization; one continuous update scope covers PPO staging, losses, and parameter updates. Both
+reject host-to-accelerator and accelerator-to-host copies before they execute, including
+`.cpu().numpy()` round trips and NumPy-created update tensors.
 
 The retained record names the exact checked workload and transition count; GPU model, concrete
 device, compute capability, and memory; and Python, GraDOOM, Torch, CUDA, cuDNN, and NumPy versions.
@@ -103,10 +105,11 @@ Its host-transition guard count and zero-transfer result are part of the validat
 fixture process may exercise this report contract only as `fixture_contract`; fixture reports remain
 non-authoritative and claim-ineligible and cannot impersonate CUDA hardware evidence.
 
-Acceptance guards exclude bounded scalar telemetry, configuration and scheduling, bootstrap
-creation, and checkpoint extraction/writing. Those operations remain permitted outside the
-per-step data plane. When the option is disabled, the trainer creates no acceptance collector,
-enters no dispatch guard, emits no acceptance record, and performs no additional host transport.
+Acceptance guards exclude bounded scalar telemetry, configuration and scheduling, process
+bootstrap, and checkpoint extraction/writing. Those operations remain permitted outside the
+steady-state data plane. When the option is disabled, the trainer creates no acceptance collector,
+uses two reusable no-op contexts per rollout instead of per-step or per-minibatch branches, emits no
+acceptance record, and performs no additional host transport.
 Hardware integration tests require an explicitly allocated CUDA device and
 `GRADOOM_RUN_CUDA_ACCEPTANCE=1`; otherwise they skip with a clear reason while deterministic
 contract and fixture-wiring tests continue to run.

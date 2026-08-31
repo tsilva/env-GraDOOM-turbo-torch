@@ -34,7 +34,7 @@ def _tensors(values: object) -> list[torch.Tensor]:
 
 
 class CudaHostTransferGuard(TorchDispatchMode):
-    """Reject accelerator-to-host tensor copies inside one guarded data-plane scope."""
+    """Reject host/device tensor copies inside one guarded data-plane scope."""
 
     def __init__(
         self,
@@ -46,11 +46,11 @@ class CudaHostTransferGuard(TorchDispatchMode):
         self.phase = phase
         self._on_detect = on_detect
 
-    def _reject(self, operation: object) -> None:
+    def _reject(self, operation: object, direction: str) -> None:
         if self._on_detect is not None:
             self._on_detect()
         raise RuntimeError(
-            f"{self.phase}: accelerator-to-host transition transport is forbidden "
+            f"{self.phase}: {direction} transition transport is forbidden "
             f"during CUDA residency acceptance ({operation})"
         )
 
@@ -66,21 +66,22 @@ class CudaHostTransferGuard(TorchDispatchMode):
         source_tensors = _tensors(args)
         if operation.startswith("aten._to_copy"):
             destination = call_kwargs.get("device")
-            if (
-                isinstance(destination, torch.device)
-                and destination.type == "cpu"
-                and any(tensor.device.type != "cpu" for tensor in source_tensors)
-            ):
-                self._reject(operation)
+            if isinstance(destination, torch.device):
+                if destination.type == "cpu" and any(
+                    tensor.device.type != "cpu" for tensor in source_tensors
+                ):
+                    self._reject(operation, "accelerator-to-host")
+                if destination.type != "cpu" and any(
+                    tensor.device.type == "cpu" for tensor in source_tensors
+                ):
+                    self._reject(operation, "host-to-accelerator")
         if operation.startswith("aten.copy_") and len(args) >= 2:
             destination, source = args[:2]
-            if (
-                isinstance(destination, torch.Tensor)
-                and destination.device.type == "cpu"
-                and isinstance(source, torch.Tensor)
-                and source.device.type != "cpu"
-            ):
-                self._reject(operation)
+            if isinstance(destination, torch.Tensor) and isinstance(source, torch.Tensor):
+                if destination.device.type == "cpu" and source.device.type != "cpu":
+                    self._reject(operation, "accelerator-to-host")
+                if destination.device.type != "cpu" and source.device.type == "cpu":
+                    self._reject(operation, "host-to-accelerator")
         return func(*args, **call_kwargs)  # type: ignore[operator]
 
 
@@ -144,8 +145,7 @@ class CudaResidencyAcceptance:
             "status": "passed",
             "checked_categories": list(CUDA_RESIDENCY_CATEGORIES),
             "devices": {
-                category: sorted(self._devices[category])
-                for category in CUDA_RESIDENCY_CATEGORIES
+                category: sorted(self._devices[category]) for category in CUDA_RESIDENCY_CATEGORIES
             },
             "host_transition_guard": {
                 "status": "passed",
