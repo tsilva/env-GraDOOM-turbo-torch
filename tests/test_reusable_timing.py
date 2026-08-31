@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import errno
 import hashlib
 import json
 import shutil
@@ -1352,6 +1353,152 @@ def test_public_command_rejects_trainer_removal_or_same_byte_replacement(
 
     assert result.returncode == 2
     assert error in result.stderr
+
+
+def test_trainer_reverification_rejects_replacement_despite_metadata_collision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    code_root = tmp_path / "trainer-code"
+    code_root.mkdir()
+    trainer = code_root / "trainer.py"
+    shutil.copyfile(FIXTURE_PROCESS, trainer)
+    payload = code_root / "payload.bin"
+    payload.write_bytes(b"arbitrary source bytes\x00\xff")
+    bound_trainer = benchmark_module._bind_trainer_files(
+        {
+            "command": [sys.executable, str(trainer)],
+            "arguments": [],
+            "code_root": str(code_root),
+        },
+        base_directory=tmp_path,
+        artifacts_root=tmp_path / "artifacts",
+    )
+    expected_by_relative = {
+        item["relative_path"]: item
+        for item in bound_trainer["bound_files"]
+        if item["role"] == "code-root-file"
+    }
+    replacement_payload = payload.read_bytes()
+    payload.unlink()
+    payload.write_bytes(replacement_payload)
+    original_snapshot = benchmark_module._snapshot_regular_code_file
+
+    def snapshot_with_colliding_metadata(path: Path, *, code_root: Path) -> dict[str, object]:
+        snapshot = original_snapshot(path, code_root=code_root)
+        expected = expected_by_relative[snapshot["relative_path"]]
+        snapshot["device"] = expected["device"]
+        snapshot["inode"] = expected["inode"]
+        return snapshot
+
+    monkeypatch.setattr(
+        benchmark_module,
+        "_snapshot_regular_code_file",
+        snapshot_with_colliding_metadata,
+    )
+
+    with pytest.raises(
+        benchmark_module.EvidenceError,
+        match="bound trainer file identity changed during the cohort",
+    ):
+        benchmark_module._reverify_trainer_files(bound_trainer)
+
+
+def test_trainer_identity_markers_reject_oversized_code_root_before_opening(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    code_root = tmp_path / "trainer-code"
+    code_root.mkdir()
+    trainer = code_root / "trainer.py"
+    shutil.copyfile(FIXTURE_PROCESS, trainer)
+    (code_root / "payload.bin").write_bytes(b"payload")
+    descriptors_before = len(list(Path("/proc/self/fd").iterdir()))
+    monkeypatch.setattr(benchmark_module, "_identity_marker_capacity", lambda: 1)
+
+    with pytest.raises(
+        benchmark_module.EvidenceError,
+        match="exceeds the safe open-file descriptor budget",
+    ):
+        benchmark_module._bind_trainer_files(
+            {
+                "command": [sys.executable, str(trainer)],
+                "arguments": [],
+                "code_root": str(code_root),
+            },
+            base_directory=tmp_path,
+            artifacts_root=tmp_path / "artifacts",
+        )
+
+    assert len(list(Path("/proc/self/fd").iterdir())) == descriptors_before
+
+
+def test_trainer_identity_marker_capacity_reserves_existing_and_runtime_descriptors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        benchmark_module.resource,
+        "getrlimit",
+        lambda _resource: (100, 100),
+    )
+    monkeypatch.setattr(benchmark_module.os, "listdir", lambda _path: [str(i) for i in range(10)])
+
+    assert benchmark_module._identity_marker_capacity() == 26
+
+
+def test_trainer_identity_markers_close_after_descriptor_exhaustion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    code_root = tmp_path / "trainer-code"
+    code_root.mkdir()
+    trainer = code_root / "trainer.py"
+    shutil.copyfile(FIXTURE_PROCESS, trainer)
+    (code_root / "payload.bin").write_bytes(b"payload")
+    descriptors_before = len(list(Path("/proc/self/fd").iterdir()))
+    original_open = benchmark_module.os.open
+    code_root_opens = 0
+
+    def exhaust_second_code_root_open(path: object, flags: int, mode: int = 0o777) -> int:
+        nonlocal code_root_opens
+        candidate = Path(path)  # type: ignore[arg-type]
+        if candidate.is_relative_to(code_root):
+            code_root_opens += 1
+            if code_root_opens == 2:
+                raise OSError(errno.EMFILE, "fixture descriptor exhaustion")
+        return original_open(path, flags, mode)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(benchmark_module.os, "open", exhaust_second_code_root_open)
+
+    with pytest.raises(
+        benchmark_module.EvidenceError,
+        match="code_root file changed while being inventoried",
+    ):
+        benchmark_module._bind_trainer_files(
+            {
+                "command": [sys.executable, str(trainer)],
+                "arguments": [],
+                "code_root": str(code_root),
+            },
+            base_directory=tmp_path,
+            artifacts_root=tmp_path / "artifacts",
+        )
+
+    assert len(list(Path("/proc/self/fd").iterdir())) == descriptors_before
+
+
+def test_trainer_identity_markers_close_after_later_report_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest = _manifest(tmp_path, outcomes={"10": [30.0, 0.0]})
+    descriptors_before = len(list(Path("/proc/self/fd").iterdir()))
+
+    def fail_after_binding(*_args: object, **_kwargs: object) -> list[dict[str, object]]:
+        raise benchmark_module.EvidenceError("fixture post-binding failure")
+
+    monkeypatch.setattr(benchmark_module, "_validate_bootstrap_files", fail_after_binding)
+
+    with pytest.raises(benchmark_module.EvidenceError, match="fixture post-binding failure"):
+        build_development_benchmark_report(manifest)
+
+    assert len(list(Path("/proc/self/fd").iterdir())) == descriptors_before
 
 
 def test_public_command_rejects_benchmark_artifacts_nested_in_code_root(

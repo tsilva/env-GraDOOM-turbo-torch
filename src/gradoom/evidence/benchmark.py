@@ -6,6 +6,7 @@ import binascii
 import json
 import math
 import os
+import resource
 import shutil
 import signal
 import stat
@@ -13,8 +14,9 @@ import statistics
 import subprocess
 import time
 from collections.abc import Callable
+from contextlib import suppress
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
@@ -62,6 +64,9 @@ _CONTROLLED_ARGUMENTS = {
     "--seed",
     "--timesteps",
 }
+
+_MAX_CODE_ROOT_IDENTITY_MARKERS = 4096
+_OPEN_DESCRIPTOR_RESERVE = 64
 
 _RESTORABLE_STATE = {
     "policy": True,
@@ -455,7 +460,46 @@ def _inventory_code_root_paths(code_root: Path) -> list[Path]:
     return paths
 
 
-def _snapshot_regular_code_file(path: Path, *, code_root: Path) -> dict[str, Any]:
+class _TrainerFileIdentityMarkers:
+    def __init__(self) -> None:
+        self.streams: dict[str, BinaryIO] = {}
+
+    def close(self) -> None:
+        streams, self.streams = self.streams, {}
+        for stream in streams.values():
+            stream.close()
+
+    def __del__(self) -> None:
+        with suppress(OSError):
+            self.close()
+
+
+def _identity_marker_capacity() -> int:
+    soft_limit, _hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft_limit == resource.RLIM_INFINITY:
+        return _MAX_CODE_ROOT_IDENTITY_MARKERS
+    descriptor_directories = ("/proc/self/fd", "/dev/fd")
+    for descriptor_directory in descriptor_directories:
+        try:
+            # listdir may transiently count its own directory descriptor, which makes this
+            # fail-closed calculation conservatively smaller by at most one marker.
+            open_descriptors = len(os.listdir(descriptor_directory))
+            break
+        except OSError:
+            continue
+    else:
+        return 0
+    available = max(0, int(soft_limit) - open_descriptors - _OPEN_DESCRIPTOR_RESERVE)
+    return min(_MAX_CODE_ROOT_IDENTITY_MARKERS, available)
+
+
+def _snapshot_regular_code_file(
+    path: Path,
+    *,
+    code_root: Path,
+    identity_markers: _TrainerFileIdentityMarkers | None = None,
+) -> dict[str, Any]:
+    stream: BinaryIO | None = None
     try:
         before = path.lstat()
         if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
@@ -465,16 +509,26 @@ def _snapshot_regular_code_file(path: Path, *, code_root: Path) -> dict[str, Any
         flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
         descriptor = os.open(path, flags)
         try:
-            opened = os.fstat(descriptor)
-            with os.fdopen(descriptor, "rb", closefd=False) as stream:
-                payload = stream.read()
-            after_read = os.fstat(descriptor)
-        finally:
+            stream = os.fdopen(descriptor, "rb")
+        except BaseException:
             os.close(descriptor)
+            raise
+        try:
+            opened = os.fstat(descriptor)
+            payload = stream.read()
+            after_read = os.fstat(descriptor)
+        except BaseException:
+            stream.close()
+            stream = None
+            raise
         after_path = path.lstat()
     except EvidenceError:
+        if stream is not None:
+            stream.close()
         raise
     except OSError as error:
+        if stream is not None:
+            stream.close()
         raise EvidenceError(
             f"benchmark trainer code_root file changed while being inventoried: {path}"
         ) from error
@@ -494,32 +548,66 @@ def _snapshot_regular_code_file(path: Path, *, code_root: Path) -> dict[str, Any
         == stable_identity(after_read)
         == stable_identity(after_path)
     ):
+        assert stream is not None
+        stream.close()
         raise EvidenceError(
             f"benchmark trainer code_root file changed while being inventoried: {path}"
         )
-    return {
+    relative_path = str(path.relative_to(code_root))
+    snapshot = {
         "role": "code-root-file",
         "path": str(path),
-        "relative_path": str(path.relative_to(code_root)),
+        "relative_path": relative_path,
         "sha256": _sha256_bytes(payload),
         "device": before.st_dev,
         "inode": before.st_ino,
         "mode": stat.S_IMODE(before.st_mode),
         "size": before.st_size,
     }
+    if identity_markers is None:
+        assert stream is not None
+        stream.close()
+    else:
+        assert stream is not None
+        identity_markers.streams[relative_path] = stream
+    return snapshot
 
 
-def _bound_code_root_files(script_path: Path, code_root: Path) -> list[dict[str, Any]]:
+def _bound_code_root_files(
+    script_path: Path,
+    code_root: Path,
+    *,
+    identity_markers: _TrainerFileIdentityMarkers | None = None,
+) -> list[dict[str, Any]]:
     paths = _python_source_closure(script_path, code_root)
-    bound = [_snapshot_regular_code_file(path, code_root=code_root) for path in paths]
-    membership_after_hashing = _inventory_code_root_paths(code_root)
-    if {path.relative_to(code_root) for path in paths} != {
-        path.relative_to(code_root) for path in membership_after_hashing
-    }:
+    if identity_markers is not None and len(paths) > _identity_marker_capacity():
         raise EvidenceError(
-            "benchmark trainer code-root membership changed while being inventoried"
+            "benchmark trainer code_root exceeds the safe open-file descriptor budget "
+            "for replacement detection"
         )
-    return bound
+    try:
+        bound = [
+            _snapshot_regular_code_file(
+                path,
+                code_root=code_root,
+                identity_markers=identity_markers,
+            )
+            if identity_markers is not None
+            else _snapshot_regular_code_file(path, code_root=code_root)
+            for path in paths
+        ]
+        membership_after_hashing = _inventory_code_root_paths(code_root)
+        if {path.relative_to(code_root) for path in paths} != {
+            path.relative_to(code_root) for path in membership_after_hashing
+        }:
+            raise EvidenceError(
+                "benchmark trainer code-root membership changed while being inventoried"
+            )
+        return bound
+    except BaseException:
+        if identity_markers is not None:
+            identity_markers.close()
+        raise
 
 
 def _python_source_closure(
@@ -721,7 +809,14 @@ def _bind_trainer_files(
             or code_root.is_relative_to(artifacts_root)
         ):
             raise EvidenceError("benchmark artifacts must be outside trainer code_root")
-        bound_files.extend(_bound_code_root_files(script_path, code_root))
+        identity_markers = _TrainerFileIdentityMarkers()
+        bound_files.extend(
+            _bound_code_root_files(
+                script_path,
+                code_root,
+                identity_markers=identity_markers,
+            )
+        )
         resolved_root: str | None = str(code_root)
     else:
         resolved_root = None
@@ -733,44 +828,73 @@ def _bind_trainer_files(
         "command": bound_command,
         "code_root": resolved_root,
         "bound_files": bound_files,
+        "_identity_markers": identity_markers,
     }
 
 
 def _reverify_trainer_files(trainer: dict[str, Any]) -> None:
-    executable = trainer["bound_files"][0]
-    for bound in (executable,):
-        path = Path(bound["path"])
-        if bound["sha256"] is None and not path.exists():
-            continue
-        try:
-            digest = _sha256_bytes(path.read_bytes())
-        except OSError as error:
-            raise EvidenceError(f"bound trainer file changed during the cohort: {path}") from error
-        if digest != bound["sha256"]:
-            raise EvidenceError(f"bound trainer file changed during the cohort: {path}")
-    code_root = Path(trainer["code_root"])
-    script_path = Path(trainer["command"][1])
-    current_files = _bound_code_root_files(script_path, code_root)
-    expected_by_relative = {
-        item["relative_path"]: item
-        for item in trainer["bound_files"]
-        if item["role"] == "code-root-file"
-    }
-    current_by_relative = {item["relative_path"]: item for item in current_files}
-    if set(expected_by_relative) != set(current_by_relative):
-        raise EvidenceError("benchmark trainer code-root membership changed during the cohort")
-    for relative_path, expected in expected_by_relative.items():
-        current = current_by_relative[relative_path]
-        path = current["path"]
-        if current["sha256"] != expected["sha256"]:
-            raise EvidenceError(f"bound trainer file changed during the cohort: {path}")
-        if any(
-            current[field] != expected[field]
-            for field in ("device", "inode", "mode", "size")
-        ):
-            raise EvidenceError(
-                f"bound trainer file identity changed during the cohort: {path}"
-            )
+    identity_markers = trainer["_identity_markers"]
+    try:
+        executable = trainer["bound_files"][0]
+        for bound in (executable,):
+            path = Path(bound["path"])
+            if bound["sha256"] is None and not path.exists():
+                continue
+            try:
+                digest = _sha256_bytes(path.read_bytes())
+            except OSError as error:
+                raise EvidenceError(
+                    f"bound trainer file changed during the cohort: {path}"
+                ) from error
+            if digest != bound["sha256"]:
+                raise EvidenceError(f"bound trainer file changed during the cohort: {path}")
+        code_root = Path(trainer["code_root"])
+        script_path = Path(trainer["command"][1])
+        current_files = _bound_code_root_files(script_path, code_root)
+        expected_by_relative = {
+            item["relative_path"]: item
+            for item in trainer["bound_files"]
+            if item["role"] == "code-root-file"
+        }
+        current_by_relative = {item["relative_path"]: item for item in current_files}
+        if set(expected_by_relative) != set(current_by_relative):
+            raise EvidenceError("benchmark trainer code-root membership changed during the cohort")
+        if set(identity_markers.streams) != set(expected_by_relative):
+            raise EvidenceError("benchmark trainer identity markers are incomplete")
+        for relative_path, expected in expected_by_relative.items():
+            current = current_by_relative[relative_path]
+            path = current["path"]
+            if current["sha256"] != expected["sha256"]:
+                raise EvidenceError(f"bound trainer file changed during the cohort: {path}")
+            if any(
+                current[field] != expected[field]
+                for field in ("device", "inode", "mode", "size")
+            ):
+                raise EvidenceError(
+                    f"bound trainer file identity changed during the cohort: {path}"
+                )
+            try:
+                current_descriptor = os.open(
+                    path,
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                )
+                try:
+                    same_file = os.path.sameopenfile(
+                        identity_markers.streams[relative_path].fileno(),
+                        current_descriptor,
+                    )
+                finally:
+                    os.close(current_descriptor)
+            except OSError as error:
+                raise EvidenceError(
+                    f"bound trainer file identity changed during the cohort: {path}"
+                ) from error
+            if not same_file:
+                raise EvidenceError(
+                    f"bound trainer file identity changed during the cohort: {path}"
+                )
+    finally:
+        identity_markers.close()
 
 
 def _validate_certificate(value: object) -> dict[str, Any]:
@@ -3094,9 +3218,10 @@ def _run_attempt(
     return attempt
 
 
-def build_development_benchmark_report(
+def _build_development_benchmark_report(
     manifest_path: Path,
     *,
+    identity_marker_registry: list[_TrainerFileIdentityMarkers],
     merge_path: Path | None = None,
     invocation_started: float | None = None,
     clock: Callable[[], float] = time.perf_counter,
@@ -3120,6 +3245,7 @@ def build_development_benchmark_report(
         base_directory=manifest_path.parent,
         artifacts_root=artifacts_root,
     )
+    identity_marker_registry.append(validated["trainer"]["_identity_markers"])
     if not manifest["fixture"]:
         authority = _formal_time_authority()
         for authority_root, label in (
@@ -3232,7 +3358,11 @@ def build_development_benchmark_report(
             "resume": "add_prior_hashed_recovery_elapsed_before_recurring_recovery_work",
             "stop": "after_final_durable_report_contains_a_conservative_authority_elapsed_seal",
         },
-        "trainer": validated["trainer"],
+        "trainer": {
+            key: value
+            for key, value in validated["trainer"].items()
+            if key != "_identity_markers"
+        },
         "parity_certificate": validated["parity_certificate"],
         "wad_profile_binding_sha256": (
             None if wad_profile is None else wad_profile["binding_sha256"]
@@ -3543,3 +3673,26 @@ def build_development_benchmark_report(
                 "could not conservatively seal reusable elapsed time through durable report write"
             )
     return report
+
+
+def build_development_benchmark_report(
+    manifest_path: Path,
+    *,
+    merge_path: Path | None = None,
+    invocation_started: float | None = None,
+    clock: Callable[[], float] = time.perf_counter,
+    report_writer: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    identity_marker_registry: list[_TrainerFileIdentityMarkers] = []
+    try:
+        return _build_development_benchmark_report(
+            manifest_path,
+            identity_marker_registry=identity_marker_registry,
+            merge_path=merge_path,
+            invocation_started=invocation_started,
+            clock=clock,
+            report_writer=report_writer,
+        )
+    finally:
+        for identity_markers in identity_marker_registry:
+            identity_markers.close()
