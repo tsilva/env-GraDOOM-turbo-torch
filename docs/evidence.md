@@ -227,11 +227,15 @@ continuation in provider state. The player-attributed kill probes require staged
 attribution in addition to counters: the former must observe a player-to-enemy event and increment
 `player_killcount`, while the latter must observe an enemy-to-enemy event and increment only
 compatibility `killcount`. For real providers, the repository-owned oracle rehashes the validated
-IWAD and PWAD at the event boundary, hashes actual public reset and event observations, and derives
-the attacker from the pinned action history: a player-attributed event must coincide with a player
-attack, while an enemy-on-enemy event must have no preceding player attack. The public state must
-change at the observed kill event. Provider- or manifest-supplied attribution labels are not
-accepted, and unchanged counter-only observations fail closed.
+IWAD and PWAD at the event boundary and consumes a freshly staged actor-population token exactly
+once; any public reset invalidates that stage. GraDOOM uses engine-recorded source and target actor
+IDs from the damage/death site. The reference provider instead uses stable native object IDs and the
+isolated before/after population to identify the distinct surviving attacker and removed target. The
+suite reconciles the exact staged and surviving populations and exactly one death with the public
+counter deltas: player-to-enemy increments `player_killcount`, while enemy-to-enemy leaves it
+unchanged and increments compatibility `killcount`. Requested actions, counters, rewards,
+observations, and pixels never supply actor identity. Provider- or manifest-supplied attribution,
+reset or stage replay, ambiguous populations, and counter-only evidence fail closed.
 
 Real execution loads GraDOOM and the immutable reference revision independently through the pinned
 reference adapter. An absent optional provider runtime is unavailable; changed assets, an invalid
