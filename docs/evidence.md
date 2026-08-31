@@ -49,7 +49,12 @@ contains:
   every regular file recursively below the declared code root are hashed into the recipe identity
   and freshly re-inventoried before the final durable report. Verification requires exact
   relative-path membership, bytes, regular-file identity, mode, and size; additions, removals,
-  replacements, and type changes fail closed. File and directory symlinks are rejected before any
+  replacements, and type changes fail closed. Each initial file object remains pinned by a private,
+  non-inheritable read-only descriptor through final verification, so unlink-and-recreate is detected
+  even on filesystems that immediately reuse inode numbers. The boundary is limited to 4,096 files
+  and is also preflighted against the process soft open-file limit, its current open descriptors, and
+  a 64-descriptor runtime reserve; insufficient capacity and mid-inventory exhaustion fail closed,
+  and all pins are released on success or error. File and directory symlinks are rejected before any
   target resolution, whether their targets are internal or external. No directory name, suffix,
   executable bit, UTF decoder, parse probe, or compression format exempts bytes, because Python can
   decode or decompress arbitrary local payloads before computed execution. Manifest and merge-report

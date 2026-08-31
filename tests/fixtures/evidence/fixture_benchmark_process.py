@@ -232,9 +232,12 @@ def main() -> int:
         if args.fixture_remove_trainer_code is not None:
             args.fixture_remove_trainer_code.unlink()
         if args.fixture_replace_trainer_code is not None:
-            replacement_payload = args.fixture_replace_trainer_code.read_bytes()
-            args.fixture_replace_trainer_code.unlink()
-            args.fixture_replace_trainer_code.write_bytes(replacement_payload)
+            # Keep the old file object alive until its replacement exists so this probe
+            # cannot be defeated by immediate inode reuse on the runner filesystem.
+            with args.fixture_replace_trainer_code.open("rb") as original:
+                replacement_payload = original.read()
+                args.fixture_replace_trainer_code.unlink()
+                args.fixture_replace_trainer_code.write_bytes(replacement_payload)
         if should_interrupt and args.fixture_hold_after_recovery_checkpoint_marker is not None:
             args.fixture_hold_after_recovery_checkpoint_marker.write_text(
                 "checkpoint-ready\n", encoding="utf-8"
