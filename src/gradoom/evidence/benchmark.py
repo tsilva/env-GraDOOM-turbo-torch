@@ -375,6 +375,22 @@ def _validated_python_tree(path: Path) -> ast.AST:
     return tree
 
 
+def _executes_during_module_import(
+    node: ast.AST,
+    *,
+    parents: dict[ast.AST, ast.AST],
+) -> bool:
+    parent = parents.get(node)
+    while parent is not None:
+        if isinstance(
+            parent,
+            (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda),
+        ):
+            return False
+        parent = parents.get(parent)
+    return True
+
+
 def _python_source_closure(
     script_path: Path,
     code_root: Path,
@@ -390,17 +406,32 @@ def _python_source_closure(
             continue
         closure.add(path)
         tree = _validated_python_tree(path)
+        parents = {
+            child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)
+        }
         modules: set[str] = set()
         relative_modules: list[tuple[int, str]] = []
         relative_members: list[tuple[int, str, str]] = []
         imported_members: list[tuple[str, str]] = []
+
         for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
+            if isinstance(node, ast.Import) and _executes_during_module_import(
+                node, parents=parents
+            ):
                 modules.update(alias.name for alias in node.names)
-            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            elif (
+                isinstance(node, ast.ImportFrom)
+                and _executes_during_module_import(node, parents=parents)
+                and node.level == 0
+                and node.module
+            ):
                 modules.add(node.module)
                 imported_members.extend((node.module, alias.name) for alias in node.names)
-            elif isinstance(node, ast.ImportFrom) and node.level > 0:
+            elif (
+                isinstance(node, ast.ImportFrom)
+                and _executes_during_module_import(node, parents=parents)
+                and node.level > 0
+            ):
                 relative_modules.extend(
                     (node.level, module)
                     for module in (
