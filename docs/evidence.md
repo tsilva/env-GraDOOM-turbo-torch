@@ -46,12 +46,15 @@ contains:
   command must be one resolved Python interpreter plus one source file; native wrappers, shells,
   `-c`, and statically visible opaque process indirection are rejected. Relative executables and
   scripts are resolved from the manifest directory. The entry point, its transitive imports, and
-  every Python source file below the declared code root are hashed into the recipe identity and
-  reverified after the cohort. The complete-root binding is deliberately independent of how code is
-  reached, so computed builtins, reflection, plugin discovery, namespace aliases, and indirect
-  process replacement cannot execute mutable local Python without binding it. Same-path helper
-  mutation or mid-cohort replacement therefore fails closed even when static import analysis cannot
-  name the executed source.
+  every regular file recursively below the declared code root are hashed into the recipe identity
+  and reverified after the cohort. File symlinks bind their target bytes; directory symlinks are
+  accepted only when they resolve back inside the already inventoried code root. No directory name,
+  suffix, executable bit, UTF decoder, parse probe, or compression format exempts bytes, because
+  Python can decode or decompress arbitrary local payloads before computed execution. The only
+  excluded paths are the explicit benchmark artifact and evidence-document boundaries, which are
+  validated separately and cannot supply trainer inputs. This complete-root binding is independent
+  of how code is reached, so computed builtins, reflection, plugin discovery, namespace aliases, and
+  indirect process replacement cannot execute mutable local bytes without binding them.
 - `artifacts_directory`: the directory under which the run-identity and per-seed artifacts are
   durably retained.
 - `bootstrap_artifacts`: optional one-time exclusions declared before the cohort. Every entry names
@@ -76,7 +79,12 @@ contains:
   attempt generation receives a second authority signature
   over its status, cumulative elapsed time, generation, predecessor hash, and durable journal hash.
   The command first writes and fsyncs an elapsed-neutral terminal journal, then asks the authority to
-  issue an elapsed seal. Final artifact verification, output-path validation, report serialization,
+  issue an elapsed seal. Before another seed can execute or the public report can be written, the
+  signed attempt and its exact run, recipe, seed, generation, journal, evidence-index, and artifact
+  provenance are atomically replaced and file/directory-fsynced in a per-generation attempt seal.
+  An identical-manifest invocation discovers and verifies these seals, recovers an authority's
+  newer same-head attestation when necessary, and never reruns a sealed seed merely because the
+  public report was lost. Final artifact verification, output-path validation, report serialization,
   atomic replacement, file and directory fsync, and the seal made durable inside that report are
   also recurring work. The writer therefore measures an initial durable write, requests a
   conservative future-charged seal, and repeats only when the signed elapsed floor did not cover the
@@ -150,7 +158,8 @@ continuation also verifies that head against the external monotonic witness. If 
 after a final same-head reseal but before report replacement, the preceding durable report remains
 recoverable: `--merge` may upgrade it only to the authority's latest attestation for the exact same
 generation, predecessor, journal hash, and status. A different generation or journal remains stale
-and is rejected.
+and is rejected. If no public report became durable, the same exact-head recovery instead starts
+from the per-generation signed attempt seal and applies the same provenance and authority checks.
 
 Before every trainer launch, the command writes and periodically refreshes a durable, checksummed
 live-attempt journal. Training and 100-episode evaluation subprocesses both receive forwarded

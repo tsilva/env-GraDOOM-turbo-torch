@@ -525,41 +525,21 @@ def _python_source_closure(
                     pending.append(initializer)
     # Static import closure is useful for rejecting known opaque launch primitives, but it
     # cannot prove which local source a dynamic Python expression will eventually execute.
-    # Bind the complete declared Python source root as the security boundary.  This makes
-    # computed ``builtins.exec`` loaders, indirect ``posix.exec*`` calls, plugin discovery,
-    # and any equivalent indirection unable to select mutable local Python without that
-    # source participating in recipe identity and post-cohort verification.
+    # Bind every regular file in the declared code root as the security boundary.  Python
+    # can decode or decompress arbitrary bytes before computed ``exec`` and can launch a
+    # file from any directory through indirect ``posix.exec*`` access.  Consequently a
+    # suffix, text decoder, parse probe, executable bit, or conventional build-directory
+    # allowlist cannot prove that local bytes are non-executable.  The only exclusions are
+    # the caller's explicit benchmark artifact/document boundaries, which are never trainer
+    # inputs and are validated separately.
     normalized_roots = tuple(path.resolve() for path in excluded_roots)
     normalized_files = {path.resolve() for path in excluded_files}
-    ignored_directories = {
-        ".git",
-        ".mypy_cache",
-        ".pytest_cache",
-        ".ruff_cache",
-        ".tox",
-        ".venv",
-        "__pycache__",
-        "dist",
-    }
 
     def excluded(candidate: Path) -> bool:
         resolved = candidate.resolve()
         return resolved in normalized_files or any(
             resolved == root or resolved.is_relative_to(root) for root in normalized_roots
         )
-
-    def is_local_executable_source(candidate: Path) -> bool:
-        if candidate.suffix.lower() in {".py", ".pyi", ".pyw", ".so", ".pyd"}:
-            return True
-        try:
-            metadata = candidate.stat()
-            if metadata.st_mode & 0o111:
-                return True
-            source = candidate.read_text(encoding="utf-8")
-            ast.parse(source, filename=str(candidate))
-        except (OSError, SyntaxError, UnicodeError, ValueError):
-            return False
-        return True
 
     local_sources: set[Path] = set()
 
@@ -572,20 +552,34 @@ def _python_source_closure(
             retained_names = []
             for name in names:
                 child = directory_path / name
-                if name in ignored_directories or excluded(child):
+                if excluded(child):
                     continue
                 if child.is_symlink():
-                    raise EvidenceError(
-                        "benchmark trainer code_root contains an unbound directory symlink: "
-                        f"{child}"
-                    )
+                    try:
+                        target = child.resolve(strict=True)
+                    except OSError as error:
+                        raise EvidenceError(
+                            "benchmark trainer code_root contains an unreadable directory "
+                            f"symlink: {child}"
+                        ) from error
+                    if not target.is_relative_to(code_root.resolve()):
+                        raise EvidenceError(
+                            "benchmark trainer code_root contains an external directory symlink: "
+                            f"{child}"
+                        )
                 retained_names.append(name)
             names[:] = retained_names
             for filename in filenames:
                 candidate = directory_path / filename
-                if not excluded(candidate) and candidate.is_file() and is_local_executable_source(
-                    candidate
-                ):
+                if excluded(candidate):
+                    continue
+                try:
+                    metadata = candidate.stat()
+                except OSError as error:
+                    raise EvidenceError(
+                        f"benchmark trainer code_root file cannot be inventoried: {candidate}"
+                    ) from error
+                if stat.S_ISREG(metadata.st_mode):
                     local_sources.add(candidate)
     except OSError as error:
         raise EvidenceError(
@@ -652,7 +646,7 @@ def _bind_trainer_files(
         for path in code_files:
             bound_files.append(
                 {
-                    "role": "python-source",
+                    "role": "code-root-file",
                     "path": str(path),
                     "relative_path": str(path.relative_to(code_root)),
                     "sha256": _sha256_bytes(path.read_bytes()),
@@ -1852,6 +1846,183 @@ def _write_durable_json(path: Path, payload: dict[str, Any], *, field: str) -> s
     return _fsync_file(path, field=field)
 
 
+def _load_durable_attempt_seals(
+    run_directory: Path,
+    *,
+    run_identity: str,
+    protocol: dict[str, Any],
+    initial_evidence_entries: list[dict[str, str]],
+    manifest_directory: Path,
+) -> tuple[list[dict[str, Any]], list[dict[str, str]], list[dict[str, str]]]:
+    """Recover authority-signed attempts whose public report was not yet durable."""
+    attempts: list[dict[str, Any]] = []
+    evidence_entries = [dict(entry) for entry in initial_evidence_entries]
+    generated_artifacts: list[dict[str, str]] = []
+    generated_paths: dict[str, str] = {}
+    missing_seal_seen = False
+    anchors_by_seed = {
+        anchor["payload"]["seed"]: anchor for anchor in protocol["elapsed_time_anchors"]
+    }
+    for seed in protocol["training_seeds"]:
+        attempt_directory = run_directory / f"seed-{seed}"
+        seal_paths = sorted(attempt_directory.glob("attempt-seal-*.json"))
+        if not seal_paths:
+            missing_seal_seen = True
+            continue
+        if missing_seal_seen:
+            raise EvidenceError("durable attempt seals cannot skip or replace a training seed")
+        generations: list[int] = []
+        for seal_path in seal_paths:
+            raw_generation = seal_path.stem.removeprefix("attempt-seal-")
+            if not raw_generation.isdigit():
+                raise EvidenceError("durable attempt seal has an invalid generation")
+            generations.append(int(raw_generation))
+        if generations != list(range(generations[-1] + 1)):
+            raise EvidenceError("durable attempt seal generation continuity is broken")
+        seal_path = seal_paths[-1]
+        generation = generations[-1]
+        try:
+            seal_bytes = seal_path.read_bytes()
+            seal = _parse_json_document(seal_bytes, document="durable benchmark attempt seal")
+        except OSError as error:
+            raise EvidenceError("durable benchmark attempt seal is unreadable") from error
+        if not isinstance(seal, dict) or set(seal) != {
+            "schema_version",
+            "run_identity",
+            "continuation_identity",
+            "attempt",
+            "evidence_entries",
+            "generated_artifacts",
+        }:
+            raise EvidenceError("durable benchmark attempt seal has an unsupported contract")
+        if (
+            seal.get("schema_version") != 1
+            or seal.get("run_identity") != run_identity
+            or seal.get("continuation_identity") != protocol["continuation_identity"]
+        ):
+            raise EvidenceError("durable benchmark attempt seal has unlike provenance")
+        attempt = seal.get("attempt")
+        if not isinstance(attempt, dict) or attempt.get("seed") != seed:
+            raise EvidenceError("durable benchmark attempt seal has an invalid seed")
+        expected_attempt_identity = _canonical_sha256(
+            {"run_identity": run_identity, "seed": seed},
+            document="benchmark attempt",
+        )
+        if attempt.get("attempt_identity") != expected_attempt_identity:
+            raise EvidenceError("durable benchmark attempt seal has unlike attempt identity")
+        journal = attempt.get("attempt_journal")
+        if not isinstance(journal, dict):
+            raise EvidenceError("durable benchmark attempt seal has no attempt journal")
+        journal_path = _resolve_evidence_path(
+            Path(journal.get("path", "")), base_directory=manifest_directory
+        )
+        try:
+            journal_bytes = journal_path.read_bytes()
+            journal_payload = _parse_json_document(
+                journal_bytes, document="sealed benchmark attempt journal"
+            )
+        except OSError as error:
+            raise EvidenceError("sealed benchmark attempt journal is unreadable") from error
+        if not isinstance(journal_payload, dict) or journal_payload.get("generation") != generation:
+            raise EvidenceError("durable benchmark attempt seal generation is invalid")
+        if (
+            _next_append_only_generation(
+                attempt_directory, "attempt-state-*.json", "attempt-state-"
+            )
+            != generation + 1
+        ):
+            raise EvidenceError("durable benchmark attempt seal is stale")
+        previous_journal_sha256 = journal_payload.get("previous_journal_sha256")
+        expected_journal = _attempt_journal_payload(
+            attempt,
+            run_identity=run_identity,
+            generation=generation,
+            previous_journal_sha256=previous_journal_sha256,
+        )
+        journal_sha256 = _sha256_bytes(journal_bytes)
+        if journal_payload != expected_journal or journal.get("sha256") != journal_sha256:
+            raise EvidenceError("durable benchmark attempt seal does not match its journal")
+        anchor = anchors_by_seed.get(seed)
+        if anchor is None:
+            raise EvidenceError("durable benchmark attempt seal has no elapsed-time anchor")
+        expected_attestation = _journal_attestation_payload(
+            expected_journal,
+            anchor=anchor,
+            journal_sha256=journal_sha256,
+        )
+        expected_attestation["reusable_elapsed_seconds"] = attempt.get(
+            "reusable_elapsed_seconds"
+        )
+        verified_attestation = _verify_generation_attestation(
+            journal.get("authority_attestation"),
+            anchor=anchor,
+            expected_payload=expected_attestation,
+            recover_same_head=True,
+        )
+        recovered_elapsed = float(verified_attestation["payload"]["reusable_elapsed_seconds"])
+        if recovered_elapsed < float(attempt["reusable_elapsed_seconds"]):
+            raise EvidenceError("durable benchmark attempt seal elapsed time moved backwards")
+        attempt["reusable_elapsed_seconds"] = recovered_elapsed
+        recovery = attempt.get("recovery")
+        if isinstance(recovery, dict):
+            recovery["accumulated_reusable_elapsed_seconds"] = recovered_elapsed
+        journal["authority_attestation"] = verified_attestation
+        attempt["_recovered_terminal_timing"] = {
+            "prior_elapsed": recovered_elapsed,
+            "anchor": anchor,
+            "journal_payload": expected_journal,
+            "journal_sha256": journal_sha256,
+        }
+        stored_entries = seal.get("evidence_entries")
+        stored_generated = seal.get("generated_artifacts")
+        if (
+            not isinstance(stored_entries, list)
+            or not all(isinstance(entry, dict) for entry in stored_entries)
+            or not isinstance(stored_generated, list)
+            or not all(isinstance(item, dict) for item in stored_generated)
+            or stored_entries[: len(evidence_entries)] != evidence_entries
+        ):
+            raise EvidenceError("durable benchmark attempt seal changed prior evidence")
+        for artifact in stored_generated:
+            name = artifact.get("name")
+            path = artifact.get("path")
+            if not isinstance(name, str) or not isinstance(path, str):
+                raise EvidenceError("durable benchmark attempt seal has invalid artifact paths")
+            if name in generated_paths and generated_paths[name] != path:
+                raise EvidenceError("durable benchmark attempt seal replaced an artifact")
+            generated_paths[name] = path
+        for entry in stored_entries[len(evidence_entries) :]:
+            name = entry.get("name")
+            path = generated_paths.get(name)
+            if not isinstance(name, str) or path is None:
+                raise EvidenceError("durable benchmark attempt seal has unbound evidence")
+            artifact_path = _resolve_evidence_path(
+                Path(path), base_directory=manifest_directory
+            )
+            if _fsync_file(artifact_path, field=f"sealed attempt evidence {name!r}") != entry.get(
+                "sha256"
+            ):
+                raise EvidenceError("durable benchmark attempt seal evidence changed")
+        evidence_entries = [dict(entry) for entry in stored_entries]
+        attempt_generated_artifacts = [dict(item) for item in stored_generated]
+        generated_artifacts = list(
+            {
+                (item["name"], item["path"]): item
+                for item in [*generated_artifacts, *attempt_generated_artifacts]
+            }.values()
+        )
+        seal_name = f"seed-{seed}-attempt-seal-{generation}"
+        seal_sha256 = _sha256_bytes(seal_bytes)
+        evidence_entries.append({"name": seal_name, "sha256": seal_sha256})
+        seal_artifact = {"name": seal_name, "path": str(seal_path)}
+        generated_artifacts.append(seal_artifact)
+        generated_paths[seal_name] = str(seal_path)
+        attempt["sealed_attempt"] = {"path": str(seal_path), "sha256": seal_sha256}
+        attempt["generated_artifacts"] = [*attempt_generated_artifacts, seal_artifact]
+        attempts.append(attempt)
+    return attempts, evidence_entries, generated_artifacts
+
+
 def _write_seed_file(path: Path, seeds: list[int]) -> str:
     path.write_text(json.dumps(seeds, separators=(",", ":")) + "\n", encoding="utf-8")
     return _fsync_file(path, field="evaluation seed file")
@@ -2132,6 +2303,7 @@ def _run_attempt(
     wad_profile: dict[str, Any] | None,
     elapsed_time_anchor: dict[str, Any] | None,
     existing_attempt: dict[str, Any] | None = None,
+    prior_generated_artifacts: list[dict[str, str]] | None = None,
     started: float | None = None,
     recurring_setup_elapsed: float = 0.0,
     clock: Callable[[], float] = time.perf_counter,
@@ -2225,9 +2397,20 @@ def _run_attempt(
     final_checkpoint = None if not outcomes else Path(outcomes[-1]["checkpoint"])
     final_checkpoint_sha256 = None if not outcomes else outcomes[-1]["checkpoint_sha256"]
     recovery: dict[str, Any] | None = None
-    generated_artifacts: list[dict[str, str]] = list(
-        (existing_attempt or {}).get("generated_artifacts", [])
+    generated_artifacts: list[dict[str, str]] = list(prior_generated_artifacts or [])
+    generated_artifacts.extend((existing_attempt or {}).get("generated_artifacts", []))
+    generated_artifacts = list(
+        {
+            (artifact["name"], artifact["path"]): artifact
+            for artifact in generated_artifacts
+        }.values()
     )
+    evaluation_seed_artifact = {
+        "name": f"seed-{seed}-evaluation-seeds",
+        "path": str(seed_file),
+    }
+    if evaluation_seed_artifact not in generated_artifacts:
+        generated_artifacts.append(evaluation_seed_artifact)
     status = "exhausted"
     cold_start = (existing_attempt or {}).get(
         "cold_start",
@@ -2786,6 +2969,26 @@ def _run_attempt(
         "sha256": attempt_journal_sha256,
         "authority_attestation": authority_attestation,
     }
+    attempt_seal_name = f"seed-{seed}-attempt-seal-{attempt_journal_generation}"
+    attempt_seal_path = attempt_directory / f"attempt-seal-{attempt_journal_generation}.json"
+    attempt_seal_sha256 = _write_durable_json(
+        attempt_seal_path,
+        {
+            "schema_version": 1,
+            "run_identity": run_identity,
+            "continuation_identity": protocol["continuation_identity"],
+            "attempt": attempt,
+            "evidence_entries": evidence_entries,
+            "generated_artifacts": generated_artifacts,
+        },
+        field="signed durable benchmark attempt seal",
+    )
+    attempt["sealed_attempt"] = {
+        "path": str(attempt_seal_path),
+        "sha256": attempt_seal_sha256,
+    }
+    evidence_entries.append({"name": attempt_seal_name, "sha256": attempt_seal_sha256})
+    generated_artifacts.append({"name": attempt_seal_name, "path": str(attempt_seal_path)})
     attempt["_terminal_timing"] = {
         "prior_elapsed": prior_elapsed,
         "terminal_elapsed": elapsed,
@@ -3035,7 +3238,8 @@ def build_development_benchmark_report(
         )
         evidence_entries = [dict(entry) for entry in continuation["evidence_index"]["entries"]]
     run_directory = artifacts_root / run_identity
-    if continuation is None and not run_directory.exists():
+    run_directory_existed = run_directory.exists()
+    if continuation is None and not run_directory_existed:
         try:
             run_directory.mkdir(parents=True, exist_ok=False)
         except FileExistsError as error:
@@ -3045,11 +3249,28 @@ def build_development_benchmark_report(
             ) from error
     elif not run_directory.is_dir():
         raise EvidenceError("benchmark continuation artifact directory is missing")
+    durable_attempts: list[dict[str, Any]] = []
+    durable_generated_artifacts: list[dict[str, str]] = []
+    if continuation is None and run_directory_existed:
+        durable_attempts, evidence_entries, durable_generated_artifacts = (
+            _load_durable_attempt_seals(
+                run_directory,
+                run_identity=run_identity,
+                protocol=protocol,
+                initial_evidence_entries=evidence_entries,
+                manifest_directory=manifest_path.parent,
+            )
+        )
+    prior_attempts = (
+        continuation.get("attempts", []) if continuation is not None else durable_attempts
+    )
     existing_by_seed = {
-        attempt["seed"]: attempt for attempt in (continuation or {}).get("attempts", [])
+        attempt["seed"]: attempt for attempt in prior_attempts
     }
     attempts = []
-    actual_generated_artifacts: list[dict[str, str]] = []
+    actual_generated_artifacts: list[dict[str, str]] = list(
+        (continuation or {}).get("generated_artifacts", durable_generated_artifacts)
+    )
     recurring_setup_elapsed = max(0.0, clock() - invocation_started)
     anchors_by_seed = {
         anchor["payload"]["seed"]: anchor for anchor in validated["elapsed_time_anchors"]
@@ -3067,6 +3288,7 @@ def build_development_benchmark_report(
             wad_profile=wad_profile,
             elapsed_time_anchor=anchors_by_seed.get(seed),
             existing_attempt=existing_attempt,
+            prior_generated_artifacts=actual_generated_artifacts,
             started=(clock() if active_attempt else None),
             recurring_setup_elapsed=(recurring_setup_elapsed if active_attempt else 0.0),
             clock=clock,

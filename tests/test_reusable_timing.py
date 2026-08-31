@@ -8,6 +8,7 @@ import stat
 import subprocess
 import sys
 import time
+import zlib
 from pathlib import Path
 
 import pytest
@@ -568,6 +569,112 @@ def test_terminal_elapsed_seal_covers_final_verification_and_report_fsync(
         ]
         == report["attempts"][0]["reusable_elapsed_seconds"]
     )
+
+
+def test_signed_attempt_is_durable_before_public_report_and_recovers_without_reexecution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest = _manifest(tmp_path, outcomes={"10": [30.0, 0.0]})
+    process_calls = 0
+    original_run_process = benchmark_module._run_process
+
+    def counted_run_process(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal process_calls
+        process_calls += 1
+        return original_run_process(*args, **kwargs)
+
+    def crash_before_public_report(_report: dict[str, object]) -> None:
+        raise RuntimeError("simulated crash before public report persistence")
+
+    monkeypatch.setattr(benchmark_module, "_run_process", counted_run_process)
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        build_development_benchmark_report(manifest, report_writer=crash_before_public_report)
+
+    sealed_attempts = list(
+        (tmp_path / "benchmark-artifacts").glob("*/seed-123/attempt-seal-0.json")
+    )
+    assert len(sealed_attempts) == 1
+    sealed_attempt = json.loads(sealed_attempts[0].read_text(encoding="utf-8"))
+    assert sealed_attempt["attempt"]["attempt_journal"]["authority_attestation"]["payload"][
+        "journal_sha256"
+    ] == sealed_attempt["attempt"]["attempt_journal"]["sha256"]
+
+    report = build_development_benchmark_report(manifest)
+
+    assert report["attempts"][0]["status"] == "succeeded"
+    assert process_calls == 2
+
+
+def test_signed_attempt_is_recovered_before_the_next_seed_executes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest = _manifest(
+        tmp_path,
+        outcomes={"10": [30.0, 0.0]},
+        training_seeds=[123, 124],
+    )
+    process_calls = 0
+    original_run_process = benchmark_module._run_process
+    original_write = benchmark_module._write_durable_json
+
+    def counted_run_process(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal process_calls
+        process_calls += 1
+        return original_run_process(*args, **kwargs)
+
+    def interrupt_after_first_seal(*args: object, **kwargs: object) -> str:
+        digest = original_write(*args, **kwargs)
+        path = args[0]
+        if kwargs.get("field") == "signed durable benchmark attempt seal" and "seed-123" in str(
+            path
+        ):
+            raise RuntimeError("simulated stop after first durable seal")
+        return digest
+
+    monkeypatch.setattr(benchmark_module, "_run_process", counted_run_process)
+    monkeypatch.setattr(benchmark_module, "_write_durable_json", interrupt_after_first_seal)
+    with pytest.raises(RuntimeError, match="simulated stop"):
+        build_development_benchmark_report(manifest)
+    assert process_calls == 2
+
+    monkeypatch.setattr(benchmark_module, "_write_durable_json", original_write)
+    report = build_development_benchmark_report(manifest)
+
+    assert [attempt["status"] for attempt in report["attempts"]] == ["succeeded", "succeeded"]
+    assert process_calls == 4
+
+
+def test_durable_attempt_seal_rejects_unlike_provenance_before_reexecution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest = _manifest(tmp_path, outcomes={"10": [30.0, 0.0]})
+    process_calls = 0
+    original_run_process = benchmark_module._run_process
+
+    def counted_run_process(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal process_calls
+        process_calls += 1
+        return original_run_process(*args, **kwargs)
+
+    monkeypatch.setattr(benchmark_module, "_run_process", counted_run_process)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        build_development_benchmark_report(
+            manifest,
+            report_writer=lambda _report: (_ for _ in ()).throw(
+                RuntimeError("simulated crash before public report persistence")
+            ),
+        )
+    seal_path = next(
+        (tmp_path / "benchmark-artifacts").glob("*/seed-123/attempt-seal-0.json")
+    )
+    seal = json.loads(seal_path.read_text(encoding="utf-8"))
+    seal["continuation_identity"]["recipe_sha256"] = "0" * 64
+    seal_path.write_text(json.dumps(seal), encoding="utf-8")
+
+    with pytest.raises(benchmark_module.EvidenceError, match="unlike provenance"):
+        build_development_benchmark_report(manifest)
+    assert process_calls == 2
 
 
 @pytest.mark.parametrize(
@@ -1625,6 +1732,117 @@ def test_public_command_binds_hidden_source_executed_through_builtins(
         str(manifest),
         "--output",
         str(tmp_path / "continued.json"),
+        "--merge",
+        str(interrupted),
+    )
+
+    assert result.returncode == 2
+    assert "unlike run identity" in result.stderr
+
+
+@pytest.mark.parametrize("directory_name", ["dist", ".venv", "__pycache__"])
+def test_public_command_binds_computed_exec_source_inside_conventional_ignored_directory(
+    tmp_path: Path, directory_name: str
+) -> None:
+    code_root = tmp_path / "code"
+    hidden_directory = code_root / directory_name
+    hidden_directory.mkdir(parents=True)
+    hidden = hidden_directory / "hidden_trainer.py"
+    shutil.copyfile(FIXTURE_PROCESS, hidden)
+    launcher = code_root / "launcher.py"
+    launcher.write_text(
+        "import builtins\n"
+        "import operator\n"
+        "from pathlib import Path\n"
+        "namespace = {'__name__': 'hidden_trainer'}\n"
+        "loader = operator.attrgetter('ex' + 'ec')(builtins)\n"
+        f"loader(Path({str(hidden)!r}).read_text(encoding='utf-8'), namespace)\n"
+        "raise SystemExit(namespace['main']())\n",
+        encoding="utf-8",
+    )
+    manifest = _manifest(
+        tmp_path,
+        outcomes={"10": [30.0, 0.0]},
+        trainer_script=launcher,
+        trainer_code_root=code_root,
+        extra_arguments=["--fixture-interrupt-once-at-step", "10"],
+    )
+    interrupted = tmp_path / "interrupted.json"
+    first = _run_evidence("--manifest", str(manifest), "--output", str(interrupted))
+    assert first.returncode == 0, first.stderr
+    bound_paths = {
+        Path(item["path"])
+        for item in json.loads(interrupted.read_text(encoding="utf-8"))[
+            "benchmark_protocol"
+        ]["trainer"]["bound_files"]
+    }
+    assert hidden in bound_paths
+    hidden.write_bytes(hidden.read_bytes() + b"\n# changed\n")
+
+    result = _run_evidence(
+        "--manifest",
+        str(manifest),
+        "--output",
+        str(tmp_path / "continued.json"),
+        "--merge",
+        str(interrupted),
+    )
+
+    assert result.returncode == 2
+    assert "unlike run identity" in result.stderr
+
+
+@pytest.mark.parametrize("payload_encoding", ["utf-16", "zlib"])
+def test_public_command_binds_suffixless_payload_decoded_before_computed_exec(
+    tmp_path: Path, payload_encoding: str
+) -> None:
+    code_root = tmp_path / "code"
+    code_root.mkdir()
+    hidden = code_root / "payload"
+    fixture_source = FIXTURE_PROCESS.read_text(encoding="utf-8")
+    if payload_encoding == "utf-16":
+        hidden.write_bytes(fixture_source.encode("utf-16"))
+        decoded_payload = "payload.decode('utf-16')"
+    else:
+        hidden.write_bytes(zlib.compress(fixture_source.encode("utf-8")))
+        decoded_payload = "zlib.decompress(payload).decode('utf-8')"
+    launcher = code_root / "launcher.py"
+    launcher.write_text(
+        "import builtins\n"
+        "import operator\n"
+        "import zlib\n"
+        "from pathlib import Path\n"
+        "namespace = {'__name__': 'hidden_trainer'}\n"
+        f"payload = Path({str(hidden)!r}).read_bytes()\n"
+        "loader = operator.attrgetter('ex' + 'ec')(builtins)\n"
+        f"loader({decoded_payload}, namespace)\n"
+        "raise SystemExit(namespace['main']())\n",
+        encoding="utf-8",
+    )
+    manifest = _manifest(
+        tmp_path,
+        outcomes={"10": [30.0, 0.0]},
+        trainer_script=launcher,
+        trainer_code_root=code_root,
+        extra_arguments=["--fixture-interrupt-once-at-step", "10"],
+    )
+    interrupted = tmp_path / f"interrupted-{payload_encoding}.json"
+    first = _run_evidence("--manifest", str(manifest), "--output", str(interrupted))
+    assert first.returncode == 0, first.stderr
+    bound_paths = {
+        Path(item["path"])
+        for item in json.loads(interrupted.read_text(encoding="utf-8"))[
+            "benchmark_protocol"
+        ]["trainer"]["bound_files"]
+    }
+    assert hidden in bound_paths
+    hidden.write_bytes(hidden.read_bytes() + b"changed")
+
+    result = _run_evidence(
+        "--manifest",
+        str(manifest),
+        "--output",
+        str(tmp_path / f"continued-{payload_encoding}.json"),
         "--merge",
         str(interrupted),
     )
