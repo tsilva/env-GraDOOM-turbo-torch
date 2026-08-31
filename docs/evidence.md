@@ -47,16 +47,21 @@ contains:
   `-c`, and statically visible opaque process indirection are rejected. Relative executables and
   scripts are resolved from the manifest directory. The entry point, its transitive imports, and
   every regular file recursively below the declared code root are hashed into the recipe identity
-  and reverified after the cohort. File symlinks bind their target bytes; directory symlinks are
-  accepted only when they resolve back inside the already inventoried code root. No directory name,
-  suffix, executable bit, UTF decoder, parse probe, or compression format exempts bytes, because
-  Python can decode or decompress arbitrary local payloads before computed execution. The only
-  excluded paths are the explicit benchmark artifact and evidence-document boundaries, which are
-  validated separately and cannot supply trainer inputs. This complete-root binding is independent
-  of how code is reached, so computed builtins, reflection, plugin discovery, namespace aliases, and
-  indirect process replacement cannot execute mutable local bytes without binding them.
+  and freshly re-inventoried before the final durable report. Verification requires exact
+  relative-path membership, bytes, regular-file identity, mode, and size; additions, removals,
+  replacements, and type changes fail closed. File and directory symlinks are rejected before any
+  target resolution, whether their targets are internal or external. No directory name, suffix,
+  executable bit, UTF decoder, parse probe, or compression format exempts bytes, because Python can
+  decode or decompress arbitrary local payloads before computed execution. Manifest and merge-report
+  files inside the root are ordinary bound members rather than exclusions. The benchmark artifact
+  root must be disjoint from the code root, and the public report must be outside the code root.
+  Trainer subprocesses cannot write Python bytecode into the source boundary.
+  This complete-root binding is independent of how code is reached, so computed builtins,
+  reflection, plugin discovery, namespace aliases, and indirect process replacement cannot execute
+  mutable local bytes without binding them.
 - `artifacts_directory`: the directory under which the run-identity and per-seed artifacts are
-  durably retained.
+  durably retained. It may neither contain nor be contained by `trainer.code_root`, preventing
+  growing benchmark outputs from becoming executable aliases or self-invalidating recipe members.
 - `bootstrap_artifacts`: optional one-time exclusions declared before the cohort. Every entry names
   a persistent read-only regular file outside the benchmark artifact directory, its SHA-256,
   creation elapsed seconds, and exact canonical reuse conditions. Eligibility is not established by

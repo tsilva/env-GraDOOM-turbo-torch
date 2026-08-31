@@ -36,6 +36,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--fixture-hardlink-checkpoint-to", type=Path)
     parser.add_argument("--fixture-mutate-bootstrap", type=Path)
     parser.add_argument("--fixture-mutate-trainer-code", type=Path)
+    parser.add_argument("--fixture-remove-trainer-code", type=Path)
+    parser.add_argument("--fixture-replace-trainer-code", type=Path)
     parser.add_argument("--fixture-interrupt-once-at-step", type=int)
     parser.add_argument("--fixture-interrupt-seed", type=int)
     parser.add_argument("--fixture-hard-crash-once-at-step", type=int)
@@ -227,6 +229,12 @@ def main() -> int:
         if args.fixture_mutate_trainer_code is not None:
             with args.fixture_mutate_trainer_code.open("a", encoding="utf-8") as stream:
                 stream.write("\n# mutated during cohort\n")
+        if args.fixture_remove_trainer_code is not None:
+            args.fixture_remove_trainer_code.unlink()
+        if args.fixture_replace_trainer_code is not None:
+            replacement_payload = args.fixture_replace_trainer_code.read_bytes()
+            args.fixture_replace_trainer_code.unlink()
+            args.fixture_replace_trainer_code.write_bytes(replacement_payload)
         if should_interrupt and args.fixture_hold_after_recovery_checkpoint_marker is not None:
             args.fixture_hold_after_recovery_checkpoint_marker.write_text(
                 "checkpoint-ready\n", encoding="utf-8"
