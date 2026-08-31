@@ -6,6 +6,7 @@ import math
 import operator
 import os
 import re
+import secrets
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,6 +20,12 @@ from gymnasium.vector import AutoresetMode, VectorEnv
 from gymnasium.vector.utils import batch_space
 
 from .actions import DEATHMATCH_ACTIONS, DEATHMATCH_BUTTONS, normalize_action_table
+from .diagnostics import (
+    ActorAttributionDiagnostics,
+    ActorAttributionStage,
+    ActorKillEvent,
+    ActorSnapshot,
+)
 from .engine import DEVICE_SIGNAL_NAMES, TorchDeathmatchEngine
 from .scenario import CompiledScenario, compile_deathmatch_scenario
 
@@ -205,7 +212,7 @@ class DeviceAutoResetTransition:
     final_info_histories: torch.Tensor
 
 
-class GraDoomVecEnv(VectorEnv):
+class GraDoomVecEnv(ActorAttributionDiagnostics, VectorEnv):
     """Device-resident vector deathmatch environment.
 
     Torch tensors are the only transition transport, including reset selectors
@@ -415,6 +422,7 @@ class GraDoomVecEnv(VectorEnv):
         self.compiled_scenario = compiled_scenario
         self.scenario_sha256 = compiled_scenario.scenario_sha256
         self.iwad_sha256 = compiled_scenario.iwad_sha256
+        self._diagnostic_stage_tokens: tuple[str, ...] | None = None
         vizdoom_options = dict(vizdoom_config or {})
         unknown_vizdoom_options = set(vizdoom_options) - {
             "episode_timeout",
@@ -797,6 +805,9 @@ class GraDoomVecEnv(VectorEnv):
             )
         seeds = torch.tensor(game_seeds, device=self.device, dtype=torch.int64)
         self._seed_values = [None] * self.num_envs
+        # Any public reset invalidates the all-lane diagnostic stage. This
+        # prevents an event token from being replayed after the world changes.
+        self._diagnostic_stage_tokens = None
         observations = self._engine.reset(mask, seeds)
         self._initialized |= mask
         self._reset_info_histories(mask)
@@ -1033,6 +1044,78 @@ class GraDoomVecEnv(VectorEnv):
 
     def active_state_indices(self) -> torch.Tensor:
         return self._device_state_indices
+
+    def diagnostic_asset_sha256(self) -> dict[str, str]:
+        """Return the exact assets consumed by this diagnostic provider."""
+
+        return {"iwad": self.iwad_sha256, "pwad": self.scenario_sha256}
+
+    def diagnostic_stage_actor_attribution(
+        self,
+        behavior: str,
+    ) -> tuple[ActorAttributionStage, ...]:
+        """Install a fixed actor stage without changing the normal API contract."""
+
+        if self.closed:
+            raise RuntimeError("cannot stage attribution on a closed environment")
+        if not bool(torch.all(self._initialized)):
+            raise RuntimeError("all lanes must be reset before attribution staging")
+        self._engine.stage_actor_attribution(behavior)
+        self._diagnostic_stage_tokens = tuple(
+            secrets.token_hex(16) for _lane in range(self.num_envs)
+        )
+        enemy_count = 1 if behavior == "player_killcount" else 2
+        actors = tuple(
+            ActorSnapshot(actor_id=actor_id, kind="enemy", alive=True)
+            for actor_id in range(1, enemy_count + 1)
+        )
+        return tuple(
+            ActorAttributionStage(
+                token=token,
+                actors=(ActorSnapshot(actor_id=0, kind="player", alive=True), *actors),
+            )
+            for token in self._diagnostic_stage_tokens
+        )
+
+    def diagnostic_actor_snapshot(self, lane: int) -> tuple[ActorSnapshot, ...]:
+        """Return identities still alive in one explicitly staged lane."""
+
+        if self._diagnostic_stage_tokens is None:
+            raise RuntimeError("actor attribution has not been staged")
+        lane_index = operator.index(lane)
+        if not 0 <= lane_index < self.num_envs:
+            raise IndexError(f"lane must be in [0, {self.num_envs - 1}]")
+        alive = self._engine.enemy_alive[lane_index].detach().to("cpu").tolist()
+        player_alive = not bool(self._engine.player_dead[lane_index].item())
+        return (
+            ActorSnapshot(actor_id=0, kind="player", alive=player_alive),
+            *(
+                ActorSnapshot(actor_id=slot + 1, kind="enemy", alive=True)
+                for slot, is_alive in enumerate(alive)
+                if is_alive
+            ),
+        )
+
+    def diagnostic_kill_events(self, lane: int) -> tuple[ActorKillEvent, ...]:
+        """Return damage-site actor provenance for one explicitly staged lane."""
+
+        if self._diagnostic_stage_tokens is None:
+            raise RuntimeError("actor attribution has not been staged")
+        lane_index = operator.index(lane)
+        if not 0 <= lane_index < self.num_envs:
+            raise IndexError(f"lane must be in [0, {self.num_envs - 1}]")
+        count = int(self._engine.actor_kill_event_count[lane_index].item())
+        if count == 0:
+            return ()
+        attacker_kind_code = int(self._engine.actor_kill_attacker_kind[lane_index].item())
+        event = ActorKillEvent(
+            stage_token=self._diagnostic_stage_tokens[lane_index],
+            attacker_id=int(self._engine.actor_kill_attacker_id[lane_index].item()),
+            attacker_kind="player" if attacker_kind_code == 0 else "enemy",
+            target_id=int(self._engine.actor_kill_target_id[lane_index].item()),
+            target_kind="enemy",
+        )
+        return (event,) * count
 
     def render_lane(self, lane: int) -> np.ndarray | None:
         if self.closed:
