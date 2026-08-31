@@ -22,3 +22,6 @@
   distribution names.
 - Add the independently versioned fast Turbo invariant suite to parity readiness,
   including named public-behavior failures and GraDOOM Torch device checks.
+- Add sealed two-origin pretrained-policy corpus validation and exhaustive,
+  restart-safe 256-seed execution in both providers through the public evidence
+  command, with deterministic nonclaiming subprocess fixtures.

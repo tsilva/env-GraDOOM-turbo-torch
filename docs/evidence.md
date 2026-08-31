@@ -6,6 +6,12 @@ inputs before the real WAD profile, reference provider, and pretrained policy co
 It reports those prerequisites as unavailable; it does not issue a parity certificate or make a
 performance claim.
 
+The `parity_certification` workflow now validates and executes a sealed pretrained-policy corpus.
+It records complete two-provider episode evidence but deliberately stops before the per-policy
+threshold, bootstrap diagnostic, and certificate verdict. Until that subsequent verdict workflow
+is complete, every corpus report has `claim_eligible: false`; deterministic fixture corpora are
+also permanently identified by the `fixture_evidence` reason.
+
 The command also provides the `development_training_benchmark` workflow. It is the inexpensive
 integration benchmark: it drives the standalone GPU-resident trainer from a fresh policy and
 optimizer, evaluates predeclared checkpoints on GraDOOM, and records its complete result using the
@@ -23,6 +29,44 @@ gradoom-evidence \
 The command exits with status 2 and a concise error when the manifest is malformed, its schema
 version is unsupported, a declared file does not match its SHA-256 digest, or a merge report is
 incompatible. It writes the report only after all validation succeeds.
+
+## Sealed pretrained-policy corpus
+
+A `parity_certification` manifest uses formal evidence and declares a `policy_evaluation` object.
+That object names three hash-verified `declared_inputs`: a corpus manifest, an episode-seed
+manifest, and one common policy-runner executable. It also binds protocol version `1` and exactly
+one revision for each provider, `gradoom` and `env-vizdoom-turbo`. An optional positive
+`timeout_seconds` applies independently to each provider-policy batch. Provider-specific runner
+commands or policy arguments are not accepted.
+
+The separate corpus manifest is selected and hashed before execution. It records schema and corpus
+versions, `sealed: true`, the shared preprocessing SHA-256 identity, and a non-empty policy array.
+Each policy records a unique ID, its `gradoom` or `env-vizdoom-turbo` training origin, immutable
+artifact path and SHA-256, model/runtime contract, `stochastic_actions: true`, `adapted: false`, and
+an empty `provider_specific_modifications` array. The v1 contract accepts Torch standalone GraDOOM
+PPO artifacts and requires at least one frozen policy from each training origin. Missing or changed
+artifacts, duplicate IDs or locations, unsupported contracts, deterministic-only policies,
+adaptation, provider compensation, and any artifact or declared-input mutation during execution
+fail closed.
+
+The seed manifest contains a versioned seed-set ID and exactly 256 unique, ordered, non-negative
+64-bit episode seeds. The evidence command passes that same complete ordered array to the same
+hash-pinned runner for every provider-policy pair. Runner success, process failure, timeout,
+malformed output, or an omitted seed all produce one retained outcome for every declared unit; a
+failed unit is never silently retried or replaced. Every record includes its provider, policy,
+seed index, seed, stable unit identity, `player_killcount`, termination state, episode length, and
+an explicit execution failure or null.
+
+The report's `policy_evaluation` object binds the corpus and seed manifest hashes, normalized corpus,
+provider revisions, exact seed list, expected outcome count, complete outcomes, and failure count.
+The evaluation and every policy artifact are separately hashed in the evidence index. The stable
+run identity also binds code provenance, evidence level, fixture state, every declared input hash,
+runner protocol and timeout, provider revisions, and corpus and seed identities.
+
+Pass `--merge` with an earlier matching corpus report to reuse already completed unit identities.
+Completed failures are evidence and are reused exactly like successes. A changed corpus, seed set,
+runner, provider revision, code provenance, protocol, timeout, evidence level, or fixture state is
+an unlike evaluation and is rejected instead of combined.
 
 ## Development training benchmark
 
@@ -265,9 +309,9 @@ readiness verdict.
 
 ## Report schema version 1
 
-The JSON report records its schema version, workflow, evidence level, fixture state, readiness
+The JSON report records its schema version, workflow, evidence level, fixture state, workflow
 status, claim eligibility and structured reasons, stable run identity, declared code provenance,
-declared inputs, prerequisites, optional WAD-profile validation, and evidence index. A fixture
+declared inputs, workflow results, and evidence index. A readiness fixture
 report is `unavailable` while real prerequisites are missing, has `claim_eligible: false`, and
 names every missing prerequisite in `claim_reasons`. Every report records the invariant-suite
 version even when provider execution has not yet been configured.
@@ -281,10 +325,11 @@ UTF-8, sorted object keys, no insignificant whitespace, and JSON separators `,` 
 are not identity fields; the declared content hashes are.
 
 The `evidence_index.entries` array contains the raw manifest-file digest, every verified declared
-input digest, and, when used, the bundled WAD-profile manifest plus every readable provider WAD
-digest. `evidence_index.sha256` hashes the canonical JSON representation of that complete entries
-array using the same rules. This makes index mutation detectable without attempting the impossible
-operation of including the report's own digest inside itself.
+input digest, and workflow-specific evidence. WAD readiness adds the bundled profile manifest and
+every readable provider WAD digest; corpus evaluation adds every policy artifact and the complete
+policy-evaluation digest. `evidence_index.sha256` hashes the canonical JSON representation of that
+complete entries array using the same rules. This makes index mutation detectable without
+attempting the impossible operation of including the report's own digest inside itself.
 
 ## Safe continuation
 
@@ -293,3 +338,7 @@ existing report schema, recomputes its run identity from its recorded identity-b
 validates its evidence-index hash, then requires the recomputed identity to equal the run described
 by the new manifest. Unlike code provenance, evidence levels, declared input hashes, or prerequisite
 sets fail instead of being combined.
+
+Corpus continuation additionally validates the stored policy-evaluation digest and every stable
+provider-policy-seed unit identity. It reuses only matching completed outcomes and retains failed
+units without replacement.
