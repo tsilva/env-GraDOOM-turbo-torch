@@ -21,12 +21,14 @@ import hashlib
 import json
 import math
 import os
+import platform
 import random
 import signal
 import statistics
 import time
 from collections import deque
 from collections.abc import Mapping, Sequence
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -40,6 +42,10 @@ from gradoom._kernels import bounded_observation_augment, frozen_nature_conv1
 from gradoom.evidence.checkpoint_policy import (
     LoadedPolicyCheckpoint,
     load_policy_checkpoint,
+)
+from gradoom.evidence.cuda_residency import (
+    CUDA_RESIDENCY_CONTRACT,
+    CudaResidencyAcceptance,
 )
 from gradoom.evidence.policy_execution import policy_execution_identity
 
@@ -441,6 +447,15 @@ def _parser() -> argparse.ArgumentParser:
         help="Exclude this many compile/warmup rollouts from steady-state aggregates.",
     )
     parser.add_argument(
+        "--cuda-residency-acceptance",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Emit fail-closed CUDA residency evidence for rollouts after the configured "
+            "steady-state warm-up boundary (default: disabled)."
+        ),
+    )
+    parser.add_argument(
         "--metrics-jsonl",
         type=Path,
         help="Optionally append every emitted JSON record to this file.",
@@ -751,7 +766,7 @@ def _audit_config(args: argparse.Namespace) -> dict[str, Any]:
         "initialize_from_sha256": initialization_sha256,
     }
     canonical = json.dumps(effective, sort_keys=True, separators=(",", ":"))
-    return {
+    audit = {
         "type": "config",
         "contract": "standalone-gradoom-deathmatch-ppo-v2",
         "operation": "evaluate" if args.evaluate_checkpoint is not None else "train",
@@ -913,6 +928,13 @@ def _audit_config(args: argparse.Namespace) -> dict[str, Any]:
             "wandb_metrics": list(GRADLAB_WANDB_METRICS),
         },
     }
+    if bool(args.cuda_residency_acceptance):
+        audit["cuda_residency_acceptance"] = {
+            "contract": CUDA_RESIDENCY_CONTRACT,
+            "enabled": True,
+            "steady_state_after_rollouts": int(args.steady_state_after_rollouts),
+        }
+    return audit
 
 
 class JsonEmitter:
@@ -1851,6 +1873,7 @@ def _ppo_update(
     precision: Precision,
     args: argparse.Namespace,
     encoder_anchors: tuple[tuple[torch.Tensor, torch.Tensor], ...] = (),
+    residency_acceptance: CudaResidencyAcceptance | None = None,
 ) -> dict[str, float]:
     policy.train()
     env_major = not bool(args.torch_permutation)
@@ -1903,7 +1926,11 @@ def _ppo_update(
                     batch_advantages.std() + 1e-8
                 )
 
-            with precision.autocast():
+            with (
+                residency_acceptance.guard("steady_state_loss")
+                if residency_acceptance is not None
+                else nullcontext()
+            ), precision.autocast():
                 if observation_features is None:
                     if observations is None:  # pragma: no cover - constructor invariant
                         raise RuntimeError("rollout has neither pixels nor encoded observations")
@@ -1965,6 +1992,14 @@ def _ppo_update(
                     + float(args.privileged_imitation_coef) * imitation_loss
                     + float(args.encoder_anchor_coef) * encoder_anchor_loss
                 )
+                if residency_acceptance is not None:
+                    residency_acceptance.observe(
+                        "losses",
+                        loss,
+                        policy_loss,
+                        value_loss,
+                        entropy_loss,
+                    )
 
             with torch.no_grad():
                 log_ratio = log_probs - batch_old_log_probs
@@ -1987,17 +2022,39 @@ def _ppo_update(
                 )
                 metric_count += 1
 
-            optimizer.zero_grad(set_to_none=True)
-            if precision.scaler.is_enabled():
-                precision.scaler.scale(loss).backward()
-                precision.scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(policy.parameters(), REFERENCE_RECIPE.max_grad_norm)
-                precision.scaler.step(optimizer)
-                precision.scaler.update()
-            else:
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(policy.parameters(), REFERENCE_RECIPE.max_grad_norm)
-                optimizer.step()
+            with (
+                residency_acceptance.guard("steady_state_parameter_update")
+                if residency_acceptance is not None
+                else nullcontext()
+            ):
+                optimizer.zero_grad(set_to_none=True)
+                if precision.scaler.is_enabled():
+                    precision.scaler.scale(loss).backward()
+                    precision.scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(
+                        policy.parameters(), REFERENCE_RECIPE.max_grad_norm
+                    )
+                    if residency_acceptance is not None:
+                        residency_acceptance.observe(
+                            "updates",
+                            tuple(parameter.grad for parameter in policy.parameters()),
+                        )
+                    precision.scaler.step(optimizer)
+                    precision.scaler.update()
+                else:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(
+                        policy.parameters(), REFERENCE_RECIPE.max_grad_norm
+                    )
+                    if residency_acceptance is not None:
+                        residency_acceptance.observe(
+                            "updates",
+                            tuple(parameter.grad for parameter in policy.parameters()),
+                        )
+                    optimizer.step()
+                if residency_acceptance is not None:
+                    residency_acceptance.observe("parameters", tuple(policy.parameters()))
+                    residency_acceptance.observe("optimizer_state", optimizer.state)
 
     returns_variance = torch.var(returns, correction=0)
     explained_variance = torch.where(
@@ -2426,6 +2483,27 @@ def _evaluation_aggregate(records: Sequence[Mapping[str, Any]]) -> dict[str, Any
     return aggregate
 
 
+def _cuda_acceptance_environment(
+    device: torch.device,
+) -> tuple[dict[str, object], dict[str, object]]:
+    properties = torch.cuda.get_device_properties(device)
+    hardware = {
+        "gpu_model": properties.name,
+        "device": str(device),
+        "compute_capability": f"{properties.major}.{properties.minor}",
+        "total_memory_bytes": int(properties.total_memory),
+    }
+    software = {
+        "python": platform.python_version(),
+        "gradoom": __import__("gradoom").__version__,
+        "torch": torch.__version__,
+        "cuda": torch.version.cuda,
+        "cudnn": str(torch.backends.cudnn.version()),
+        "numpy": np.__version__,
+    }
+    return hardware, software
+
+
 def _evaluate(
     args: argparse.Namespace,
     emitter: JsonEmitter,
@@ -2850,6 +2928,11 @@ def _train(
                 policy.observation_feature_count if bool(args.freeze_observation_encoder) else None
             ),
         )
+        residency_acceptance = (
+            CudaResidencyAcceptance(observations.device)
+            if bool(args.cuda_residency_acceptance)
+            else None
+        )
         episode_starts = torch.ones(int(args.num_envs), dtype=torch.bool, device=device)
         dones = torch.zeros(int(args.num_envs), dtype=torch.bool, device=device)
         episode_returns = torch.zeros(int(args.num_envs), dtype=torch.float32, device=device)
@@ -2982,6 +3065,9 @@ def _train(
             )
         last_metrics: dict[str, Any] = {}
         rollout_transitions = int(args.num_envs) * int(args.n_steps)
+        residency_checked_rollouts = 0
+        residency_checked_steps = 0
+        residency_global_step_start: int | None = None
         training_started = time.perf_counter()
         torch.cuda.synchronize(device)
         torch.cuda.reset_peak_memory_stats(device)
@@ -3003,6 +3089,18 @@ def _train(
 
         while global_step < _execution_timesteps(args) and not interrupted:
             executed_rollouts += 1
+            check_residency = (
+                residency_acceptance is not None
+                and executed_rollouts > int(args.steady_state_after_rollouts)
+            )
+            active_residency = residency_acceptance if check_residency else None
+            if active_residency is not None:
+                if residency_global_step_start is None:
+                    residency_global_step_start = global_step
+                active_residency.observe("observations", observations)
+                active_residency.observe("resets", reset_mask, episode_index, episode_starts, dones)
+                active_residency.observe("rollout_state", buffer.__dict__)
+                active_residency.observe("parameters", tuple(policy.parameters()))
             episode_seeds.ensure(int(episode_index.max().item()) + int(args.n_steps) + 1)
             buffer.reset()
             policy.eval()
@@ -3024,7 +3122,11 @@ def _train(
                     context,
                     episode_starts,
                 )
-                with torch.no_grad(), precision.autocast():
+                with (
+                    active_residency.guard("steady_state_inference")
+                    if active_residency is not None
+                    else nullcontext()
+                ), torch.no_grad(), precision.autocast():
                     if bool(args.freeze_observation_encoder):
                         actions, values, log_probs, observation_features = calls.act_and_encode(
                             staged_observations,
@@ -3037,10 +3139,31 @@ def _train(
                         )
                         observation_features = None
                 next_episode_index = episode_index + 1
-                transition = env.step_and_reset_device(
-                    actions,
-                    episode_seeds.lookup(next_episode_index),
-                )
+                next_episode_seeds = episode_seeds.lookup(next_episode_index)
+                with (
+                    active_residency.guard("steady_state_transition")
+                    if active_residency is not None
+                    else nullcontext()
+                ):
+                    transition = env.step_and_reset_device(actions, next_episode_seeds)
+                if active_residency is not None:
+                    active_residency.observe("observations", transition.observations)
+                    active_residency.observe("actions", actions)
+                    active_residency.observe(
+                        "inference",
+                        actions,
+                        values,
+                        log_probs,
+                        observation_features,
+                    )
+                    active_residency.observe("rewards", transition.rewards)
+                    active_residency.observe(
+                        "resets",
+                        next_episode_index,
+                        next_episode_seeds,
+                        transition.terminated,
+                        transition.truncated,
+                    )
                 if str(args.reward_shape) == "native-death-v1":
                     policy_rewards = transition.rewards - (
                         float(args.death_penalty) * transition.terminated.to(torch.float32)
@@ -3071,6 +3194,9 @@ def _train(
                     episode_lengths=episode_lengths,
                     final_kills=transition.final_signals[:, kill_index],
                 )
+                if active_residency is not None:
+                    active_residency.observe("rewards", policy_rewards)
+                    active_residency.observe("rollout_state", buffer.__dict__)
                 observations = transition.observations
                 context = context_encoder.encode(transition.info_histories)
                 torch.logical_or(
@@ -3124,7 +3250,11 @@ def _train(
                 precision=precision,
                 args=args,
                 encoder_anchors=encoder_anchors,
+                residency_acceptance=active_residency,
             )
+            if active_residency is not None:
+                residency_checked_rollouts += 1
+                residency_checked_steps += rollout_transitions
             torch.cuda.synchronize(device)
             update_seconds = time.perf_counter() - update_started
             loop_seconds = rollout_seconds + update_seconds
@@ -3178,6 +3308,29 @@ def _train(
 
         torch.cuda.synchronize(device)
         training_elapsed_seconds = time.perf_counter() - training_started
+        if residency_acceptance is not None:
+            hardware, software = _cuda_acceptance_environment(observations.device)
+            residency_record = residency_acceptance.report(
+                checked_rollouts=residency_checked_rollouts,
+                checked_steps=residency_checked_steps,
+                workload={
+                    "trainer_contract": "standalone-gradoom-deathmatch-ppo-v2",
+                    "num_envs": int(args.num_envs),
+                    "n_steps": int(args.n_steps),
+                    "checked_rollouts": residency_checked_rollouts,
+                    "checked_transitions": residency_checked_steps,
+                    "global_step_start": residency_global_step_start,
+                    "global_step_end": global_step,
+                    "observation_renderer": str(args.observation_renderer),
+                    "reward_shape": str(args.reward_shape),
+                    "policy_architecture": str(args.policy_architecture),
+                    "precision": str(args.precision),
+                },
+                hardware=hardware,
+                software=software,
+            )
+            residency_record["evidence_kind"] = "cuda_hardware"
+            emitter.emit(residency_record)
         checkpoint_path = None
         if args.checkpoint is not None:
             checkpoint_path = _save_checkpoint(
