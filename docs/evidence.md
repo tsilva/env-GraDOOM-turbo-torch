@@ -117,6 +117,10 @@ contains:
 - `wad_profile`: required for non-fixture runs and validated through the immutable
   `freedoom2-deathmatch-v1` binding before training. The trainer and evaluator must report the same
   IWAD and PWAD hashes. CPU-only fixture manifests may omit real WAD assets.
+- `cuda_residency_acceptance`: an optional boolean, defaulting to `false`. When true, the evidence
+  command owns the standalone trainer's `--cuda-residency-acceptance` flag and requires a passing
+  `gradoom-cuda-residency-v1` record from every training segment. Trainer arguments cannot override
+  this setting.
 
 For each seed, the command starts the reusable timer before attempt setup and invokes the existing
 `standalone-gradoom-deathmatch-ppo-v2` trainer contract at every checkpoint cadence. The first
@@ -148,6 +152,34 @@ The standalone trainer's `--evaluation-seeds-file` accepts a UTF-8 JSON array of
 uint32 game seeds. Its emitted config binds the complete ordered seed list, file hash, stochastic
 action setting, `player_killcount` gate signal, and separate compatibility signal into the retained
 evaluation evidence.
+
+### CUDA residency acceptance
+
+CUDA residency acceptance instruments the real standalone trainer used by the development
+benchmark (and available to the primary benchmark through the same trainer contract). It begins
+only after `--steady-state-after-rollouts` and fails closed if no later rollout is checked. The
+record verifies one concrete CUDA device for observations, actions, rewards, reset selectors and
+state, rollout state, inference outputs, loss tensors, optimizer state, parameters, and gradients
+used for updates. One continuous rollout scope covers observation augmentation and staging,
+transitions, reward shaping, rollout writes, context/reset updates, value bootstrap, and rollout
+finalization; one continuous update scope covers PPO staging, losses, and parameter updates. Both
+reject host-to-accelerator and accelerator-to-host copies before they execute, including
+`.cpu().numpy()` round trips and NumPy-created update tensors.
+
+The retained record names the exact checked workload and transition count; GPU model, concrete
+device, compute capability, and memory; and Python, GraDOOM, Torch, CUDA, cuDNN, and NumPy versions.
+Its host-transition guard count and zero-transfer result are part of the validated evidence. A
+fixture process may exercise this report contract only as `fixture_contract`; fixture reports remain
+non-authoritative and claim-ineligible and cannot impersonate CUDA hardware evidence.
+
+Acceptance guards exclude bounded scalar telemetry, configuration and scheduling, process
+bootstrap, and checkpoint extraction/writing. Those operations remain permitted outside the
+steady-state data plane. When the option is disabled, the trainer creates no acceptance collector,
+uses two reusable no-op contexts per rollout instead of per-step or per-minibatch branches, emits no
+acceptance record, and performs no additional host transport.
+Hardware integration tests require an explicitly allocated CUDA device and
+`GRADOOM_RUN_CUDA_ACCEPTANCE=1`; otherwise they skip with a clear reason while deterministic
+contract and fixture-wiring tests continue to run.
 
 ## Manifest schema version 1
 
