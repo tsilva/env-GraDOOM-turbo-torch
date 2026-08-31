@@ -122,6 +122,13 @@ def _reference_attribution_env_class(base: type[Any]) -> type[Any]:
             # not change the configured action or observation semantics.
             self._use_indexed_native = False
 
+        def reset(self, *args: Any, **kwargs: Any) -> Any:
+            # A public reset changes the native world and therefore invalidates
+            # every actor identity captured for the previous staged event.
+            if hasattr(self, "_diagnostic_attribution_stages"):
+                del self._diagnostic_attribution_stages
+            return super().reset(*args, **kwargs)
+
         def diagnostic_asset_sha256(self) -> dict[str, str]:
             iwad = Path(str(self._rom_path)).expanduser().resolve()
             pwad = self._scenario.config_path.with_name("deathmatch.wad").resolve()

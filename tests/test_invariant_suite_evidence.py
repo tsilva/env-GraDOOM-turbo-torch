@@ -874,6 +874,39 @@ def test_real_attribution_oracle_rejects_changed_assets(tmp_path: Path) -> None:
         )
 
 
+def test_real_attribution_oracle_rejects_replayed_stage() -> None:
+    stage = ActorAttributionStage(
+        token="one-use-stage",
+        actors=(
+            ActorSnapshot(0, "player", True),
+            ActorSnapshot(1, "enemy", True),
+        ),
+    )
+
+    class DiagnosticEnv:
+        def diagnostic_kill_events(self, lane: int) -> tuple[ActorKillEvent, ...]:
+            assert lane == 0
+            return (ActorKillEvent("one-use-stage", 0, "player", 1, "enemy"),)
+
+        def diagnostic_actor_snapshot(self, lane: int) -> tuple[ActorSnapshot, ...]:
+            assert lane == 0
+            return (ActorSnapshot(0, "player", True),)
+
+    env = DiagnosticEnv()
+    oracle = invariant_runner._RealAttributionOracle(
+        provider="gradoom",
+        expected_assets={},
+        stages={id(env): (stage,)},
+    )
+    oracle._verify_assets = lambda: None  # type: ignore[method-assign]
+    oracle._verify_provider = lambda _env: None  # type: ignore[method-assign]
+
+    oracle(env, lane=0, behavior="player_killcount")
+
+    with pytest.raises(RuntimeError, match="was not prepared"):
+        oracle(env, lane=0, behavior="player_killcount")
+
+
 @pytest.mark.parametrize(
     ("events", "actors", "message"),
     [

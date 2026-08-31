@@ -477,7 +477,8 @@ class _RealAttributionOracle:
         self._verify_assets()
         self._verify_provider(env)
         try:
-            stage = self.stages[id(env)][lane]
+            stages = self.stages.pop(id(env))
+            stage = stages[lane]
         except (KeyError, IndexError) as error:
             raise RuntimeError("staged attribution was not prepared for this execution") from error
         events = env.diagnostic_kill_events(lane)

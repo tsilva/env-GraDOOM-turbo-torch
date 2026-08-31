@@ -265,3 +265,27 @@ def test_reference_diagnostic_surfaces_unexpected_surviving_actors() -> None:
         ActorSnapshot(83, "enemy", True),
         ActorSnapshot(99, "enemy", True),
     )
+
+
+def test_reference_diagnostic_reset_invalidates_staged_actor_identities() -> None:
+    class ResettableDiagnosticBase:
+        def reset(self, *args: object, **kwargs: object) -> tuple[str, str]:
+            del args, kwargs
+            return "observation", "infos"
+
+    cls = reference_provider._reference_attribution_env_class(ResettableDiagnosticBase)
+    env = object.__new__(cls)
+    env._games = [_ObjectGame([_actor(0, "Self")])]
+    env._diagnostic_attribution_stages = (
+        ActorAttributionStage(
+            token="stale-stage",
+            actors=(
+                ActorSnapshot(0, "player", True),
+                ActorSnapshot(71, "enemy", True),
+            ),
+        ),
+    )
+
+    assert env.reset() == ("observation", "infos")
+    with pytest.raises(RuntimeError, match="has not been staged"):
+        env.diagnostic_actor_snapshot(0)
