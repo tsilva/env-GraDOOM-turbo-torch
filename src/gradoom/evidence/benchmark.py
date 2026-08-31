@@ -531,15 +531,25 @@ def _python_source_closure(
         return True
 
     local_sources: set[Path] = set()
+
+    def inventory_error(error: OSError) -> None:
+        raise error
+
     try:
-        for directory, names, filenames in os.walk(code_root):
+        for directory, names, filenames in os.walk(code_root, onerror=inventory_error):
             directory_path = Path(directory)
-            names[:] = [
-                name
-                for name in names
-                if name not in ignored_directories
-                and not excluded(directory_path / name)
-            ]
+            retained_names = []
+            for name in names:
+                child = directory_path / name
+                if name in ignored_directories or excluded(child):
+                    continue
+                if child.is_symlink():
+                    raise EvidenceError(
+                        "benchmark trainer code_root contains an unbound directory symlink: "
+                        f"{child}"
+                    )
+                retained_names.append(name)
+            names[:] = retained_names
             for filename in filenames:
                 candidate = directory_path / filename
                 if not excluded(candidate) and candidate.is_file() and is_local_executable_source(
@@ -733,17 +743,6 @@ def _validate_elapsed_time_anchors(
     if [item["payload"]["seed"] for item in anchors] != training_seeds:
         raise EvidenceError("benchmark.elapsed_time_anchors must cover each training seed in order")
     return anchors
-
-
-def _signed_elapsed_floor(anchor: dict[str, Any], checkpoint: Path) -> float:
-    try:
-        checkpoint_ctime_ns = checkpoint.stat().st_ctime_ns
-    except OSError as error:
-        raise EvidenceError("signed elapsed-time floor checkpoint is unavailable") from error
-    return max(
-        0.0,
-        (checkpoint_ctime_ns - anchor["payload"]["started_unix_ns"]) / 1_000_000_000,
-    )
 
 
 def _attestation_bytes(payload: dict[str, Any]) -> bytes:
@@ -2059,7 +2058,6 @@ def _load_live_interrupted_attempt(
         )
         if elapsed_time_anchor is None:
             raise EvidenceError("live benchmark recovery is missing a signed elapsed-time floor")
-        elapsed = max(elapsed, _signed_elapsed_floor(elapsed_time_anchor, checkpoint))
         return {
             "seed": seed,
             "attempt_identity": attempt_identity,
@@ -2176,8 +2174,6 @@ def _run_attempt(
             raise EvidenceError(f"seed {seed} recovery checkpoint SHA-256 mismatch")
         if elapsed_time_anchor is None:
             raise EvidenceError("benchmark recovery is missing a signed elapsed-time floor")
-        if prior_elapsed + 1e-9 < _signed_elapsed_floor(elapsed_time_anchor, recovery_path):
-            raise EvidenceError("benchmark recovery is below its signed elapsed-time floor")
         previous_checkpoint = {
             "path": recovery_path,
             "progress_step": existing_recovery["progress_step"],
@@ -2647,11 +2643,6 @@ def _run_attempt(
         if status != "exhausted":
             break
     elapsed = prior_elapsed + recurring_setup_elapsed + clock() - started
-    if recovery is not None and elapsed_time_anchor is not None:
-        elapsed = max(
-            elapsed,
-            _signed_elapsed_floor(elapsed_time_anchor, Path(recovery["checkpoint"])),
-        )
     if recovery is not None:
         recovery["accumulated_reusable_elapsed_seconds"] = elapsed
         recovery_generation = _next_append_only_generation(

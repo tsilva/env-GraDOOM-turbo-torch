@@ -472,6 +472,35 @@ def test_public_command_does_not_charge_one_seed_for_another_seeds_work(
     assert elapsed[124] < 0.4
 
 
+def test_public_command_does_not_charge_recovery_for_another_seeds_work(
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest(
+        tmp_path,
+        outcomes={"10": [30.0, 0.0]},
+        training_seeds=[123, 124],
+        extra_arguments=[
+            "--fixture-training-delay-seed",
+            "123",
+            "--fixture-training-delay-seconds",
+            "0.5",
+            "--fixture-interrupt-once-at-step",
+            "10",
+            "--fixture-interrupt-seed",
+            "124",
+        ],
+    )
+    output = tmp_path / "report.json"
+
+    result = _run_evidence("--manifest", str(manifest), "--output", str(output))
+
+    assert result.returncode == 0, result.stderr
+    attempts = json.loads(output.read_text(encoding="utf-8"))["attempts"]
+    assert [attempt["status"] for attempt in attempts] == ["succeeded", "interrupted"]
+    assert attempts[0]["reusable_elapsed_seconds"] >= 0.5
+    assert attempts[1]["recovery"]["accumulated_reusable_elapsed_seconds"] < 0.4
+
+
 def test_terminal_elapsed_includes_durable_journal_and_authority_delay(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
