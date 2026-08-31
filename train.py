@@ -81,6 +81,7 @@ GRADOOM_WANDB_TAG = "env_provider:env-gradoom-turbo-torch"
 UINT32_MASK = (1 << 32) - 1
 SEED_TABLE_INITIAL_EPISODES = 64
 NATIVE_MONSTER_KILL_REWARDS = (1.0, 3.0, 3.0, 4.0, 3.0, 10.0)
+_NOOP_CONTEXT = nullcontext()
 
 GAME_VARIABLES = (
     "killcount",
@@ -726,6 +727,12 @@ def _runtime_paths(args: argparse.Namespace) -> None:
 def _execution_timesteps(args: argparse.Namespace) -> int:
     quantum = int(args.num_envs) * int(args.n_steps)
     return int(args.timesteps) // quantum * quantum
+
+
+def _max_episode_index(episode_index: torch.Tensor) -> int:
+    """Return the bounded host scalar used only to grow the episode-seed table."""
+
+    return int(episode_index.max().item())
 
 
 def _audit_config(args: argparse.Namespace) -> dict[str, Any]:
@@ -1864,7 +1871,7 @@ def _encoder_anchor_loss(
     ).sum()
 
 
-def _ppo_update(
+def _ppo_update_device(
     policy: NatureActorCritic,
     optimizer: torch.optim.Optimizer,
     buffer: RolloutBuffer,
@@ -1874,7 +1881,7 @@ def _ppo_update(
     args: argparse.Namespace,
     encoder_anchors: tuple[tuple[torch.Tensor, torch.Tensor], ...] = (),
     residency_acceptance: CudaResidencyAcceptance | None = None,
-) -> dict[str, float]:
+) -> tuple[torch.Tensor, torch.Tensor, int, torch.Tensor]:
     policy.train()
     env_major = not bool(args.torch_permutation)
     observations = (
@@ -1926,11 +1933,7 @@ def _ppo_update(
                     batch_advantages.std() + 1e-8
                 )
 
-            with (
-                residency_acceptance.guard("steady_state_loss")
-                if residency_acceptance is not None
-                else nullcontext()
-            ), precision.autocast():
+            with precision.autocast():
                 if observation_features is None:
                     if observations is None:  # pragma: no cover - constructor invariant
                         raise RuntimeError("rollout has neither pixels nor encoded observations")
@@ -2022,39 +2025,30 @@ def _ppo_update(
                 )
                 metric_count += 1
 
-            with (
-                residency_acceptance.guard("steady_state_parameter_update")
-                if residency_acceptance is not None
-                else nullcontext()
-            ):
-                optimizer.zero_grad(set_to_none=True)
-                if precision.scaler.is_enabled():
-                    precision.scaler.scale(loss).backward()
-                    precision.scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(
-                        policy.parameters(), REFERENCE_RECIPE.max_grad_norm
-                    )
-                    if residency_acceptance is not None:
-                        residency_acceptance.observe(
-                            "updates",
-                            tuple(parameter.grad for parameter in policy.parameters()),
-                        )
-                    precision.scaler.step(optimizer)
-                    precision.scaler.update()
-                else:
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(
-                        policy.parameters(), REFERENCE_RECIPE.max_grad_norm
-                    )
-                    if residency_acceptance is not None:
-                        residency_acceptance.observe(
-                            "updates",
-                            tuple(parameter.grad for parameter in policy.parameters()),
-                        )
-                    optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            if precision.scaler.is_enabled():
+                precision.scaler.scale(loss).backward()
+                precision.scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(policy.parameters(), REFERENCE_RECIPE.max_grad_norm)
                 if residency_acceptance is not None:
-                    residency_acceptance.observe("parameters", tuple(policy.parameters()))
-                    residency_acceptance.observe("optimizer_state", optimizer.state)
+                    residency_acceptance.observe(
+                        "updates",
+                        tuple(parameter.grad for parameter in policy.parameters()),
+                    )
+                precision.scaler.step(optimizer)
+                precision.scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(policy.parameters(), REFERENCE_RECIPE.max_grad_norm)
+                if residency_acceptance is not None:
+                    residency_acceptance.observe(
+                        "updates",
+                        tuple(parameter.grad for parameter in policy.parameters()),
+                    )
+                optimizer.step()
+            if residency_acceptance is not None:
+                residency_acceptance.observe("parameters", tuple(policy.parameters()))
+                residency_acceptance.observe("optimizer_state", optimizer.state)
 
     returns_variance = torch.var(returns, correction=0)
     explained_variance = torch.where(
@@ -2063,6 +2057,36 @@ def _ppo_update(
         1.0 - torch.var(returns - old_values, correction=0) / returns_variance,
     )
     means = metric_sums / max(metric_count, 1)
+    return means, last_epoch_kl_sum, last_epoch_kl_count, explained_variance
+
+
+def _ppo_update(
+    policy: NatureActorCritic,
+    optimizer: torch.optim.Optimizer,
+    buffer: RolloutBuffer,
+    *,
+    calls: PolicyCalls,
+    precision: Precision,
+    args: argparse.Namespace,
+    encoder_anchors: tuple[tuple[torch.Tensor, torch.Tensor], ...] = (),
+    residency_acceptance: CudaResidencyAcceptance | None = None,
+) -> dict[str, float]:
+    with (
+        residency_acceptance.guard("steady_state_update")
+        if residency_acceptance is not None
+        else _NOOP_CONTEXT
+    ):
+        means, last_epoch_kl_sum, last_epoch_kl_count, explained_variance = _ppo_update_device(
+            policy,
+            optimizer,
+            buffer,
+            calls=calls,
+            precision=precision,
+            args=args,
+            encoder_anchors=encoder_anchors,
+            residency_acceptance=residency_acceptance,
+        )
+
     tensors = (
         torch.stack(
             (
@@ -3031,7 +3055,7 @@ def _train(
                         "new_lanes_start_at_episode": 0,
                     }
                 )
-            episode_seeds.ensure(int(episode_index.max().item()))
+            episode_seeds.ensure(_max_episode_index(episode_index))
             observations, _signals = env.reset_device(
                 reset_mask,
                 episode_seeds.lookup(episode_index),
@@ -3089,9 +3113,8 @@ def _train(
 
         while global_step < _execution_timesteps(args) and not interrupted:
             executed_rollouts += 1
-            check_residency = (
-                residency_acceptance is not None
-                and executed_rollouts > int(args.steady_state_after_rollouts)
+            check_residency = residency_acceptance is not None and executed_rollouts > int(
+                args.steady_state_after_rollouts
             )
             active_residency = residency_acceptance if check_residency else None
             if active_residency is not None:
@@ -3101,114 +3124,133 @@ def _train(
                 active_residency.observe("resets", reset_mask, episode_index, episode_starts, dones)
                 active_residency.observe("rollout_state", buffer.__dict__)
                 active_residency.observe("parameters", tuple(policy.parameters()))
-            episode_seeds.ensure(int(episode_index.max().item()) + int(args.n_steps) + 1)
-            buffer.reset()
-            policy.eval()
+            episode_seeds.ensure(_max_episode_index(episode_index) + int(args.n_steps) + 1)
             torch.cuda.synchronize(device)
             rollout_started = time.perf_counter()
-            for _step in range(int(args.n_steps)):
-                if combat_teacher is None:
-                    teacher_actions = disabled_teacher_actions
-                    teacher_valid = disabled_teacher_valid
-                else:
-                    with torch.no_grad():
-                        teacher_actions, teacher_valid = combat_teacher.actions()
-                policy_observations = _augment_training_observations(
-                    observations,
-                    str(args.observation_augmentation),
-                )
-                staged_observations, staged_context = buffer.stage(
-                    policy_observations,
-                    context,
-                    episode_starts,
-                )
-                with (
-                    active_residency.guard("steady_state_inference")
-                    if active_residency is not None
-                    else nullcontext()
-                ), torch.no_grad(), precision.autocast():
-                    if bool(args.freeze_observation_encoder):
-                        actions, values, log_probs, observation_features = calls.act_and_encode(
-                            staged_observations,
-                            staged_context,
-                        )
+            with (
+                active_residency.guard("steady_state_rollout")
+                if active_residency is not None
+                else _NOOP_CONTEXT
+            ):
+                buffer.reset()
+                policy.eval()
+                for _step in range(int(args.n_steps)):
+                    if combat_teacher is None:
+                        teacher_actions = disabled_teacher_actions
+                        teacher_valid = disabled_teacher_valid
                     else:
-                        actions, values, log_probs = calls.act(
-                            staged_observations,
-                            staged_context,
-                        )
-                        observation_features = None
-                next_episode_index = episode_index + 1
-                next_episode_seeds = episode_seeds.lookup(next_episode_index)
-                with (
-                    active_residency.guard("steady_state_transition")
-                    if active_residency is not None
-                    else nullcontext()
-                ):
+                        with torch.no_grad():
+                            teacher_actions, teacher_valid = combat_teacher.actions()
+                    policy_observations = _augment_training_observations(
+                        observations,
+                        str(args.observation_augmentation),
+                    )
+                    staged_observations, staged_context = buffer.stage(
+                        policy_observations,
+                        context,
+                        episode_starts,
+                    )
+                    with torch.no_grad(), precision.autocast():
+                        if bool(args.freeze_observation_encoder):
+                            actions, values, log_probs, observation_features = calls.act_and_encode(
+                                staged_observations,
+                                staged_context,
+                            )
+                        else:
+                            actions, values, log_probs = calls.act(
+                                staged_observations,
+                                staged_context,
+                            )
+                            observation_features = None
+                    next_episode_index = episode_index + 1
+                    next_episode_seeds = episode_seeds.lookup(next_episode_index)
                     transition = env.step_and_reset_device(actions, next_episode_seeds)
-                if active_residency is not None:
-                    active_residency.observe("observations", transition.observations)
-                    active_residency.observe("actions", actions)
-                    active_residency.observe(
-                        "inference",
-                        actions,
-                        values,
-                        log_probs,
-                        observation_features,
+                    if active_residency is not None:
+                        active_residency.observe("observations", transition.observations)
+                        active_residency.observe("actions", actions)
+                        active_residency.observe(
+                            "inference",
+                            actions,
+                            values,
+                            log_probs,
+                            observation_features,
+                        )
+                        active_residency.observe("rewards", transition.rewards)
+                        active_residency.observe(
+                            "resets",
+                            next_episode_index,
+                            next_episode_seeds,
+                            transition.terminated,
+                            transition.truncated,
+                        )
+                    if str(args.reward_shape) == "native-death-v1":
+                        policy_rewards = transition.rewards - (
+                            float(args.death_penalty) * transition.terminated.to(torch.float32)
+                        )
+                    elif reward_shaper is None:
+                        policy_rewards = transition.rewards
+                    else:
+                        policy_rewards = reward_shaper.process(
+                            transition.final_signals,
+                            transition.terminated,
+                            transition.truncated,
+                        )
+                    episode_returns.add_(policy_rewards)
+                    episode_lengths.add_(1)
+                    buffer.add(
+                        actions=actions,
+                        teacher_actions=teacher_actions,
+                        teacher_valid=teacher_valid,
+                        rewards=policy_rewards,
+                        values=values,
+                        log_probs=log_probs,
+                        observation_features=observation_features,
+                        terminated=transition.terminated,
+                        truncated=transition.truncated,
+                        final_observations=transition.final_observations,
+                        final_histories=transition.final_info_histories,
+                        episode_returns=episode_returns,
+                        episode_lengths=episode_lengths,
+                        final_kills=transition.final_signals[:, kill_index],
                     )
-                    active_residency.observe("rewards", transition.rewards)
-                    active_residency.observe(
-                        "resets",
-                        next_episode_index,
-                        next_episode_seeds,
+                    if active_residency is not None:
+                        active_residency.observe("rewards", policy_rewards)
+                        active_residency.observe("rollout_state", buffer.__dict__)
+                    observations = transition.observations
+                    context = context_encoder.encode(transition.info_histories)
+                    torch.logical_or(
                         transition.terminated,
                         transition.truncated,
+                        out=dones,
                     )
-                if str(args.reward_shape) == "native-death-v1":
-                    policy_rewards = transition.rewards - (
-                        float(args.death_penalty) * transition.terminated.to(torch.float32)
+                    episode_starts = dones
+                    episode_returns.masked_fill_(dones, 0.0)
+                    episode_lengths.masked_fill_(dones, 0)
+                    episode_index.add_(dones.to(torch.int64))
+                    global_step += int(args.num_envs)
+
+                with torch.no_grad(), precision.autocast():
+                    last_values = calls.value(
+                        _augment_training_observations(
+                            observations,
+                            str(args.observation_augmentation),
+                        ),
+                        context,
                     )
-                elif reward_shaper is None:
-                    policy_rewards = transition.rewards
-                else:
-                    policy_rewards = reward_shaper.process(
-                        transition.final_signals,
-                        transition.terminated,
-                        transition.truncated,
-                    )
-                episode_returns.add_(policy_rewards)
-                episode_lengths.add_(1)
-                buffer.add(
-                    actions=actions,
-                    teacher_actions=teacher_actions,
-                    teacher_valid=teacher_valid,
-                    rewards=policy_rewards,
-                    values=values,
-                    log_probs=log_probs,
-                    observation_features=observation_features,
-                    terminated=transition.terminated,
-                    truncated=transition.truncated,
-                    final_observations=transition.final_observations,
-                    final_histories=transition.final_info_histories,
-                    episode_returns=episode_returns,
-                    episode_lengths=episode_lengths,
-                    final_kills=transition.final_signals[:, kill_index],
+                _bootstrap_time_limits(
+                    buffer,
+                    calls=calls,
+                    context_encoder=context_encoder,
+                    precision=precision,
+                    gamma=REFERENCE_RECIPE.gamma,
+                    observation_augmentation=str(args.observation_augmentation),
                 )
-                if active_residency is not None:
-                    active_residency.observe("rewards", policy_rewards)
-                    active_residency.observe("rollout_state", buffer.__dict__)
-                observations = transition.observations
-                context = context_encoder.encode(transition.info_histories)
-                torch.logical_or(
-                    transition.terminated,
-                    transition.truncated,
-                    out=dones,
+                buffer.finish(
+                    last_values=last_values,
+                    dones=dones,
+                    gamma=REFERENCE_RECIPE.gamma,
+                    gae_lambda=REFERENCE_RECIPE.gae_lambda,
                 )
-                episode_starts = dones
-                episode_returns.masked_fill_(dones, 0.0)
-                episode_lengths.masked_fill_(dones, 0)
-                episode_index.add_(dones.to(torch.int64))
-                global_step += int(args.num_envs)
 
             for episode_return, kills, length, success in buffer.completed_episode_rows():
                 rolling_returns.append(float(episode_return))
@@ -3216,28 +3258,6 @@ def _train(
                 rolling_lengths.append(float(length))
                 rolling_success.append(float(success))
                 completed_episodes += 1
-            with torch.no_grad(), precision.autocast():
-                last_values = calls.value(
-                    _augment_training_observations(
-                        observations,
-                        str(args.observation_augmentation),
-                    ),
-                    context,
-                )
-            _bootstrap_time_limits(
-                buffer,
-                calls=calls,
-                context_encoder=context_encoder,
-                precision=precision,
-                gamma=REFERENCE_RECIPE.gamma,
-                observation_augmentation=str(args.observation_augmentation),
-            )
-            buffer.finish(
-                last_values=last_values,
-                dones=dones,
-                gamma=REFERENCE_RECIPE.gamma,
-                gae_lambda=REFERENCE_RECIPE.gae_lambda,
-            )
             torch.cuda.synchronize(device)
             rollout_seconds = time.perf_counter() - rollout_started
 

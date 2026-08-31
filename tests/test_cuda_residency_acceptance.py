@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 
+import numpy as np
 import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
@@ -87,10 +88,24 @@ def test_cuda_residency_contract_fails_closed_on_cpu_tensor_or_missing_category(
 def test_host_transition_guard_rejects_an_accelerator_to_cpu_copy_before_execution() -> None:
     source = torch.empty(1, device="meta")
 
-    with pytest.raises(
-        RuntimeError, match=r"steady_state_step.*accelerator-to-host"
-    ), CudaHostTransferGuard("steady_state_step"):
+    with (
+        pytest.raises(RuntimeError, match=r"steady_state_step.*accelerator-to-host"),
+        CudaHostTransferGuard("steady_state_step"),
+    ):
         source.cpu()
+
+
+def test_host_transition_guard_rejects_cpu_and_numpy_inputs_to_accelerator() -> None:
+    with (
+        pytest.raises(RuntimeError, match=r"steady_state_update.*host-to-accelerator"),
+        CudaHostTransferGuard("steady_state_update"),
+    ):
+        torch.ones(1).to("meta")
+    with (
+        pytest.raises(RuntimeError, match=r"steady_state_update.*host-to-accelerator"),
+        CudaHostTransferGuard("steady_state_update"),
+    ):
+        torch.as_tensor(np.ones(1), device="meta")
 
 
 @pytest.mark.skipif(
@@ -103,11 +118,13 @@ def test_host_transition_guard_rejects_an_accelerator_to_cpu_copy_before_executi
 def test_cuda_host_transition_guard_rejects_cpu_and_numpy_round_trips() -> None:
     transition = torch.ones(1, device="cuda")
 
-    with pytest.raises(
-        RuntimeError, match="accelerator-to-host"
-    ), CudaHostTransferGuard("steady_state_step"):
+    with (
+        pytest.raises(RuntimeError, match="accelerator-to-host"),
+        CudaHostTransferGuard("steady_state_step"),
+    ):
         transition.cpu()
-    with pytest.raises(
-        RuntimeError, match="accelerator-to-host"
-    ), CudaHostTransferGuard("steady_state_step"):
+    with (
+        pytest.raises(RuntimeError, match="accelerator-to-host"),
+        CudaHostTransferGuard("steady_state_step"),
+    ):
         transition.cpu().numpy()
