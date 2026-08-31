@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -156,6 +157,38 @@ def test_repository_authority_rejects_replayed_journal_head(tmp_path: Path) -> N
     recovery = _authority(state, "recover-latest-journal-head", first_attestation)
     assert recovery.returncode == 2
     assert "different generation" in recovery.stderr
+
+
+def test_repository_authority_seals_seed_local_elapsed_not_precommand_anchor_age(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "authority"
+    assert _authority(state, "init").returncode == 0
+    anchor_result = _authority(state, "start-attempt", {"seed": 124})
+    assert anchor_result.returncode == 0, anchor_result.stderr
+    anchor = json.loads(anchor_result.stdout)
+    # This gap represents another seed's work after all pre-command anchors were issued.
+    time.sleep(0.3)
+
+    sealed = _authority(
+        state,
+        "sign-journal-head",
+        {
+            "schema_version": 1,
+            "authority": anchor["payload"]["authority"],
+            "seed": 124,
+            "started_unix_ns": anchor["payload"]["started_unix_ns"],
+            "generation": 0,
+            "previous_journal_sha256": None,
+            "journal_sha256": "4" * 64,
+            "status": "succeeded",
+            "prior_reusable_elapsed_seconds": 0.0,
+            "minimum_reusable_elapsed_seconds": 0.01,
+        },
+    )
+
+    assert sealed.returncode == 0, sealed.stderr
+    assert json.loads(sealed.stdout)["payload"]["reusable_elapsed_seconds"] == 0.01
 
 
 def test_repository_authority_rejects_coherent_state_directory_rollback(

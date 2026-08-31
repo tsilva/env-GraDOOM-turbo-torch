@@ -44,14 +44,14 @@ contains:
   asset, and runtime arguments. The evidence command owns all seed, initialization, resume,
   checkpoint, timing, metrics, and evaluation arguments and rejects attempts to override them. The
   command must be one resolved Python interpreter plus one source file; native wrappers, shells,
-  `-c`, `eval`/`exec`, dynamic runners, and subprocess indirection are rejected because their full
-  executed-code closure cannot be proven. Capability-bearing modules use a positive access policy:
-  only the exact configuration and fixture operations needed by the documented trainer are allowed;
-  namespace dictionaries, reflection, computed attributes, container aliases, and equivalent
-  process-replacement paths fail closed. Relative executables and scripts are resolved from the
-  manifest directory. The entry point and its
-  transitive local Python import closure below the code root are hashed into the recipe identity and
-  reverified after the cohort, so same-path helper mutation or mid-cohort replacement fails closed.
+  `-c`, and statically visible opaque process indirection are rejected. Relative executables and
+  scripts are resolved from the manifest directory. The entry point, its transitive imports, and
+  every Python source file below the declared code root are hashed into the recipe identity and
+  reverified after the cohort. The complete-root binding is deliberately independent of how code is
+  reached, so computed builtins, reflection, plugin discovery, namespace aliases, and indirect
+  process replacement cannot execute mutable local Python without binding it. Same-path helper
+  mutation or mid-cohort replacement therefore fails closed even when static import analysis cannot
+  name the executed source.
 - `artifacts_directory`: the directory under which the run-identity and per-seed artifacts are
   durably retained.
 - `bootstrap_artifacts`: optional one-time exclusions declared before the cohort. Every entry names
@@ -82,6 +82,11 @@ contains:
   conservative future-charged seal, and repeats only when the signed elapsed floor did not cover the
   completed write. Thus the final durable report contains a signed elapsed value no lower than its
   actual terminal boundary without requiring a journal or report to contain its own digest.
+  Pre-command anchors establish attempt identity and append continuity; they are not treated as one
+  continuously running stopwatch across the cohort. Each seed accumulates the common recurring
+  setup/finalization costs, only that seed's active training/evaluation and recovery spans, and only
+  its own sealing overhead. Work performed for another seed is never added merely because its anchor
+  was issued earlier.
   The packaged authority maintains a signed append-only event chain plus an independently keyed,
   separately stored monotonic witness. The witness directory must live on a durability boundary
   that operators cannot roll back with the authority state snapshot; formal evidence is not honest
