@@ -331,6 +331,7 @@ def main(argv: list[str] | None = None) -> int:
                 expected_manifest_sha256=manifest_entry["sha256"],
                 manifest_directory=args.manifest.parent,
                 expected_wad_profile=report.get("wad_profile"),
+                expected_invariant_suite=report.get("invariant_suite"),
                 expected_evidence_entries=[
                     entry
                     for entry in entries

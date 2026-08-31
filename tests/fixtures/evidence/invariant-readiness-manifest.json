@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "workflow": "parity_readiness",
+  "evidence_level": "development",
+  "fixture": true,
+  "code_provenance": {
+    "repository": "tsilva/env-GraDOOM-turbo-torch",
+    "revision": "fixture-revision",
+    "dirty": false
+  },
+  "declared_inputs": [
+    {
+      "name": "invariant_runner",
+      "path": "../../../src/gradoom/evidence/invariant_runner.py",
+      "sha256": "d0a25a233a9d9f44ec4a50e1ca1039b3977bd4414f9e9b127909a85181b5180c"
+    }
+  ],
+  "prerequisites": [
+    {
+      "id": "certified_freedoom2_wad_profile",
+      "available": false,
+      "reason": "The real pinned Freedoom2 WAD profile has not been validated."
+    },
+    {
+      "id": "pinned_reference_provider",
+      "available": true
+    },
+    {
+      "id": "real_pretrained_policy_corpus",
+      "available": false,
+      "reason": "The required real pretrained policy corpus is unavailable."
+    }
+  ],
+  "invariant_suite": {
+    "version": "1.0.0",
+    "mode": "fixture",
+    "runner_input": "invariant_runner",
+    "fixture_case": "pass",
+    "diagnostics": [
+      {"id": "mechanics", "status": "failed"},
+      {"id": "trace", "status": "unavailable"},
+      {"id": "distribution", "status": "failed"},
+      {"id": "observation", "status": "failed"},
+      {"id": "rendering", "status": "unavailable"}
+    ]
+  }
+}

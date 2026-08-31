@@ -1816,6 +1816,14 @@ class TorchDeathmatchEngine:
         self.enemy_death_elapsed = torch.zeros(
             (n, self.enemy_slots), device=device, dtype=torch.int32
         )
+        # Diagnostic-only provenance is written only when a monster dies.  It
+        # is deliberately outside the transition signal buffer and therefore
+        # adds no policy-facing transport or per-step host work.
+        self.actor_kill_event_count = torch.zeros(n, device=device, dtype=torch.int32)
+        self.actor_kill_attacker_kind = torch.full((n,), -1, device=device, dtype=torch.int8)
+        self.actor_kill_attacker_id = torch.full((n,), -1, device=device, dtype=torch.int64)
+        self.actor_kill_target_id = torch.full((n,), -1, device=device, dtype=torch.int64)
+        self.actor_attribution_diagnostics_active = False
         self.teleport_fog_x = torch.zeros((n, self.enemy_slots), device=device)
         self.teleport_fog_y = torch.zeros((n, self.enemy_slots), device=device)
         self.teleport_fog_z = torch.zeros((n, self.enemy_slots), device=device)
@@ -2301,7 +2309,11 @@ class TorchDeathmatchEngine:
         # the first spatial sample from collapsing toward the low edge of the map.
         for _ in range(4):
             self._random_u32(mask)
+        diagnostics_were_active = self.actor_attribution_diagnostics_active
+        self.actor_attribution_diagnostics_active = False
         self._reset_enemies(mask)
+        if diagnostics_were_active:
+            self.clear_actor_kill_events(mask)
         spawn_x, spawn_y, spawn_angle, _ = self._random_spawn_positions(mask, avoid_player=False)
         self.x.copy_(torch.where(mask, spawn_x, self.x))
         self.y.copy_(torch.where(mask, spawn_y, self.y))
@@ -5052,6 +5064,11 @@ class TorchDeathmatchEngine:
         self.enemy_health.copy_(torch.where(self.enemy_alive, updated, previous))
         killed = self.enemy_alive & (previous > 0) & (updated <= 0)
         killed_type = self.enemy_type.clamp_min(0)
+        self._record_actor_kill_events(
+            killed,
+            credit_player=credit_player,
+            monster_damage_by_source=monster_damage_by_source,
+        )
         extreme_death = (
             killed
             & self._enemy_has_xdeath[killed_type]
@@ -5144,6 +5161,136 @@ class TorchDeathmatchEngine:
         if credit_player:
             self.player_killcount.add_(killed_count)
         return reward
+
+    def _record_actor_kill_events(
+        self,
+        killed: torch.Tensor,
+        *,
+        credit_player: bool,
+        monster_damage_by_source: torch.Tensor | None,
+    ) -> None:
+        if not self.actor_attribution_diagnostics_active:
+            return
+        killed_count = torch.sum(killed.to(torch.int32), dim=1)
+        first_event = (self.actor_kill_event_count == 0) & (killed_count == 1)
+        target_slot = torch.argmax(killed.to(torch.int32), dim=1)
+        target_id = target_slot + 1
+        if credit_player:
+            attacker_kind = torch.zeros_like(target_slot, dtype=torch.int8)
+            attacker_id = torch.zeros_like(target_slot)
+        elif monster_damage_by_source is not None:
+            rows = torch.arange(self.num_envs, device=self.device)
+            sources = monster_damage_by_source[rows, :, target_slot] > 0
+            source_count = torch.sum(sources.to(torch.int32), dim=1)
+            source_slot = torch.argmax(sources.to(torch.int32), dim=1)
+            unambiguous = source_count == 1
+            attacker_kind = torch.where(
+                unambiguous,
+                torch.ones_like(source_slot, dtype=torch.int8),
+                torch.full_like(source_slot, -1, dtype=torch.int8),
+            )
+            attacker_id = torch.where(
+                unambiguous,
+                source_slot + 1,
+                torch.full_like(source_slot, -1),
+            )
+        else:
+            attacker_kind = torch.full_like(target_slot, -1, dtype=torch.int8)
+            attacker_id = torch.full_like(target_slot, -1)
+        self.actor_kill_attacker_kind.copy_(
+            torch.where(first_event, attacker_kind, self.actor_kill_attacker_kind)
+        )
+        self.actor_kill_attacker_id.copy_(
+            torch.where(first_event, attacker_id, self.actor_kill_attacker_id)
+        )
+        self.actor_kill_target_id.copy_(
+            torch.where(first_event, target_id, self.actor_kill_target_id)
+        )
+        self.actor_kill_event_count.add_(killed_count)
+
+    def clear_actor_kill_events(self, mask: torch.Tensor) -> None:
+        """Clear diagnostic kill provenance for selected lanes."""
+
+        self.actor_kill_event_count.masked_fill_(mask, 0)
+        self.actor_kill_attacker_kind.masked_fill_(mask, -1)
+        self.actor_kill_attacker_id.masked_fill_(mask, -1)
+        self.actor_kill_target_id.masked_fill_(mask, -1)
+
+    def stage_actor_attribution(self, behavior: str) -> None:
+        """Install the fixed, diagnostic-only attribution stage in every lane."""
+
+        if behavior not in {
+            "player_killcount",
+            "player_killcount.enemy_on_enemy_exclusion",
+        }:
+            raise ValueError(f"unsupported actor attribution behavior {behavior!r}")
+        mask = torch.ones(self.num_envs, device=self.device, dtype=torch.bool)
+        self._reset_enemies(mask)
+        self.clear_actor_kill_events(mask)
+        self.actor_attribution_diagnostics_active = True
+        self.next_spawn_check.fill_(torch.iinfo(torch.int32).max)
+        center_x = torch.full((self.num_envs,), 512.0, device=self.device)
+        center_y = torch.full((self.num_envs,), 512.0, device=self.device)
+        self.x.copy_(center_x)
+        self.y.copy_(center_y)
+        self._x_fixed.copy_(torch.round(center_x * _FIXED_UNIT).to(torch.int64))
+        self._y_fixed.copy_(torch.round(center_y * _FIXED_UNIT).to(torch.int64))
+        self._angle_bam.fill_(_ANGLE_180)
+        self.angle.fill_(math.pi)
+        sector = self._sector_at(center_x, center_y)
+        floor = self.map.sector_heights[sector, 0]
+        ceiling = self.map.sector_heights[sector, 1]
+        self.z.copy_(floor)
+        self.player_floor_z.copy_(floor)
+        self.previous_player_floor_z.copy_(floor)
+        self.player_ceiling_z.copy_(ceiling)
+        self.view_z.copy_(floor + _VIEW_HEIGHT)
+        self.view_height.fill_(_VIEW_HEIGHT)
+        self._momentum_x_fixed.zero_()
+        self._momentum_y_fixed.zero_()
+        self.momentum_x.zero_()
+        self.momentum_y.zero_()
+        self.velocity_z.zero_()
+        self.reaction_time.zero_()
+        self.attack_down.zero_()
+        self.attack_cooldown.zero_()
+        self.weapon_raise_cooldown.zero_()
+        self.weapon_ready_tics.fill_(6)
+        self.pending_weapon.fill_(-1)
+        self.pending_attack_weapon.fill_(-1)
+        self.pending_attack_delay.zero_()
+        self.selected_weapon.fill_(2)
+        self.weapons[:, 1].fill_(1)
+        self.ammo[:, 1].clamp_min_(50)
+        self.health.clamp_min_(100)
+        self.player_dead.zero_()
+        self.pending_reset.zero_()
+
+        def spawn(enemy_type: int, slot_index: int, x_value: float) -> None:
+            slot = torch.full((self.num_envs,), slot_index, device=self.device, dtype=torch.int64)
+            x = torch.full((self.num_envs,), x_value, device=self.device)
+            y = center_y
+            angle = torch.zeros(self.num_envs, device=self.device)
+            self._initialize_enemy_spawn_tensor(enemy_type, mask, slot, x, y, angle)
+            rows = torch.arange(self.num_envs, device=self.device)
+            enemy_sector = self._sector_at(x, y)
+            enemy_floor = self.map.sector_heights[enemy_sector, 0]
+            enemy_ceiling = self.map.sector_heights[enemy_sector, 1]
+            self.enemy_z[rows, slot] = enemy_floor
+            self._enemy_z_fixed[rows, slot] = torch.round(enemy_floor * _FIXED_UNIT).to(torch.int64)
+            self._enemy_floor_z_fixed[rows, slot] = self._enemy_z_fixed[rows, slot]
+            self._enemy_ceiling_z_fixed[rows, slot] = torch.round(enemy_ceiling * _FIXED_UNIT).to(
+                torch.int64
+            )
+            self._enemy_velocity_z_fixed[rows, slot] = 0
+            self.enemy_reaction_time[rows, slot] = 0
+
+        if behavior == "player_killcount":
+            spawn(0, 0, 412.0)
+        else:
+            spawn(0, 0, 612.0)
+            spawn(1, 1, 712.0)
+            self.enemy_heard_player[:, :2] = True
 
     def _spawn_player_projectile(
         self,
