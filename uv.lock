@@ -374,7 +374,7 @@ wheels = [
 
 [[package]]
 name = "env-gradoom-turbo-torch"
-version = "0.2.0"
+version = "0.2.1"
 source = { editable = "." }
 dependencies = [
     { name = "gymnasium" },
