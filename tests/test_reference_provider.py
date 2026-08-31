@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import numpy as np
 import pytest
 
+from gradoom.diagnostics import ActorAttributionStage, ActorSnapshot
 from gradoom.evidence import reference_provider
 
 
@@ -163,3 +164,128 @@ def test_reference_constructor_forwards_the_shared_contract_unchanged(
         "obs_crop": (0, 32, 0, 0),
         "obs_resize": (84, 84),
     }
+
+
+class _DiagnosticBase:
+    pass
+
+
+class _ObjectGame:
+    def __init__(self, objects: list[SimpleNamespace]) -> None:
+        self.objects = objects
+
+    def get_state(self) -> SimpleNamespace:
+        return SimpleNamespace(objects=self.objects)
+
+
+def _actor(actor_id: int, category: str) -> SimpleNamespace:
+    return SimpleNamespace(id=actor_id, category=category)
+
+
+def test_reference_diagnostic_derives_third_party_identity_from_native_object_ids() -> None:
+    cls = reference_provider._reference_attribution_env_class(_DiagnosticBase)
+    env = object.__new__(cls)
+    env._games = [_ObjectGame([_actor(0, "Self"), _actor(83, "Monster")])]
+    env._diagnostic_attribution_stages = (
+        ActorAttributionStage(
+            token="native-stage",
+            actors=(
+                ActorSnapshot(0, "player", True),
+                ActorSnapshot(71, "enemy", True),
+                ActorSnapshot(83, "enemy", True),
+            ),
+        ),
+    )
+
+    events = env.diagnostic_kill_events(0)
+
+    assert len(events) == 1
+    assert events[0].stage_token == "native-stage"
+    assert events[0].attacker_kind == "enemy"
+    assert events[0].attacker_id == 83
+    assert events[0].target_kind == "enemy"
+    assert events[0].target_id == 71
+
+
+def test_reference_diagnostic_derives_player_identity_from_native_object_ids() -> None:
+    cls = reference_provider._reference_attribution_env_class(_DiagnosticBase)
+    env = object.__new__(cls)
+    env._games = [_ObjectGame([_actor(0, "Self")])]
+    env._diagnostic_attribution_stages = (
+        ActorAttributionStage(
+            token="native-stage",
+            actors=(
+                ActorSnapshot(0, "player", True),
+                ActorSnapshot(71, "enemy", True),
+            ),
+        ),
+    )
+
+    events = env.diagnostic_kill_events(0)
+
+    assert events == (
+        reference_provider.ActorKillEvent(
+            stage_token="native-stage",
+            attacker_id=0,
+            attacker_kind="player",
+            target_id=71,
+            target_kind="enemy",
+        ),
+    )
+
+
+def test_reference_diagnostic_surfaces_unexpected_surviving_actors() -> None:
+    cls = reference_provider._reference_attribution_env_class(_DiagnosticBase)
+    env = object.__new__(cls)
+    env._games = [
+        _ObjectGame(
+            [
+                _actor(0, "Self"),
+                _actor(83, "Monster"),
+                _actor(99, "Monster"),
+            ]
+        )
+    ]
+    env._diagnostic_attribution_stages = (
+        ActorAttributionStage(
+            token="native-stage",
+            actors=(
+                ActorSnapshot(0, "player", True),
+                ActorSnapshot(71, "enemy", True),
+                ActorSnapshot(83, "enemy", True),
+            ),
+        ),
+    )
+
+    events = env.diagnostic_kill_events(0)
+
+    assert events[0].attacker_id == 83
+    assert env.diagnostic_actor_snapshot(0) == (
+        ActorSnapshot(0, "player", True),
+        ActorSnapshot(83, "enemy", True),
+        ActorSnapshot(99, "enemy", True),
+    )
+
+
+def test_reference_diagnostic_reset_invalidates_staged_actor_identities() -> None:
+    class ResettableDiagnosticBase:
+        def reset(self, *args: object, **kwargs: object) -> tuple[str, str]:
+            del args, kwargs
+            return "observation", "infos"
+
+    cls = reference_provider._reference_attribution_env_class(ResettableDiagnosticBase)
+    env = object.__new__(cls)
+    env._games = [_ObjectGame([_actor(0, "Self")])]
+    env._diagnostic_attribution_stages = (
+        ActorAttributionStage(
+            token="stale-stage",
+            actors=(
+                ActorSnapshot(0, "player", True),
+                ActorSnapshot(71, "enemy", True),
+            ),
+        ),
+    )
+
+    assert env.reset() == ("observation", "infos")
+    with pytest.raises(RuntimeError, match="has not been staged"):
+        env.diagnostic_actor_snapshot(0)

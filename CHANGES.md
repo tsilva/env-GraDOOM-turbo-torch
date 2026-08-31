@@ -20,3 +20,5 @@
 - Point reference-provider documentation, diagnostics, and local asset defaults
   at the standardized `env-ViZDoom-turbo` project and `env-vizdoom-turbo`
   distribution names.
+- Add the independently versioned fast Turbo invariant suite to parity readiness,
+  including named public-behavior failures and GraDOOM Torch device checks.
