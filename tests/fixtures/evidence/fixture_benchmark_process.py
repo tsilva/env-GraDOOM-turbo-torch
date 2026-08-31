@@ -37,6 +37,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--fixture-mutate-bootstrap", type=Path)
     parser.add_argument("--fixture-mutate-trainer-code", type=Path)
     parser.add_argument("--fixture-interrupt-once-at-step", type=int)
+    parser.add_argument("--fixture-interrupt-seed", type=int)
     parser.add_argument("--fixture-hard-crash-once-at-step", type=int)
     parser.add_argument("--fixture-hold-after-recovery-checkpoint-marker", type=Path)
     parser.add_argument("--fixture-recovery-child-exited-marker", type=Path)
@@ -105,7 +106,10 @@ def main() -> int:
             resumed_checkpoint = json.loads(args.resume.read_text(encoding="utf-8"))
             assert resumed_checkpoint["evidence_run_identity"] == args.evidence_run_identity
             assert resumed_checkpoint["evidence_attempt_identity"] == args.evidence_attempt_identity
-        cooperative_interruption = args.fixture_interrupt_once_at_step == args.timesteps
+        cooperative_interruption = (
+            args.fixture_interrupt_once_at_step == args.timesteps
+            and (args.fixture_interrupt_seed is None or args.fixture_interrupt_seed == args.seed)
+        )
         hard_crash = args.fixture_hard_crash_once_at_step == args.timesteps
         should_interrupt = (cooperative_interruption or hard_crash) and not (
             resumed_checkpoint or {}
