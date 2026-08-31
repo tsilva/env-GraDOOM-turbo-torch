@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .cuda_residency import CUDA_RESIDENCY_CATEGORIES, CUDA_RESIDENCY_CONTRACT
 from .report import (
     EvidenceError,
     _canonical_sha256,
@@ -32,6 +33,7 @@ _CONTROLLED_ARGUMENTS = {
     "--checkpoint",
     "--checkpoint-every-rollouts",
     "--config-only",
+    "--cuda-residency-acceptance",
     "--evaluate-checkpoint",
     "--evaluation-episodes",
     "--evaluation-seed",
@@ -40,6 +42,7 @@ _CONTROLLED_ARGUMENTS = {
     "--initialize-from",
     "--metrics-jsonl",
     "--no-evaluation-stochastic",
+    "--no-cuda-residency-acceptance",
     "--resume",
     "--seed",
     "--timesteps",
@@ -168,6 +171,9 @@ def _validate_benchmark(manifest: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(artifacts_directory, str) or not artifacts_directory.strip():
         raise EvidenceError("benchmark.artifacts_directory must be a non-whitespace path")
     certificate = _validate_certificate(benchmark.get("parity_certificate"))
+    cuda_residency_acceptance = benchmark.get("cuda_residency_acceptance", False)
+    if type(cuda_residency_acceptance) is not bool:
+        raise EvidenceError("benchmark.cuda_residency_acceptance must be a boolean")
     return {
         "code_provenance": code_provenance,
         "training_seeds": training_seeds,
@@ -178,6 +184,7 @@ def _validate_benchmark(manifest: dict[str, Any]) -> dict[str, Any]:
         "trainer": trainer,
         "artifacts_directory": artifacts_directory,
         "parity_certificate": certificate,
+        "cuda_residency_acceptance": cuda_residency_acceptance,
     }
 
 
@@ -220,10 +227,22 @@ def _validate_training_records(
     previous_checkpoint: Path | None,
     manifest_directory: Path,
     wad_profile: dict[str, Any] | None,
-) -> dict[str, Any]:
+    cuda_residency_acceptance: bool,
+    fixture: bool,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
     config = _record(records, "config", phase="training")
     if config.get("contract") != _TRAINER_CONTRACT or config.get("operation") != "train":
         raise EvidenceError("training process did not use the standalone GPU-resident trainer")
+    configured_acceptance = config.get("cuda_residency_acceptance")
+    if cuda_residency_acceptance:
+        if (
+            not isinstance(configured_acceptance, dict)
+            or configured_acceptance.get("contract") != CUDA_RESIDENCY_CONTRACT
+            or configured_acceptance.get("enabled") is not True
+        ):
+            raise EvidenceError("training process did not enable CUDA residency acceptance")
+    elif configured_acceptance is not None:
+        raise EvidenceError("training process enabled unrequested CUDA residency acceptance")
     initialization = config.get("initialization")
     if not isinstance(initialization, dict) or initialization.get("mode") != "random":
         raise EvidenceError("training process must declare random policy initialization")
@@ -275,7 +294,99 @@ def _validate_training_records(
     if recorded_checkpoint != checkpoint:
         raise EvidenceError("training process reported a different checkpoint path")
     _validate_runtime_assets(summary, phase="training", wad_profile=wad_profile)
-    return summary
+    acceptance_records = [
+        record for record in records if record.get("type") == "cuda_residency_acceptance"
+    ]
+    if not cuda_residency_acceptance:
+        if acceptance_records:
+            raise EvidenceError(
+                "training process emitted unrequested CUDA residency acceptance evidence"
+            )
+        return summary, None
+    if len(acceptance_records) != 1:
+        raise EvidenceError(
+            "training process must emit exactly one 'cuda_residency_acceptance' record, "
+            f"got {len(acceptance_records)}"
+        )
+    acceptance = acceptance_records[0]
+    _validate_cuda_residency_record(acceptance, fixture=fixture)
+    return summary, acceptance
+
+
+def _validate_cuda_residency_record(record: dict[str, Any], *, fixture: bool) -> None:
+    if record.get("contract") != CUDA_RESIDENCY_CONTRACT or record.get("status") != "passed":
+        raise EvidenceError("CUDA residency acceptance record did not pass the required contract")
+    expected_kind = "fixture_contract" if fixture else "cuda_hardware"
+    if record.get("evidence_kind") != expected_kind:
+        raise EvidenceError(
+            f"CUDA residency acceptance evidence_kind must be {expected_kind!r}"
+        )
+    if record.get("checked_categories") != list(CUDA_RESIDENCY_CATEGORIES):
+        raise EvidenceError("CUDA residency acceptance did not check every required category")
+    devices = record.get("devices")
+    if not isinstance(devices, dict) or set(devices) != set(CUDA_RESIDENCY_CATEGORIES):
+        raise EvidenceError("CUDA residency acceptance device evidence is incomplete")
+    concrete_devices: set[str] = set()
+    for category in CUDA_RESIDENCY_CATEGORIES:
+        values = devices[category]
+        if not isinstance(values, list) or not values:
+            raise EvidenceError(f"CUDA residency acceptance {category} devices must be non-empty")
+        for value in values:
+            if not isinstance(value, str) or not value.startswith("cuda:"):
+                raise EvidenceError(
+                    f"CUDA residency acceptance {category} used a non-CUDA device"
+                )
+            concrete_devices.add(value)
+    if len(concrete_devices) != 1:
+        raise EvidenceError("CUDA residency acceptance used inconsistent CUDA devices")
+    guard = record.get("host_transition_guard")
+    if (
+        not isinstance(guard, dict)
+        or guard.get("status") != "passed"
+        or type(guard.get("guarded_scopes")) is not int
+        or guard["guarded_scopes"] <= 0
+        or guard.get("detected_transfers") != 0
+    ):
+        raise EvidenceError("CUDA residency acceptance host-transition guard did not pass")
+    for field in ("checked_rollouts", "checked_steps"):
+        if type(record.get(field)) is not int or record[field] <= 0:
+            raise EvidenceError(f"CUDA residency acceptance {field} must be positive")
+    workload = record.get("workload")
+    if (
+        not isinstance(workload, dict)
+        or workload.get("trainer_contract") != _TRAINER_CONTRACT
+    ):
+        raise EvidenceError("CUDA residency acceptance workload did not use the benchmark trainer")
+    if (
+        workload.get("checked_rollouts") != record["checked_rollouts"]
+        or workload.get("checked_transitions") != record["checked_steps"]
+    ):
+        raise EvidenceError("CUDA residency acceptance workload counts are inconsistent")
+    hardware = record.get("hardware")
+    if not isinstance(hardware, dict):
+        raise EvidenceError("CUDA residency acceptance hardware is required")
+    for field in ("gpu_model", "device", "compute_capability"):
+        if not isinstance(hardware.get(field), str) or not hardware[field]:
+            raise EvidenceError(f"CUDA residency acceptance hardware.{field} is required")
+    if hardware["device"] != next(iter(concrete_devices)):
+        raise EvidenceError(
+            "CUDA residency acceptance hardware device does not match checked tensor devices"
+        )
+    minimum_memory = 0 if fixture else 1
+    if (
+        type(hardware.get("total_memory_bytes")) is not int
+        or hardware["total_memory_bytes"] < minimum_memory
+    ):
+        raise EvidenceError("CUDA residency acceptance hardware.total_memory_bytes is invalid")
+    software = record.get("software")
+    if not isinstance(software, dict):
+        raise EvidenceError("CUDA residency acceptance software is required")
+    required_software = {"python", "gradoom", "torch", "cuda", "cudnn", "numpy"}
+    if set(software) != required_software or any(
+        not isinstance(software[field], str) or not software[field]
+        for field in required_software
+    ):
+        raise EvidenceError("CUDA residency acceptance software versions are incomplete")
 
 
 def _validate_runtime_assets(
@@ -476,6 +587,8 @@ def _run_attempt(
             "--metrics-jsonl",
             str(training_metrics),
         ]
+        if protocol["cuda_residency_acceptance"]["enabled"]:
+            training_command.append("--cuda-residency-acceptance")
         if previous_checkpoint is not None:
             training_command.extend(("--resume", str(previous_checkpoint)))
         training_process = _run_process(training_command, cwd=manifest_directory)
@@ -492,13 +605,15 @@ def _run_attempt(
             break
         try:
             training_records = _read_jsonl(training_metrics, phase="training")
-            training_summary = _validate_training_records(
+            training_summary, cuda_residency = _validate_training_records(
                 training_records,
                 checkpoint=checkpoint,
                 requested_step=checkpoint_step,
                 previous_checkpoint=previous_checkpoint,
                 manifest_directory=manifest_directory,
                 wad_profile=wad_profile,
+                cuda_residency_acceptance=protocol["cuda_residency_acceptance"]["enabled"],
+                fixture=protocol["fixture"],
             )
             checkpoint_sha256 = _fsync_file(checkpoint, field="training checkpoint")
             training_metrics_sha256 = _fsync_file(
@@ -601,6 +716,7 @@ def _run_attempt(
                 "mean_killcount": mean_compatibility,
                 "passed": passed,
                 "training": training_summary,
+                "cuda_residency_acceptance": cuda_residency,
                 "evaluation": evaluation,
                 "episodes": episodes,
             }
@@ -708,6 +824,11 @@ def build_development_benchmark_report(manifest_path: Path) -> dict[str, Any]:
             "durable_checkpoint_write",
         ],
         "trainer": validated["trainer"],
+        "fixture": manifest["fixture"],
+        "cuda_residency_acceptance": {
+            "contract": CUDA_RESIDENCY_CONTRACT,
+            "enabled": validated["cuda_residency_acceptance"],
+        },
         "parity_certificate": validated["parity_certificate"],
         "wad_profile_binding_sha256": (
             None if wad_profile is None else wad_profile["binding_sha256"]

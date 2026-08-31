@@ -31,6 +31,7 @@ def _manifest(
     training_seeds: list[int] | None = None,
     checkpoint_steps: list[int] | None = None,
     extra_arguments: list[str] | None = None,
+    cuda_residency_acceptance: bool = False,
 ) -> Path:
     command_arguments = ["--fixture-outcomes", json.dumps(outcomes, sort_keys=True)]
     command_arguments.extend(extra_arguments or [])
@@ -47,6 +48,7 @@ def _manifest(
             "available": False,
             "reason": "No current parity certificate exists for the fixture profile.",
         },
+        "cuda_residency_acceptance": cuda_residency_acceptance,
     }
     if training_seeds is not None:
         benchmark["training_seeds"] = training_seeds
@@ -66,6 +68,100 @@ def _manifest(
     path = tmp_path / "manifest.json"
     path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return path
+
+
+def test_development_benchmark_owns_cuda_residency_acceptance_on_the_trainer_seam(
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest(
+        tmp_path,
+        checkpoint_steps=[10],
+        outcomes={"10": [31.0, 0.0]},
+        cuda_residency_acceptance=True,
+    )
+    output = tmp_path / "report.json"
+
+    result = _run_evidence("--manifest", str(manifest), "--output", str(output))
+
+    assert result.returncode == 0, result.stderr
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert report["benchmark_protocol"]["cuda_residency_acceptance"] == {
+        "contract": "gradoom-cuda-residency-v1",
+        "enabled": True,
+    }
+    acceptance = report["attempts"][0]["outcomes"][0]["cuda_residency_acceptance"]
+    assert acceptance["evidence_kind"] == "fixture_contract"
+    assert acceptance["status"] == "passed"
+    assert acceptance["checked_categories"] == [
+        "observations",
+        "actions",
+        "rewards",
+        "resets",
+        "rollout_state",
+        "inference",
+        "losses",
+        "optimizer_state",
+        "parameters",
+        "updates",
+    ]
+    assert acceptance["hardware"]["gpu_model"] == "fixture-only"
+    assert acceptance["software"] == {
+        "cuda": "fixture",
+        "cudnn": "fixture",
+        "gradoom": "fixture",
+        "numpy": "fixture",
+        "python": "fixture",
+        "torch": "fixture",
+    }
+    assert acceptance["workload"]["trainer_contract"] == (
+        "standalone-gradoom-deathmatch-ppo-v2"
+    )
+    assert report["fixture"] is True
+    assert report["claim_eligible"] is False
+
+
+@pytest.mark.parametrize(
+    ("extra_arguments", "message"),
+    [
+        (
+            ["--fixture-omit-cuda-residency-record"],
+            "must emit exactly one 'cuda_residency_acceptance' record",
+        ),
+        (
+            ["--fixture-cuda-residency-cpu-category", "observations"],
+            "observations used a non-CUDA device",
+        ),
+        (
+            ["--fixture-cuda-residency-detected-transfer"],
+            "host-transition guard did not pass",
+        ),
+        (
+            ["--fixture-cuda-residency-hardware-device", "cuda:1"],
+            "hardware device does not match checked tensor devices",
+        ),
+    ],
+)
+def test_development_benchmark_fails_closed_on_invalid_cuda_residency_evidence(
+    tmp_path: Path,
+    extra_arguments: list[str],
+    message: str,
+) -> None:
+    manifest = _manifest(
+        tmp_path,
+        checkpoint_steps=[10],
+        outcomes={"10": [31.0, 0.0]},
+        extra_arguments=extra_arguments,
+        cuda_residency_acceptance=True,
+    )
+    output = tmp_path / "report.json"
+
+    result = _run_evidence("--manifest", str(manifest), "--output", str(output))
+
+    assert result.returncode == 0, result.stderr
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert report["status"] == "failed"
+    assert report["attempts"][0]["status"] == "evidence_failed"
+    assert message in report["attempts"][0]["failures"][0]["message"]
 
 
 def test_development_benchmark_defaults_to_one_cold_seed_and_stops_at_first_pass(
@@ -298,6 +394,12 @@ def test_report_output_cannot_alias_generated_benchmark_artifacts(
                 ["--initialize-from", "learned.pt"]
             ),
             "must not control '--initialize-from'",
+        ),
+        (
+            lambda benchmark: benchmark["trainer"]["arguments"].append(
+                "--cuda-residency-acceptance"
+            ),
+            "must not control '--cuda-residency-acceptance'",
         ),
     ],
 )
