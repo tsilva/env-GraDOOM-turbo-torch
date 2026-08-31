@@ -51,6 +51,18 @@ def test_checkpoint_evaluation_defaults_to_exact_stochastic_100() -> None:
     assert audit["evaluation"]["kills_target_signal"] == "player_killcount"
 
 
+def test_cuda_residency_acceptance_is_opt_in_on_the_real_trainer_contract() -> None:
+    disabled = train._audit_config(_args())
+    enabled = train._audit_config(_args("--cuda-residency-acceptance"))
+
+    assert "cuda_residency_acceptance" not in disabled
+    assert enabled["cuda_residency_acceptance"] == {
+        "contract": "gradoom-cuda-residency-v1",
+        "enabled": True,
+        "steady_state_after_rollouts": 1,
+    }
+
+
 def test_training_command_rejects_ten_step_budget_without_overshoot(tmp_path: Path) -> None:
     metrics = tmp_path / "metrics.jsonl"
 
