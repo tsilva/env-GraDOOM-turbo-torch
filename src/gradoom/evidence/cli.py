@@ -241,6 +241,19 @@ def _validate_document_paths(
                         raise EvidenceError(f"output path aliases WAD profile asset {asset_id!r}")
     benchmark = manifest.get("benchmark")
     if isinstance(benchmark, dict):
+        trainer = benchmark.get("trainer")
+        if isinstance(trainer, dict):
+            raw_code_root = trainer.get("code_root")
+            if isinstance(raw_code_root, str) and raw_code_root.strip():
+                resolved_code_root = _resolve_evidence_path(
+                    Path(raw_code_root), base_directory=manifest_directory
+                )
+                if resolved_output == resolved_code_root or resolved_output.is_relative_to(
+                    resolved_code_root
+                ):
+                    raise EvidenceError(
+                        "benchmark report output must be outside trainer code_root"
+                    )
         bootstrap_artifacts = benchmark.get("bootstrap_artifacts")
         if isinstance(bootstrap_artifacts, list):
             for artifact in bootstrap_artifacts:

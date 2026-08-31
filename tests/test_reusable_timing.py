@@ -1168,13 +1168,16 @@ def test_public_command_rejects_mismatched_continuation_identity(
 def test_public_command_rejects_same_path_trainer_script_replacement(
     tmp_path: Path,
 ) -> None:
-    trainer_script = tmp_path / "trainer.py"
+    code_root = tmp_path / "trainer-code"
+    code_root.mkdir()
+    trainer_script = code_root / "trainer.py"
     shutil.copyfile(FIXTURE_PROCESS, trainer_script)
     manifest = _manifest(
         tmp_path,
         outcomes={"10": [30.0, 0.0]},
         extra_arguments=["--fixture-interrupt-once-at-step", "10"],
         trainer_script=trainer_script,
+        trainer_code_root=code_root,
     )
     interrupted_output = tmp_path / "interrupted-report.json"
     initial = _run_evidence(
@@ -1203,11 +1206,13 @@ def test_public_command_rejects_same_path_trainer_script_replacement(
 
 
 def test_public_command_rejects_shell_eval_trainer_indirection(tmp_path: Path) -> None:
+    code_root = tmp_path / "trainer-code"
+    code_root.mkdir()
     manifest = _manifest(
         tmp_path,
         outcomes={"10": [30.0, 0.0]},
         trainer_command=[sys.executable, "-c", "exec(open('hidden.py').read())"],
-        trainer_code_root=tmp_path,
+        trainer_code_root=code_root,
     )
 
     result = _run_evidence(
@@ -1281,6 +1286,249 @@ def test_public_command_rejects_trainer_code_changed_during_cohort(tmp_path: Pat
 
     assert result.returncode == 2
     assert "bound trainer file changed during the cohort" in result.stderr
+
+
+def test_public_command_rejects_trainer_file_added_during_cohort(tmp_path: Path) -> None:
+    code_root = tmp_path / "trainer-code"
+    code_root.mkdir()
+    trainer = code_root / "trainer.py"
+    shutil.copyfile(FIXTURE_PROCESS, trainer)
+    late_payload = code_root / "late_payload.bin"
+    manifest = _manifest(
+        tmp_path,
+        outcomes={"10": [30.0, 0.0]},
+        extra_arguments=["--fixture-mutate-trainer-code", str(late_payload)],
+        trainer_script=trainer,
+        trainer_code_root=code_root,
+    )
+
+    result = _run_evidence(
+        "--manifest",
+        str(manifest),
+        "--output",
+        str(tmp_path / "report.json"),
+    )
+
+    assert result.returncode == 2
+    assert "code-root membership changed during the cohort" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("mutation_option", "error"),
+    [
+        (
+            "--fixture-remove-trainer-code",
+            "code-root membership changed during the cohort",
+        ),
+        (
+            "--fixture-replace-trainer-code",
+            "bound trainer file identity changed during the cohort",
+        ),
+    ],
+)
+def test_public_command_rejects_trainer_removal_or_same_byte_replacement(
+    tmp_path: Path, mutation_option: str, error: str
+) -> None:
+    code_root = tmp_path / "trainer-code"
+    code_root.mkdir()
+    trainer = code_root / "trainer.py"
+    shutil.copyfile(FIXTURE_PROCESS, trainer)
+    payload = code_root / "payload.bin"
+    payload.write_bytes(b"arbitrary source bytes\x00\xff")
+    manifest = _manifest(
+        tmp_path,
+        outcomes={"10": [30.0, 0.0]},
+        extra_arguments=[mutation_option, str(payload)],
+        trainer_script=trainer,
+        trainer_code_root=code_root,
+    )
+
+    result = _run_evidence(
+        "--manifest",
+        str(manifest),
+        "--output",
+        str(tmp_path / "report.json"),
+    )
+
+    assert result.returncode == 2
+    assert error in result.stderr
+
+
+def test_public_command_rejects_benchmark_artifacts_nested_in_code_root(
+    tmp_path: Path,
+) -> None:
+    code_root = tmp_path / "trainer-code"
+    code_root.mkdir()
+    trainer = code_root / "trainer.py"
+    shutil.copyfile(FIXTURE_PROCESS, trainer)
+    manifest = _manifest(
+        tmp_path,
+        outcomes={"10": [30.0, 0.0]},
+        trainer_script=trainer,
+        trainer_code_root=code_root,
+    )
+    document = json.loads(manifest.read_text(encoding="utf-8"))
+    document["benchmark"]["artifacts_directory"] = str(code_root / "outputs")
+    manifest.write_text(json.dumps(document), encoding="utf-8")
+
+    result = _run_evidence(
+        "--manifest",
+        str(manifest),
+        "--output",
+        str(tmp_path / "report.json"),
+    )
+
+    assert result.returncode == 2
+    assert "benchmark artifacts must be outside trainer code_root" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "entry_kind",
+    ["internal-directory", "external-directory", "internal-file", "external-file"],
+)
+def test_public_command_rejects_every_symlink_alias_in_code_root(
+    tmp_path: Path, entry_kind: str
+) -> None:
+    code_root = tmp_path / "trainer-code"
+    code_root.mkdir()
+    trainer = code_root / "trainer.py"
+    shutil.copyfile(FIXTURE_PROCESS, trainer)
+    external_root = tmp_path / "external"
+    external_root.mkdir()
+    is_directory = entry_kind.endswith("directory")
+    is_external = entry_kind.startswith("external")
+    target_root = external_root if is_external else code_root
+    target = target_root / ("payload-directory" if is_directory else "payload.bin")
+    if is_directory:
+        target.mkdir()
+        (target / "payload").write_bytes(b"arbitrary nested bytes")
+    else:
+        target.write_bytes(b"arbitrary file bytes")
+    (code_root / "alias").symlink_to(target, target_is_directory=is_directory)
+    manifest = _manifest(
+        tmp_path,
+        outcomes={"10": [30.0, 0.0]},
+        trainer_script=trainer,
+        trainer_code_root=code_root,
+    )
+
+    result = _run_evidence(
+        "--manifest",
+        str(manifest),
+        "--output",
+        str(tmp_path / "report.json"),
+    )
+
+    assert result.returncode == 2
+    assert "trainer code_root contains a symlink alias" in result.stderr
+
+
+def test_public_command_rejects_directory_symlink_alias_to_artifacts_root(
+    tmp_path: Path,
+) -> None:
+    code_root = tmp_path / "trainer-code"
+    code_root.mkdir()
+    trainer = code_root / "trainer.py"
+    shutil.copyfile(FIXTURE_PROCESS, trainer)
+    artifacts_root = tmp_path / "benchmark-artifacts"
+    artifacts_root.mkdir()
+    (artifacts_root / "payload.bin").write_bytes(b"mutable output bytes")
+    (code_root / "output-alias").symlink_to(artifacts_root, target_is_directory=True)
+    manifest = _manifest(
+        tmp_path,
+        outcomes={"10": [30.0, 0.0]},
+        trainer_script=trainer,
+        trainer_code_root=code_root,
+    )
+
+    result = _run_evidence(
+        "--manifest",
+        str(manifest),
+        "--output",
+        str(tmp_path / "report.json"),
+    )
+
+    assert result.returncode == 2
+    assert "trainer code_root contains a symlink alias" in result.stderr
+
+
+def test_public_command_rejects_code_root_symlink_alias(tmp_path: Path) -> None:
+    actual_code_root = tmp_path / "actual-trainer-code"
+    actual_code_root.mkdir()
+    trainer = actual_code_root / "trainer.py"
+    shutil.copyfile(FIXTURE_PROCESS, trainer)
+    aliased_code_root = tmp_path / "aliased-trainer-code"
+    aliased_code_root.symlink_to(actual_code_root, target_is_directory=True)
+    manifest = _manifest(
+        tmp_path,
+        outcomes={"10": [30.0, 0.0]},
+        trainer_script=trainer,
+        trainer_code_root=aliased_code_root,
+    )
+
+    result = _run_evidence(
+        "--manifest",
+        str(manifest),
+        "--output",
+        str(tmp_path / "report.json"),
+    )
+
+    assert result.returncode == 2
+    assert "trainer code_root contains a symlink alias" in result.stderr
+
+
+def test_public_command_rejects_report_output_inside_code_root(tmp_path: Path) -> None:
+    code_root = tmp_path / "trainer-code"
+    code_root.mkdir()
+    trainer = code_root / "trainer.py"
+    shutil.copyfile(FIXTURE_PROCESS, trainer)
+    manifest = _manifest(
+        tmp_path,
+        outcomes={"10": [30.0, 0.0]},
+        trainer_script=trainer,
+        trainer_code_root=code_root,
+    )
+
+    result = _run_evidence(
+        "--manifest",
+        str(manifest),
+        "--output",
+        str(code_root / "report.json"),
+    )
+
+    assert result.returncode == 2
+    assert "benchmark report output must be outside trainer code_root" in result.stderr
+
+
+def test_code_root_inventory_rejects_membership_race_while_hashing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    code_root = tmp_path / "trainer-code"
+    code_root.mkdir()
+    trainer = code_root / "trainer.py"
+    shutil.copyfile(FIXTURE_PROCESS, trainer)
+    original_snapshot = benchmark_module._snapshot_regular_code_file
+    injected = False
+
+    def snapshot_then_add_member(path: Path, *, code_root: Path) -> dict[str, object]:
+        nonlocal injected
+        snapshot = original_snapshot(path, code_root=code_root)
+        if not injected:
+            injected = True
+            (code_root / "late_payload.bin").write_bytes(b"arbitrary late bytes")
+        return snapshot
+
+    monkeypatch.setattr(
+        benchmark_module,
+        "_snapshot_regular_code_file",
+        snapshot_then_add_member,
+    )
+
+    with pytest.raises(
+        benchmark_module.EvidenceError,
+        match="code-root membership changed while being inventoried",
+    ):
+        benchmark_module._bound_code_root_files(trainer, code_root)
 
 
 def test_public_command_rejects_tampered_accumulated_recovery_elapsed(
@@ -1494,16 +1742,18 @@ def test_public_command_rejects_stale_interrupted_report_after_terminal_generati
 def test_trainer_relative_executable_is_resolved_from_manifest_directory(
     tmp_path: Path,
 ) -> None:
-    trainer = tmp_path / "trainer.py"
+    code_root = tmp_path / "trainer-code"
+    code_root.mkdir()
+    trainer = code_root / "trainer.py"
     shutil.copyfile(FIXTURE_PROCESS, trainer)
     launcher = tmp_path / "trainer"
     launcher.symlink_to(Path(sys.executable))
     manifest = _manifest(
         tmp_path,
         outcomes={"10": [30.0, 0.0]},
-        trainer_script=Path("trainer.py"),
-        trainer_command=["./trainer", "trainer.py"],
-        trainer_code_root=tmp_path,
+        trainer_script=Path("trainer-code/trainer.py"),
+        trainer_command=["./trainer", "trainer-code/trainer.py"],
+        trainer_code_root=code_root,
     )
 
     result = _run_evidence("--manifest", str(manifest), "--output", str(tmp_path / "report.json"))
@@ -1624,7 +1874,9 @@ def test_public_command_binds_relative_from_import_submodule(tmp_path: Path) -> 
 
 
 def test_public_command_rejects_os_exec_trainer_indirection(tmp_path: Path) -> None:
-    launcher = tmp_path / "launcher.py"
+    code_root = tmp_path / "trainer-code"
+    code_root.mkdir()
+    launcher = code_root / "launcher.py"
     launcher.write_text(
         "import os\nos.execv('/tmp/hidden-trainer', ['/tmp/hidden-trainer'])\n",
         encoding="utf-8",
@@ -1633,7 +1885,7 @@ def test_public_command_rejects_os_exec_trainer_indirection(tmp_path: Path) -> N
         tmp_path,
         outcomes={"10": [30.0, 0.0]},
         trainer_script=launcher,
-        trainer_code_root=tmp_path,
+        trainer_code_root=code_root,
     )
 
     result = _run_evidence("--manifest", str(manifest), "--output", str(tmp_path / "report.json"))
@@ -1643,7 +1895,9 @@ def test_public_command_rejects_os_exec_trainer_indirection(tmp_path: Path) -> N
 
 
 def test_public_command_rejects_nonliteral_dynamic_exec_indirection(tmp_path: Path) -> None:
-    launcher = tmp_path / "launcher.py"
+    code_root = tmp_path / "trainer-code"
+    code_root.mkdir()
+    launcher = code_root / "launcher.py"
     launcher.write_text(
         "import os\nname = 'exec' + 'v'\nrunners = [os]\n"
         "getattr(runners[0], name)('/tmp/hidden', ['/tmp/hidden'])\n",
@@ -1653,7 +1907,7 @@ def test_public_command_rejects_nonliteral_dynamic_exec_indirection(tmp_path: Pa
         tmp_path,
         outcomes={"10": [30.0, 0.0]},
         trainer_script=launcher,
-        trainer_code_root=tmp_path,
+        trainer_code_root=code_root,
     )
 
     result = _run_evidence("--manifest", str(manifest), "--output", str(tmp_path / "report.json"))
@@ -1678,13 +1932,15 @@ def test_public_command_rejects_nonliteral_dynamic_exec_indirection(tmp_path: Pa
 def test_public_command_rejects_computed_module_namespace_exec_indirection(
     tmp_path: Path, launcher_source: str
 ) -> None:
-    launcher = tmp_path / "launcher.py"
+    code_root = tmp_path / "trainer-code"
+    code_root.mkdir()
+    launcher = code_root / "launcher.py"
     launcher.write_text(launcher_source, encoding="utf-8")
     manifest = _manifest(
         tmp_path,
         outcomes={"10": [30.0, 0.0]},
         trainer_script=launcher,
-        trainer_code_root=tmp_path,
+        trainer_code_root=code_root,
     )
 
     result = _run_evidence("--manifest", str(manifest), "--output", str(tmp_path / "report.json"))
@@ -1696,9 +1952,11 @@ def test_public_command_rejects_computed_module_namespace_exec_indirection(
 def test_public_command_binds_hidden_source_executed_through_builtins(
     tmp_path: Path,
 ) -> None:
-    hidden = tmp_path / "hidden_trainer"
+    code_root = tmp_path / "trainer-code"
+    code_root.mkdir()
+    hidden = code_root / "hidden_trainer"
     shutil.copyfile(FIXTURE_PROCESS, hidden)
-    launcher = tmp_path / "launcher.py"
+    launcher = code_root / "launcher.py"
     launcher.write_text(
         "import builtins\n"
         "from pathlib import Path\n"
@@ -1712,7 +1970,7 @@ def test_public_command_binds_hidden_source_executed_through_builtins(
         tmp_path,
         outcomes={"10": [30.0, 0.0]},
         trainer_script=launcher,
-        trainer_code_root=tmp_path,
+        trainer_code_root=code_root,
         extra_arguments=["--fixture-interrupt-once-at-step", "10"],
     )
     interrupted = tmp_path / "interrupted.json"
@@ -1854,9 +2112,11 @@ def test_public_command_binds_suffixless_payload_decoded_before_computed_exec(
 def test_public_command_binds_hidden_trainer_launched_through_operator_and_posix(
     tmp_path: Path,
 ) -> None:
-    hidden = tmp_path / "hidden_trainer.py"
+    code_root = tmp_path / "trainer-code"
+    code_root.mkdir()
+    hidden = code_root / "hidden_trainer.py"
     shutil.copyfile(FIXTURE_PROCESS, hidden)
-    launcher = tmp_path / "launcher.py"
+    launcher = code_root / "launcher.py"
     launcher.write_text(
         "import operator\n"
         "import pathlib\n"
@@ -1868,7 +2128,7 @@ def test_public_command_binds_hidden_trainer_launched_through_operator_and_posix
         tmp_path,
         outcomes={"10": [30.0, 0.0]},
         trainer_script=launcher,
-        trainer_code_root=tmp_path,
+        trainer_code_root=code_root,
         extra_arguments=["--fixture-interrupt-once-at-step", "10"],
     )
     interrupted = tmp_path / "interrupted.json"
@@ -1896,9 +2156,15 @@ def test_public_command_binds_hidden_trainer_launched_through_operator_and_posix
     assert "unlike run identity" in result.stderr
 
 
-def test_documented_train_python_closure_allows_importlib_resources() -> None:
+def test_documented_train_python_closure_allows_importlib_resources(tmp_path: Path) -> None:
     repository = Path(__file__).resolve().parents[1]
+    staged_repository = tmp_path / "staged-repository"
+    staged_repository.mkdir()
+    shutil.copyfile(repository / "train.py", staged_repository / "train.py")
+    shutil.copytree(repository / "src", staged_repository / "src")
 
-    closure = benchmark_module._python_source_closure(repository / "train.py", repository)
+    closure = benchmark_module._python_source_closure(
+        staged_repository / "train.py", staged_repository
+    )
 
-    assert repository / "src/gradoom/scenario.py" in closure
+    assert staged_repository / "src/gradoom/scenario.py" in closure

@@ -391,13 +391,145 @@ def _executes_during_module_import(
     return True
 
 
+def _inventory_code_root_paths(code_root: Path) -> list[Path]:
+    try:
+        root_metadata = code_root.lstat()
+    except OSError as error:
+        raise EvidenceError(
+            f"benchmark trainer code_root cannot be inventoried: {code_root}"
+        ) from error
+    if stat.S_ISLNK(root_metadata.st_mode):
+        raise EvidenceError(
+            f"benchmark trainer code_root contains a symlink alias: {code_root}"
+        )
+    if not stat.S_ISDIR(root_metadata.st_mode):
+        raise EvidenceError(f"benchmark trainer code_root is not a directory: {code_root}")
+
+    paths: list[Path] = []
+
+    def inventory_error(error: OSError) -> None:
+        raise error
+
+    try:
+        for directory, names, filenames in os.walk(code_root, onerror=inventory_error):
+            directory_path = Path(directory)
+            names.sort()
+            filenames.sort()
+            for name in names:
+                child = directory_path / name
+                try:
+                    metadata = child.lstat()
+                except OSError as error:
+                    raise EvidenceError(
+                        f"benchmark trainer code_root entry cannot be inventoried: {child}"
+                    ) from error
+                if stat.S_ISLNK(metadata.st_mode):
+                    raise EvidenceError(
+                        f"benchmark trainer code_root contains a symlink alias: {child}"
+                    )
+                if not stat.S_ISDIR(metadata.st_mode):
+                    raise EvidenceError(
+                        f"benchmark trainer code_root contains a non-regular entry: {child}"
+                    )
+            for filename in filenames:
+                candidate = directory_path / filename
+                try:
+                    metadata = candidate.lstat()
+                except OSError as error:
+                    raise EvidenceError(
+                        f"benchmark trainer code_root entry cannot be inventoried: {candidate}"
+                    ) from error
+                if stat.S_ISLNK(metadata.st_mode):
+                    raise EvidenceError(
+                        f"benchmark trainer code_root contains a symlink alias: {candidate}"
+                    )
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise EvidenceError(
+                        f"benchmark trainer code_root contains a non-regular entry: {candidate}"
+                    )
+                paths.append(candidate)
+    except OSError as error:
+        raise EvidenceError(
+            f"benchmark trainer code_root cannot be inventoried: {code_root}"
+        ) from error
+    return paths
+
+
+def _snapshot_regular_code_file(path: Path, *, code_root: Path) -> dict[str, Any]:
+    try:
+        before = path.lstat()
+        if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+            raise EvidenceError(
+                f"benchmark trainer code_root entry is no longer a regular file: {path}"
+            )
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        try:
+            opened = os.fstat(descriptor)
+            with os.fdopen(descriptor, "rb", closefd=False) as stream:
+                payload = stream.read()
+            after_read = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        after_path = path.lstat()
+    except EvidenceError:
+        raise
+    except OSError as error:
+        raise EvidenceError(
+            f"benchmark trainer code_root file changed while being inventoried: {path}"
+        ) from error
+
+    def stable_identity(value: os.stat_result) -> tuple[int, int, int, int, int, int]:
+        return (
+            value.st_dev,
+            value.st_ino,
+            value.st_mode,
+            value.st_size,
+            value.st_mtime_ns,
+            value.st_ctime_ns,
+        )
+    if not (
+        stable_identity(before)
+        == stable_identity(opened)
+        == stable_identity(after_read)
+        == stable_identity(after_path)
+    ):
+        raise EvidenceError(
+            f"benchmark trainer code_root file changed while being inventoried: {path}"
+        )
+    return {
+        "role": "code-root-file",
+        "path": str(path),
+        "relative_path": str(path.relative_to(code_root)),
+        "sha256": _sha256_bytes(payload),
+        "device": before.st_dev,
+        "inode": before.st_ino,
+        "mode": stat.S_IMODE(before.st_mode),
+        "size": before.st_size,
+    }
+
+
+def _bound_code_root_files(script_path: Path, code_root: Path) -> list[dict[str, Any]]:
+    paths = _python_source_closure(script_path, code_root)
+    bound = [_snapshot_regular_code_file(path, code_root=code_root) for path in paths]
+    membership_after_hashing = _inventory_code_root_paths(code_root)
+    if {path.relative_to(code_root) for path in paths} != {
+        path.relative_to(code_root) for path in membership_after_hashing
+    }:
+        raise EvidenceError(
+            "benchmark trainer code-root membership changed while being inventoried"
+        )
+    return bound
+
+
 def _python_source_closure(
     script_path: Path,
     code_root: Path,
-    *,
-    excluded_roots: tuple[Path, ...] = (),
-    excluded_files: tuple[Path, ...] = (),
 ) -> list[Path]:
+    # Reject aliases and establish the whole-byte membership boundary before resolving
+    # static imports.  In particular, a symlink to a mutable output directory must never
+    # disappear through target-based exclusion logic.
+    local_sources = set(_inventory_code_root_paths(code_root))
     pending = [script_path]
     closure: set[Path] = set()
     while pending:
@@ -523,68 +655,8 @@ def _python_source_closure(
                 initializer = code_root / parent / "__init__.py"
                 if initializer.is_file():
                     pending.append(initializer)
-    # Static import closure is useful for rejecting known opaque launch primitives, but it
-    # cannot prove which local source a dynamic Python expression will eventually execute.
-    # Bind every regular file in the declared code root as the security boundary.  Python
-    # can decode or decompress arbitrary bytes before computed ``exec`` and can launch a
-    # file from any directory through indirect ``posix.exec*`` access.  Consequently a
-    # suffix, text decoder, parse probe, executable bit, or conventional build-directory
-    # allowlist cannot prove that local bytes are non-executable.  The only exclusions are
-    # the caller's explicit benchmark artifact/document boundaries, which are never trainer
-    # inputs and are validated separately.
-    normalized_roots = tuple(path.resolve() for path in excluded_roots)
-    normalized_files = {path.resolve() for path in excluded_files}
-
-    def excluded(candidate: Path) -> bool:
-        resolved = candidate.resolve()
-        return resolved in normalized_files or any(
-            resolved == root or resolved.is_relative_to(root) for root in normalized_roots
-        )
-
-    local_sources: set[Path] = set()
-
-    def inventory_error(error: OSError) -> None:
-        raise error
-
-    try:
-        for directory, names, filenames in os.walk(code_root, onerror=inventory_error):
-            directory_path = Path(directory)
-            retained_names = []
-            for name in names:
-                child = directory_path / name
-                if excluded(child):
-                    continue
-                if child.is_symlink():
-                    try:
-                        target = child.resolve(strict=True)
-                    except OSError as error:
-                        raise EvidenceError(
-                            "benchmark trainer code_root contains an unreadable directory "
-                            f"symlink: {child}"
-                        ) from error
-                    if not target.is_relative_to(code_root.resolve()):
-                        raise EvidenceError(
-                            "benchmark trainer code_root contains an external directory symlink: "
-                            f"{child}"
-                        )
-                retained_names.append(name)
-            names[:] = retained_names
-            for filename in filenames:
-                candidate = directory_path / filename
-                if excluded(candidate):
-                    continue
-                try:
-                    metadata = candidate.stat()
-                except OSError as error:
-                    raise EvidenceError(
-                        f"benchmark trainer code_root file cannot be inventoried: {candidate}"
-                    ) from error
-                if stat.S_ISREG(metadata.st_mode):
-                    local_sources.add(candidate)
-    except OSError as error:
-        raise EvidenceError(
-            f"benchmark trainer code_root cannot be inventoried: {code_root}"
-        ) from error
+    # Static import closure rejects known opaque launch primitives, while the complete
+    # inventory binds arbitrary bytes regardless of suffix, encoding, or parseability.
     return sorted(closure | local_sources)
 
 
@@ -592,8 +664,7 @@ def _bind_trainer_files(
     trainer: dict[str, Any],
     *,
     base_directory: Path,
-    excluded_roots: tuple[Path, ...] = (),
-    excluded_files: tuple[Path, ...] = (),
+    artifacts_root: Path,
 ) -> dict[str, Any]:
     command = trainer["command"]
     raw_executable = Path(command[0])
@@ -631,27 +702,26 @@ def _bind_trainer_files(
         if not script_path.is_file() or script_path.suffix != ".py":
             raise EvidenceError("benchmark trainer Python command must name one source file")
         raw_root = trainer.get("code_root")
+        declared_root = Path(raw_root) if raw_root is not None else script_path.parent
+        if not declared_root.is_absolute():
+            declared_root = base_directory / declared_root
+        if declared_root.is_symlink():
+            raise EvidenceError(
+                f"benchmark trainer code_root contains a symlink alias: {declared_root}"
+            )
         code_root = _resolve_evidence_path(
-            Path(raw_root) if raw_root is not None else script_path.parent,
+            declared_root,
             base_directory=base_directory,
         )
         if not code_root.is_dir() or not script_path.is_relative_to(code_root):
             raise EvidenceError("benchmark trainer script must be inside its code_root")
-        code_files = _python_source_closure(
-            script_path,
-            code_root,
-            excluded_roots=excluded_roots,
-            excluded_files=excluded_files,
-        )
-        for path in code_files:
-            bound_files.append(
-                {
-                    "role": "code-root-file",
-                    "path": str(path),
-                    "relative_path": str(path.relative_to(code_root)),
-                    "sha256": _sha256_bytes(path.read_bytes()),
-                }
-            )
+        if (
+            artifacts_root == code_root
+            or artifacts_root.is_relative_to(code_root)
+            or code_root.is_relative_to(artifacts_root)
+        ):
+            raise EvidenceError("benchmark artifacts must be outside trainer code_root")
+        bound_files.extend(_bound_code_root_files(script_path, code_root))
         resolved_root: str | None = str(code_root)
     else:
         resolved_root = None
@@ -667,7 +737,8 @@ def _bind_trainer_files(
 
 
 def _reverify_trainer_files(trainer: dict[str, Any]) -> None:
-    for bound in trainer["bound_files"]:
+    executable = trainer["bound_files"][0]
+    for bound in (executable,):
         path = Path(bound["path"])
         if bound["sha256"] is None and not path.exists():
             continue
@@ -677,6 +748,29 @@ def _reverify_trainer_files(trainer: dict[str, Any]) -> None:
             raise EvidenceError(f"bound trainer file changed during the cohort: {path}") from error
         if digest != bound["sha256"]:
             raise EvidenceError(f"bound trainer file changed during the cohort: {path}")
+    code_root = Path(trainer["code_root"])
+    script_path = Path(trainer["command"][1])
+    current_files = _bound_code_root_files(script_path, code_root)
+    expected_by_relative = {
+        item["relative_path"]: item
+        for item in trainer["bound_files"]
+        if item["role"] == "code-root-file"
+    }
+    current_by_relative = {item["relative_path"]: item for item in current_files}
+    if set(expected_by_relative) != set(current_by_relative):
+        raise EvidenceError("benchmark trainer code-root membership changed during the cohort")
+    for relative_path, expected in expected_by_relative.items():
+        current = current_by_relative[relative_path]
+        path = current["path"]
+        if current["sha256"] != expected["sha256"]:
+            raise EvidenceError(f"bound trainer file changed during the cohort: {path}")
+        if any(
+            current[field] != expected[field]
+            for field in ("device", "inode", "mode", "size")
+        ):
+            raise EvidenceError(
+                f"bound trainer file identity changed during the cohort: {path}"
+            )
 
 
 def _validate_certificate(value: object) -> dict[str, Any]:
@@ -1765,6 +1859,7 @@ def _run_process(
         process = subprocess.Popen(
             command,
             cwd=cwd,
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -3023,12 +3118,7 @@ def build_development_benchmark_report(
     validated["trainer"] = _bind_trainer_files(
         validated["trainer"],
         base_directory=manifest_path.parent,
-        excluded_roots=(artifacts_root,),
-        excluded_files=tuple(
-            path.resolve()
-            for path in (manifest_path, merge_path)
-            if path is not None
-        ),
+        artifacts_root=artifacts_root,
     )
     if not manifest["fixture"]:
         authority = _formal_time_authority()
