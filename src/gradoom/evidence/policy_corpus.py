@@ -120,6 +120,9 @@ _POLICY_REPORT_FIELDS = frozenset(
 _EVIDENCE_INDEX_FIELDS = frozenset({"algorithm", "entries", "sha256"})
 _RUNNER_CAPTURE_LIMIT = 8 * 1024 * 1024
 _FAILURE_MESSAGE_LIMIT = 4096
+_FAILURE_CODE_LIMIT = 128
+_FIELD_DIAGNOSTIC_LIMIT = 128
+_FIELD_DIAGNOSTIC_COUNT = 8
 _MAX_OUTCOME_NUMBER = 2**63 - 1
 _MAX_TIMEOUT_SECONDS = 2**31 - 1
 _MFD_ALLOW_SEALING = 0x0002
@@ -162,12 +165,22 @@ def _limit_runner_output_files() -> None:
     resource.setrlimit(resource.RLIMIT_FSIZE, (_RUNNER_CAPTURE_LIMIT, _RUNNER_CAPTURE_LIMIT))
 
 
+def _bounded_text(value: str, *, limit: int, suffix: str) -> str:
+    payload = value.encode(errors="replace")
+    if len(payload) <= limit:
+        return value
+    suffix_payload = suffix.encode()
+    prefix = payload[: limit - len(suffix_payload)].decode(errors="ignore")
+    return prefix + suffix
+
+
 def _bounded_failure_message(payload: bytes) -> str:
-    truncated = len(payload) > _FAILURE_MESSAGE_LIMIT
-    message = payload[:_FAILURE_MESSAGE_LIMIT].decode(errors="replace").strip()
-    if truncated:
-        message += "\n[runner stderr truncated]"
-    return message
+    message = payload[: _FAILURE_MESSAGE_LIMIT + 1].decode(errors="replace").strip()
+    return _bounded_text(
+        message,
+        limit=_FAILURE_MESSAGE_LIMIT,
+        suffix="\n[runner stderr truncated]",
+    )
 
 
 def _validate_sources_unchanged(
@@ -240,7 +253,8 @@ def _validate_contract(value: object, *, field: str) -> dict[str, Any]:
         raise EvidenceError(f"{field} must be an object")
     _exact_fields(value, _MODEL_RUNTIME_CONTRACT_FIELDS, document=field)
     if (
-        value.get("contract_version") != 1
+        type(value.get("contract_version")) is not int
+        or value.get("contract_version") != 1
         or value.get("artifact_format") != CHECKPOINT_FORMAT
         or value.get("runtime") != "torch"
         or value.get("architecture") not in _SUPPORTED_POLICY_ARCHITECTURES
@@ -416,13 +430,52 @@ def _unit_identity(
 
 
 def _failure_outcome(seed: int, *, code: str, message: str) -> dict[str, Any]:
+    bounded_message = _bounded_text(
+        message,
+        limit=_FAILURE_MESSAGE_LIMIT,
+        suffix="\n[failure message truncated]",
+    )
     return {
         "seed": seed,
         "player_killcount": None,
         "termination_state": None,
         "episode_length": None,
-        "execution_failure": {"code": code, "message": message},
+        "execution_failure": {"code": code, "message": bounded_message},
     }
+
+
+def _same_json_value(actual: object, expected: object) -> bool:
+    if type(actual) is not type(expected):
+        return False
+    if isinstance(expected, dict):
+        if not isinstance(actual, dict):
+            return False
+        return set(actual) == set(expected) and all(
+            _same_json_value(actual[key], value) for key, value in expected.items()
+        )
+    if isinstance(expected, list):
+        if not isinstance(actual, list):
+            return False
+        return len(actual) == len(expected) and all(
+            _same_json_value(actual_item, expected_item)
+            for actual_item, expected_item in zip(actual, expected, strict=True)
+        )
+    return actual == expected
+
+
+def _field_diagnostic(fields: list[str]) -> str:
+    displayed = fields[:_FIELD_DIAGNOSTIC_COUNT]
+    rendered = ", ".join(
+        repr(
+            field
+            if len(field) <= _FIELD_DIAGNOSTIC_LIMIT
+            else field[:_FIELD_DIAGNOSTIC_LIMIT] + "…"
+        )
+        for field in displayed
+    )
+    if len(fields) > len(displayed):
+        rendered += f", and {len(fields) - len(displayed)} more"
+    return rendered
 
 
 def _exact_fields(
@@ -437,9 +490,9 @@ def _exact_fields(
     if missing or extra:
         details = []
         if missing:
-            details.append(f"missing {', '.join(repr(field) for field in missing)}")
+            details.append(f"missing {_field_diagnostic(missing)}")
         if extra:
-            details.append(f"undeclared {', '.join(repr(field) for field in extra)}")
+            details.append(f"undeclared {_field_diagnostic(extra)}")
         raise EvidenceError(f"{document} has invalid fields: {'; '.join(details)}")
 
 
@@ -464,6 +517,8 @@ def _canonical_outcome(
         message = _required_string(failure["message"], f"{document}.failure.message")
         if not code.strip() or not message.strip():
             raise EvidenceError(f"{document}.execution_failure fields must be non-whitespace")
+        if len(code.encode()) > _FAILURE_CODE_LIMIT:
+            raise EvidenceError(f"{document}.failure.code exceeds the supported length")
         if any(
             value[field] is not None
             for field in ("player_killcount", "termination_state", "episode_length")
@@ -509,7 +564,10 @@ def _normalize_runner_outcomes(
             frozenset({"protocol_version", "outcomes"}),
             document="policy runner response",
         )
-        if response.get("protocol_version") != POLICY_RUNNER_PROTOCOL_VERSION:
+        if (
+            type(response.get("protocol_version")) is not int
+            or response.get("protocol_version") != POLICY_RUNNER_PROTOCOL_VERSION
+        ):
             raise EvidenceError("policy runner response uses an unsupported protocol")
         raw_outcomes = response.get("outcomes")
         if not isinstance(raw_outcomes, list):
@@ -540,11 +598,16 @@ def _normalize_runner_outcomes(
             )
         return normalized
     except EvidenceError as error:
+        message = _bounded_text(
+            str(error),
+            limit=_FAILURE_MESSAGE_LIMIT,
+            suffix="\n[failure message truncated]",
+        )
         return {
             seed: _failure_outcome(
                 seed,
                 code="invalid_runner_response",
-                message=str(error),
+                message=message,
             )
             for seed in requested_seeds
         }
@@ -643,7 +706,7 @@ def _load_reusable_outcomes(
     if report.get("run_identity") != evaluation_identity:
         raise EvidenceError("cannot merge unlike policy evaluation identities")
     for field, expected in expected_report_binding.items():
-        if report.get(field) != expected:
+        if not _same_json_value(report.get(field), expected):
             raise EvidenceError(f"merge report {field} does not match current evidence")
     status = report.get("status")
     if status not in {"evaluation_in_progress", "evaluation_complete"}:
@@ -669,7 +732,7 @@ def _load_reusable_outcomes(
     )
     _exact_fields(evaluation, required_evaluation_fields, document="merge policy_evaluation")
     for field, expected in expected_binding.items():
-        if evaluation.get(field) != expected:
+        if not _same_json_value(evaluation.get(field), expected):
             raise EvidenceError(
                 f"merge report policy_evaluation.{field} does not match current evidence"
             )
@@ -692,7 +755,7 @@ def _load_reusable_outcomes(
         *expected_evidence_entries,
         {"name": "policy_evaluation", "sha256": evaluation_digest},
     ]
-    if entries != expected_entries:
+    if not _same_json_value(entries, expected_entries):
         raise EvidenceError("merge report policy_evaluation SHA-256 mismatch")
     outcomes = evaluation.get("outcomes")
     if not isinstance(outcomes, list):
@@ -718,7 +781,14 @@ def _load_reusable_outcomes(
             item.get("seed_index"),
             item.get("seed"),
         )
-        if expected is None or actual != expected or identity in reusable:
+        if (
+            expected is None
+            or not all(
+                _same_json_value(actual_item, expected_item)
+                for actual_item, expected_item in zip(actual, expected, strict=True)
+            )
+            or identity in reusable
+        ):
             raise EvidenceError("merge report contains mismatched or duplicate policy evidence")
         try:
             normalized = _canonical_outcome(
@@ -748,7 +818,7 @@ def _load_reusable_outcomes(
     if status == "evaluation_in_progress" and len(observed_order) >= len(expected_unit_order):
         raise EvidenceError("in-progress policy evaluation cannot contain the complete grid")
     failure_count = sum(item["execution_failure"] is not None for item in reusable.values())
-    if evaluation.get("failure_count") != failure_count:
+    if not _same_json_value(evaluation.get("failure_count"), failure_count):
         raise EvidenceError("merge report policy_evaluation.failure_count is invalid")
     return reusable
 
@@ -797,7 +867,10 @@ def build_policy_evaluation_report(
         optional=_POLICY_EVALUATION_OPTIONAL_FIELDS,
         document="policy_evaluation",
     )
-    if configuration.get("protocol_version") != POLICY_RUNNER_PROTOCOL_VERSION:
+    if (
+        type(configuration.get("protocol_version")) is not int
+        or configuration.get("protocol_version") != POLICY_RUNNER_PROTOCOL_VERSION
+    ):
         raise EvidenceError("policy_evaluation uses an unsupported protocol_version")
     corpus_input = _declared_input(
         configuration.get("corpus_input"),

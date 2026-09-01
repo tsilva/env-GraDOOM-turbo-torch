@@ -12,6 +12,8 @@ import pytest
 RUNNER = Path(__file__).parent / "fixtures" / "evidence" / "fixture_policy_runner.py"
 INCOMPLETE_RUNNER = RUNNER.with_name("fixture_incomplete_policy_runner.py")
 INVALID_TYPE_RUNNER = RUNNER.with_name("fixture_invalid_type_policy_runner.py")
+FLOAT_PROTOCOL_RUNNER = RUNNER.with_name("fixture_float_protocol_policy_runner.py")
+NEAR_LIMIT_MALFORMED_RUNNER = RUNNER.with_name("fixture_near_limit_malformed_policy_runner.py")
 MUTATING_RUNNER = RUNNER.with_name("fixture_mutating_policy_runner.py")
 TRANSIENT_RUNNER = RUNNER.with_name("fixture_transient_restore_runner.py")
 INTERRUPT_RUNNER = RUNNER.with_name("fixture_interrupt_once_runner.py")
@@ -221,6 +223,34 @@ def test_invalid_corpus_is_rejected_before_execution(
     assert message in result.stderr
 
 
+@pytest.mark.parametrize("contract_version", [True, 1.0])
+def test_model_contract_version_requires_an_exact_json_integer(
+    tmp_path: Path, contract_version: object
+) -> None:
+    manifest_path, corpus_path, manifest = _documents(tmp_path)
+    corpus = json.loads(corpus_path.read_text(encoding="utf-8"))
+    corpus["policies"][0]["model_runtime_contract"]["contract_version"] = contract_version
+    _write_json(corpus_path, corpus)
+    manifest["declared_inputs"][0]["sha256"] = _sha256(corpus_path)  # type: ignore[index]
+    _write_json(manifest_path, manifest)
+
+    result = _run("--manifest", str(manifest_path), "--output", str(tmp_path / "report.json"))
+
+    assert result.returncode == 2
+    assert "unsupported model/runtime contract" in result.stderr
+
+
+def test_policy_evaluation_protocol_requires_an_exact_json_integer(tmp_path: Path) -> None:
+    manifest_path, _corpus_path, manifest = _documents(tmp_path)
+    manifest["policy_evaluation"]["protocol_version"] = 2.0  # type: ignore[index]
+    _write_json(manifest_path, manifest)
+
+    result = _run("--manifest", str(manifest_path), "--output", str(tmp_path / "report.json"))
+
+    assert result.returncode == 2
+    assert "unsupported protocol_version" in result.stderr
+
+
 @pytest.mark.parametrize(
     "mutation",
     [
@@ -360,6 +390,39 @@ def test_unhashable_runner_types_are_retained_as_failures(tmp_path: Path) -> Non
     } == {"invalid_runner_response"}
 
 
+def test_runner_protocol_requires_an_exact_json_integer(tmp_path: Path) -> None:
+    manifest_path, _corpus_path, manifest = _documents(tmp_path)
+    _replace_runner(manifest_path, manifest, FLOAT_PROTOCOL_RUNNER)
+    output = tmp_path / "report.json"
+
+    result = _run("--manifest", str(manifest_path), "--output", str(output))
+
+    assert result.returncode == 0, result.stderr
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert report["policy_evaluation"]["failure_count"] == 2 * 2 * 256
+    assert {
+        item["execution_failure"]["code"] for item in report["policy_evaluation"]["outcomes"]
+    } == {"invalid_runner_response"}
+
+
+def test_near_capture_limit_malformed_response_has_bounded_failure_evidence(
+    tmp_path: Path,
+) -> None:
+    manifest_path, _corpus_path, manifest = _documents(tmp_path)
+    _replace_runner(manifest_path, manifest, NEAR_LIMIT_MALFORMED_RUNNER)
+    output = tmp_path / "report.json"
+
+    result = _run("--manifest", str(manifest_path), "--output", str(output))
+
+    assert result.returncode == 0, result.stderr
+    report = json.loads(output.read_text(encoding="utf-8"))
+    failures = [item["execution_failure"] for item in report["policy_evaluation"]["outcomes"]]
+    assert len(failures) == 2 * 2 * 256
+    assert {failure["code"] for failure in failures} == {"invalid_runner_response"}
+    assert max(len(failure["message"].encode()) for failure in failures) <= 4096
+    assert output.stat().st_size < 2 * 1024 * 1024
+
+
 @pytest.mark.parametrize("timeout_seconds", [10**400, 2**63 - 1])
 def test_oversized_manifest_timeout_fails_without_a_traceback(
     tmp_path: Path, timeout_seconds: int
@@ -464,6 +527,47 @@ def test_merge_rejects_tampered_top_level_report(tmp_path: Path, mutation: objec
     assert _run("--manifest", str(manifest_path), "--output", str(initial)).returncode == 0
     report = json.loads(initial.read_text(encoding="utf-8"))
     mutation(report)  # type: ignore[operator]
+    _write_json(initial, report)
+
+    result = _run(
+        "--manifest",
+        str(manifest_path),
+        "--output",
+        str(tmp_path / "resumed.json"),
+        "--merge",
+        str(initial),
+    )
+
+    assert result.returncode == 2
+    assert "merge report" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda report: report.update(schema_version=True),
+        lambda report: report.update(fixture=1),
+        lambda report: report.update(claim_eligible=0),
+        lambda report: report["code_provenance"].update(dirty=0),
+        lambda report: report["policy_evaluation"].update(protocol_version=2.0),
+        lambda report: report["policy_evaluation"].update(expected_outcome_count=1024.0),
+        lambda report: report["policy_evaluation"].update(failure_count=0.0),
+        lambda report: report["policy_evaluation"]["corpus"].update(schema_version=True),
+        lambda report: report["policy_evaluation"]["corpus"]["policies"][0][
+            "model_runtime_contract"
+        ].update(contract_version=True),
+        lambda report: report["policy_evaluation"]["seed_manifest"].update(schema_version=True),
+    ],
+)
+def test_merge_rejects_self_consistently_rehashed_json_type_substitutions(
+    tmp_path: Path, mutation: object
+) -> None:
+    manifest_path, _corpus_path, _manifest = _documents(tmp_path)
+    initial = tmp_path / "initial.json"
+    assert _run("--manifest", str(manifest_path), "--output", str(initial)).returncode == 0
+    report = json.loads(initial.read_text(encoding="utf-8"))
+    mutation(report)  # type: ignore[operator]
+    _rehash_policy_report(report)
     _write_json(initial, report)
 
     result = _run(
