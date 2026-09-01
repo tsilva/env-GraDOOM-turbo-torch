@@ -21,6 +21,7 @@ from typing import Any, BinaryIO
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 
+from .cuda_residency import CUDA_RESIDENCY_CATEGORIES, CUDA_RESIDENCY_CONTRACT
 from .report import (
     EvidenceError,
     _canonical_sha256,
@@ -50,6 +51,7 @@ _CONTROLLED_ARGUMENTS = {
     "--checkpoint",
     "--checkpoint-every-rollouts",
     "--config-only",
+    "--cuda-residency-acceptance",
     "--evaluate-checkpoint",
     "--evaluation-episodes",
     "--evaluation-seed",
@@ -60,6 +62,7 @@ _CONTROLLED_ARGUMENTS = {
     "--initialize-from",
     "--metrics-jsonl",
     "--no-evaluation-stochastic",
+    "--no-cuda-residency-acceptance",
     "--resume",
     "--seed",
     "--timesteps",
@@ -1737,6 +1740,9 @@ def _validate_benchmark(manifest: dict[str, Any]) -> dict[str, Any]:
         training_seeds=training_seeds,
         fixture=manifest["fixture"],
     )
+    cuda_residency_acceptance = benchmark.get("cuda_residency_acceptance", False)
+    if type(cuda_residency_acceptance) is not bool:
+        raise EvidenceError("benchmark.cuda_residency_acceptance must be a boolean")
     return {
         "code_provenance": code_provenance,
         "training_seeds": training_seeds,
@@ -1749,6 +1755,7 @@ def _validate_benchmark(manifest: dict[str, Any]) -> dict[str, Any]:
         "parity_certificate": certificate,
         "bootstrap_artifacts": bootstrap_artifacts,
         "elapsed_time_anchors": elapsed_time_anchors,
+        "cuda_residency_acceptance": cuda_residency_acceptance,
     }
 
 
@@ -1794,7 +1801,9 @@ def _validate_training_records(
     run_identity: str,
     attempt_identity: str,
     interrupted: bool = False,
-) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    cuda_residency_acceptance: bool,
+    fixture: bool,
+) -> tuple[dict[str, Any], dict[str, Any] | None, dict[str, Any] | None]:
     config = _record(records, "config", phase="training")
     if config.get("contract") != _TRAINER_CONTRACT or config.get("operation") != "train":
         raise EvidenceError("training process did not use the standalone GPU-resident trainer")
@@ -1804,6 +1813,16 @@ def _validate_training_records(
     }
     if config.get("evidence_binding") != expected_binding:
         raise EvidenceError("training process did not bind the exact run and attempt identity")
+    configured_acceptance = config.get("cuda_residency_acceptance")
+    if cuda_residency_acceptance:
+        if (
+            not isinstance(configured_acceptance, dict)
+            or configured_acceptance.get("contract") != CUDA_RESIDENCY_CONTRACT
+            or configured_acceptance.get("enabled") is not True
+        ):
+            raise EvidenceError("training process did not enable CUDA residency acceptance")
+    elif configured_acceptance is not None:
+        raise EvidenceError("training process enabled unrequested CUDA residency acceptance")
     initialization = config.get("initialization")
     if not isinstance(initialization, dict) or initialization.get("mode") != "random":
         raise EvidenceError("training process must declare random policy initialization")
@@ -1871,7 +1890,100 @@ def _validate_training_records(
     if recorded_checkpoint != checkpoint:
         raise EvidenceError("training process reported a different checkpoint path")
     _validate_runtime_assets(summary, phase="training", wad_profile=wad_profile)
-    return summary, (None if previous_checkpoint is None else resumed[0])
+    acceptance_records = [
+        record for record in records if record.get("type") == "cuda_residency_acceptance"
+    ]
+    resumed_record = None if previous_checkpoint is None else resumed[0]
+    if not cuda_residency_acceptance:
+        if acceptance_records:
+            raise EvidenceError(
+                "training process emitted unrequested CUDA residency acceptance evidence"
+            )
+        return summary, resumed_record, None
+    if len(acceptance_records) != 1:
+        raise EvidenceError(
+            "training process must emit exactly one 'cuda_residency_acceptance' record, "
+            f"got {len(acceptance_records)}"
+        )
+    acceptance = acceptance_records[0]
+    _validate_cuda_residency_record(acceptance, fixture=fixture)
+    return summary, resumed_record, acceptance
+
+
+def _validate_cuda_residency_record(record: dict[str, Any], *, fixture: bool) -> None:
+    if record.get("contract") != CUDA_RESIDENCY_CONTRACT or record.get("status") != "passed":
+        raise EvidenceError("CUDA residency acceptance record did not pass the required contract")
+    expected_kind = "fixture_contract" if fixture else "cuda_hardware"
+    if record.get("evidence_kind") != expected_kind:
+        raise EvidenceError(
+            f"CUDA residency acceptance evidence_kind must be {expected_kind!r}"
+        )
+    if record.get("checked_categories") != list(CUDA_RESIDENCY_CATEGORIES):
+        raise EvidenceError("CUDA residency acceptance did not check every required category")
+    devices = record.get("devices")
+    if not isinstance(devices, dict) or set(devices) != set(CUDA_RESIDENCY_CATEGORIES):
+        raise EvidenceError("CUDA residency acceptance device evidence is incomplete")
+    concrete_devices: set[str] = set()
+    for category in CUDA_RESIDENCY_CATEGORIES:
+        values = devices[category]
+        if not isinstance(values, list) or not values:
+            raise EvidenceError(f"CUDA residency acceptance {category} devices must be non-empty")
+        for value in values:
+            if not isinstance(value, str) or not value.startswith("cuda:"):
+                raise EvidenceError(
+                    f"CUDA residency acceptance {category} used a non-CUDA device"
+                )
+            concrete_devices.add(value)
+    if len(concrete_devices) != 1:
+        raise EvidenceError("CUDA residency acceptance used inconsistent CUDA devices")
+    guard = record.get("host_transition_guard")
+    if (
+        not isinstance(guard, dict)
+        or guard.get("status") != "passed"
+        or type(guard.get("guarded_scopes")) is not int
+        or guard["guarded_scopes"] <= 0
+        or guard.get("detected_transfers") != 0
+    ):
+        raise EvidenceError("CUDA residency acceptance host-transition guard did not pass")
+    for field in ("checked_rollouts", "checked_steps"):
+        if type(record.get(field)) is not int or record[field] <= 0:
+            raise EvidenceError(f"CUDA residency acceptance {field} must be positive")
+    workload = record.get("workload")
+    if (
+        not isinstance(workload, dict)
+        or workload.get("trainer_contract") != _TRAINER_CONTRACT
+    ):
+        raise EvidenceError("CUDA residency acceptance workload did not use the benchmark trainer")
+    if (
+        workload.get("checked_rollouts") != record["checked_rollouts"]
+        or workload.get("checked_transitions") != record["checked_steps"]
+    ):
+        raise EvidenceError("CUDA residency acceptance workload counts are inconsistent")
+    hardware = record.get("hardware")
+    if not isinstance(hardware, dict):
+        raise EvidenceError("CUDA residency acceptance hardware is required")
+    for field in ("gpu_model", "device", "compute_capability"):
+        if not isinstance(hardware.get(field), str) or not hardware[field]:
+            raise EvidenceError(f"CUDA residency acceptance hardware.{field} is required")
+    if hardware["device"] != next(iter(concrete_devices)):
+        raise EvidenceError(
+            "CUDA residency acceptance hardware device does not match checked tensor devices"
+        )
+    minimum_memory = 0 if fixture else 1
+    if (
+        type(hardware.get("total_memory_bytes")) is not int
+        or hardware["total_memory_bytes"] < minimum_memory
+    ):
+        raise EvidenceError("CUDA residency acceptance hardware.total_memory_bytes is invalid")
+    software = record.get("software")
+    if not isinstance(software, dict):
+        raise EvidenceError("CUDA residency acceptance software is required")
+    required_software = {"python", "gradoom", "torch", "cuda", "cudnn", "numpy"}
+    if set(software) != required_software or any(
+        not isinstance(software[field], str) or not software[field]
+        for field in required_software
+    ):
+        raise EvidenceError("CUDA residency acceptance software versions are incomplete")
 
 
 def _validate_runtime_assets(
@@ -2430,7 +2542,7 @@ def _load_live_interrupted_attempt(
         if type(requested_step) is not int:
             raise EvidenceError("live benchmark attempt has invalid checkpoint step")
         records = _read_jsonl(training_metrics, phase="interrupted training")
-        summary, _resumed = _validate_training_records(
+        summary, _resumed, _cuda_residency = _validate_training_records(
             records,
             checkpoint=checkpoint,
             requested_step=requested_step,
@@ -2440,6 +2552,8 @@ def _load_live_interrupted_attempt(
             run_identity=run_identity,
             attempt_identity=attempt_identity,
             interrupted=phase == "training",
+            cuda_residency_acceptance=protocol["cuda_residency_acceptance"]["enabled"],
+            fixture=protocol["fixture"],
         )
         checkpoint_sha256 = _fsync_file(checkpoint, field="live recovery checkpoint")
         metrics_sha256 = _fsync_file(training_metrics, field="live recovery metrics")
@@ -2709,7 +2823,7 @@ def _run_attempt(
                     Path(validation_previous["path"]), base_directory=manifest_directory
                 ),
             }
-        training_summary, _resumed = _validate_training_records(
+        training_summary, _resumed, cuda_residency = _validate_training_records(
             training_records,
             checkpoint=checkpoint,
             requested_step=checkpoint_step,
@@ -2718,6 +2832,8 @@ def _run_attempt(
             wad_profile=wad_profile,
             run_identity=run_identity,
             attempt_identity=attempt_identity,
+            cuda_residency_acceptance=protocol["cuda_residency_acceptance"]["enabled"],
+            fixture=protocol["fixture"],
         )
         checkpoint_sha256 = _fsync_file(checkpoint, field="recovered evaluation checkpoint")
         if checkpoint_sha256 != existing_recovery["checkpoint_sha256"]:
@@ -2774,6 +2890,7 @@ def _run_attempt(
             failures.append(failure)
         if outcome is not None:
             outcome["training"] = training_summary
+            outcome["cuda_residency_acceptance"] = cuda_residency
             outcomes.append(outcome)
             assert evaluation_sha256 is not None
             evaluation_name = f"seed-{seed}-step-{checkpoint_step}-evaluation-metrics"
@@ -2819,6 +2936,8 @@ def _run_attempt(
             "--metrics-jsonl",
             str(training_metrics),
         ]
+        if protocol["cuda_residency_acceptance"]["enabled"]:
+            training_command.append("--cuda-residency-acceptance")
         if previous_checkpoint is not None:
             training_command.extend(("--resume", str(previous_checkpoint["path"])))
         checkpoint_evidence_name = f"seed-{seed}-step-{checkpoint_step}{suffix}-checkpoint"
@@ -2912,7 +3031,7 @@ def _run_attempt(
         was_interrupted = training_process.returncode == 130 or crash_left_recovery_evidence
         try:
             training_records = _read_jsonl(training_metrics, phase="training")
-            training_summary, resumed_record = _validate_training_records(
+            training_summary, resumed_record, cuda_residency = _validate_training_records(
                 training_records,
                 checkpoint=checkpoint,
                 requested_step=checkpoint_step,
@@ -2922,6 +3041,8 @@ def _run_attempt(
                 run_identity=run_identity,
                 attempt_identity=attempt_identity,
                 interrupted=was_interrupted,
+                cuda_residency_acceptance=protocol["cuda_residency_acceptance"]["enabled"],
+                fixture=protocol["fixture"],
             )
             checkpoint_sha256 = _fsync_file(checkpoint, field="training checkpoint")
             training_metrics_sha256 = _fsync_file(
@@ -3037,6 +3158,7 @@ def _run_attempt(
             failures.append(failure)
         if outcome is not None:
             outcome["training"] = training_summary
+            outcome["cuda_residency_acceptance"] = cuda_residency
             outcomes.append(outcome)
             assert evaluation_metrics_sha256 is not None
             evidence_entries.append(
@@ -3362,6 +3484,11 @@ def _build_development_benchmark_report(
             key: value
             for key, value in validated["trainer"].items()
             if key != "_identity_markers"
+        },
+        "fixture": manifest["fixture"],
+        "cuda_residency_acceptance": {
+            "contract": CUDA_RESIDENCY_CONTRACT,
+            "enabled": validated["cuda_residency_acceptance"],
         },
         "parity_certificate": validated["parity_certificate"],
         "wad_profile_binding_sha256": (

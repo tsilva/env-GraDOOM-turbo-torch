@@ -102,6 +102,12 @@ standalone trainer and exact 100-episode stochastic GraDOOM evaluation path. Its
 non-authoritative and claim-ineligible, including passes made before a current parity certificate
 exists.
 
+Set `benchmark.cuda_residency_acceptance` in a development benchmark manifest to run the opt-in
+CUDA residency check around that same trainer. It records the checked workload and device/software
+identity and rejects host transition copies while leaving ordinary training uninstrumented. See the
+[evidence contract](./docs/evidence.md#cuda-residency-acceptance) for its bounded host allowances and
+explicit hardware-test gate.
+
 ## Notes
 
 - `env-GraDOOM-turbo-torch` is under active construction and is not yet parity-certified. No current release supports a public quality- or speed-leadership claim.
