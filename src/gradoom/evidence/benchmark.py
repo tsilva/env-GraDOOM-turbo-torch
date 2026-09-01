@@ -6,6 +6,7 @@ import binascii
 import ctypes
 import fcntl
 import hashlib
+import importlib.machinery
 import json
 import math
 import os
@@ -15,6 +16,8 @@ import signal
 import stat
 import statistics
 import subprocess
+import sys
+import sysconfig
 import time
 import zipfile
 from collections.abc import Callable
@@ -74,6 +77,10 @@ _CONTROLLED_ARGUMENTS = {
 
 _MAX_CODE_ROOT_IDENTITY_MARKERS = 4096
 _OPEN_DESCRIPTOR_RESERVE = 64
+_MAX_SEALED_SOURCE_FILES = 16_384
+_MAX_SEALED_SOURCE_FILE_BYTES = 16 * 1024 * 1024
+_MAX_SEALED_EXTENSION_FILE_BYTES = 512 * 1024 * 1024
+_MAX_SEALED_TOTAL_BYTES = 768 * 1024 * 1024
 _SEALED_EXECUTION_EXIT = 125
 _SEALED_EXECUTION_CONTRACT = "kernel-sealed-python-zip-v1"
 _MFD_CLOEXEC = 0x0001
@@ -85,26 +92,210 @@ _F_SEAL_SHRINK = 0x0002
 _F_SEAL_GROW = 0x0004
 _F_SEAL_WRITE = 0x0008
 _SEALED_PYTHON_BOOTSTRAP = r"""
+import importlib.machinery
+import importlib.util
+import builtins
+import io
+import json
+import linecache
 import os
 import sys
-import zipfile
+import tokenize
 
-archive_path, code_root, entry_relative, *trainer_arguments = sys.argv[1:]
+(
+    archive_path,
+    code_root,
+    entry_relative,
+    protected_roots_json,
+    extension_descriptors_json,
+    *trainer_arguments,
+) = sys.argv[1:]
 entry_path = os.path.join(code_root, entry_relative)
+protected_roots = json.loads(protected_roots_json)
+extension_descriptors = json.loads(extension_descriptors_json)
+sealed_extension_originals = {
+    os.path.realpath(value[1]) for value in extension_descriptors.values()
+}
 violations = []
 
 
-def inside_code_root(value):
+import zipfile
+
+
+def inside_protected_root(value):
     if not isinstance(value, (str, bytes, os.PathLike)):
         return False
     try:
         candidate = os.path.realpath(os.fsdecode(value))
-        return os.path.commonpath((code_root, candidate)) == code_root
+        return any(os.path.commonpath((root, candidate)) == root for root in protected_roots)
     except (OSError, ValueError):
         return False
 
 
-def reject_code_root_mutation(event, arguments):
+sealed_archive = zipfile.ZipFile(archive_path)
+archive_names = set(sealed_archive.namelist())
+entry_source = sealed_archive.read("code/" + entry_relative)
+sealed_source_names = {
+    archive_path + "/" + name: name
+    for name in archive_names
+    if name.startswith("code/") and name.endswith(".py")
+}
+for archive_name in tuple(sealed_source_names.values()):
+    sealed_source_names[os.path.join(code_root, archive_name[len("code/") :])] = archive_name
+environment_sources = {}
+namespace_packages = {}
+for archive_name in sorted(archive_names):
+    if not archive_name.startswith("environment/") or not archive_name.endswith(".py"):
+        continue
+    _, raw_index, relative_path = archive_name.split("/", 2)
+    root = protected_roots[int(raw_index) + 1]
+    is_package = relative_path.endswith("/__init__.py")
+    if is_package:
+        module = relative_path[: -len("/__init__.py")].replace("/", ".")
+        original_path = os.path.join(root, relative_path)
+    else:
+        module = relative_path[:-3].replace("/", ".")
+        original_path = os.path.join(root, relative_path)
+    if module and module not in environment_sources:
+        environment_sources[module] = (archive_name, original_path, is_package)
+        sealed_source_names[original_path] = archive_name
+        sealed_source_names[archive_path + "/" + archive_name] = archive_name
+    parts = module.split(".")
+    for length in range(1, len(parts)):
+        parent = ".".join(parts[:length])
+        namespace_packages.setdefault(parent, os.path.join(root, *parts[:length]))
+for module, (_, original_path) in extension_descriptors.items():
+    parts = module.split(".")
+    for length in range(1, len(parts)):
+        parent_path = original_path
+        for _ in range(len(parts) - length):
+            parent_path = os.path.dirname(parent_path)
+        namespace_packages.setdefault(".".join(parts[:length]), parent_path)
+for module in set(environment_sources) | set(extension_descriptors):
+    namespace_packages.pop(module, None)
+
+
+original_open = builtins.open
+
+
+def sealed_source_open(file, mode="r", *args, **kwargs):
+    writing = isinstance(mode, str) and any(marker in mode for marker in "wax+")
+    archive_name = None
+    if not writing and isinstance(file, (str, bytes, os.PathLike)):
+        archive_name = sealed_source_names.get(os.path.realpath(os.fsdecode(file)))
+    if archive_name is None:
+        return original_open(file, mode, *args, **kwargs)
+    payload = sealed_archive.read(archive_name)
+    if "b" in mode:
+        return io.BytesIO(payload)
+    encoding = kwargs.get("encoding")
+    if encoding is None:
+        encoding, _ = tokenize.detect_encoding(io.BytesIO(payload).readline)
+    return io.TextIOWrapper(
+        io.BytesIO(payload),
+        encoding=encoding,
+        errors=kwargs.get("errors"),
+        newline=kwargs.get("newline"),
+    )
+
+
+builtins.open = sealed_source_open
+io.open = sealed_source_open
+
+
+class SealedSourceLoader:
+    def __init__(self, archive_name, original_path, is_package):
+        self.archive_name = archive_name
+        self.original_path = original_path
+        self.package = is_package
+
+    def create_module(self, spec):
+        return None
+
+    def exec_module(self, module):
+        source = sealed_archive.read(self.archive_name)
+        if not self.archive_name.startswith("environment/0/"):
+            encoding, _ = tokenize.detect_encoding(io.BytesIO(source).readline)
+            source_text = source.decode(encoding)
+            linecache.cache[self.original_path] = (
+                len(source),
+                None,
+                source_text.splitlines(keepends=True),
+                self.original_path,
+            )
+        code = compile(source, self.original_path, "exec")
+        exec(code, module.__dict__, module.__dict__)
+
+    def is_package(self, fullname):
+        return self.package
+
+    def get_filename(self, fullname):
+        return self.original_path
+
+
+class SealedEnvironmentFinder:
+    def find_spec(self, fullname, path=None, target=None):
+        source = environment_sources.get(fullname)
+        if source is not None:
+            loader = SealedSourceLoader(*source)
+            spec = importlib.util.spec_from_loader(
+                fullname, loader, origin=source[1], is_package=source[2]
+            )
+            spec.has_location = True
+            if source[2]:
+                spec.submodule_search_locations = [
+                    archive_path + "/" + os.path.dirname(source[0])
+                ]
+            return spec
+        extension = extension_descriptors.get(fullname)
+        if extension is not None:
+            descriptor, original_path = extension
+            extension_path = "/proc/self/fd/" + str(descriptor)
+            loader = importlib.machinery.ExtensionFileLoader(fullname, extension_path)
+            return importlib.util.spec_from_loader(fullname, loader, origin=original_path)
+        namespace_path = namespace_packages.get(fullname)
+        if namespace_path is not None:
+            spec = importlib.machinery.ModuleSpec(fullname, loader=None, is_package=True)
+            spec.submodule_search_locations = [namespace_path]
+            return spec
+        if path and any(inside_protected_root(item) for item in path):
+            raise ModuleNotFoundError(
+                "sealed trainer execution binding refused an unbound environment module: "
+                + fullname
+            )
+        return None
+
+
+sys.meta_path.insert(0, SealedEnvironmentFinder())
+entry_encoding, _ = tokenize.detect_encoding(io.BytesIO(entry_source).readline)
+entry_text = entry_source.decode(entry_encoding)
+linecache.cache[entry_path] = (
+    len(entry_source),
+    None,
+    entry_text.splitlines(keepends=True),
+    entry_path,
+)
+entry_code = compile(entry_source, entry_path, "exec")
+
+
+def trusted_generated_code_caller():
+    try:
+        filename = sys._getframe(2).f_code.co_filename
+    except (AttributeError, ValueError):
+        return False
+    if filename not in sealed_source_names:
+        return False
+    if filename.startswith(archive_path + "/environment/"):
+        return True
+    try:
+        return any(
+            os.path.commonpath((root, filename)) == root for root in protected_roots[1:]
+        )
+    except ValueError:
+        return False
+
+
+def reject_unsealed_execution(event, arguments):
     targets = ()
     if event == "open":
         path, mode, flags = arguments
@@ -113,8 +304,25 @@ def reject_code_root_mutation(event, arguments):
             and flags
             & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND)
         )
-        if writing:
-            targets = (path,)
+        relative_path = isinstance(path, (str, bytes, os.PathLike)) and not os.path.isabs(
+            os.fsdecode(path)
+        )
+        if writing and (relative_path or inside_protected_root(path)):
+            violations.append(event + ":" + repr(os.fsdecode(path)))
+            raise PermissionError(
+                "sealed trainer execution binding forbids protected-source mutation"
+            )
+        protected_source_read = (
+            inside_protected_root(path)
+            and (
+                os.path.commonpath((code_root, os.path.realpath(os.fsdecode(path)))) == code_root
+                or os.fsdecode(path).endswith((".py", ".pyc", ".pyo"))
+                or os.path.realpath(os.fsdecode(path)) in sealed_extension_originals
+            )
+        )
+        if not writing and not relative_path and protected_source_read:
+            violations.append(event + ":" + repr(os.fsdecode(path)))
+            raise PermissionError("sealed trainer execution binding forbids mutable-source reads")
     elif event in {
         "os.remove",
         "os.rmdir",
@@ -128,23 +336,51 @@ def reject_code_root_mutation(event, arguments):
         targets = arguments[:1]
     elif event in {"os.rename", "os.link"}:
         targets = arguments[:2]
-    if any(inside_code_root(target) for target in targets):
+    if targets and any(
+        not isinstance(target, int)
+        and (not os.path.isabs(os.fsdecode(target)) or inside_protected_root(target))
+        for target in targets
+    ):
         violations.append(event)
-        raise PermissionError("sealed trainer execution binding forbids code-root mutation")
+        raise PermissionError("sealed trainer execution binding forbids protected-source mutation")
+    if event in {"os.exec", "os.posix_spawn"}:
+        violations.append(event)
+        raise PermissionError("sealed trainer execution binding forbids process replacement")
+    if event == "compile":
+        source, filename = arguments
+        archive_name = sealed_source_names.get(filename)
+        if archive_name is not None:
+            expected = sealed_archive.read(archive_name)
+            actual = source.encode() if isinstance(source, str) else bytes(source)
+            if actual == expected:
+                return
+        if trusted_generated_code_caller():
+            return
+        violations.append(event)
+        raise PermissionError("sealed trainer execution binding forbids dynamic code compilation")
+    if event == "exec":
+        code = arguments[0]
+        if code is entry_code or code.co_filename in sealed_source_names:
+            return
+        if trusted_generated_code_caller():
+            return
+        violations.append(event)
+        raise PermissionError("sealed trainer execution binding forbids dynamic code execution")
+    if event in {"marshal.loads", "code.__new__"}:
+        if trusted_generated_code_caller():
+            return
+        violations.append(event)
+        raise PermissionError("sealed trainer execution binding forbids opaque code construction")
 
 
-sys.addaudithook(reject_code_root_mutation)
+sys.addaudithook(reject_unsealed_execution)
 search_roots = []
 entry_parent = os.path.dirname(entry_relative)
-for relative in (entry_parent, "", "src"):
-    candidate = archive_path if not relative else archive_path + "/" + relative
+for relative in ("code/" + entry_parent, "code", "code/src"):
+    candidate = archive_path + "/" + relative.rstrip("/")
     if candidate not in search_roots:
         search_roots.append(candidate)
-sys.path[:] = search_roots + [
-    item
-    for item in sys.path
-    if item and not inside_code_root(item)
-]
+sys.path[:] = search_roots
 sys.argv[:] = [entry_path, *trainer_arguments]
 namespace = {
     "__name__": "__main__",
@@ -154,12 +390,14 @@ namespace = {
     "__spec__": None,
 }
 try:
-    with zipfile.ZipFile(archive_path) as archive:
-        entry_source = archive.read(entry_relative)
-    exec(compile(entry_source, entry_path, "exec"), namespace, namespace)
+    exec(entry_code, namespace, namespace)
 finally:
     if violations:
-        sys.stderr.write("sealed trainer execution binding rejected a code-root mutation\n")
+        if any(event.startswith("open") or event.startswith("os.") for event in violations):
+            message = "sealed trainer execution binding rejected a protected-source mutation"
+        else:
+            message = "sealed trainer execution binding rejected unsealed execution"
+        sys.stderr.write(message + ": " + violations[-1] + "\n")
         sys.stderr.flush()
         os._exit(125)
 """
@@ -306,7 +544,15 @@ def _validated_python_tree(path: Path) -> ast.AST:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     except (OSError, SyntaxError, UnicodeError) as error:
         raise EvidenceError(f"benchmark trainer Python source is unreadable: {path}") from error
-    forbidden_imports = {"ctypes", "multiprocessing", "runpy", "subprocess", "sys"}
+    forbidden_imports = {
+        "builtins",
+        "ctypes",
+        "marshal",
+        "multiprocessing",
+        "runpy",
+        "subprocess",
+        "sys",
+    }
     forbidden_builtins = {"__import__", "eval", "exec", "compile"}
     forbidden_attributes = {
         "system",
@@ -329,10 +575,14 @@ def _validated_python_tree(path: Path) -> ast.AST:
         "spawnve",
         "spawnvp",
         "spawnvpe",
+        "attrgetter",
+        "CodeType",
         "import_module",
         "find_spec",
         "module_from_spec",
         "__dict__",
+        "__globals__",
+        "__closure__",
         "__getattribute__",
         "__class__",
         "__bases__",
@@ -451,6 +701,11 @@ def _validated_python_tree(path: Path) -> ast.AST:
             forbidden_call = (
                 isinstance(node.func, ast.Name) and node.func.id in forbidden_builtins
             ) or (isinstance(node.func, ast.Attribute) and node.func.attr in forbidden_attributes)
+            nested_os_call = (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Attribute)
+                and node.func.value.attr in {"os", "posix"}
+            )
             if (
                 isinstance(node.func, ast.Name)
                 and node.func.id == "getattr"
@@ -471,7 +726,7 @@ def _validated_python_tree(path: Path) -> ast.AST:
                     or dynamic_callable
                 ):
                     forbidden_call = True
-            if forbidden_call:
+            if forbidden_call or nested_os_call:
                 raise EvidenceError("shell, -c, eval, and opaque trainer indirection are forbidden")
     return tree
 
@@ -564,9 +819,16 @@ class _TrainerFileIdentityMarkers:
         self.archive_writer: zipfile.ZipFile | None = None
         self.sealed_archive: BinaryIO | None = None
         self.sealed_archive_sha256: str | None = None
+        self.sealed_file_count = 0
+        self.sealed_total_bytes = 0
         self.code_root: Path | None = None
         self.entry_relative: Path | None = None
         self.executable_argv0: str | None = None
+        self.environment_roots: list[Path] = []
+        self.environment_identities: list[dict[str, Any]] = []
+        self.sealed_extensions: dict[str, BinaryIO] = {}
+        self.sealed_extension_paths: dict[str, Path] = {}
+        self.native_library_directories: list[Path] = []
 
     def close(self) -> None:
         streams, self.streams = self.streams, {}
@@ -584,6 +846,9 @@ class _TrainerFileIdentityMarkers:
         archive, self.sealed_archive = self.sealed_archive, None
         if archive is not None:
             archive.close()
+        extensions, self.sealed_extensions = self.sealed_extensions, {}
+        for extension in extensions.values():
+            extension.close()
 
     def __del__(self) -> None:
         with suppress(OSError):
@@ -622,6 +887,20 @@ def _snapshot_regular_code_file(
             raise EvidenceError(
                 f"benchmark trainer code_root entry is no longer a regular file: {path}"
             )
+        if before.st_size > _MAX_SEALED_SOURCE_FILE_BYTES:
+            raise EvidenceError(
+                f"sealed source {str(path)!r} exceeds the sealed-source per-file byte limit"
+            )
+        if (
+            identity_markers is not None
+            and identity_markers.sealed_file_count >= _MAX_SEALED_SOURCE_FILES
+        ):
+            raise EvidenceError("sealed execution environment exceeds the source-file count limit")
+        if identity_markers is not None and (
+            identity_markers.sealed_total_bytes + before.st_size
+            > _MAX_SEALED_TOTAL_BYTES
+        ):
+            raise EvidenceError("sealed execution environment exceeds the total sealed byte limit")
         flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
         descriptor = os.open(path, flags)
         try:
@@ -686,7 +965,9 @@ def _snapshot_regular_code_file(
     else:
         assert stream is not None
         identity_markers.streams[relative_path] = stream
-        _append_trainer_execution_payload(identity_markers, relative_path, payload)
+        _append_trainer_execution_payload(
+            identity_markers, f"code/{relative_path}", payload
+        )
     return snapshot
 
 
@@ -709,11 +990,33 @@ def _new_sealable_memory_file() -> int:
     return descriptor
 
 
+def _reserve_sealed_payload(
+    identity_markers: _TrainerFileIdentityMarkers,
+    relative_path: str,
+    payload: bytes,
+    *,
+    per_file_limit: int = _MAX_SEALED_SOURCE_FILE_BYTES,
+) -> None:
+    if len(payload) > per_file_limit:
+        raise EvidenceError(
+            f"sealed source {relative_path!r} exceeds the sealed-source per-file byte limit"
+        )
+    if identity_markers.sealed_file_count >= _MAX_SEALED_SOURCE_FILES:
+        raise EvidenceError("sealed execution environment exceeds the source-file count limit")
+    if (
+        identity_markers.sealed_total_bytes + len(payload) > _MAX_SEALED_TOTAL_BYTES
+    ):
+        raise EvidenceError("sealed execution environment exceeds the total sealed byte limit")
+    identity_markers.sealed_file_count += 1
+    identity_markers.sealed_total_bytes += len(payload)
+
+
 def _append_trainer_execution_payload(
     identity_markers: _TrainerFileIdentityMarkers,
     relative_path: str,
     payload: bytes,
 ) -> None:
+    _reserve_sealed_payload(identity_markers, relative_path, payload)
     if identity_markers.archive_descriptor is None:
         descriptor = _new_sealable_memory_file()
         try:
@@ -792,8 +1095,6 @@ def _bound_code_root_files(
             raise EvidenceError(
                 "benchmark trainer code-root membership changed while being inventoried"
             )
-        if identity_markers is not None:
-            _seal_trainer_execution_archive(identity_markers)
         return bound
     except BaseException:
         if identity_markers is not None:
@@ -939,6 +1240,244 @@ def _python_source_closure(
     return sorted(closure | local_sources)
 
 
+def _stable_environment_payload(
+    path: Path,
+    identity_markers: _TrainerFileIdentityMarkers,
+    *,
+    per_file_limit: int = _MAX_SEALED_SOURCE_FILE_BYTES,
+) -> bytes:
+    try:
+        before = path.lstat()
+        if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+            raise EvidenceError(
+                f"Python execution environment contains a non-regular source: {path}"
+            )
+        if before.st_size > per_file_limit:
+            raise EvidenceError(
+                f"sealed source {str(path)!r} exceeds the sealed-source per-file byte limit"
+            )
+        if identity_markers.sealed_file_count >= _MAX_SEALED_SOURCE_FILES:
+            raise EvidenceError("sealed execution environment exceeds the source-file count limit")
+        if (
+            identity_markers.sealed_total_bytes + before.st_size
+            > _MAX_SEALED_TOTAL_BYTES
+        ):
+            raise EvidenceError("sealed execution environment exceeds the total sealed byte limit")
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            opened = os.fstat(descriptor)
+            with os.fdopen(descriptor, "rb") as stream:
+                payload = stream.read()
+                after_read = os.fstat(stream.fileno())
+        except BaseException:
+            with suppress(OSError):
+                os.close(descriptor)
+            raise
+        after_path = path.lstat()
+    except EvidenceError:
+        raise
+    except OSError as error:
+        raise EvidenceError(
+            f"Python execution environment changed while being sealed: {path}"
+        ) from error
+    identities = (
+        before.st_dev,
+        before.st_ino,
+        before.st_mode,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    if any(
+        (
+            value.st_dev,
+            value.st_ino,
+            value.st_mode,
+            value.st_size,
+            value.st_mtime_ns,
+            value.st_ctime_ns,
+        )
+        != identities
+        for value in (opened, after_read, after_path)
+    ):
+        raise EvidenceError(f"Python execution environment changed while being sealed: {path}")
+    return payload
+
+
+def _local_import_roots(code_root: Path) -> set[str]:
+    roots: set[str] = set()
+    for path in sorted(code_root.rglob("*.py")):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        except (OSError, SyntaxError, UnicodeError):
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                roots.update(alias.name.split(".", 1)[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                roots.add(node.module.split(".", 1)[0])
+    return roots
+
+
+def _is_local_import(code_root: Path, module: str) -> bool:
+    parts = module.split(".")
+    return any(
+        candidate.is_file()
+        for candidate in (
+            code_root.joinpath(*parts).with_suffix(".py"),
+            code_root.joinpath(*parts, "__init__.py"),
+            code_root.joinpath("src", *parts).with_suffix(".py"),
+            code_root.joinpath("src", *parts, "__init__.py"),
+        )
+    )
+
+
+def _python_environment_roots(code_root: Path) -> list[Path]:
+    candidates: list[Path] = []
+    for raw_path in sys.path:
+        if not raw_path:
+            continue
+        try:
+            candidate = Path(raw_path).resolve(strict=True)
+        except OSError:
+            continue
+        if not candidate.is_dir() or candidate == code_root or candidate.is_relative_to(code_root):
+            continue
+        if candidate not in candidates:
+            candidates.append(candidate)
+    stdlib = Path(sysconfig.get_path("stdlib")).resolve(strict=True)
+    selected = {stdlib}
+    for module in sorted(_local_import_roots(code_root)):
+        if _is_local_import(code_root, module):
+            continue
+        parts = module.split(".")
+        for root in candidates:
+            if root.joinpath(*parts).with_suffix(".py").is_file() or root.joinpath(
+                *parts, "__init__.py"
+            ).is_file():
+                selected.add(root)
+                break
+    ordered = [root for root in candidates if root in selected]
+    if stdlib not in ordered:
+        ordered.insert(0, stdlib)
+    return ordered
+
+
+def _extension_module_name(relative_path: Path) -> str | None:
+    name = relative_path.name
+    suffix = next(
+        (
+            candidate
+            for candidate in sorted(importlib.machinery.EXTENSION_SUFFIXES, key=len, reverse=True)
+            if name.endswith(candidate)
+        ),
+        None,
+    )
+    if suffix is None:
+        return None
+    if suffix == ".so" and any(
+        part in {"lib", "libs"} or part.endswith(".libs") for part in relative_path.parts
+    ):
+        return None
+    module_parts = [*relative_path.parts[:-1], name[: -len(suffix)]]
+    if not module_parts or any(not part.isidentifier() for part in module_parts):
+        return None
+    return ".".join(module_parts)
+
+
+def _seal_extension_payload(
+    identity_markers: _TrainerFileIdentityMarkers,
+    *,
+    module: str,
+    path: Path,
+    payload: bytes,
+) -> None:
+    _reserve_sealed_payload(
+        identity_markers,
+        str(path),
+        payload,
+        per_file_limit=_MAX_SEALED_EXTENSION_FILE_BYTES,
+    )
+    descriptor = _new_sealable_memory_file()
+    try:
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            view = view[written:]
+        os.fsync(descriptor)
+        seals = _F_SEAL_SHRINK | _F_SEAL_GROW | _F_SEAL_WRITE | _F_SEAL_SEAL
+        fcntl.fcntl(descriptor, _F_ADD_SEALS, seals)
+        if fcntl.fcntl(descriptor, _F_GET_SEALS) & seals != seals:
+            raise EvidenceError("Python extension module could not be kernel-sealed")
+        identity_markers.sealed_extensions[module] = os.fdopen(descriptor, "rb")
+        identity_markers.sealed_extension_paths[module] = path
+        descriptor = -1
+    except OSError as error:
+        raise EvidenceError("Python extension module could not be kernel-sealed") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _bind_python_environment(
+    identity_markers: _TrainerFileIdentityMarkers,
+    *,
+    code_root: Path,
+) -> None:
+    roots = _python_environment_roots(code_root)
+    identities: list[dict[str, Any]] = []
+    extensions_seen: set[str] = set()
+    native_library_directories: set[Path] = set()
+    for root_index, root in enumerate(roots):
+        prefix = f"environment/{root_index}"
+        for path in sorted(root.rglob("*.py")):
+            payload = _stable_environment_payload(path, identity_markers)
+            relative_path = path.relative_to(root)
+            archive_path = f"{prefix}/{relative_path}"
+            _append_trainer_execution_payload(identity_markers, archive_path, payload)
+            identities.append(
+                {
+                    "role": "python-source",
+                    "root": str(root),
+                    "relative_path": str(relative_path),
+                    "sha256": _sha256_bytes(payload),
+                    "size": len(payload),
+                }
+            )
+        for library_path in root.rglob("*.so*"):
+            if library_path.is_file():
+                native_library_directories.add(library_path.parent)
+        for path in sorted(root.rglob("*.so")):
+            relative_path = path.relative_to(root)
+            module = _extension_module_name(relative_path)
+            if module is None or module in extensions_seen:
+                continue
+            payload = _stable_environment_payload(
+                path,
+                identity_markers,
+                per_file_limit=_MAX_SEALED_EXTENSION_FILE_BYTES,
+            )
+            _seal_extension_payload(
+                identity_markers,
+                module=module,
+                path=path,
+                payload=payload,
+            )
+            extensions_seen.add(module)
+            identities.append(
+                {
+                    "role": "extension-module",
+                    "root": str(root),
+                    "relative_path": str(relative_path),
+                    "sha256": _sha256_bytes(payload),
+                    "size": len(payload),
+                }
+            )
+    identity_markers.environment_roots = roots
+    identity_markers.environment_identities = identities
+    identity_markers.native_library_directories = sorted(native_library_directories)
+
+
 def _bind_trainer_files(
     trainer: dict[str, Any],
     *,
@@ -1012,18 +1551,37 @@ def _bind_trainer_files(
         identity_markers.code_root = code_root
         identity_markers.entry_relative = script_path.relative_to(code_root)
         identity_markers.executable_argv0 = str(executable_argv0)
-        bound_files.extend(
-            _bound_code_root_files(
-                script_path,
-                code_root,
-                identity_markers=identity_markers,
+        try:
+            bound_files.extend(
+                _bound_code_root_files(
+                    script_path,
+                    code_root,
+                    identity_markers=identity_markers,
+                )
             )
-        )
+            _bind_python_environment(identity_markers, code_root=code_root)
+            _seal_trainer_execution_archive(identity_markers)
+        except BaseException:
+            identity_markers.close()
+            raise
         assert identity_markers.sealed_archive_sha256 is not None
         execution_binding = {
             "contract": _SEALED_EXECUTION_CONTRACT,
             "archive_sha256": identity_markers.sealed_archive_sha256,
             "bootstrap_sha256": _sha256_bytes(_SEALED_PYTHON_BOOTSTRAP.encode()),
+            "environment_sha256": _canonical_sha256(
+                identity_markers.environment_identities,
+                document="sealed Python execution environment",
+            ),
+            "environment_roots": [str(root) for root in identity_markers.environment_roots],
+            "sealed_file_count": identity_markers.sealed_file_count,
+            "sealed_total_bytes": identity_markers.sealed_total_bytes,
+            "limits": {
+                "files": _MAX_SEALED_SOURCE_FILES,
+                "per_file_bytes": _MAX_SEALED_SOURCE_FILE_BYTES,
+                "extension_per_file_bytes": _MAX_SEALED_EXTENSION_FILE_BYTES,
+                "total_bytes": _MAX_SEALED_TOTAL_BYTES,
+            },
         }
         resolved_root: str | None = str(code_root)
     else:
@@ -2309,24 +2867,55 @@ def _run_process(
     if code_root is None or entry_relative is None or executable_argv0 is None:
         raise EvidenceError("sealed trainer execution binding has incomplete source metadata")
     archive_descriptor = archive.fileno()
+    extension_descriptors = {
+        module: [stream.fileno(), str(execution_binding.sealed_extension_paths[module])]
+        for module, stream in execution_binding.sealed_extensions.items()
+    }
+    protected_roots = [str(code_root), *map(str, execution_binding.environment_roots)]
     launched_command = [
         executable_argv0,
         "-P",
+        "-S",
         "-s",
         "-c",
         _SEALED_PYTHON_BOOTSTRAP,
         f"/proc/self/fd/{archive_descriptor}",
         str(code_root),
         str(entry_relative),
+        json.dumps(protected_roots, separators=(",", ":")),
+        json.dumps(extension_descriptors, separators=(",", ":")),
         *command[2:],
     ]
+    archive_environment_roots = [
+        f"/proc/self/fd/{archive_descriptor}/environment/{index}"
+        for index in range(len(execution_binding.environment_roots))
+    ]
+    environment = {
+        **os.environ,
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONPATH": os.pathsep.join(archive_environment_roots),
+    }
+    native_library_path = os.pathsep.join(
+        map(str, execution_binding.native_library_directories)
+    )
+    if native_library_path:
+        existing_library_path = environment.get("LD_LIBRARY_PATH")
+        environment["LD_LIBRARY_PATH"] = (
+            native_library_path
+            if not existing_library_path
+            else native_library_path + os.pathsep + existing_library_path
+        )
+    inherited_descriptors = (
+        archive_descriptor,
+        *(value[0] for value in extension_descriptors.values()),
+    )
     try:
         process = subprocess.Popen(
             launched_command,
             executable=command[0],
             cwd=cwd,
-            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
-            pass_fds=(archive_descriptor,),
+            env=environment,
+            pass_fds=inherited_descriptors,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -2373,7 +2962,15 @@ def _run_process(
         os.kill(os.getpid(), forwarded_signal)
         raise AssertionError("termination signal did not terminate evidence parent")
     if completed.returncode == _SEALED_EXECUTION_EXIT:
-        raise EvidenceError("sealed trainer execution binding rejected a code-root mutation")
+        detail = next(
+            (
+                line
+                for line in reversed(completed.stderr.splitlines())
+                if line.startswith("sealed trainer execution binding rejected")
+            ),
+            "sealed trainer execution binding rejected unsealed execution",
+        )
+        raise EvidenceError(detail)
     return completed
 
 
