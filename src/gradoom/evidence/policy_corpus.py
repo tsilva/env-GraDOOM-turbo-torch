@@ -168,7 +168,7 @@ def _limit_runner_output_files() -> None:
 def _bounded_text(value: str, *, limit: int, suffix: str) -> str:
     payload = value.encode(errors="replace")
     if len(payload) <= limit:
-        return value
+        return payload.decode()
     suffix_payload = suffix.encode()
     prefix = payload[: limit - len(suffix_payload)].decode(errors="ignore")
     return prefix + suffix
@@ -559,6 +559,7 @@ def _normalize_runner_outcomes(
         response = _parse_json_document(payload, document="policy runner response")
         if not isinstance(response, dict):
             raise EvidenceError("policy runner response must be an object")
+        _validate_string_content(response, document="policy runner response")
         _exact_fields(
             response,
             frozenset({"protocol_version", "outcomes"}),
@@ -703,7 +704,8 @@ def _load_reusable_outcomes(
     if not isinstance(report, dict):
         raise EvidenceError("merge report must be an object")
     _exact_fields(report, _POLICY_REPORT_FIELDS, document="merge report")
-    if report.get("run_identity") != evaluation_identity:
+    report_identity = _validate_sha256(report.get("run_identity"), "merge report run_identity")
+    if report_identity != evaluation_identity:
         raise EvidenceError("cannot merge unlike policy evaluation identities")
     for field, expected in expected_report_binding.items():
         if not _same_json_value(report.get(field), expected):
@@ -714,7 +716,11 @@ def _load_reusable_outcomes(
     evaluation = report.get("policy_evaluation")
     if not isinstance(evaluation, dict):
         raise EvidenceError("merge report policy_evaluation must be an object")
-    if evaluation.get("evaluation_identity") != evaluation_identity:
+    retained_evaluation_identity = _validate_sha256(
+        evaluation.get("evaluation_identity"),
+        "merge report policy_evaluation.evaluation_identity",
+    )
+    if retained_evaluation_identity != evaluation_identity:
         raise EvidenceError("cannot merge unlike policy evaluation identities")
     required_evaluation_fields = frozenset(
         {
@@ -773,7 +779,10 @@ def _load_reusable_outcomes(
             )
         except EvidenceError as error:
             raise EvidenceError("merge report contains an invalid policy outcome") from error
-        identity = item.get("unit_identity")
+        identity = _validate_sha256(
+            item.get("unit_identity"),
+            f"merge policy outcome[{index}].unit_identity",
+        )
         expected = expected_units.get(identity)
         actual = (
             item.get("provider_id"),

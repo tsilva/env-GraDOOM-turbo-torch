@@ -14,6 +14,7 @@ INCOMPLETE_RUNNER = RUNNER.with_name("fixture_incomplete_policy_runner.py")
 INVALID_TYPE_RUNNER = RUNNER.with_name("fixture_invalid_type_policy_runner.py")
 FLOAT_PROTOCOL_RUNNER = RUNNER.with_name("fixture_float_protocol_policy_runner.py")
 NEAR_LIMIT_MALFORMED_RUNNER = RUNNER.with_name("fixture_near_limit_malformed_policy_runner.py")
+SURROGATE_FAILURE_RUNNER = RUNNER.with_name("fixture_surrogate_failure_policy_runner.py")
 MUTATING_RUNNER = RUNNER.with_name("fixture_mutating_policy_runner.py")
 TRANSIENT_RUNNER = RUNNER.with_name("fixture_transient_restore_runner.py")
 INTERRUPT_RUNNER = RUNNER.with_name("fixture_interrupt_once_runner.py")
@@ -423,6 +424,24 @@ def test_near_capture_limit_malformed_response_has_bounded_failure_evidence(
     assert output.stat().st_size < 2 * 1024 * 1024
 
 
+def test_lone_surrogate_runner_failure_is_retained_as_bounded_failures(
+    tmp_path: Path,
+) -> None:
+    manifest_path, _corpus_path, manifest = _documents(tmp_path)
+    _replace_runner(manifest_path, manifest, SURROGATE_FAILURE_RUNNER)
+    output = tmp_path / "report.json"
+
+    result = _run("--manifest", str(manifest_path), "--output", str(output))
+
+    assert result.returncode == 0, result.stderr
+    report = json.loads(output.read_text(encoding="utf-8"))
+    failures = [item["execution_failure"] for item in report["policy_evaluation"]["outcomes"]]
+    assert len(failures) == 2 * 2 * 256
+    assert {failure["code"] for failure in failures} == {"invalid_runner_response"}
+    assert max(len(failure["message"].encode()) for failure in failures) <= 4096
+    assert "Traceback" not in result.stderr
+
+
 @pytest.mark.parametrize("timeout_seconds", [10**400, 2**63 - 1])
 def test_oversized_manifest_timeout_fails_without_a_traceback(
     tmp_path: Path, timeout_seconds: int
@@ -602,6 +621,29 @@ def test_merge_rejects_tampered_policy_evidence(tmp_path: Path) -> None:
 
     assert result.returncode == 2
     assert "policy_evaluation SHA-256 mismatch" in result.stderr
+
+
+def test_merge_rejects_unhashable_unit_identity_without_a_traceback(tmp_path: Path) -> None:
+    manifest_path, _corpus_path, _manifest = _documents(tmp_path)
+    initial = tmp_path / "initial.json"
+    assert _run("--manifest", str(manifest_path), "--output", str(initial)).returncode == 0
+    report = json.loads(initial.read_text(encoding="utf-8"))
+    report["policy_evaluation"]["outcomes"][0]["unit_identity"] = []
+    _rehash_policy_report(report)
+    _write_json(initial, report)
+
+    result = _run(
+        "--manifest",
+        str(manifest_path),
+        "--output",
+        str(tmp_path / "resumed.json"),
+        "--merge",
+        str(initial),
+    )
+
+    assert result.returncode == 2
+    assert "unit_identity must be a lowercase SHA-256 digest" in result.stderr
+    assert "Traceback" not in result.stderr
 
 
 @pytest.mark.parametrize(
