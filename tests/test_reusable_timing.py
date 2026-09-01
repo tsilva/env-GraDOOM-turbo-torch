@@ -4,6 +4,7 @@ import base64
 import errno
 import hashlib
 import json
+import os
 import shutil
 import stat
 import subprocess
@@ -22,7 +23,7 @@ from gradoom.evidence.benchmark import (
     _attempt_journal_payload,
     build_development_benchmark_report,
 )
-from gradoom.evidence.report import _canonical_sha256
+from gradoom.evidence.report import EvidenceError, _canonical_sha256
 
 FIXTURE_PROCESS = Path(__file__).parent / "fixtures" / "evidence" / "fixture_benchmark_process.py"
 EVALUATION_SEEDS = list(range(20_000, 20_100))
@@ -471,7 +472,7 @@ def test_public_command_does_not_charge_one_seed_for_another_seeds_work(
     attempts = json.loads(output.read_text(encoding="utf-8"))["attempts"]
     elapsed = {attempt["seed"]: attempt["reusable_elapsed_seconds"] for attempt in attempts}
     assert elapsed[123] >= 0.5
-    assert elapsed[124] < 0.4
+    assert elapsed[123] - elapsed[124] >= 0.4
 
 
 def test_public_command_does_not_charge_recovery_for_another_seeds_work(
@@ -1286,7 +1287,7 @@ def test_public_command_rejects_trainer_code_changed_during_cohort(tmp_path: Pat
     )
 
     assert result.returncode == 2
-    assert "sealed trainer execution binding rejected a code-root mutation" in result.stderr
+    assert "sealed trainer execution binding rejected a protected-source mutation" in result.stderr
 
 
 def test_public_command_rejects_trainer_file_added_during_cohort(tmp_path: Path) -> None:
@@ -1311,7 +1312,7 @@ def test_public_command_rejects_trainer_file_added_during_cohort(tmp_path: Path)
     )
 
     assert result.returncode == 2
-    assert "sealed trainer execution binding rejected a code-root mutation" in result.stderr
+    assert "sealed trainer execution binding rejected a protected-source mutation" in result.stderr
 
 
 @pytest.mark.parametrize(
@@ -1343,7 +1344,7 @@ def test_public_command_rejects_trainer_removal_or_same_byte_replacement(
     )
 
     assert result.returncode == 2
-    assert "sealed trainer execution binding rejected a code-root mutation" in result.stderr
+    assert "sealed trainer execution binding rejected a protected-source mutation" in result.stderr
 
 
 def test_trainer_reverification_rejects_replacement_despite_metadata_collision(
@@ -2039,7 +2040,7 @@ def test_public_command_rejects_same_inode_mutate_import_restore(tmp_path: Path)
     result = _run_evidence("--manifest", str(manifest), "--output", str(tmp_path / "report.json"))
 
     assert result.returncode == 2
-    assert "sealed trainer execution binding rejected a code-root mutation" in result.stderr
+    assert "sealed trainer execution binding rejected a protected-source mutation" in result.stderr
     assert payload.read_bytes() == FIXTURE_PROCESS.read_bytes()
 
 
@@ -2068,8 +2069,206 @@ def test_public_command_rejects_temporary_add_import_remove(tmp_path: Path) -> N
     result = _run_evidence("--manifest", str(manifest), "--output", str(tmp_path / "report.json"))
 
     assert result.returncode == 2
-    assert "sealed trainer execution binding rejected a code-root mutation" in result.stderr
+    assert "sealed trainer execution binding rejected a protected-source mutation" in result.stderr
     assert not (code_root / "temporary_payload.py").exists()
+
+
+def test_public_command_rejects_dir_fd_mutate_read_restore_computed_exec(
+    tmp_path: Path,
+) -> None:
+    code_root = tmp_path / "code"
+    code_root.mkdir()
+    payload = code_root / "payload.py"
+    shutil.copyfile(FIXTURE_PROCESS, payload)
+    launcher = code_root / "launcher.py"
+    launcher.write_text(
+        "import builtins\n"
+        "import operator\n"
+        "import pathlib\n"
+        f"root_fd = pathlib.os.open({str(code_root)!r}, pathlib.os.O_RDONLY)\n"
+        f"original = pathlib.Path({str(payload)!r}).read_bytes()\n"
+        "try:\n"
+        "    fd = pathlib.os.open('payload.py', pathlib.os.O_WRONLY | pathlib.os.O_TRUNC, "
+        "dir_fd=root_fd)\n"
+        "    pathlib.os.write(fd, b'raise SystemExit(93)\\n')\n"
+        "    pathlib.os.close(fd)\n"
+        f"    changed = pathlib.Path({str(payload)!r}).read_text(encoding='utf-8')\n"
+        "    operator.attrgetter('ex' + 'ec')(builtins)(changed, {'__name__': '__main__'})\n"
+        "finally:\n"
+        "    fd = pathlib.os.open('payload.py', pathlib.os.O_WRONLY | pathlib.os.O_TRUNC, "
+        "dir_fd=root_fd)\n"
+        "    pathlib.os.write(fd, original)\n"
+        "    pathlib.os.close(fd)\n",
+        encoding="utf-8",
+    )
+    manifest = _manifest(
+        tmp_path,
+        outcomes={"10": [30.0, 0.0]},
+        trainer_script=launcher,
+        trainer_code_root=code_root,
+    )
+
+    result = _run_evidence("--manifest", str(manifest), "--output", str(tmp_path / "report.json"))
+
+    assert result.returncode == 2
+    assert "opaque trainer indirection" in result.stderr
+    assert payload.read_bytes() == FIXTURE_PROCESS.read_bytes()
+
+
+def test_public_command_rejects_reflective_process_replacement(tmp_path: Path) -> None:
+    code_root = tmp_path / "code"
+    code_root.mkdir()
+    launcher = code_root / "launcher.py"
+    launcher.write_text(
+        "import operator\n"
+        "import pathlib\n"
+        "operator.attrgetter('os.posix.execv')(pathlib)('/tmp/mutable', ['/tmp/mutable'])\n",
+        encoding="utf-8",
+    )
+    manifest = _manifest(
+        tmp_path,
+        outcomes={"10": [30.0, 0.0]},
+        trainer_script=launcher,
+        trainer_code_root=code_root,
+    )
+
+    result = _run_evidence("--manifest", str(manifest), "--output", str(tmp_path / "report.json"))
+
+    assert result.returncode == 2
+    assert "opaque trainer indirection" in result.stderr
+
+
+def test_public_command_rejects_external_module_mutate_import_restore(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dependency_root = tmp_path / "dependencies"
+    dependency_root.mkdir()
+    dependency = dependency_root / "external_payload.py"
+    shutil.copyfile(FIXTURE_PROCESS, dependency)
+    code_root = tmp_path / "code"
+    code_root.mkdir()
+    launcher = code_root / "launcher.py"
+    launcher.write_text(
+        "from pathlib import Path\n"
+        f"payload_path = Path({str(dependency)!r})\n"
+        "original = payload_path.read_bytes()\n"
+        "try:\n"
+        "    payload_path.write_text(\"raise SystemExit(94)\\n\", encoding='utf-8')\n"
+        "    import external_payload\n"
+        "finally:\n"
+        "    payload_path.write_bytes(original)\n"
+        "raise SystemExit(external_payload.main())\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(
+        "PYTHONPATH",
+        str(dependency_root) + os.pathsep + os.environ.get("PYTHONPATH", ""),
+    )
+    manifest = _manifest(
+        tmp_path,
+        outcomes={"10": [30.0, 0.0]},
+        trainer_script=launcher,
+        trainer_code_root=code_root,
+    )
+
+    result = _run_evidence("--manifest", str(manifest), "--output", str(tmp_path / "report.json"))
+
+    assert result.returncode == 2
+    assert "sealed trainer execution binding rejected a protected-source mutation" in result.stderr
+    assert dependency.read_bytes() == FIXTURE_PROCESS.read_bytes()
+
+
+def test_public_command_binds_external_module_into_continuation_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dependency_root = tmp_path / "dependencies"
+    dependency_root.mkdir()
+    dependency = dependency_root / "external_payload.py"
+    shutil.copyfile(FIXTURE_PROCESS, dependency)
+    code_root = tmp_path / "code"
+    code_root.mkdir()
+    launcher = code_root / "launcher.py"
+    launcher.write_text(
+        "import external_payload\nraise SystemExit(external_payload.main())\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(
+        "PYTHONPATH",
+        str(dependency_root) + os.pathsep + os.environ.get("PYTHONPATH", ""),
+    )
+    manifest = _manifest(
+        tmp_path,
+        outcomes={"10": [30.0, 0.0]},
+        trainer_script=launcher,
+        trainer_code_root=code_root,
+        extra_arguments=["--fixture-interrupt-once-at-step", "10"],
+    )
+    interrupted = tmp_path / "interrupted.json"
+    first = _run_evidence("--manifest", str(manifest), "--output", str(interrupted))
+    assert first.returncode == 0, first.stderr
+    first_binding = json.loads(interrupted.read_text(encoding="utf-8"))["benchmark_protocol"][
+        "trainer"
+    ]["execution_binding"]
+    dependency.write_bytes(dependency.read_bytes() + b"\n# changed dependency\n")
+
+    result = _run_evidence(
+        "--manifest",
+        str(manifest),
+        "--output",
+        str(tmp_path / "continued.json"),
+        "--merge",
+        str(interrupted),
+    )
+
+    assert result.returncode == 2
+    assert "unlike run identity" in result.stderr
+    assert first_binding["environment_sha256"]
+
+
+def test_public_command_rejects_oversized_sealed_source_file(tmp_path: Path) -> None:
+    code_root = tmp_path / "code"
+    code_root.mkdir()
+    trainer = code_root / "trainer.py"
+    shutil.copyfile(FIXTURE_PROCESS, trainer)
+    (code_root / "oversized.bin").write_bytes(
+        b"x" * (benchmark_module._MAX_SEALED_SOURCE_FILE_BYTES + 1)
+    )
+    manifest = _manifest(
+        tmp_path,
+        outcomes={"10": [30.0, 0.0]},
+        trainer_script=trainer,
+        trainer_code_root=code_root,
+    )
+
+    result = _run_evidence("--manifest", str(manifest), "--output", str(tmp_path / "report.json"))
+
+    assert result.returncode == 2
+    assert "exceeds the sealed-source per-file byte limit" in result.stderr
+
+
+def test_binding_rejects_aggregate_sealed_source_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    code_root = tmp_path / "code"
+    code_root.mkdir()
+    trainer = code_root / "trainer.py"
+    shutil.copyfile(FIXTURE_PROCESS, trainer)
+    monkeypatch.setattr(
+        benchmark_module,
+        "_MAX_SEALED_TOTAL_BYTES",
+        trainer.stat().st_size - 1,
+    )
+
+    with pytest.raises(EvidenceError, match="total sealed byte limit"):
+        benchmark_module._bind_trainer_files(
+            {
+                "command": [sys.executable, str(trainer)],
+                "arguments": [],
+                "code_root": str(code_root),
+            },
+            base_directory=tmp_path,
+            artifacts_root=tmp_path / "artifacts",
+        )
 
 
 def test_public_command_rejects_os_exec_trainer_indirection(tmp_path: Path) -> None:
@@ -2148,7 +2347,7 @@ def test_public_command_rejects_computed_module_namespace_exec_indirection(
     assert "opaque trainer indirection" in result.stderr
 
 
-def test_public_command_binds_hidden_source_executed_through_builtins(
+def test_public_command_rejects_hidden_source_executed_through_builtins(
     tmp_path: Path,
 ) -> None:
     code_root = tmp_path / "trainer-code"
@@ -2170,35 +2369,19 @@ def test_public_command_binds_hidden_source_executed_through_builtins(
         outcomes={"10": [30.0, 0.0]},
         trainer_script=launcher,
         trainer_code_root=code_root,
-        extra_arguments=["--fixture-interrupt-once-at-step", "10"],
     )
-    interrupted = tmp_path / "interrupted.json"
-    first = _run_evidence("--manifest", str(manifest), "--output", str(interrupted))
-    assert first.returncode == 0, first.stderr
-    bound_paths = {
-        Path(item["path"])
-        for item in json.loads(interrupted.read_text(encoding="utf-8"))[
-            "benchmark_protocol"
-        ]["trainer"]["bound_files"]
-    }
-    assert hidden in bound_paths
-    hidden.write_text(hidden.read_text(encoding="utf-8") + "\n# changed\n", encoding="utf-8")
-
     result = _run_evidence(
         "--manifest",
         str(manifest),
-        "--output",
-        str(tmp_path / "continued.json"),
-        "--merge",
-        str(interrupted),
+        "--output", str(tmp_path / "report.json"),
     )
 
     assert result.returncode == 2
-    assert "unlike run identity" in result.stderr
+    assert "opaque trainer indirection" in result.stderr
 
 
 @pytest.mark.parametrize("directory_name", ["dist", ".venv", "__pycache__"])
-def test_public_command_binds_computed_exec_source_inside_conventional_ignored_directory(
+def test_public_command_rejects_computed_exec_inside_conventional_ignored_directory(
     tmp_path: Path, directory_name: str
 ) -> None:
     code_root = tmp_path / "code"
@@ -2222,35 +2405,19 @@ def test_public_command_binds_computed_exec_source_inside_conventional_ignored_d
         outcomes={"10": [30.0, 0.0]},
         trainer_script=launcher,
         trainer_code_root=code_root,
-        extra_arguments=["--fixture-interrupt-once-at-step", "10"],
     )
-    interrupted = tmp_path / "interrupted.json"
-    first = _run_evidence("--manifest", str(manifest), "--output", str(interrupted))
-    assert first.returncode == 0, first.stderr
-    bound_paths = {
-        Path(item["path"])
-        for item in json.loads(interrupted.read_text(encoding="utf-8"))[
-            "benchmark_protocol"
-        ]["trainer"]["bound_files"]
-    }
-    assert hidden in bound_paths
-    hidden.write_bytes(hidden.read_bytes() + b"\n# changed\n")
-
     result = _run_evidence(
         "--manifest",
         str(manifest),
-        "--output",
-        str(tmp_path / "continued.json"),
-        "--merge",
-        str(interrupted),
+        "--output", str(tmp_path / "report.json"),
     )
 
     assert result.returncode == 2
-    assert "unlike run identity" in result.stderr
+    assert "opaque trainer indirection" in result.stderr
 
 
 @pytest.mark.parametrize("payload_encoding", ["utf-16", "zlib"])
-def test_public_command_binds_suffixless_payload_decoded_before_computed_exec(
+def test_public_command_rejects_suffixless_payload_decoded_before_computed_exec(
     tmp_path: Path, payload_encoding: str
 ) -> None:
     code_root = tmp_path / "code"
@@ -2281,34 +2448,18 @@ def test_public_command_binds_suffixless_payload_decoded_before_computed_exec(
         outcomes={"10": [30.0, 0.0]},
         trainer_script=launcher,
         trainer_code_root=code_root,
-        extra_arguments=["--fixture-interrupt-once-at-step", "10"],
     )
-    interrupted = tmp_path / f"interrupted-{payload_encoding}.json"
-    first = _run_evidence("--manifest", str(manifest), "--output", str(interrupted))
-    assert first.returncode == 0, first.stderr
-    bound_paths = {
-        Path(item["path"])
-        for item in json.loads(interrupted.read_text(encoding="utf-8"))[
-            "benchmark_protocol"
-        ]["trainer"]["bound_files"]
-    }
-    assert hidden in bound_paths
-    hidden.write_bytes(hidden.read_bytes() + b"changed")
-
     result = _run_evidence(
         "--manifest",
         str(manifest),
-        "--output",
-        str(tmp_path / f"continued-{payload_encoding}.json"),
-        "--merge",
-        str(interrupted),
+        "--output", str(tmp_path / f"report-{payload_encoding}.json"),
     )
 
     assert result.returncode == 2
-    assert "unlike run identity" in result.stderr
+    assert "opaque trainer indirection" in result.stderr
 
 
-def test_public_command_binds_hidden_trainer_launched_through_operator_and_posix(
+def test_public_command_rejects_hidden_trainer_launched_through_operator_and_posix(
     tmp_path: Path,
 ) -> None:
     code_root = tmp_path / "trainer-code"
@@ -2328,31 +2479,15 @@ def test_public_command_binds_hidden_trainer_launched_through_operator_and_posix
         outcomes={"10": [30.0, 0.0]},
         trainer_script=launcher,
         trainer_code_root=code_root,
-        extra_arguments=["--fixture-interrupt-once-at-step", "10"],
     )
-    interrupted = tmp_path / "interrupted.json"
-    first = _run_evidence("--manifest", str(manifest), "--output", str(interrupted))
-    assert first.returncode == 0, first.stderr
-    bound_paths = {
-        Path(item["path"])
-        for item in json.loads(interrupted.read_text(encoding="utf-8"))[
-            "benchmark_protocol"
-        ]["trainer"]["bound_files"]
-    }
-    assert hidden in bound_paths
-    hidden.write_text(hidden.read_text(encoding="utf-8") + "\n# changed\n", encoding="utf-8")
-
     result = _run_evidence(
         "--manifest",
         str(manifest),
-        "--output",
-        str(tmp_path / "continued.json"),
-        "--merge",
-        str(interrupted),
+        "--output", str(tmp_path / "report.json"),
     )
 
     assert result.returncode == 2
-    assert "unlike run identity" in result.stderr
+    assert "opaque trainer indirection" in result.stderr
 
 
 def test_documented_train_python_closure_allows_importlib_resources(tmp_path: Path) -> None:

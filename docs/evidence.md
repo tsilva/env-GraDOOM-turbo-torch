@@ -60,16 +60,23 @@ contains:
   decode or decompress arbitrary local payloads before computed execution. Manifest and merge-report
   files inside the root are ordinary bound members rather than exclusions. The benchmark artifact
   root must be disjoint from the code root, and the public report must be outside the code root.
-  Before the first trainer subprocess, those exact bytes are streamed into a deterministic
-  kernel-sealed in-memory ZIP whose hash and bootstrap-loader hash are part of the recipe identity.
-  The entry point, local imports, and package resources execute from that inherited read-only
-  archive for every training and evaluation child; mutable code-root paths are removed from the
-  child import search path. A child audit hook rejects writes, additions, removals, replacements,
-  links, and metadata mutations anywhere under the code root, including attempts that would restore
-  the original bytes before final verification. Trainer subprocesses also cannot write Python
-  bytecode into the source boundary. This full-lifetime binding is independent of how code is
-  reached, so computed builtins, reflection, plugin discovery, namespace aliases, and indirect
-  process replacement cannot execute mutable local bytes without binding them.
+  Before the first trainer subprocess, those exact bytes and every Python source reachable from the
+  selected interpreter environment are streamed into a deterministic kernel-sealed in-memory ZIP.
+  Importable native Python extensions are copied into individually sealed memory files. Aggregate
+  environment identity, archive hash, and bootstrap-loader hash are part of the recipe identity, so
+  changing an external package between an interrupted attempt and its continuation is an unlike-run
+  failure. The entry point, local imports, external Python packages, and source introspection read
+  only those inherited sealed bytes for every training and evaluation child; mutable code-root and
+  environment paths are removed from the child import search path. The seal is bounded to 16,384
+  payloads, 16 MiB per source payload, 512 MiB per native extension, and 768 MiB in aggregate, with
+  excess rejected before the payload is read. A child audit hook rejects relative writes and writes,
+  additions, removals, replacements, links, and metadata mutations anywhere under the protected
+  roots, including `dir_fd` attempts and attempts that would restore the original bytes before final
+  verification. It also rejects protected mutable-source reads, process replacement, opaque code
+  construction, and dynamic compilation or execution not attributable to sealed bytes. Trainer
+  subprocesses cannot write Python bytecode into a protected source boundary. This full-lifetime
+  binding is independent of how code is reached, so computed builtins, reflection, plugin discovery,
+  namespace aliases, and indirect process replacement cannot execute mutable Python bytes.
 - `artifacts_directory`: the directory under which the run-identity and per-seed artifacts are
   durably retained. It may neither contain nor be contained by `trainer.code_root`, preventing
   growing benchmark outputs from becoming executable aliases or self-invalidating recipe members.
