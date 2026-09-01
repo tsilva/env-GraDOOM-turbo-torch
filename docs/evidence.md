@@ -60,10 +60,16 @@ contains:
   decode or decompress arbitrary local payloads before computed execution. Manifest and merge-report
   files inside the root are ordinary bound members rather than exclusions. The benchmark artifact
   root must be disjoint from the code root, and the public report must be outside the code root.
-  Trainer subprocesses cannot write Python bytecode into the source boundary.
-  This complete-root binding is independent of how code is reached, so computed builtins,
-  reflection, plugin discovery, namespace aliases, and indirect process replacement cannot execute
-  mutable local bytes without binding them.
+  Before the first trainer subprocess, those exact bytes are streamed into a deterministic
+  kernel-sealed in-memory ZIP whose hash and bootstrap-loader hash are part of the recipe identity.
+  The entry point, local imports, and package resources execute from that inherited read-only
+  archive for every training and evaluation child; mutable code-root paths are removed from the
+  child import search path. A child audit hook rejects writes, additions, removals, replacements,
+  links, and metadata mutations anywhere under the code root, including attempts that would restore
+  the original bytes before final verification. Trainer subprocesses also cannot write Python
+  bytecode into the source boundary. This full-lifetime binding is independent of how code is
+  reached, so computed builtins, reflection, plugin discovery, namespace aliases, and indirect
+  process replacement cannot execute mutable local bytes without binding them.
 - `artifacts_directory`: the directory under which the run-identity and per-seed artifacts are
   durably retained. It may neither contain nor be contained by `trainer.code_root`, preventing
   growing benchmark outputs from becoming executable aliases or self-invalidating recipe members.
