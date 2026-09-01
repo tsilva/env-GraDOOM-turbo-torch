@@ -5,11 +5,13 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 _TRAIN_PATH = Path(__file__).parents[1] / "train.py"
 _TRAIN_SPEC = importlib.util.spec_from_file_location("standalone_train", _TRAIN_PATH)
@@ -49,6 +51,252 @@ def test_checkpoint_evaluation_defaults_to_exact_stochastic_100() -> None:
     assert audit["evaluation"]["kills_signal"] == "player_killcount"
     assert audit["evaluation"]["compatibility_killcount_signal"] == "killcount"
     assert audit["evaluation"]["kills_target_signal"] == "player_killcount"
+
+
+def test_cuda_residency_acceptance_is_opt_in_on_the_real_trainer_contract() -> None:
+    disabled = train._audit_config(_args())
+    enabled = train._audit_config(_args("--cuda-residency-acceptance"))
+
+    assert "cuda_residency_acceptance" not in disabled
+    assert enabled["cuda_residency_acceptance"] == {
+        "contract": "gradoom-cuda-residency-v1",
+        "enabled": True,
+        "steady_state_after_rollouts": 1,
+    }
+
+
+@pytest.mark.parametrize(
+    "fault_site",
+    (
+        "augmentation",
+        "staging",
+        "transition",
+        "reward",
+        "rollout_write",
+        "context_update",
+        "reset_update",
+        "bootstrap",
+        "finalization",
+        "update",
+    ),
+)
+def test_real_trainer_guard_rejects_host_round_trip_across_the_data_plane(
+    monkeypatch: pytest.MonkeyPatch,
+    fault_site: str,
+) -> None:
+    """Exercise the trainer's actual steady-state boundary without allocating CUDA."""
+
+    class FakeEnv:
+        single_action_space = SimpleNamespace(n=train.REFERENCE_RECIPE.action_count)
+        device_info_history_names = train.MODEL_HISTORY_SIGNALS
+        device_signal_names = train.INFO_SIGNALS
+        engine_backend = "fake"
+        iwad_sha256 = "fixture"
+        scenario_sha256 = "fixture"
+        num_envs = 1
+
+        def reset_device(
+            self, _reset_mask: torch.Tensor, _seeds: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            return (
+                torch.zeros((1, 4, 84, 84), dtype=torch.uint8, device="cuda"),
+                torch.zeros((1, len(train.INFO_SIGNALS)), device="cuda"),
+            )
+
+        def device_info_histories(self) -> torch.Tensor:
+            return torch.zeros(
+                (1, len(train.MODEL_HISTORY_SIGNALS), train.FRAME_STACK),
+                device="cuda",
+            )
+
+        def step_and_reset_device(
+            self, actions: torch.Tensor, _seeds: torch.Tensor
+        ) -> SimpleNamespace:
+            if fault_site == "transition":
+                host_round_trip(actions)
+            observations = torch.zeros((1, 4, 84, 84), dtype=torch.uint8, device="cuda")
+            histories = torch.zeros(
+                (1, len(train.MODEL_HISTORY_SIGNALS), train.FRAME_STACK),
+                device="cuda",
+            )
+            return SimpleNamespace(
+                observations=observations,
+                rewards=torch.zeros(1, device="cuda"),
+                terminated=torch.zeros(1, dtype=torch.bool, device="cuda"),
+                truncated=torch.zeros(1, dtype=torch.bool, device="cuda"),
+                final_signals=torch.zeros((1, len(train.INFO_SIGNALS)), device="cuda"),
+                final_observations=observations,
+                final_info_histories=histories,
+                info_histories=histories,
+            )
+
+        def close(self) -> None:
+            pass
+
+    class FakePolicy(torch.nn.Module):
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones((), device="cuda"))
+            self.observation_encoder = torch.nn.Sequential()
+            self.observation_feature_count = 1
+
+        def to(self, *_args: object, **_kwargs: object) -> FakePolicy:
+            return self
+
+    class FakeCalls:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def act(
+            self, observations: torch.Tensor, _context: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            size = observations.shape[0]
+            return (
+                torch.zeros(size, dtype=torch.int64, device="cuda"),
+                torch.zeros(size, device="cuda"),
+                torch.zeros(size, device="cuda"),
+            )
+
+        def value(self, observations: torch.Tensor, _context: torch.Tensor) -> torch.Tensor:
+            return torch.zeros(observations.shape[0], device="cuda")
+
+    class FakePrecision:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def autocast(self):
+            return train._NOOP_CONTEXT
+
+    class FakeReward:
+        def process(
+            self,
+            final_signals: torch.Tensor,
+            _terminated: torch.Tensor,
+            _truncated: torch.Tensor,
+        ) -> torch.Tensor:
+            rewards = final_signals[:, 0]
+            return host_round_trip(rewards) if fault_site == "reward" else rewards
+
+    def host_round_trip(tensor: torch.Tensor) -> torch.Tensor:
+        return tensor.cpu().to("cuda")
+
+    monkeypatch.setattr(train, "_make_env", lambda *_args, **_kwargs: FakeEnv())
+    monkeypatch.setattr(train, "NatureActorCritic", FakePolicy)
+    monkeypatch.setattr(train, "PolicyCalls", FakeCalls)
+    monkeypatch.setattr(train, "Precision", FakePrecision)
+    monkeypatch.setattr(train, "KillcountReward", lambda *_args, **_kwargs: FakeReward())
+    monkeypatch.setattr(train.torch.cuda, "synchronize", lambda *_args: None)
+    monkeypatch.setattr(train.torch.cuda, "reset_peak_memory_stats", lambda *_args: None)
+    monkeypatch.setattr(train, "_max_episode_index", lambda _indices: 0, raising=False)
+
+    original_augment = train._augment_training_observations
+
+    def augment(observations: torch.Tensor, mode: str) -> torch.Tensor:
+        if fault_site == "augmentation":
+            return host_round_trip(observations)
+        return original_augment(observations, mode)
+
+    monkeypatch.setattr(train, "_augment_training_observations", augment)
+    original_stage = train.RolloutBuffer.stage
+
+    def stage(buffer, observations, context, episode_starts):
+        if fault_site == "staging":
+            host_round_trip(observations)
+        return original_stage(buffer, observations, context, episode_starts)
+
+    monkeypatch.setattr(train.RolloutBuffer, "stage", stage)
+    original_add = train.RolloutBuffer.add
+
+    def add(buffer, **kwargs):
+        if fault_site == "rollout_write":
+            host_round_trip(kwargs["actions"])
+        return original_add(buffer, **kwargs)
+
+    monkeypatch.setattr(train.RolloutBuffer, "add", add)
+    original_encode = train.CombatContextEncoder.encode
+    encode_calls = 0
+
+    def encode(encoder, histories):
+        nonlocal encode_calls
+        encode_calls += 1
+        if fault_site == "context_update" and encode_calls > 1:
+            host_round_trip(histories)
+        return original_encode(encoder, histories)
+
+    monkeypatch.setattr(train.CombatContextEncoder, "encode", encode)
+    original_logical_or = train.torch.logical_or
+
+    def logical_or(left, right, *, out=None):
+        if fault_site == "reset_update":
+            host_round_trip(left)
+        return original_logical_or(left, right, out=out)
+
+    monkeypatch.setattr(train.torch, "logical_or", logical_or)
+    original_bootstrap = train._bootstrap_time_limits
+
+    def bootstrap(*bootstrap_args, **bootstrap_kwargs):
+        if fault_site == "bootstrap":
+            host_round_trip(bootstrap_args[0].rewards)
+        if fault_site in {"finalization", "update"}:
+            return None
+        return original_bootstrap(*bootstrap_args, **bootstrap_kwargs)
+
+    monkeypatch.setattr(train, "_bootstrap_time_limits", bootstrap)
+    original_finish = train.RolloutBuffer.finish
+
+    def finish(buffer, **kwargs):
+        if fault_site == "finalization":
+            host_round_trip(buffer.rewards)
+        return original_finish(buffer, **kwargs)
+
+    monkeypatch.setattr(train.RolloutBuffer, "finish", finish)
+    if fault_site == "update":
+        monkeypatch.setattr(train.RolloutBuffer, "completed_episode_rows", lambda _buffer: [])
+
+        def update_fault(*_args, **_kwargs):
+            return host_round_trip(_args[2].rewards)
+
+        monkeypatch.setattr(train, "_ppo_update_device", update_fault)
+    args = _args(
+        "--cuda-residency-acceptance",
+        "--num-envs",
+        "1",
+        "--n-steps",
+        "1",
+        "--timesteps",
+        "1",
+        "--steady-state-after-rollouts",
+        "0",
+        "--batch-size",
+        "1",
+        "--n-epochs",
+        "1",
+        "--reward-shape",
+        "killcount-v1",
+        "--no-compile-policy",
+        "--no-compile-engine",
+        "--no-fused-optimizer",
+    )
+
+    with FakeTensorMode(allow_non_fake_inputs=True):
+        real_cuda_available = train.torch.cuda.is_available
+
+        def pass_initial_cuda_check() -> bool:
+            monkeypatch.setattr(train.torch.cuda, "is_available", real_cuda_available)
+            return True
+
+        monkeypatch.setattr(train.torch.cuda, "is_available", pass_initial_cuda_check)
+        with pytest.raises(
+            RuntimeError,
+            match=rf"steady_state_{'update' if fault_site == 'update' else 'rollout'}.*"
+            r"accelerator-to-host",
+        ):
+            train._train(
+                args,
+                train.JsonEmitter(None),
+                train._audit_config(args),
+                process_started=time.perf_counter(),
+            )
 
 
 def test_training_command_rejects_ten_step_budget_without_overshoot(tmp_path: Path) -> None:
