@@ -3,6 +3,9 @@ from __future__ import annotations
 import ast
 import base64
 import binascii
+import ctypes
+import fcntl
+import hashlib
 import json
 import math
 import os
@@ -13,6 +16,7 @@ import stat
 import statistics
 import subprocess
 import time
+import zipfile
 from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path
@@ -70,6 +74,95 @@ _CONTROLLED_ARGUMENTS = {
 
 _MAX_CODE_ROOT_IDENTITY_MARKERS = 4096
 _OPEN_DESCRIPTOR_RESERVE = 64
+_SEALED_EXECUTION_EXIT = 125
+_SEALED_EXECUTION_CONTRACT = "kernel-sealed-python-zip-v1"
+_MFD_CLOEXEC = 0x0001
+_MFD_ALLOW_SEALING = 0x0002
+_F_ADD_SEALS = 1033
+_F_GET_SEALS = 1034
+_F_SEAL_SEAL = 0x0001
+_F_SEAL_SHRINK = 0x0002
+_F_SEAL_GROW = 0x0004
+_F_SEAL_WRITE = 0x0008
+_SEALED_PYTHON_BOOTSTRAP = r"""
+import os
+import sys
+import zipfile
+
+archive_path, code_root, entry_relative, *trainer_arguments = sys.argv[1:]
+entry_path = os.path.join(code_root, entry_relative)
+violations = []
+
+
+def inside_code_root(value):
+    if not isinstance(value, (str, bytes, os.PathLike)):
+        return False
+    try:
+        candidate = os.path.realpath(os.fsdecode(value))
+        return os.path.commonpath((code_root, candidate)) == code_root
+    except (OSError, ValueError):
+        return False
+
+
+def reject_code_root_mutation(event, arguments):
+    targets = ()
+    if event == "open":
+        path, mode, flags = arguments
+        writing = (isinstance(mode, str) and any(marker in mode for marker in "wax+")) or (
+            isinstance(flags, int)
+            and flags
+            & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND)
+        )
+        if writing:
+            targets = (path,)
+    elif event in {
+        "os.remove",
+        "os.rmdir",
+        "os.mkdir",
+        "os.chmod",
+        "os.chown",
+        "os.truncate",
+        "os.utime",
+        "os.symlink",
+    }:
+        targets = arguments[:1]
+    elif event in {"os.rename", "os.link"}:
+        targets = arguments[:2]
+    if any(inside_code_root(target) for target in targets):
+        violations.append(event)
+        raise PermissionError("sealed trainer execution binding forbids code-root mutation")
+
+
+sys.addaudithook(reject_code_root_mutation)
+search_roots = []
+entry_parent = os.path.dirname(entry_relative)
+for relative in (entry_parent, "", "src"):
+    candidate = archive_path if not relative else archive_path + "/" + relative
+    if candidate not in search_roots:
+        search_roots.append(candidate)
+sys.path[:] = search_roots + [
+    item
+    for item in sys.path
+    if item and not inside_code_root(item)
+]
+sys.argv[:] = [entry_path, *trainer_arguments]
+namespace = {
+    "__name__": "__main__",
+    "__file__": entry_path,
+    "__package__": None,
+    "__cached__": None,
+    "__spec__": None,
+}
+try:
+    with zipfile.ZipFile(archive_path) as archive:
+        entry_source = archive.read(entry_relative)
+    exec(compile(entry_source, entry_path, "exec"), namespace, namespace)
+finally:
+    if violations:
+        sys.stderr.write("sealed trainer execution binding rejected a code-root mutation\n")
+        sys.stderr.flush()
+        os._exit(125)
+"""
 
 _RESTORABLE_STATE = {
     "policy": True,
@@ -466,11 +559,31 @@ def _inventory_code_root_paths(code_root: Path) -> list[Path]:
 class _TrainerFileIdentityMarkers:
     def __init__(self) -> None:
         self.streams: dict[str, BinaryIO] = {}
+        self.archive_descriptor: int | None = None
+        self.archive_writer_stream: BinaryIO | None = None
+        self.archive_writer: zipfile.ZipFile | None = None
+        self.sealed_archive: BinaryIO | None = None
+        self.sealed_archive_sha256: str | None = None
+        self.code_root: Path | None = None
+        self.entry_relative: Path | None = None
+        self.executable_argv0: str | None = None
 
     def close(self) -> None:
         streams, self.streams = self.streams, {}
         for stream in streams.values():
             stream.close()
+        writer, self.archive_writer = self.archive_writer, None
+        if writer is not None:
+            writer.close()
+        writer_stream, self.archive_writer_stream = self.archive_writer_stream, None
+        if writer_stream is not None:
+            writer_stream.close()
+        descriptor, self.archive_descriptor = self.archive_descriptor, None
+        if descriptor is not None:
+            os.close(descriptor)
+        archive, self.sealed_archive = self.sealed_archive, None
+        if archive is not None:
+            archive.close()
 
     def __del__(self) -> None:
         with suppress(OSError):
@@ -573,7 +686,80 @@ def _snapshot_regular_code_file(
     else:
         assert stream is not None
         identity_markers.streams[relative_path] = stream
+        _append_trainer_execution_payload(identity_markers, relative_path, payload)
     return snapshot
+
+
+def _new_sealable_memory_file() -> int:
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        memfd_create = libc.memfd_create
+        memfd_create.argtypes = (ctypes.c_char_p, ctypes.c_uint)
+        memfd_create.restype = ctypes.c_int
+        descriptor = memfd_create(b"gradoom-sealed-trainer", _MFD_ALLOW_SEALING | _MFD_CLOEXEC)
+    except (AttributeError, OSError) as error:
+        raise EvidenceError(
+            "benchmark trainer requires kernel-sealed in-memory execution binding support"
+        ) from error
+    if descriptor < 0:
+        error_number = ctypes.get_errno()
+        raise EvidenceError(
+            "benchmark trainer requires kernel-sealed in-memory execution binding support"
+        ) from OSError(error_number, os.strerror(error_number))
+    return descriptor
+
+
+def _append_trainer_execution_payload(
+    identity_markers: _TrainerFileIdentityMarkers,
+    relative_path: str,
+    payload: bytes,
+) -> None:
+    if identity_markers.archive_descriptor is None:
+        descriptor = _new_sealable_memory_file()
+        try:
+            writer_stream = os.fdopen(os.dup(descriptor), "w+b")
+            writer = zipfile.ZipFile(writer_stream, mode="w", compression=zipfile.ZIP_STORED)
+        except BaseException:
+            os.close(descriptor)
+            raise
+        identity_markers.archive_descriptor = descriptor
+        identity_markers.archive_writer_stream = writer_stream
+        identity_markers.archive_writer = writer
+    writer = identity_markers.archive_writer
+    assert writer is not None
+    info = zipfile.ZipInfo(relative_path, date_time=(1980, 1, 1, 0, 0, 0))
+    info.compress_type = zipfile.ZIP_STORED
+    info.external_attr = 0o100444 << 16
+    writer.writestr(info, payload)
+
+
+def _seal_trainer_execution_archive(identity_markers: _TrainerFileIdentityMarkers) -> None:
+    descriptor = identity_markers.archive_descriptor
+    writer = identity_markers.archive_writer
+    archive_stream = identity_markers.archive_writer_stream
+    if descriptor is None or writer is None or archive_stream is None:
+        raise EvidenceError("benchmark trainer execution archive has no source payloads")
+    try:
+        writer.close()
+        identity_markers.archive_writer = None
+        archive_stream.flush()
+        os.fsync(archive_stream.fileno())
+        archive_stream.close()
+        identity_markers.archive_writer_stream = None
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        digest = hashlib.sha256()
+        with os.fdopen(os.dup(descriptor), "rb") as archive_reader:
+            while chunk := archive_reader.read(1024 * 1024):
+                digest.update(chunk)
+        seals = _F_SEAL_SHRINK | _F_SEAL_GROW | _F_SEAL_WRITE | _F_SEAL_SEAL
+        fcntl.fcntl(descriptor, _F_ADD_SEALS, seals)
+        if fcntl.fcntl(descriptor, _F_GET_SEALS) & seals != seals:
+            raise EvidenceError("benchmark trainer execution archive could not be kernel-sealed")
+        identity_markers.sealed_archive = os.fdopen(descriptor, "rb")
+        identity_markers.archive_descriptor = None
+        identity_markers.sealed_archive_sha256 = digest.hexdigest()
+    except (OSError, ValueError, zipfile.BadZipFile) as error:
+        raise EvidenceError("benchmark trainer execution archive could not be sealed") from error
 
 
 def _bound_code_root_files(
@@ -606,6 +792,8 @@ def _bound_code_root_files(
             raise EvidenceError(
                 "benchmark trainer code-root membership changed while being inventoried"
             )
+        if identity_markers is not None:
+            _seal_trainer_execution_archive(identity_markers)
         return bound
     except BaseException:
         if identity_markers is not None:
@@ -760,9 +948,17 @@ def _bind_trainer_files(
     command = trainer["command"]
     raw_executable = Path(command[0])
     if raw_executable.is_absolute() or raw_executable.parent != Path("."):
+        executable_argv0 = (
+            raw_executable if raw_executable.is_absolute() else base_directory / raw_executable
+        ).absolute()
         executable_path = _resolve_evidence_path(raw_executable, base_directory=base_directory)
     else:
         executable = shutil.which(command[0])
+        executable_argv0 = (
+            (base_directory / raw_executable).absolute()
+            if executable is None
+            else Path(executable).absolute()
+        )
         executable_path = (
             _resolve_evidence_path(raw_executable, base_directory=base_directory)
             if executable is None
@@ -813,6 +1009,9 @@ def _bind_trainer_files(
         ):
             raise EvidenceError("benchmark artifacts must be outside trainer code_root")
         identity_markers = _TrainerFileIdentityMarkers()
+        identity_markers.code_root = code_root
+        identity_markers.entry_relative = script_path.relative_to(code_root)
+        identity_markers.executable_argv0 = str(executable_argv0)
         bound_files.extend(
             _bound_code_root_files(
                 script_path,
@@ -820,6 +1019,12 @@ def _bind_trainer_files(
                 identity_markers=identity_markers,
             )
         )
+        assert identity_markers.sealed_archive_sha256 is not None
+        execution_binding = {
+            "contract": _SEALED_EXECUTION_CONTRACT,
+            "archive_sha256": identity_markers.sealed_archive_sha256,
+            "bootstrap_sha256": _sha256_bytes(_SEALED_PYTHON_BOOTSTRAP.encode()),
+        }
         resolved_root: str | None = str(code_root)
     else:
         resolved_root = None
@@ -831,6 +1036,7 @@ def _bind_trainer_files(
         "command": bound_command,
         "code_root": resolved_root,
         "bound_files": bound_files,
+        "execution_binding": execution_binding,
         "_identity_markers": identity_markers,
     }
 
@@ -2089,13 +2295,38 @@ def _run_process(
     command: list[str],
     *,
     cwd: Path,
+    execution_binding: _TrainerFileIdentityMarkers,
     heartbeat: Callable[[], None] | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    archive = execution_binding.sealed_archive
+    if archive is None or archive.closed:
+        raise EvidenceError("sealed trainer execution binding is unavailable")
+    if len(command) < 2:
+        raise EvidenceError("sealed trainer execution binding has no Python entry point")
+    code_root = execution_binding.code_root
+    entry_relative = execution_binding.entry_relative
+    executable_argv0 = execution_binding.executable_argv0
+    if code_root is None or entry_relative is None or executable_argv0 is None:
+        raise EvidenceError("sealed trainer execution binding has incomplete source metadata")
+    archive_descriptor = archive.fileno()
+    launched_command = [
+        executable_argv0,
+        "-P",
+        "-s",
+        "-c",
+        _SEALED_PYTHON_BOOTSTRAP,
+        f"/proc/self/fd/{archive_descriptor}",
+        str(code_root),
+        str(entry_relative),
+        *command[2:],
+    ]
     try:
         process = subprocess.Popen(
-            command,
+            launched_command,
+            executable=command[0],
             cwd=cwd,
             env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+            pass_fds=(archive_descriptor,),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -2141,6 +2372,8 @@ def _run_process(
         signal.signal(forwarded_signal, signal.SIG_DFL)
         os.kill(os.getpid(), forwarded_signal)
         raise AssertionError("termination signal did not terminate evidence parent")
+    if completed.returncode == _SEALED_EXECUTION_EXIT:
+        raise EvidenceError("sealed trainer execution binding rejected a code-root mutation")
     return completed
 
 
@@ -2397,6 +2630,7 @@ def _execute_evaluation(
     evaluation_metrics: Path,
     manifest_directory: Path,
     wad_profile: dict[str, Any] | None,
+    execution_binding: _TrainerFileIdentityMarkers,
     heartbeat: Callable[[], None] | None,
 ) -> tuple[str, dict[str, Any] | None, dict[str, Any] | None, str | None]:
     evaluation_command = [
@@ -2416,6 +2650,7 @@ def _execute_evaluation(
     evaluation_process = _run_process(
         evaluation_command,
         cwd=manifest_directory,
+        execution_binding=execution_binding,
         heartbeat=heartbeat,
     )
     if evaluation_process.returncode == 130:
@@ -2634,6 +2869,7 @@ def _run_attempt(
     manifest_directory: Path,
     evidence_entries: list[dict[str, str]],
     wad_profile: dict[str, Any] | None,
+    execution_binding: _TrainerFileIdentityMarkers,
     elapsed_time_anchor: dict[str, Any] | None,
     existing_attempt: dict[str, Any] | None = None,
     prior_generated_artifacts: list[dict[str, str]] | None = None,
@@ -2874,6 +3110,7 @@ def _run_attempt(
             evaluation_metrics=evaluation_metrics,
             manifest_directory=manifest_directory,
             wad_profile=wad_profile,
+            execution_binding=execution_binding,
             heartbeat=heartbeat,
         )
         evaluation_live_sha256 = _fsync_file(
@@ -3003,6 +3240,7 @@ def _run_attempt(
         training_process = _run_process(
             training_command,
             cwd=manifest_directory,
+            execution_binding=execution_binding,
             heartbeat=persist_live_attempt,
         )
         live_journal_sha256 = _fsync_file(
@@ -3142,6 +3380,7 @@ def _run_attempt(
             evaluation_metrics=evaluation_metrics,
             manifest_directory=manifest_directory,
             wad_profile=wad_profile,
+            execution_binding=execution_binding,
             heartbeat=heartbeat,
         )
         evaluation_live_sha256 = _fsync_file(
@@ -3633,6 +3872,7 @@ def _build_development_benchmark_report(
             manifest_directory=manifest_path.parent,
             evidence_entries=evidence_entries,
             wad_profile=wad_profile,
+            execution_binding=validated["trainer"]["_identity_markers"],
             elapsed_time_anchor=anchors_by_seed.get(seed),
             existing_attempt=existing_attempt,
             prior_generated_artifacts=actual_generated_artifacts,

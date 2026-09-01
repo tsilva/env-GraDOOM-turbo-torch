@@ -1286,7 +1286,7 @@ def test_public_command_rejects_trainer_code_changed_during_cohort(tmp_path: Pat
     )
 
     assert result.returncode == 2
-    assert "bound trainer file changed during the cohort" in result.stderr
+    assert "sealed trainer execution binding rejected a code-root mutation" in result.stderr
 
 
 def test_public_command_rejects_trainer_file_added_during_cohort(tmp_path: Path) -> None:
@@ -1311,24 +1311,15 @@ def test_public_command_rejects_trainer_file_added_during_cohort(tmp_path: Path)
     )
 
     assert result.returncode == 2
-    assert "code-root membership changed during the cohort" in result.stderr
+    assert "sealed trainer execution binding rejected a code-root mutation" in result.stderr
 
 
 @pytest.mark.parametrize(
-    ("mutation_option", "error"),
-    [
-        (
-            "--fixture-remove-trainer-code",
-            "code-root membership changed during the cohort",
-        ),
-        (
-            "--fixture-replace-trainer-code",
-            "bound trainer file identity changed during the cohort",
-        ),
-    ],
+    "mutation_option",
+    ["--fixture-remove-trainer-code", "--fixture-replace-trainer-code"],
 )
 def test_public_command_rejects_trainer_removal_or_same_byte_replacement(
-    tmp_path: Path, mutation_option: str, error: str
+    tmp_path: Path, mutation_option: str
 ) -> None:
     code_root = tmp_path / "trainer-code"
     code_root.mkdir()
@@ -1352,7 +1343,7 @@ def test_public_command_rejects_trainer_removal_or_same_byte_replacement(
     )
 
     assert result.returncode == 2
-    assert error in result.stderr
+    assert "sealed trainer execution binding rejected a code-root mutation" in result.stderr
 
 
 def test_trainer_reverification_rejects_replacement_despite_metadata_collision(
@@ -2020,6 +2011,67 @@ def test_public_command_binds_relative_from_import_submodule(tmp_path: Path) -> 
     assert "unlike run identity" in result.stderr
 
 
+def test_public_command_rejects_same_inode_mutate_import_restore(tmp_path: Path) -> None:
+    code_root = tmp_path / "code"
+    code_root.mkdir()
+    payload = code_root / "payload.py"
+    shutil.copyfile(FIXTURE_PROCESS, payload)
+    launcher = code_root / "launcher.py"
+    launcher.write_text(
+        "from pathlib import Path\n"
+        "payload_path = Path(__file__).with_name('payload.py')\n"
+        "original = payload_path.read_bytes()\n"
+        "try:\n"
+        "    payload_path.write_text(\"raise SystemExit(91)\\n\", encoding='utf-8')\n"
+        "    import payload\n"
+        "finally:\n"
+        "    payload_path.write_bytes(original)\n"
+        "raise SystemExit(payload.main())\n",
+        encoding="utf-8",
+    )
+    manifest = _manifest(
+        tmp_path,
+        outcomes={"10": [30.0, 0.0]},
+        trainer_script=launcher,
+        trainer_code_root=code_root,
+    )
+
+    result = _run_evidence("--manifest", str(manifest), "--output", str(tmp_path / "report.json"))
+
+    assert result.returncode == 2
+    assert "sealed trainer execution binding rejected a code-root mutation" in result.stderr
+    assert payload.read_bytes() == FIXTURE_PROCESS.read_bytes()
+
+
+def test_public_command_rejects_temporary_add_import_remove(tmp_path: Path) -> None:
+    code_root = tmp_path / "code"
+    code_root.mkdir()
+    launcher = code_root / "launcher.py"
+    launcher.write_text(
+        "from pathlib import Path\n"
+        "temporary = Path(__file__).with_name('temporary_payload.py')\n"
+        "try:\n"
+        "    temporary.write_text(\"raise SystemExit(92)\\n\", encoding='utf-8')\n"
+        "    import temporary_payload\n"
+        "finally:\n"
+        "    temporary.unlink(missing_ok=True)\n"
+        "raise SystemExit(temporary_payload.main())\n",
+        encoding="utf-8",
+    )
+    manifest = _manifest(
+        tmp_path,
+        outcomes={"10": [30.0, 0.0]},
+        trainer_script=launcher,
+        trainer_code_root=code_root,
+    )
+
+    result = _run_evidence("--manifest", str(manifest), "--output", str(tmp_path / "report.json"))
+
+    assert result.returncode == 2
+    assert "sealed trainer execution binding rejected a code-root mutation" in result.stderr
+    assert not (code_root / "temporary_payload.py").exists()
+
+
 def test_public_command_rejects_os_exec_trainer_indirection(tmp_path: Path) -> None:
     code_root = tmp_path / "trainer-code"
     code_root.mkdir()
@@ -2315,3 +2367,32 @@ def test_documented_train_python_closure_allows_importlib_resources(tmp_path: Pa
     )
 
     assert staged_repository / "src/gradoom/scenario.py" in closure
+
+
+def test_sealed_execution_binding_preserves_documented_trainer_imports(tmp_path: Path) -> None:
+    repository = Path(__file__).resolve().parents[1]
+    staged_repository = tmp_path / "staged-repository"
+    staged_repository.mkdir()
+    shutil.copyfile(repository / "train.py", staged_repository / "train.py")
+    shutil.copytree(repository / "src", staged_repository / "src")
+    bound = benchmark_module._bind_trainer_files(
+        {
+            "command": [sys.executable, str(staged_repository / "train.py")],
+            "arguments": [],
+            "code_root": str(staged_repository),
+        },
+        base_directory=staged_repository,
+        artifacts_root=tmp_path / "artifacts",
+    )
+
+    try:
+        result = benchmark_module._run_process(
+            [*bound["command"], "--help"],
+            cwd=tmp_path,
+            execution_binding=bound["_identity_markers"],
+        )
+    finally:
+        bound["_identity_markers"].close()
+
+    assert result.returncode == 0, result.stderr
+    assert "--config-only" in result.stdout
