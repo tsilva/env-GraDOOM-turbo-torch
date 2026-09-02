@@ -31,6 +31,7 @@ if not artifact.read_bytes().startswith(b"frozen "):
 json.dump(
     {
         "protocol_version": 2,
+        "execution_binding": request["execution_binding"],
         "outcomes": [
             {
                 "seed": seed,

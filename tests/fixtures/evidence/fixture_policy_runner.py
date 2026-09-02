@@ -22,4 +22,11 @@ for seed in request["seeds"]:
             ),
         }
     )
-json.dump({"protocol_version": 2, "outcomes": outcomes}, sys.stdout)
+json.dump(
+    {
+        "protocol_version": 2,
+        "execution_binding": request["execution_binding"],
+        "outcomes": outcomes,
+    },
+    sys.stdout,
+)

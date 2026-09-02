@@ -34,7 +34,9 @@ incompatible. It writes the report only after all validation succeeds.
 
 A `parity_certification` manifest uses formal evidence and declares a `policy_evaluation` object.
 That object names three hash-verified `declared_inputs`: a corpus manifest, an episode-seed
-manifest, and one common policy-runner executable. It also binds protocol version `2`, a
+manifest, and one common policy-runner executable. Fixture runs may declare a test runner;
+non-fixture runs accept only the repository-owned authenticated runner entry point, so an
+arbitrary declared executable cannot manufacture claim-bearing provider outcomes. It also binds protocol version `2`, a
 non-negative 64-bit `bootstrap_seed`, and exactly one revision for each provider, `gradoom` and
 `env-vizdoom-turbo`. An optional positive
 `timeout_seconds` applies independently to each provider-policy batch. Provider-specific runner
@@ -60,6 +62,11 @@ and restoring an original path during execution therefore cannot change the byte
 an attempted write to an execution descriptor fails. Original paths are still checked between
 batches so a persistent post-seal mutation fails before more progress is committed.
 
+Every runner request carries an execution binding for the evaluation identity, fixture state,
+runner authority, provider revision, policy execution identity, complete WAD profile, and invariant
+suite. The response must return that exact binding; a missing or changed binding becomes failed
+runner evidence rather than an accepted outcome.
+
 The seed manifest contains a versioned seed-set ID and exactly 256 unique, ordered, non-negative
 64-bit episode seeds. The evidence command passes that same complete ordered array to the same
 hash-pinned runner for every provider-policy pair. Runner success, process failure, timeout,
@@ -80,7 +87,9 @@ evidence rather than unbounded host-memory growth.
 
 The report's `policy_evaluation` object binds the corpus and seed manifest hashes, normalized corpus,
 provider revisions, exact seed list, expected outcome count, complete outcomes, and failure count.
-The evaluation and every policy artifact are separately hashed in the evidence index. The stable
+The evaluation and every policy artifact are separately hashed in the evidence index. System names,
+including `policy_evaluation`, `parity_verdict`, and `parity_certificate`, are reserved, and every
+evidence-index name must be unique on initial construction and resume. The stable
 run identity also binds code provenance, evidence level, fixture state, every declared input hash,
 runner protocol and timeout, provider revisions, and corpus and seed identities.
 
@@ -119,7 +128,9 @@ than inheriting an old certificate.
 
 After each complete provider-policy batch, the command atomically replaces the requested output
 with an `evaluation_in_progress` report, fsyncs both file and containing directory, and only then
-starts the next batch. The last batch durably writes `evaluation_complete`. After interruption,
+starts the next batch. Even the last batch remains non-claim-bearing until declared inputs, policy
+artifacts, WAD bindings, and repository cleanliness have been checked again. Only then does the
+command build and durably write `evaluation_complete`. After interruption,
 pass that progress report through `--merge` and use a distinct output path. Resume accepts only the
 exact leading prefix of the fixed provider-policy-seed order, revalidates every outcome, and never
 reruns a retained success or failure. Gaps, reordering, mismatched identities, corrupt hashes, or a
