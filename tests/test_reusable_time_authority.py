@@ -47,6 +47,17 @@ def _artifact_request(tmp_path: Path) -> tuple[Path, dict[str, object]]:
     }
 
 
+def _start_timing_segment(state: Path, anchor: dict[str, object]) -> None:
+    payload = anchor["payload"]
+    assert isinstance(payload, dict)
+    started = _authority(
+        state,
+        "start-timing-segment",
+        {"seed": payload["seed"], "started_unix_ns": payload["started_unix_ns"]},
+    )
+    assert started.returncode == 0, started.stderr
+
+
 def test_repository_authority_requires_chronological_unchanged_reuse(tmp_path: Path) -> None:
     state = tmp_path / "authority"
     initialized = _authority(state, "init")
@@ -136,6 +147,7 @@ def test_repository_authority_rejects_replayed_journal_head(tmp_path: Path) -> N
         "prior_reusable_elapsed_seconds": 0.0,
         "minimum_reusable_elapsed_seconds": 1.0,
     }
+    _start_timing_segment(state, anchor)
     first = _authority(state, "sign-journal-head", first_head)
     assert first.returncode == 0, first.stderr
     first_attestation = json.loads(first.stdout)
@@ -147,6 +159,7 @@ def test_repository_authority_rejects_replayed_journal_head(tmp_path: Path) -> N
         "status": "succeeded",
         "prior_reusable_elapsed_seconds": first_attestation["payload"]["reusable_elapsed_seconds"],
     }
+    _start_timing_segment(state, anchor)
     second = _authority(state, "sign-journal-head", second_head)
     assert second.returncode == 0, second.stderr
 
@@ -159,20 +172,18 @@ def test_repository_authority_rejects_replayed_journal_head(tmp_path: Path) -> N
     assert "different generation" in recovery.stderr
 
 
-def test_repository_authority_seals_seed_local_elapsed_not_precommand_anchor_age(
+def test_repository_authority_owns_seed_local_elapsed_without_charging_anchor_age(
     tmp_path: Path,
 ) -> None:
     state = tmp_path / "authority"
-    assert _authority(state, "init").returncode == 0
-    anchor_result = _authority(state, "start-attempt", {"seed": 124})
-    assert anchor_result.returncode == 0, anchor_result.stderr
-    anchor = json.loads(anchor_result.stdout)
+    authority = ReusableTimeAuthority.initialize(state)
+    anchor = authority.start_attempt(124)
     # This gap represents another seed's work after all pre-command anchors were issued.
     time.sleep(0.3)
+    authority.start_timing_segment(124, anchor["payload"]["started_unix_ns"])
+    time.sleep(0.05)
 
-    sealed = _authority(
-        state,
-        "sign-journal-head",
+    sealed = authority.sign_journal_head(
         {
             "schema_version": 1,
             "authority": anchor["payload"]["authority"],
@@ -184,11 +195,11 @@ def test_repository_authority_seals_seed_local_elapsed_not_precommand_anchor_age
             "status": "succeeded",
             "prior_reusable_elapsed_seconds": 0.0,
             "minimum_reusable_elapsed_seconds": 0.01,
-        },
+        }
     )
 
-    assert sealed.returncode == 0, sealed.stderr
-    assert json.loads(sealed.stdout)["payload"]["reusable_elapsed_seconds"] == 0.01
+    elapsed = sealed["payload"]["reusable_elapsed_seconds"]
+    assert 0.04 <= elapsed < 0.2
 
 
 def test_repository_authority_rejects_coherent_state_directory_rollback(
@@ -212,6 +223,7 @@ def test_repository_authority_rejects_coherent_state_directory_rollback(
         "prior_reusable_elapsed_seconds": 0.0,
         "minimum_reusable_elapsed_seconds": 1.0,
     }
+    _start_timing_segment(state, anchor)
     first = _authority(state, "sign-journal-head", first_request)
     assert first.returncode == 0, first.stderr
     first_attestation = json.loads(first.stdout)
@@ -225,6 +237,7 @@ def test_repository_authority_rejects_coherent_state_directory_rollback(
         "prior_reusable_elapsed_seconds": first_attestation["payload"]["reusable_elapsed_seconds"],
         "minimum_reusable_elapsed_seconds": 10.0,
     }
+    _start_timing_segment(state, anchor)
     second = _authority(state, "sign-journal-head", second_request)
     assert second.returncode == 0, second.stderr
     shutil.rmtree(state)
@@ -256,9 +269,11 @@ def test_repository_authority_recovers_durable_report_after_same_head_reseal(
         "prior_reusable_elapsed_seconds": 0.0,
         "minimum_reusable_elapsed_seconds": 1.0,
     }
+    _start_timing_segment(state, anchor)
     first = _authority(state, "sign-journal-head", request)
     assert first.returncode == 0, first.stderr
     durable_report_attestation = json.loads(first.stdout)
+    _start_timing_segment(state, anchor)
     resealed = _authority(
         state,
         "sign-journal-head",

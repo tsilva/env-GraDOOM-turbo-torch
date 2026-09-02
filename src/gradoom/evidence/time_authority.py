@@ -460,6 +460,80 @@ class ReusableTimeAuthority:
             raise TimeAuthorityError("attempt anchor is not registered in the persistent ledger")
         return matches[0]
 
+    def start_timing_segment(self, seed: int, started_unix_ns: int) -> dict[str, Any]:
+        """Open one authority-clocked, seed-local interval for a registered attempt."""
+        if type(seed) is not int or type(started_unix_ns) is not int:
+            raise TimeAuthorityError("attempt timing identity is invalid")
+        self._start_event(seed, started_unix_ns)
+        prior_segments = [
+            item["payload"]
+            for item in self.ledger
+            if item["payload"].get("event_type") == "timing_segment_started"
+            and item["payload"].get("seed") == seed
+            and item["payload"].get("started_unix_ns") == started_unix_ns
+        ]
+        consumed = {
+            item["payload"].get("timing_segment_event_id")
+            for item in self.ledger
+            if item["payload"].get("event_type") == "journal_sealed"
+            and item["payload"].get("seed") == seed
+            and item["payload"].get("started_unix_ns") == started_unix_ns
+        }
+        active = [item for item in prior_segments if item["event_id"] not in consumed]
+        if active:
+            if len(active) != 1:
+                raise TimeAuthorityError("attempt has ambiguous active timing segments")
+            return active[0]
+        try:
+            boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+        except OSError:
+            boot_id = None
+        return self._append(
+            "timing_segment_started",
+            {
+                "seed": seed,
+                "started_unix_ns": started_unix_ns,
+                "segment_started_unix_ns": time.time_ns(),
+                "segment_started_monotonic_ns": time.monotonic_ns(),
+                "boot_id": boot_id,
+            },
+        )
+
+    def _active_timing_segment(self, seed: int, started_unix_ns: int) -> dict[str, Any]:
+        segments = [
+            item["payload"]
+            for item in self.ledger
+            if item["payload"].get("event_type") == "timing_segment_started"
+            and item["payload"].get("seed") == seed
+            and item["payload"].get("started_unix_ns") == started_unix_ns
+        ]
+        consumed = {
+            item["payload"].get("timing_segment_event_id")
+            for item in self.ledger
+            if item["payload"].get("event_type") == "journal_sealed"
+            and item["payload"].get("seed") == seed
+            and item["payload"].get("started_unix_ns") == started_unix_ns
+        }
+        active = [item for item in segments if item["event_id"] not in consumed]
+        if len(active) != 1:
+            raise TimeAuthorityError("journal seal requires one active authority timing segment")
+        return active[0]
+
+    @staticmethod
+    def _segment_elapsed_seconds(segment: dict[str, Any]) -> float:
+        wall_elapsed = max(0, time.time_ns() - segment["segment_started_unix_ns"])
+        monotonic_elapsed = 0
+        try:
+            boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+        except OSError:
+            boot_id = None
+        if boot_id == segment.get("boot_id"):
+            monotonic_elapsed = max(
+                0,
+                time.monotonic_ns() - segment["segment_started_monotonic_ns"],
+            )
+        return max(wall_elapsed, monotonic_elapsed) / 1_000_000_000
+
     def sign_journal_head(self, request: dict[str, Any]) -> dict[str, Any]:
         required = {
             "schema_version",
@@ -507,9 +581,14 @@ class ReusableTimeAuthority:
                 raise TimeAuthorityError("journal elapsed time attempts to move backwards")
         elif request["generation"] != 0 or request["previous_journal_sha256"] is not None:
             raise TimeAuthorityError("initial journal generation is invalid")
+        segment = self._active_timing_segment(request["seed"], request["started_unix_ns"])
+        authority_elapsed = float(request["prior_reusable_elapsed_seconds"]) + (
+            self._segment_elapsed_seconds(segment)
+        )
         elapsed = max(
             float(request["prior_reusable_elapsed_seconds"]),
             float(request["minimum_reusable_elapsed_seconds"]),
+            authority_elapsed,
         )
         attestation_payload = {
             key: request[key]
@@ -529,6 +608,7 @@ class ReusableTimeAuthority:
             "journal_sealed",
             {
                 "attestation_payload": attestation_payload,
+                "timing_segment_event_id": segment["event_id"],
                 **{"seed": request["seed"], "started_unix_ns": request["started_unix_ns"]},
             },
         )
@@ -831,6 +911,7 @@ def _parser() -> argparse.ArgumentParser:
             "init",
             "identity",
             "start-attempt",
+            "start-timing-segment",
             "sign-journal-head",
             "verify-latest-journal-head",
             "recover-latest-journal-head",
@@ -867,6 +948,11 @@ def main(argv: list[str] | None = None) -> int:
                 result = authority.identity
             elif args.operation == "start-attempt":
                 result = authority.start_attempt(_stdin_object().get("seed"))
+            elif args.operation == "start-timing-segment":
+                request = _stdin_object()
+                result = authority.start_timing_segment(
+                    request.get("seed"), request.get("started_unix_ns")
+                )
             elif args.operation == "sign-journal-head":
                 result = authority.sign_journal_head(_stdin_object())
             elif args.operation == "verify-latest-journal-head":
