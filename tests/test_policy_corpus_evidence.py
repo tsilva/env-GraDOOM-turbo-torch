@@ -251,6 +251,7 @@ def test_complete_real_context_issues_a_fully_bound_certificate(
         "_validate_real_runner_authority",
         lambda *args, **kwargs: {"kind": "repository_owned", "runner_sha256": "3" * 64},
     )
+    monkeypatch.setattr(policy_corpus, "_real_runner_context", lambda *args, **kwargs: {})
     monkeypatch.setattr(policy_corpus, "_validate_repository_clean", lambda *args: None)
 
     report = policy_corpus.build_policy_evaluation_report(manifest_path)
@@ -1360,6 +1361,7 @@ def test_final_validation_failure_never_publishes_claim_bearing_progress(
         "_validate_real_runner_authority",
         lambda *args, **kwargs: {"kind": "repository_owned", "runner_sha256": "3" * 64},
     )
+    monkeypatch.setattr(policy_corpus, "_real_runner_context", lambda *args, **kwargs: {})
     if late_change == "repository":
         monkeypatch.setattr(
             policy_corpus,

@@ -325,6 +325,57 @@ def _validate_real_runner_authority(
     }
 
 
+def _real_runner_context(
+    manifest: dict[str, Any],
+    *,
+    manifest_directory: Path,
+    verified: dict[str, tuple[Path, bytes]],
+    wad_profile: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if manifest["fixture"]:
+        return None
+    invariant_declaration = manifest.get("invariant_suite")
+    real_configuration = (
+        invariant_declaration.get("real_configuration")
+        if isinstance(invariant_declaration, dict)
+        else None
+    )
+    if not isinstance(real_configuration, dict):
+        raise EvidenceError("real policy execution requires real invariant configuration")
+    config_input = real_configuration.get("reference_scenario_config_input")
+    if not isinstance(config_input, str) or config_input not in verified:
+        raise EvidenceError("real policy execution requires the bound reference scenario config")
+    if not isinstance(wad_profile, dict) or wad_profile.get("status") != "matched":
+        raise EvidenceError("real policy execution requires a matched WAD profile")
+    raw_providers = wad_profile.get("providers")
+    if not isinstance(raw_providers, list):
+        raise EvidenceError("real policy execution requires complete WAD provider bindings")
+    providers: dict[str, dict[str, Any]] = {}
+    for provider in raw_providers:
+        if not isinstance(provider, dict) or provider.get("id") not in PROVIDER_IDS:
+            raise EvidenceError("real policy execution has invalid WAD provider bindings")
+        provider_id = provider["id"]
+        normalized: dict[str, Any] = {"configuration": provider.get("configuration")}
+        for asset in ("iwad", "pwad"):
+            asset_report = provider.get(asset)
+            if not isinstance(asset_report, dict) or not isinstance(asset_report.get("path"), str):
+                raise EvidenceError("real policy execution has incomplete WAD provider bindings")
+            raw_path = Path(asset_report["path"])
+            path = raw_path if raw_path.is_absolute() else manifest_directory / raw_path
+            normalized[asset] = {
+                "path": str(path.resolve(strict=False)),
+                "sha256": asset_report.get("sha256"),
+            }
+        providers[provider_id] = normalized
+    if set(providers) != set(PROVIDER_IDS):
+        raise EvidenceError("real policy execution must bind both providers")
+    return {
+        "device": real_configuration.get("device"),
+        "reference_scenario_config_path": str(verified[config_input][0]),
+        "providers": providers,
+    }
+
+
 def _read_verified_input(
     declared_input: dict[str, Any], *, base_directory: Path
 ) -> tuple[Path, bytes]:
@@ -1206,6 +1257,12 @@ def build_policy_evaluation_report(
         )
     except InvariantSuiteError as error:
         raise EvidenceError(str(error)) from error
+    runner_context = _real_runner_context(
+        manifest,
+        manifest_directory=manifest_path.parent,
+        verified=verified,
+        wad_profile=wad_profile,
+    )
 
     evaluation_identity = _canonical_sha256(
         {
@@ -1427,6 +1484,7 @@ def build_policy_evaluation_report(
                             "policy_execution_identity": policy["execution_identity"],
                             "wad_profile": _wad_profile_identity(wad_profile),
                             "invariant_suite": _invariant_suite_identity(invariant_suite),
+                            "runner_context": runner_context,
                         },
                     )
                     if pending_seeds
