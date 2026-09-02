@@ -172,7 +172,7 @@ def _limit_runner_output_files() -> None:
 
 
 def _bounded_text(value: str, *, limit: int, suffix: str) -> str:
-    payload = value.encode(errors="replace")
+    payload = value.encode(errors="backslashreplace").replace(b"\0", b"\\x00")
     if len(payload) <= limit:
         return payload.decode()
     suffix_payload = suffix.encode()

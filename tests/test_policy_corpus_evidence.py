@@ -21,6 +21,7 @@ SURROGATE_FAILURE_RUNNER = RUNNER.with_name("fixture_surrogate_failure_policy_ru
 MUTATING_RUNNER = RUNNER.with_name("fixture_mutating_policy_runner.py")
 TRANSIENT_RUNNER = RUNNER.with_name("fixture_transient_restore_runner.py")
 INTERRUPT_RUNNER = RUNNER.with_name("fixture_interrupt_once_runner.py")
+INVALID_STDERR_INTERRUPT_RUNNER = RUNNER.with_name("fixture_invalid_stderr_interrupt_runner.py")
 NOISY_RUNNER = RUNNER.with_name("fixture_noisy_policy_runner.py")
 OVERSIZED_NUMERIC_RUNNER = RUNNER.with_name("fixture_oversized_numeric_policy_runner.py")
 LIMITED_FILE_SIZE_HARNESS = """
@@ -927,6 +928,57 @@ def test_interruption_durably_retains_and_resumes_completed_prefix(tmp_path: Pat
     assert len(report["policy_evaluation"]["outcomes"]) == 2 * 2 * 256
     assert report["policy_evaluation"]["failure_count"] == 4
     assert retained_failure in report["policy_evaluation"]["outcomes"]
+    invocations = invocation_log.read_text(encoding="utf-8").splitlines()
+    assert invocations.count("gradoom:gradoom-policy") == 1
+    assert invocations.count("gradoom:reference-policy") == 2
+    assert len(invocations) == 5
+
+
+def test_interrupted_progress_sanitizes_stderr_failures_and_resumes_without_reexecution(
+    tmp_path: Path,
+) -> None:
+    manifest_path, _corpus_path, manifest = _documents(tmp_path)
+    _replace_runner(manifest_path, manifest, INVALID_STDERR_INTERRUPT_RUNNER)
+    partial = tmp_path / "partial.json"
+    marker = tmp_path / "interrupt.marker"
+    invocation_log = tmp_path / "invocations.log"
+    env = {
+        "GRADOOM_INTERRUPT_MARKER": str(marker),
+        "GRADOOM_INVOCATION_LOG": str(invocation_log),
+    }
+
+    interrupted = _run(
+        "--manifest",
+        str(manifest_path),
+        "--output",
+        str(partial),
+        env=env,
+    )
+
+    assert interrupted.returncode < 0
+    progress = json.loads(partial.read_text(encoding="utf-8"))
+    retained = progress["policy_evaluation"]["outcomes"]
+    assert progress["status"] == "evaluation_in_progress"
+    assert len(retained) == 256
+    assert progress["policy_evaluation"]["failure_count"] == 256
+    assert {item["execution_failure"]["code"] for item in retained} == {"runner_process_failure"}
+    assert {item["execution_failure"]["message"] for item in retained} == {"bad\\x00stderr"}
+
+    completed = tmp_path / "completed.json"
+    resumed = _run(
+        "--manifest",
+        str(manifest_path),
+        "--output",
+        str(completed),
+        "--merge",
+        str(partial),
+        env=env,
+    )
+
+    assert resumed.returncode == 0, resumed.stderr
+    report = json.loads(completed.read_text(encoding="utf-8"))
+    assert report["status"] == "evaluation_complete"
+    assert report["policy_evaluation"]["outcomes"][:256] == retained
     invocations = invocation_log.read_text(encoding="utf-8").splitlines()
     assert invocations.count("gradoom:gradoom-policy") == 1
     assert invocations.count("gradoom:reference-policy") == 2
