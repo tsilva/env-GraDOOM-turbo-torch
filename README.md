@@ -105,7 +105,9 @@ exists.
 The `parity_certification` path evaluates the sealed two-origin policy corpus, applies the exact
 per-policy kill threshold, and reports a deterministic paired 10,000-resample bootstrap diagnostic.
 Only complete, clean, non-fixture evidence with a matched WAD profile and a passing fast invariant
-suite can emit a revision-bound parity certificate.
+suite can emit a revision-bound parity certificate. Real outcomes must come from the
+repository-owned authenticated runner, and the command rechecks its complete input and repository
+state before any claim-bearing report is written.
 
 The separate `fixed_time_training_diagnostic` path binds an existing benchmark report, then runs the
 same recipe and seeds to one predeclared reusable-time budget. It reports final mean

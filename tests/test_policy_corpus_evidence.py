@@ -12,6 +12,7 @@ import pytest
 
 from gradoom.evidence import policy_corpus
 from gradoom.evidence.parity_verdict import REQUIRED_FAST_INVARIANTS
+from gradoom.evidence.report import EvidenceError
 
 RUNNER = Path(__file__).parent / "fixtures" / "evidence" / "fixture_policy_runner.py"
 INCOMPLETE_RUNNER = RUNNER.with_name("fixture_incomplete_policy_runner.py")
@@ -25,6 +26,7 @@ INTERRUPT_RUNNER = RUNNER.with_name("fixture_interrupt_once_runner.py")
 INVALID_STDERR_INTERRUPT_RUNNER = RUNNER.with_name("fixture_invalid_stderr_interrupt_runner.py")
 NOISY_RUNNER = RUNNER.with_name("fixture_noisy_policy_runner.py")
 OVERSIZED_NUMERIC_RUNNER = RUNNER.with_name("fixture_oversized_numeric_policy_runner.py")
+BINDING_CAPTURE_RUNNER = RUNNER.with_name("fixture_binding_capture_policy_runner.py")
 LIMITED_FILE_SIZE_HARNESS = """
 import json
 import resource
@@ -244,6 +246,12 @@ def test_complete_real_context_issues_a_fully_bound_certificate(
     monkeypatch.setattr(
         policy_corpus, "run_invariant_suite", lambda *args, **kwargs: invariant_report
     )
+    monkeypatch.setattr(
+        policy_corpus,
+        "_validate_real_runner_authority",
+        lambda *args, **kwargs: {"kind": "repository_owned", "runner_sha256": "3" * 64},
+    )
+    monkeypatch.setattr(policy_corpus, "_validate_repository_clean", lambda *args: None)
 
     report = policy_corpus.build_policy_evaluation_report(manifest_path)
 
@@ -1186,3 +1194,195 @@ def test_merge_rejects_progress_inside_a_provider_policy_batch(tmp_path: Path) -
 
     assert result.returncode == 2
     assert "complete provider-policy batches" in result.stderr
+
+
+def _passing_invariant_report(gradoom_revision: str) -> dict[str, object]:
+    return {
+        "version": "1.0.0",
+        "configured": True,
+        "status": "passed",
+        "checks": [
+            {"behavior": behavior, "status": "passed"}
+            for behavior in sorted(REQUIRED_FAST_INVARIANTS)
+        ],
+        "failures": [],
+        "unavailable_reasons": [],
+        "providers": [
+            {"id": "gradoom", "revision": gradoom_revision},
+            {"id": "env-vizdoom-turbo", "revision": "reference-revision"},
+        ],
+        "diagnostics": {"affects_verdict": False, "tools": []},
+    }
+
+
+def _make_real_candidate(manifest: dict[str, object]) -> dict[str, object]:
+    manifest["fixture"] = False
+    manifest["code_provenance"]["revision"] = "gradoom-revision"  # type: ignore[index]
+    manifest["policy_evaluation"]["providers"] = [  # type: ignore[index]
+        {"id": "gradoom", "revision": "gradoom-revision"},
+        {"id": "env-vizdoom-turbo", "revision": "reference-revision"},
+    ]
+    manifest["wad_profile"] = {"profile_id": "test-bound-profile"}
+    return manifest
+
+
+def _matched_wad_report() -> dict[str, object]:
+    return {
+        "status": "matched",
+        "profile_identity": "1" * 64,
+        "binding_sha256": "2" * 64,
+        "binding_identity": {
+            "profile": {"profile_id": "test-bound-profile"},
+            "providers": [
+                {"id": "gradoom", "configuration": {"map": "MAP01"}},
+                {"id": "env-vizdoom-turbo", "configuration": {"map": "MAP01"}},
+            ],
+        },
+    }
+
+
+@pytest.mark.parametrize("reserved_name", ["parity_verdict", "parity_certificate"])
+def test_declared_inputs_cannot_collide_with_system_verdict_entries(
+    tmp_path: Path, reserved_name: str
+) -> None:
+    manifest_path, _corpus_path, manifest = _documents(tmp_path)
+    manifest["declared_inputs"][0]["name"] = reserved_name  # type: ignore[index]
+    manifest["policy_evaluation"]["corpus_input"] = reserved_name  # type: ignore[index]
+    _write_json(manifest_path, manifest)
+
+    result = _run("--manifest", str(manifest_path), "--output", str(tmp_path / "report.json"))
+
+    assert result.returncode == 2
+    assert "reserved system evidence names" in result.stderr
+
+
+def test_resume_rejects_duplicate_evidence_index_names(tmp_path: Path) -> None:
+    manifest_path, _corpus_path, _manifest = _documents(tmp_path)
+    report_path = tmp_path / "report.json"
+    assert _run("--manifest", str(manifest_path), "--output", str(report_path)).returncode == 0
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    entries = report["evidence_index"]["entries"]
+    entries.append(dict(entries[-1]))
+    report["evidence_index"]["sha256"] = _canonical_sha256(entries)
+    _write_json(report_path, report)
+
+    result = _run(
+        "--manifest",
+        str(manifest_path),
+        "--output",
+        str(tmp_path / "resumed.json"),
+        "--merge",
+        str(report_path),
+    )
+
+    assert result.returncode == 2
+    assert "duplicate name" in result.stderr
+
+
+def test_runner_request_and_response_bind_full_execution_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest_path, _corpus_path, manifest = _documents(tmp_path)
+    manifest["wad_profile"] = {"profile_id": "test-bound-profile"}
+    _replace_runner(manifest_path, manifest, BINDING_CAPTURE_RUNNER)
+    monkeypatch.setattr(
+        policy_corpus,
+        "validate_wad_profile",
+        lambda *args, **kwargs: (_matched_wad_report(), []),
+    )
+    monkeypatch.setattr(
+        policy_corpus,
+        "run_invariant_suite",
+        lambda *args, **kwargs: _passing_invariant_report("fixture-revision"),
+    )
+    capture = tmp_path / "request.json"
+    monkeypatch.setenv("GRADOOM_BINDING_CAPTURE", str(capture))
+
+    report = policy_corpus.build_policy_evaluation_report(manifest_path)
+    request = json.loads(capture.read_text(encoding="utf-8"))
+    binding = request["execution_binding"]
+
+    assert binding["evaluation_identity"] == report["run_identity"]
+    assert binding["fixture"] is True
+    assert binding["provider"]["id"] == request["provider_id"]
+    assert binding["provider"]["revision"] == request["provider_revision"]
+    assert binding["policy_execution_identity"] == request["policy"]["execution_identity"]
+    assert binding["wad_profile"] == _matched_wad_report()["binding_identity"]
+    assert binding["invariant_suite"]["version"] == "1.0.0"
+    assert report["policy_evaluation"]["failure_count"] == 0
+
+    mismatched = json.dumps(
+        {"protocol_version": 2, "execution_binding": {}, "outcomes": []}
+    ).encode()
+    rejected = policy_corpus._normalize_runner_outcomes(
+        mismatched,
+        requested_seeds=[7],
+        expected_binding=binding,
+    )
+    assert rejected[7]["execution_failure"]["code"] == "invalid_runner_response"
+
+
+def test_arbitrary_runner_cannot_issue_nonfixture_certificate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest_path, _corpus_path, manifest = _documents(tmp_path)
+    _make_real_candidate(manifest)
+    _write_json(manifest_path, manifest)
+    monkeypatch.setattr(
+        policy_corpus,
+        "validate_wad_profile",
+        lambda *args, **kwargs: (_matched_wad_report(), []),
+    )
+
+    with pytest.raises(EvidenceError, match="repository-owned authenticated policy runner"):
+        policy_corpus.build_policy_evaluation_report(manifest_path)
+
+
+@pytest.mark.parametrize("late_change", ["declared_input", "repository"])
+def test_final_validation_failure_never_publishes_claim_bearing_progress(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, late_change: str
+) -> None:
+    manifest_path, corpus_path, manifest = _documents(tmp_path)
+    _make_real_candidate(manifest)
+    _write_json(manifest_path, manifest)
+    monkeypatch.setattr(
+        policy_corpus,
+        "validate_wad_profile",
+        lambda *args, **kwargs: (_matched_wad_report(), []),
+    )
+    monkeypatch.setattr(
+        policy_corpus,
+        "run_invariant_suite",
+        lambda *args, **kwargs: _passing_invariant_report("gradoom-revision"),
+    )
+    monkeypatch.setattr(
+        policy_corpus,
+        "_validate_real_runner_authority",
+        lambda *args, **kwargs: {"kind": "repository_owned", "runner_sha256": "3" * 64},
+    )
+    if late_change == "repository":
+        monkeypatch.setattr(
+            policy_corpus,
+            "_validate_repository_clean",
+            lambda *args: (_ for _ in ()).throw(EvidenceError("repository became dirty")),
+        )
+    else:
+        monkeypatch.setattr(policy_corpus, "_validate_repository_clean", lambda *args: None)
+    progress: list[dict[str, object]] = []
+
+    def retain_progress(report: dict[str, object]) -> None:
+        progress.append(report)
+        outcomes = report["policy_evaluation"]["outcomes"]  # type: ignore[index]
+        if late_change == "declared_input" and len(outcomes) == 4 * 256:  # type: ignore[arg-type]
+            corpus_path.write_bytes(corpus_path.read_bytes() + b"\n")
+
+    with pytest.raises(EvidenceError, match=r"changed|dirty"):
+        policy_corpus.build_policy_evaluation_report(
+            manifest_path,
+            progress_callback=retain_progress,
+        )
+
+    assert progress
+    assert all(report["status"] == "evaluation_in_progress" for report in progress)
+    assert all(report["claim_eligible"] is False for report in progress)
+    assert all(report["parity_certificate"] is None for report in progress)

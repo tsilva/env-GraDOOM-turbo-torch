@@ -137,6 +137,9 @@ _POLICY_REPORT_FIELDS = frozenset(
     }
 )
 _EVIDENCE_INDEX_FIELDS = frozenset({"algorithm", "entries", "sha256"})
+_SYSTEM_EVIDENCE_NAMES = frozenset(
+    {"manifest", "policy_evaluation", "parity_verdict", "parity_certificate"}
+)
 _RUNNER_CAPTURE_LIMIT = 8 * 1024 * 1024
 _FAILURE_MESSAGE_LIMIT = 4096
 _FAILURE_CODE_LIMIT = 128
@@ -234,6 +237,92 @@ def _validate_sources_unchanged(
             raise EvidenceError(
                 f"policy {policy['id']!r} artifact changed after the corpus was sealed"
             )
+
+
+def _validate_unique_evidence_entries(
+    entries: object,
+    *,
+    document: str,
+) -> list[dict[str, str]]:
+    if not isinstance(entries, list):
+        raise EvidenceError(f"{document} must be an array")
+    names: set[str] = set()
+    normalized: list[dict[str, str]] = []
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict) or set(entry) != {"name", "sha256"}:
+            raise EvidenceError(f"{document}[{index}] is invalid")
+        name = _required_string(entry.get("name"), f"{document}[{index}].name")
+        sha256 = _validate_sha256(entry.get("sha256"), f"{document}[{index}].sha256")
+        if name in names:
+            raise EvidenceError(f"{document} contains duplicate name {name!r}")
+        names.add(name)
+        normalized.append({"name": name, "sha256": sha256})
+    return normalized
+
+
+def _validate_repository_clean(code_provenance: dict[str, Any]) -> None:
+    """Prove the package checkout still matches the claimed clean revision."""
+
+    repository = Path(__file__).resolve().parents[3]
+    try:
+        top_level = subprocess.run(
+            ["git", "-C", str(repository), "rev-parse", "--show-toplevel"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        ).stdout.strip()
+        revision = subprocess.run(
+            ["git", "-C", str(repository), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        ).stdout.strip()
+        status = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repository),
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        ).stdout
+    except (OSError, subprocess.SubprocessError) as error:
+        raise EvidenceError("cannot prove the GraDOOM repository is clean") from error
+    if Path(top_level).resolve() != repository or revision != code_provenance["revision"] or status:
+        raise EvidenceError("GraDOOM repository changed or became dirty during policy evaluation")
+
+
+def _validate_real_runner_authority(
+    runner_path: Path,
+    runner_payload: bytes,
+    *,
+    fixture: bool,
+) -> dict[str, Any]:
+    """Bind real evidence to the repository-owned runner, never an arbitrary script."""
+
+    if fixture:
+        return {"kind": "fixture", "runner_sha256": _sha256_bytes(runner_payload)}
+    authorized_path = Path(__file__).with_name("certification_policy_runner.py")
+    try:
+        authorized_payload = authorized_path.read_bytes()
+    except OSError as error:
+        raise EvidenceError("the authenticated real policy runner is unavailable") from error
+    if not _paths_alias(runner_path, authorized_path) or runner_payload != authorized_payload:
+        raise EvidenceError(
+            "non-fixture parity evidence requires the repository-owned authenticated policy runner"
+        )
+    return {
+        "kind": "repository_owned",
+        "runner_sha256": _sha256_bytes(authorized_payload),
+        "entry_point": "gradoom.evidence.certification_policy_runner",
+    }
 
 
 def _read_verified_input(
@@ -612,7 +701,10 @@ def _canonical_outcome(
 
 
 def _normalize_runner_outcomes(
-    payload: bytes, *, requested_seeds: list[int]
+    payload: bytes,
+    *,
+    requested_seeds: list[int],
+    expected_binding: dict[str, Any],
 ) -> dict[int, dict[str, Any]]:
     try:
         response = _parse_json_document(payload, document="policy runner response")
@@ -621,7 +713,7 @@ def _normalize_runner_outcomes(
         _validate_string_content(response, document="policy runner response")
         _exact_fields(
             response,
-            frozenset({"protocol_version", "outcomes"}),
+            frozenset({"protocol_version", "execution_binding", "outcomes"}),
             document="policy runner response",
         )
         if (
@@ -629,6 +721,8 @@ def _normalize_runner_outcomes(
             or response.get("protocol_version") != POLICY_RUNNER_PROTOCOL_VERSION
         ):
             raise EvidenceError("policy runner response uses an unsupported protocol")
+        if not _same_json_value(response.get("execution_binding"), expected_binding):
+            raise EvidenceError("policy runner response execution binding does not match request")
         raw_outcomes = response.get("outcomes")
         if not isinstance(raw_outcomes, list):
             raise EvidenceError("policy runner response outcomes must be an array")
@@ -682,6 +776,7 @@ def _execute_batch(
     seeds: list[int],
     fixture_failure_seed: int | None,
     timeout_seconds: float,
+    execution_binding: dict[str, Any],
 ) -> dict[int, dict[str, Any]]:
     request: dict[str, Any] = {
         "protocol_version": POLICY_RUNNER_PROTOCOL_VERSION,
@@ -697,6 +792,7 @@ def _execute_batch(
             "execution_identity": policy["execution_identity"],
         },
         "seeds": seeds,
+        "execution_binding": execution_binding,
     }
     if fixture_failure_seed is not None:
         request["fixture_failure_seed"] = fixture_failure_seed
@@ -744,7 +840,11 @@ def _execute_batch(
             )
             for seed in seeds
         }
-    return _normalize_runner_outcomes(stdout_payload, requested_seeds=seeds)
+    return _normalize_runner_outcomes(
+        stdout_payload,
+        requested_seeds=seeds,
+        expected_binding=execution_binding,
+    )
 
 
 def _load_reusable_outcomes(
@@ -816,9 +916,9 @@ def _load_reusable_outcomes(
     if not isinstance(evidence_index, dict):
         raise EvidenceError("merge report evidence_index is invalid")
     _exact_fields(evidence_index, _EVIDENCE_INDEX_FIELDS, document="merge evidence_index")
-    entries = evidence_index.get("entries")
-    if not isinstance(entries, list):
-        raise EvidenceError("merge report evidence_index is invalid")
+    entries = _validate_unique_evidence_entries(
+        evidence_index.get("entries"), document="merge evidence_index.entries"
+    )
     if evidence_index.get("algorithm") != "sha256":
         raise EvidenceError("merge report evidence_index algorithm is invalid")
     stored_index = evidence_index.get("sha256")
@@ -988,6 +1088,16 @@ def build_policy_evaluation_report(
     declared_inputs = _validate_declared_inputs(
         manifest.get("declared_inputs"), base_directory=manifest_path.parent
     )
+    reserved_declared_names = sorted(
+        item["name"]
+        for item in declared_inputs
+        if item["name"] in _SYSTEM_EVIDENCE_NAMES or item["name"].startswith("policy_artifact.")
+    )
+    if reserved_declared_names:
+        raise EvidenceError(
+            "declared_inputs use reserved system evidence names: "
+            + ", ".join(repr(name) for name in reserved_declared_names)
+        )
     wad_profile = None
     wad_evidence_entries: list[dict[str, str]] = []
     if "wad_profile" in manifest:
@@ -1036,6 +1146,12 @@ def build_policy_evaluation_report(
         item["name"]: _read_verified_input(item, base_directory=manifest_path.parent)
         for item in declared_inputs
     }
+    runner_path, runner_payload = verified[runner_input["name"]]
+    runner_authority = _validate_real_runner_authority(
+        runner_path,
+        runner_payload,
+        fixture=manifest["fixture"],
+    )
     corpus_path, corpus_payload = verified[corpus_input["name"]]
     corpus, policies, artifact_payloads = _load_corpus(corpus_path, corpus_payload)
     evidence_document_paths = [manifest_path.resolve(strict=False)] + [
@@ -1106,6 +1222,7 @@ def build_policy_evaluation_report(
             "corpus_manifest_sha256": corpus_input["sha256"],
             "seed_manifest_sha256": seeds_input["sha256"],
             "runner_sha256": runner_input["sha256"],
+            "runner_authority": runner_authority,
             "providers": providers,
             "bootstrap_seed": bootstrap_seed,
             "timeout_seconds": timeout_seconds,
@@ -1162,6 +1279,9 @@ def build_policy_evaluation_report(
         ),
         *wad_evidence_entries,
     ]
+    _validate_unique_evidence_entries(
+        expected_evidence_entries, document="generated evidence_index.entries"
+    )
     reusable = _load_reusable_outcomes(
         merge_path,
         evaluation_identity=evaluation_identity,
@@ -1196,6 +1316,16 @@ def build_policy_evaluation_report(
             invariant_suite=invariant_suite,
             complete=complete,
         )
+        if (
+            complete
+            and not manifest["fixture"]
+            and verdict.get("would_issue") is True
+            and code_provenance.get("dirty") is False
+            and isinstance(wad_profile, dict)
+            and wad_profile.get("status") == "matched"
+            and invariant_suite.get("status") == "passed"
+        ):
+            _validate_repository_clean(code_provenance)
         certificate = issue_parity_certificate(
             evaluation,
             verdict=verdict,
@@ -1289,6 +1419,15 @@ def build_policy_evaluation_report(
                         seeds=pending_seeds,
                         fixture_failure_seed=fixture_failure_seed,
                         timeout_seconds=float(timeout_seconds),
+                        execution_binding={
+                            "evaluation_identity": evaluation_identity,
+                            "fixture": manifest["fixture"],
+                            "runner_authority": runner_authority,
+                            "provider": provider,
+                            "policy_execution_identity": policy["execution_identity"],
+                            "wad_profile": _wad_profile_identity(wad_profile),
+                            "invariant_suite": _invariant_suite_identity(invariant_suite),
+                        },
                     )
                     if pending_seeds
                     else {}
@@ -1322,7 +1461,7 @@ def build_policy_evaluation_report(
                     progress_callback(
                         build_report(
                             outcomes,
-                            complete=len(outcomes) == len(expected_unit_order),
+                            complete=False,
                         )
                     )
     _validate_sources_unchanged(

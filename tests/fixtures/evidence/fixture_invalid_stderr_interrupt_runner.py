@@ -27,6 +27,7 @@ if unit == "gradoom:reference-policy" and not marker.exists():
 json.dump(
     {
         "protocol_version": 2,
+        "execution_binding": request["execution_binding"],
         "outcomes": [
             {
                 "seed": seed,
