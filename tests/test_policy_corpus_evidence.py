@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from gradoom.evidence import policy_corpus
+from gradoom.evidence.parity_verdict import REQUIRED_FAST_INVARIANTS
 
 RUNNER = Path(__file__).parent / "fixtures" / "evidence" / "fixture_policy_runner.py"
 INCOMPLETE_RUNNER = RUNNER.with_name("fixture_incomplete_policy_runner.py")
@@ -120,6 +121,7 @@ def _documents(tmp_path: Path) -> tuple[Path, Path, dict[str, object]]:
         ],
         "policy_evaluation": {
             "protocol_version": 2,
+            "bootstrap_seed": 20260827,
             "corpus_input": "policy_corpus",
             "seed_manifest_input": "episode_seeds",
             "runner_input": "policy_runner",
@@ -174,8 +176,15 @@ def test_public_command_executes_complete_sealed_fixture_corpus(tmp_path: Path) 
     assert report["claim_eligible"] is False
     assert {reason["code"] for reason in report["claim_reasons"]} == {
         "fixture_evidence",
-        "parity_verdict_pending",
+        "invariant_suite_not_passed",
+        "wad_profile_not_matched",
+        "gradoom_revision_mismatch",
     }
+    assert report["parity_verdict"]["status"] == "passed"
+    assert report["parity_verdict"]["all_policies_passed"] is True
+    assert report["parity_verdict"]["all_invariants_passed"] is False
+    assert report["parity_verdict"]["would_issue"] is False
+    assert report["parity_certificate"] is None
     evaluation = report["policy_evaluation"]
     assert evaluation["corpus"]["corpus_version"] == "fixture-corpus-v1"
     assert evaluation["corpus"]["sealed"] is True
@@ -194,6 +203,87 @@ def test_public_command_executes_complete_sealed_fixture_corpus(tmp_path: Path) 
             assert all(item["termination_state"] == "terminated" for item in outcomes)
             assert all(item["episode_length"] >= 100 for item in outcomes)
             assert all(item["unit_identity"] for item in outcomes)
+
+
+def test_complete_real_context_issues_a_fully_bound_certificate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest_path, _corpus_path, manifest = _documents(tmp_path)
+    manifest["fixture"] = False
+    manifest["code_provenance"]["revision"] = "gradoom-revision"  # type: ignore[index]
+    manifest["policy_evaluation"]["providers"] = [  # type: ignore[index]
+        {"id": "gradoom", "revision": "gradoom-revision"},
+        {"id": "env-vizdoom-turbo", "revision": "reference-revision"},
+    ]
+    manifest["wad_profile"] = {"profile_id": "test-bound-profile"}
+    _write_json(manifest_path, manifest)
+    wad_report = {
+        "status": "matched",
+        "profile_identity": "1" * 64,
+        "binding_sha256": "2" * 64,
+    }
+    invariant_report = {
+        "version": "1.0.0",
+        "configured": True,
+        "status": "passed",
+        "checks": [
+            {"behavior": behavior, "status": "passed"}
+            for behavior in sorted(REQUIRED_FAST_INVARIANTS)
+        ],
+        "failures": [],
+        "unavailable_reasons": [],
+        "providers": [
+            {"id": "gradoom", "revision": "gradoom-revision"},
+            {"id": "env-vizdoom-turbo", "revision": "reference-revision"},
+        ],
+        "diagnostics": {"affects_verdict": False, "tools": []},
+    }
+    monkeypatch.setattr(
+        policy_corpus, "validate_wad_profile", lambda *args, **kwargs: (wad_report, [])
+    )
+    monkeypatch.setattr(
+        policy_corpus, "run_invariant_suite", lambda *args, **kwargs: invariant_report
+    )
+
+    report = policy_corpus.build_policy_evaluation_report(manifest_path)
+
+    assert report["parity_verdict"]["would_issue"] is True
+    assert report["claim_eligible"] is True
+    assert report["claim_reasons"] == []
+    assert report["parity_certificate"]["binding"]["evaluation_identity"] == report["run_identity"]
+    assert {item["name"] for item in report["evidence_index"]["entries"]} >= {
+        "parity_verdict",
+        "parity_certificate",
+    }
+
+
+def test_fixture_context_can_would_issue_but_never_emits_a_certificate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest_path, _corpus_path, _manifest = _documents(tmp_path)
+    invariant_report = {
+        "version": "1.0.0",
+        "configured": True,
+        "status": "passed",
+        "checks": [
+            {"behavior": behavior, "status": "passed"}
+            for behavior in sorted(REQUIRED_FAST_INVARIANTS)
+        ],
+        "failures": [],
+        "unavailable_reasons": [],
+        "providers": [],
+        "diagnostics": {"affects_verdict": False, "tools": []},
+    }
+    monkeypatch.setattr(
+        policy_corpus, "run_invariant_suite", lambda *args, **kwargs: invariant_report
+    )
+
+    report = policy_corpus.build_policy_evaluation_report(manifest_path)
+
+    assert report["parity_verdict"]["would_issue"] is True
+    assert report["claim_eligible"] is False
+    assert report["parity_certificate"] is None
+    assert "fixture_evidence" in {reason["code"] for reason in report["claim_reasons"]}
 
 
 @pytest.mark.parametrize(
@@ -324,6 +414,20 @@ def test_policy_evaluation_protocol_requires_an_exact_json_integer(tmp_path: Pat
 
     assert result.returncode == 2
     assert "unsupported protocol_version" in result.stderr
+
+
+@pytest.mark.parametrize("bootstrap_seed", [True, 1.0, -1])
+def test_bootstrap_seed_requires_a_non_negative_64_bit_integer(
+    tmp_path: Path, bootstrap_seed: object
+) -> None:
+    manifest_path, _corpus_path, manifest = _documents(tmp_path)
+    manifest["policy_evaluation"]["bootstrap_seed"] = bootstrap_seed  # type: ignore[index]
+    _write_json(manifest_path, manifest)
+
+    result = _run("--manifest", str(manifest_path), "--output", str(tmp_path / "report.json"))
+
+    assert result.returncode == 2
+    assert "bootstrap_seed must be a non-negative 64-bit integer" in result.stderr
 
 
 @pytest.mark.parametrize(
@@ -852,7 +956,7 @@ def test_merge_rejects_tampered_policy_evidence(tmp_path: Path) -> None:
     )
 
     assert result.returncode == 2
-    assert "policy_evaluation SHA-256 mismatch" in result.stderr
+    assert "parity_verdict does not match its policy outcomes" in result.stderr
 
 
 def test_merge_rejects_unhashable_unit_identity_without_a_traceback(tmp_path: Path) -> None:

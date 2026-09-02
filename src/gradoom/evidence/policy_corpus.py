@@ -15,6 +15,12 @@ from pathlib import Path
 from typing import Any
 
 from .checkpoint_policy import CHECKPOINT_FORMAT
+from .invariant_suite import InvariantSuiteError, run_invariant_suite
+from .parity_verdict import (
+    build_parity_verdict,
+    issue_parity_certificate,
+    parity_claim_reasons,
+)
 from .policy_execution import POLICY_PREPROCESSING_SHA256, policy_execution_identity
 from .report import (
     EvidenceError,
@@ -31,6 +37,7 @@ from .report import (
     _validate_sha256,
     _validate_string_content,
 )
+from .wad_profile import validate_wad_profile
 
 POLICY_RUNNER_PROTOCOL_VERSION = 2
 PROVIDER_IDS = ("gradoom", "env-vizdoom-turbo")
@@ -84,10 +91,18 @@ _POLICY_MANIFEST_FIELDS = frozenset(
         "policy_evaluation",
     }
 )
+_POLICY_MANIFEST_OPTIONAL_FIELDS = frozenset({"wad_profile", "invariant_suite"})
 _CODE_PROVENANCE_FIELDS = frozenset({"repository", "revision", "dirty"})
 _DECLARED_INPUT_FIELDS = frozenset({"name", "path", "sha256"})
 _POLICY_EVALUATION_FIELDS = frozenset(
-    {"protocol_version", "corpus_input", "seed_manifest_input", "runner_input", "providers"}
+    {
+        "protocol_version",
+        "corpus_input",
+        "seed_manifest_input",
+        "runner_input",
+        "providers",
+        "bootstrap_seed",
+    }
 )
 _POLICY_EVALUATION_OPTIONAL_FIELDS = frozenset({"timeout_seconds", "fixture_failure_seed"})
 _SUPPORTED_POLICY_ARCHITECTURES = frozenset(
@@ -114,6 +129,10 @@ _POLICY_REPORT_FIELDS = frozenset(
         "code_provenance",
         "declared_inputs",
         "policy_evaluation",
+        "wad_profile",
+        "invariant_suite",
+        "parity_verdict",
+        "parity_certificate",
         "evidence_index",
     }
 )
@@ -420,6 +439,33 @@ def _providers(value: object) -> list[dict[str, str]]:
     return [by_id[provider_id] for provider_id in PROVIDER_IDS]
 
 
+def _wad_profile_identity(value: dict[str, Any] | None) -> object:
+    if value is None:
+        return None
+    if value.get("status") == "matched":
+        return value.get("binding_identity")
+    return {
+        "status": value.get("status"),
+        "authority": value.get("authority"),
+        "failures": value.get("failures"),
+    }
+
+
+def _invariant_suite_identity(value: dict[str, Any]) -> dict[str, Any]:
+    return {
+        field: value.get(field)
+        for field in (
+            "version",
+            "configured",
+            "status",
+            "checks",
+            "failures",
+            "unavailable_reasons",
+            "providers",
+        )
+    }
+
+
 def _unit_identity(
     evaluation_identity: str,
     *,
@@ -710,6 +756,11 @@ def _load_reusable_outcomes(
     expected_binding: dict[str, Any],
     expected_report_binding: dict[str, Any],
     expected_evidence_entries: list[dict[str, str]],
+    bootstrap_seed: int,
+    fixture: bool,
+    code_provenance: dict[str, Any],
+    wad_profile: dict[str, Any] | None,
+    invariant_suite: dict[str, Any],
 ) -> dict[str, dict[str, Any]]:
     if merge_path is None:
         return {}
@@ -778,8 +829,6 @@ def _load_reusable_outcomes(
         *expected_evidence_entries,
         {"name": "policy_evaluation", "sha256": evaluation_digest},
     ]
-    if not _same_json_value(entries, expected_entries):
-        raise EvidenceError("merge report policy_evaluation SHA-256 mismatch")
     outcomes = evaluation.get("outcomes")
     if not isinstance(outcomes, list):
         raise EvidenceError("merge report policy_evaluation.outcomes must be an array")
@@ -846,6 +895,57 @@ def _load_reusable_outcomes(
     failure_count = sum(item["execution_failure"] is not None for item in reusable.values())
     if not _same_json_value(evaluation.get("failure_count"), failure_count):
         raise EvidenceError("merge report policy_evaluation.failure_count is invalid")
+    complete = status == "evaluation_complete"
+    normalized_evaluation = {
+        **expected_binding,
+        "outcomes": [reusable[identity] for identity in observed_order],
+        "failure_count": failure_count,
+    }
+    expected_verdict = build_parity_verdict(
+        normalized_evaluation,
+        bootstrap_seed=bootstrap_seed,
+        invariant_suite=invariant_suite,
+        complete=complete,
+    )
+    if not _same_json_value(report.get("parity_verdict"), expected_verdict):
+        raise EvidenceError("merge report parity_verdict does not match its policy outcomes")
+    expected_certificate = issue_parity_certificate(
+        normalized_evaluation,
+        verdict=expected_verdict,
+        fixture=fixture,
+        code_provenance=code_provenance,
+        wad_profile=wad_profile,
+        invariant_suite=invariant_suite,
+        report_schema_version=1,
+    )
+    if not _same_json_value(report.get("parity_certificate"), expected_certificate):
+        raise EvidenceError("merge report parity_certificate does not match current evidence")
+    expected_reasons = parity_claim_reasons(
+        normalized_evaluation,
+        verdict=expected_verdict,
+        fixture=fixture,
+        code_provenance=code_provenance,
+        wad_profile=wad_profile,
+        invariant_suite=invariant_suite,
+    )
+    if not _same_json_value(report.get("claim_reasons"), expected_reasons):
+        raise EvidenceError("merge report claim_reasons do not match current evidence")
+    if not _same_json_value(report.get("claim_eligible"), expected_certificate is not None):
+        raise EvidenceError("merge report claim_eligible does not match its certificate")
+
+    verdict_digest = _canonical_sha256(expected_verdict, document="merge parity verdict")
+    expected_entries.append({"name": "parity_verdict", "sha256": verdict_digest})
+    if expected_certificate is not None:
+        expected_entries.append(
+            {
+                "name": "parity_certificate",
+                "sha256": _canonical_sha256(
+                    expected_certificate, document="merge parity certificate"
+                ),
+            }
+        )
+    if not _same_json_value(entries, expected_entries):
+        raise EvidenceError("merge report verdict or certificate SHA-256 mismatch")
     return reusable
 
 
@@ -857,7 +957,12 @@ def build_policy_evaluation_report(
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     manifest, manifest_payload = _load_manifest(manifest_path)
-    _exact_fields(manifest, _POLICY_MANIFEST_FIELDS, document="manifest")
+    _exact_fields(
+        manifest,
+        _POLICY_MANIFEST_FIELDS,
+        optional=_POLICY_MANIFEST_OPTIONAL_FIELDS,
+        document="manifest",
+    )
     _validate_schema_version(manifest.get("schema_version"), document="manifest")
     if manifest.get("workflow") != "parity_certification":
         raise EvidenceError("this command path requires workflow parity_certification")
@@ -883,6 +988,20 @@ def build_policy_evaluation_report(
     declared_inputs = _validate_declared_inputs(
         manifest.get("declared_inputs"), base_directory=manifest_path.parent
     )
+    wad_profile = None
+    wad_evidence_entries: list[dict[str, str]] = []
+    if "wad_profile" in manifest:
+        wad_profile, wad_evidence_entries = validate_wad_profile(
+            manifest["wad_profile"], base_directory=manifest_path.parent
+        )
+    declared_evidence_names = {"manifest", *(item["name"] for item in declared_inputs)}
+    wad_evidence_names = {item["name"] for item in wad_evidence_entries}
+    collisions = sorted(declared_evidence_names & wad_evidence_names)
+    if collisions:
+        raise EvidenceError(
+            "declared_inputs use reserved WAD profile evidence names: "
+            + ", ".join(repr(name) for name in collisions)
+        )
     inputs_by_name = {item["name"]: item for item in declared_inputs}
     configuration = manifest.get("policy_evaluation")
     if not isinstance(configuration, dict):
@@ -934,6 +1053,15 @@ def build_policy_evaluation_report(
                 raise EvidenceError(f"output path aliases policy artifact {policy['id']!r}")
     seeds = _load_seeds(verified[seeds_input["name"]][1])
     providers = _providers(configuration.get("providers"))
+    bootstrap_seed = configuration.get("bootstrap_seed")
+    if (
+        type(bootstrap_seed) is not int
+        or bootstrap_seed < 0
+        or bootstrap_seed > _MAX_OUTCOME_NUMBER
+    ):
+        raise EvidenceError(
+            "policy_evaluation.bootstrap_seed must be a non-negative 64-bit integer"
+        )
     timeout_seconds = configuration.get("timeout_seconds", 120)
     if (
         type(timeout_seconds) not in {int, float}
@@ -951,6 +1079,17 @@ def build_policy_evaluation_report(
             raise EvidenceError("policy_evaluation.fixture_failure_seed is fixture-only")
         if fixture_failure_seed not in seeds["seeds"]:
             raise EvidenceError("policy_evaluation.fixture_failure_seed must be a declared seed")
+    try:
+        invariant_suite = run_invariant_suite(
+            manifest.get("invariant_suite"),
+            base_directory=manifest_path.parent,
+            declared_inputs=declared_inputs,
+            fixture=manifest["fixture"],
+            gradoom_revision=code_provenance["revision"],
+            wad_profile=wad_profile,
+        )
+    except InvariantSuiteError as error:
+        raise EvidenceError(str(error)) from error
 
     evaluation_identity = _canonical_sha256(
         {
@@ -968,8 +1107,11 @@ def build_policy_evaluation_report(
             "seed_manifest_sha256": seeds_input["sha256"],
             "runner_sha256": runner_input["sha256"],
             "providers": providers,
+            "bootstrap_seed": bootstrap_seed,
             "timeout_seconds": timeout_seconds,
             "fixture_failure_seed": fixture_failure_seed,
+            "wad_profile": _wad_profile_identity(wad_profile),
+            "invariant_suite": _invariant_suite_identity(invariant_suite),
         },
         document="policy evaluation manifest",
     )
@@ -997,32 +1139,16 @@ def build_policy_evaluation_report(
         "providers": providers,
         "expected_outcome_count": len(expected_units),
     }
-    reasons = [
-        {
-            "code": "parity_verdict_pending",
-            "message": (
-                "Policy outcomes have not yet been evaluated by the parity verdict workflow."
-            ),
-        }
-    ]
-    if manifest["fixture"]:
-        reasons.insert(
-            0,
-            {
-                "code": "fixture_evidence",
-                "message": "Fixture evidence cannot support public claims.",
-            },
-        )
     expected_report_binding = {
         "schema_version": 1,
         "workflow": "parity_certification",
         "evidence_level": "formal",
         "fixture": manifest["fixture"],
-        "claim_eligible": False,
-        "claim_reasons": reasons,
         "run_identity": evaluation_identity,
         "code_provenance": code_provenance,
         "declared_inputs": declared_inputs,
+        "wad_profile": wad_profile,
+        "invariant_suite": invariant_suite,
     }
     expected_evidence_entries = [
         {"name": "manifest", "sha256": _sha256_bytes(manifest_payload)},
@@ -1034,6 +1160,7 @@ def build_policy_evaluation_report(
             }
             for policy in policies
         ),
+        *wad_evidence_entries,
     ]
     reusable = _load_reusable_outcomes(
         merge_path,
@@ -1043,6 +1170,11 @@ def build_policy_evaluation_report(
         expected_binding=expected_binding,
         expected_report_binding=expected_report_binding,
         expected_evidence_entries=expected_evidence_entries,
+        bootstrap_seed=bootstrap_seed,
+        fixture=manifest["fixture"],
+        code_provenance=code_provenance,
+        wad_profile=wad_profile,
+        invariant_suite=invariant_suite,
     )
 
     def build_report(outcomes: list[dict[str, Any]], *, complete: bool) -> dict[str, Any]:
@@ -1058,16 +1190,67 @@ def build_policy_evaluation_report(
                 "sha256": _canonical_sha256(evaluation, document="policy evaluation report"),
             },
         ]
+        verdict = build_parity_verdict(
+            evaluation,
+            bootstrap_seed=bootstrap_seed,
+            invariant_suite=invariant_suite,
+            complete=complete,
+        )
+        certificate = issue_parity_certificate(
+            evaluation,
+            verdict=verdict,
+            fixture=manifest["fixture"],
+            code_provenance=code_provenance,
+            wad_profile=wad_profile,
+            invariant_suite=invariant_suite,
+            report_schema_version=1,
+        )
+        reasons = parity_claim_reasons(
+            evaluation,
+            verdict=verdict,
+            fixture=manifest["fixture"],
+            code_provenance=code_provenance,
+            wad_profile=wad_profile,
+            invariant_suite=invariant_suite,
+        )
+        evidence_entries.append(
+            {
+                "name": "parity_verdict",
+                "sha256": _canonical_sha256(verdict, document="parity verdict report"),
+            }
+        )
+        if certificate is not None:
+            evidence_entries.append(
+                {
+                    "name": "parity_certificate",
+                    "sha256": _canonical_sha256(certificate, document="parity certificate report"),
+                }
+            )
         return {
             **expected_report_binding,
             "status": "evaluation_complete" if complete else "evaluation_in_progress",
+            "claim_eligible": certificate is not None,
+            "claim_reasons": reasons,
             "policy_evaluation": evaluation,
+            "parity_verdict": verdict,
+            "parity_certificate": certificate,
             "evidence_index": {
                 "algorithm": "sha256",
                 "entries": evidence_entries,
                 "sha256": _canonical_sha256(evidence_entries, document="policy evaluation report"),
             },
         }
+
+    def validate_profile_unchanged() -> None:
+        if "wad_profile" not in manifest:
+            return
+        current_profile, current_entries = validate_wad_profile(
+            manifest["wad_profile"], base_directory=manifest_path.parent
+        )
+        if not _same_json_value(current_profile, wad_profile) or not _same_json_value(
+            current_entries, wad_evidence_entries
+        ):
+            raise EvidenceError("WAD profile assets or binding changed during policy evaluation")
 
     outcomes: list[dict[str, Any]] = []
     with contextlib.ExitStack() as stack:
@@ -1116,6 +1299,7 @@ def build_policy_evaluation_report(
                         verified=verified,
                         policies=policies,
                     )
+                    validate_profile_unchanged()
                 for seed_index, seed in enumerate(seeds["seeds"]):
                     identity = _unit_identity(
                         evaluation_identity,
@@ -1146,6 +1330,7 @@ def build_policy_evaluation_report(
         verified=verified,
         policies=policies,
     )
+    validate_profile_unchanged()
     return build_report(outcomes, complete=True)
 
 

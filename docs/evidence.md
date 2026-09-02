@@ -6,11 +6,11 @@ inputs before the real WAD profile, reference provider, and pretrained policy co
 It reports those prerequisites as unavailable; it does not issue a parity certificate or make a
 performance claim.
 
-The `parity_certification` workflow now validates and executes a sealed pretrained-policy corpus.
-It records complete two-provider episode evidence but deliberately stops before the per-policy
-threshold, bootstrap diagnostic, and certificate verdict. Until that subsequent verdict workflow
-is complete, every corpus report has `claim_eligible: false`; deterministic fixture corpora are
-also permanently identified by the `fixture_evidence` reason.
+The `parity_certification` workflow validates and executes a sealed pretrained-policy corpus, then
+computes every per-policy threshold and its paired bootstrap diagnostic. A real certificate issues
+only when the complete corpus and fast invariant suite pass against one matched WAD profile and the
+evaluated GraDOOM revision is clean. Fixture, partial, failed, dirty, stale, or mismatched evidence
+retains its would-issue diagnostics but emits no real certificate.
 
 The command also provides the `development_training_benchmark` workflow. It is the inexpensive
 integration benchmark: it drives the standalone GPU-resident trainer from a fresh policy and
@@ -34,8 +34,9 @@ incompatible. It writes the report only after all validation succeeds.
 
 A `parity_certification` manifest uses formal evidence and declares a `policy_evaluation` object.
 That object names three hash-verified `declared_inputs`: a corpus manifest, an episode-seed
-manifest, and one common policy-runner executable. It also binds protocol version `2` and exactly
-one revision for each provider, `gradoom` and `env-vizdoom-turbo`. An optional positive
+manifest, and one common policy-runner executable. It also binds protocol version `2`, a
+non-negative 64-bit `bootstrap_seed`, and exactly one revision for each provider, `gradoom` and
+`env-vizdoom-turbo`. An optional positive
 `timeout_seconds` applies independently to each provider-policy batch. Provider-specific runner
 commands or policy arguments are not accepted.
 
@@ -89,6 +90,32 @@ runner, provider revision, code provenance, protocol, timeout, evidence level, o
 an unlike evaluation and is rejected instead of combined. Resume also revalidates the complete
 top-level report schema, provenance, declared inputs, claim state, evidence index, and normalized
 corpus instead of trusting a stored identity string.
+
+## Parity verdict and certificate
+
+For each corpus policy, the report pairs GraDOOM and `env-ViZDoom-turbo` outcomes by their ordered
+seed index. Any missing or failed outcome makes that policy verdict unavailable. Otherwise it
+reports both mean `player_killcount` values, their signed and absolute difference, and the exact
+acceptance limit `max(2, 0.1 * env_vizdoom_turbo_mean)`. The policy passes only when its absolute
+difference is less than or equal to that limit, including the exact boundary and zero-reference
+cases.
+
+Each available policy also reports a deterministic paired 95 percent percentile bootstrap interval
+for the signed mean difference. The algorithm uses NumPy PCG64 to draw 10,000 resamples from the
+256 paired seed differences with the manifest's predeclared bootstrap seed, then uses linear
+percentile interpolation. The interval is explicitly marked `affects_verdict: false`; it cannot
+rescue a threshold failure or veto a threshold pass.
+
+`parity_verdict.would_issue` requires every corpus policy and every fast invariant to pass. It can
+be useful on fixture evidence, but `claim_eligible` remains false and `parity_certificate` remains
+null unless the evidence is non-fixture, complete, clean, bound to the same provider revisions, and
+uses a matched certified WAD profile. A real certificate binds the GraDOOM repository revision and
+clean state, reference revision, WAD profile identity and binding, corpus-manifest hash,
+seed-manifest hash, invariant-suite version, policy and verdict protocols, bootstrap configuration,
+report schema, complete evaluation identity, and verdict hash. Both verdict and certificate have
+separate entries in the report evidence index. Resume recomputes them from retained outcomes;
+self-consistent edits to identity-bearing source material therefore produce unlike evidence rather
+than inheriting an old certificate.
 
 After each complete provider-policy batch, the command atomically replaces the requested output
 with an `evaluation_in_progress` report, fsyncs both file and containing directory, and only then
