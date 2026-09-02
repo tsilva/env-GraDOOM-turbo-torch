@@ -8,6 +8,9 @@ from pathlib import Path
 
 import pytest
 
+from gradoom.evidence import cli as evidence_cli
+from gradoom.evidence.report import EvidenceError
+
 FIXTURES = Path(__file__).parent / "fixtures" / "evidence"
 
 
@@ -107,16 +110,16 @@ def test_malformed_manifest_fails_with_a_clear_error(tmp_path: Path) -> None:
     manifest_path = tmp_path / "manifest.json"
     manifest_path.write_text(
         json.dumps(
-                {
-                    "schema_version": 1,
-                    "workflow": "parity_readiness",
-                    "evidence_level": "development",
-                    "fixture": True,
-                    "code_provenance": {
-                        "repository": "tsilva/env-GraDOOM-turbo-torch",
-                        "revision": "fixture-revision",
-                        "dirty": False,
-                    },
+            {
+                "schema_version": 1,
+                "workflow": "parity_readiness",
+                "evidence_level": "development",
+                "fixture": True,
+                "code_provenance": {
+                    "repository": "tsilva/env-GraDOOM-turbo-torch",
+                    "revision": "fixture-revision",
+                    "dirty": False,
+                },
                 "declared_inputs": [{}],
                 "prerequisites": [],
             }
@@ -174,9 +177,7 @@ def test_non_standard_json_constants_fail_with_a_clear_error(
     invalid_path = tmp_path / "invalid.json"
     output = tmp_path / "report.json"
     if document == "manifest":
-        payload = json.loads(
-            (FIXTURES / "readiness-manifest.json").read_text(encoding="utf-8")
-        )
+        payload = json.loads((FIXTURES / "readiness-manifest.json").read_text(encoding="utf-8"))
         arguments = ["--manifest", str(invalid_path), "--output", str(output)]
     else:
         initial_report = tmp_path / "initial-report.json"
@@ -203,10 +204,7 @@ def test_non_standard_json_constants_fail_with_a_clear_error(
     result = run_evidence(*arguments)
 
     assert result.returncode == 2
-    assert (
-        f"{document} is not valid JSON: non-standard constant {constant}"
-        in result.stderr
-    )
+    assert f"{document} is not valid JSON: non-standard constant {constant}" in result.stderr
     assert "Traceback" not in result.stderr
     assert not output.exists()
 
@@ -229,12 +227,8 @@ def test_json_resource_and_numeric_failures_are_clear_validation_errors(
     invalid_path = tmp_path / "invalid.json"
     output = tmp_path / "report.json"
     if document == "manifest":
-        payload = json.loads(
-            (FIXTURES / "readiness-manifest.json").read_text(encoding="utf-8")
-        )
-        payload["declared_inputs"][0]["path"] = str(
-            FIXTURES / "provider-contract.json"
-        )
+        payload = json.loads((FIXTURES / "readiness-manifest.json").read_text(encoding="utf-8"))
+        payload["declared_inputs"][0]["path"] = str(FIXTURES / "provider-contract.json")
         arguments = ["--manifest", str(invalid_path), "--output", str(output)]
     else:
         initial_report = tmp_path / "initial-report.json"
@@ -274,12 +268,8 @@ def test_lone_surrogate_json_fails_with_a_clear_error(
     invalid_path = tmp_path / "invalid.json"
     output = tmp_path / "report.json"
     if document == "manifest":
-        payload = json.loads(
-            (FIXTURES / "readiness-manifest.json").read_text(encoding="utf-8")
-        )
-        payload["declared_inputs"][0]["path"] = str(
-            FIXTURES / "provider-contract.json"
-        )
+        payload = json.loads((FIXTURES / "readiness-manifest.json").read_text(encoding="utf-8"))
+        payload["declared_inputs"][0]["path"] = str(FIXTURES / "provider-contract.json")
         arguments = ["--manifest", str(invalid_path), "--output", str(output)]
     else:
         initial_report = tmp_path / "initial-report.json"
@@ -327,12 +317,8 @@ def test_all_schema_strings_reject_lone_surrogates(
     invalid_path = tmp_path / "invalid.json"
     output = tmp_path / "report.json"
     if document == "manifest":
-        payload = json.loads(
-            (FIXTURES / "readiness-manifest.json").read_text(encoding="utf-8")
-        )
-        payload["declared_inputs"][0]["path"] = str(
-            FIXTURES / "provider-contract.json"
-        )
+        payload = json.loads((FIXTURES / "readiness-manifest.json").read_text(encoding="utf-8"))
+        payload["declared_inputs"][0]["path"] = str(FIXTURES / "provider-contract.json")
         arguments = ["--manifest", str(invalid_path), "--output", str(output)]
     else:
         initial_report = tmp_path / "initial-report.json"
@@ -375,9 +361,7 @@ def test_declared_input_paths_reject_embedded_nulls(
     invalid_path = tmp_path / "invalid.json"
     output = tmp_path / "report.json"
     if document == "manifest":
-        payload = json.loads(
-            (FIXTURES / "readiness-manifest.json").read_text(encoding="utf-8")
-        )
+        payload = json.loads((FIXTURES / "readiness-manifest.json").read_text(encoding="utf-8"))
         arguments = ["--manifest", str(invalid_path), "--output", str(output)]
     else:
         initial_report = tmp_path / "initial-report.json"
@@ -403,9 +387,7 @@ def test_declared_input_paths_reject_embedded_nulls(
     result = run_evidence(*arguments)
 
     assert result.returncode == 2
-    assert (
-        f"{document} contains U+0000 in declared_inputs[0].path" in result.stderr
-    )
+    assert f"{document} contains U+0000 in declared_inputs[0].path" in result.stderr
     assert "Traceback" not in result.stderr
     assert not output.exists()
 
@@ -428,9 +410,7 @@ def test_recursive_extension_strings_and_keys_reject_lone_surrogates(
     invalid_path = tmp_path / "invalid.json"
     output = tmp_path / "report.json"
     if document == "manifest":
-        payload = json.loads(
-            (FIXTURES / "readiness-manifest.json").read_text(encoding="utf-8")
-        )
+        payload = json.loads((FIXTURES / "readiness-manifest.json").read_text(encoding="utf-8"))
         arguments = ["--manifest", str(invalid_path), "--output", str(output)]
     else:
         initial_report = tmp_path / "initial-report.json"
@@ -459,9 +439,7 @@ def test_recursive_extension_strings_and_keys_reject_lone_surrogates(
     result = run_evidence(*arguments)
 
     assert result.returncode == 2
-    assert (
-        f"{document} contains invalid Unicode in {expected_field}" in result.stderr
-    )
+    assert f"{document} contains invalid Unicode in {expected_field}" in result.stderr
     assert "Traceback" not in result.stderr
     assert not output.exists()
 
@@ -474,9 +452,7 @@ def test_whitespace_only_prerequisite_reasons_fail_with_a_clear_error(
     invalid_path = tmp_path / "invalid.json"
     output = tmp_path / "report.json"
     if document == "manifest":
-        payload = json.loads(
-            (FIXTURES / "readiness-manifest.json").read_text(encoding="utf-8")
-        )
+        payload = json.loads((FIXTURES / "readiness-manifest.json").read_text(encoding="utf-8"))
         arguments = ["--manifest", str(invalid_path), "--output", str(output)]
     else:
         initial_report = tmp_path / "initial-report.json"
@@ -502,10 +478,7 @@ def test_whitespace_only_prerequisite_reasons_fail_with_a_clear_error(
     result = run_evidence(*arguments)
 
     assert result.returncode == 2
-    assert (
-        "prerequisites[0].reason must be a human-readable non-whitespace string"
-        in result.stderr
-    )
+    assert "prerequisites[0].reason must be a human-readable non-whitespace string" in result.stderr
     assert "Traceback" not in result.stderr
     assert not output.exists()
 
@@ -534,9 +507,7 @@ def test_declared_input_paths_reject_whitespace(
     document_path = tmp_path / "invalid.json"
     output = tmp_path / "report.json"
     if document == "manifest":
-        payload = json.loads(
-            (FIXTURES / "readiness-manifest.json").read_text(encoding="utf-8")
-        )
+        payload = json.loads((FIXTURES / "readiness-manifest.json").read_text(encoding="utf-8"))
         arguments = ["--manifest", str(document_path), "--output", str(output)]
     else:
         initial_report = tmp_path / "initial-report.json"
@@ -575,9 +546,7 @@ def test_declared_input_paths_must_be_unique(
     invalid_path = tmp_path / "invalid.json"
     output = tmp_path / "report.json"
     if document == "manifest":
-        payload = json.loads(
-            (FIXTURES / "readiness-manifest.json").read_text(encoding="utf-8")
-        )
+        payload = json.loads((FIXTURES / "readiness-manifest.json").read_text(encoding="utf-8"))
         arguments = ["--manifest", str(invalid_path), "--output", str(output)]
     else:
         initial_report = tmp_path / "initial-report.json"
@@ -618,9 +587,7 @@ def test_declared_input_normalized_path_aliases_must_be_unique(
     invalid_path = tmp_path / "invalid.json"
     output = tmp_path / "report.json"
     if document == "manifest":
-        payload = json.loads(
-            (FIXTURES / "readiness-manifest.json").read_text(encoding="utf-8")
-        )
+        payload = json.loads((FIXTURES / "readiness-manifest.json").read_text(encoding="utf-8"))
         arguments = ["--manifest", str(invalid_path), "--output", str(output)]
     else:
         initial_report = tmp_path / "initial-report.json"
@@ -655,9 +622,7 @@ def test_declared_input_normalized_path_aliases_must_be_unique(
 
 
 def test_unknown_manifest_schema_version_fails_with_a_clear_error(tmp_path: Path) -> None:
-    manifest = json.loads(
-        (FIXTURES / "readiness-manifest.json").read_text(encoding="utf-8")
-    )
+    manifest = json.loads((FIXTURES / "readiness-manifest.json").read_text(encoding="utf-8"))
     manifest["schema_version"] = 2
     manifest_path = tmp_path / "manifest.json"
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
@@ -676,9 +641,7 @@ def test_unknown_manifest_schema_version_fails_with_a_clear_error(tmp_path: Path
 def test_changed_declared_input_hash_fails_with_a_clear_error(tmp_path: Path) -> None:
     input_path = tmp_path / "provider-contract.json"
     input_path.write_text('{"provider":"changed"}\n', encoding="utf-8")
-    manifest = json.loads(
-        (FIXTURES / "readiness-manifest.json").read_text(encoding="utf-8")
-    )
+    manifest = json.loads((FIXTURES / "readiness-manifest.json").read_text(encoding="utf-8"))
     manifest["declared_inputs"][0]["path"] = input_path.name
     manifest_path = tmp_path / "manifest.json"
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
@@ -714,12 +677,8 @@ def test_output_cannot_overwrite_evidence_sources_through_a_path_alias(
     alias_directory.mkdir()
     if protected_source == "manifest":
         source_path = tmp_path / "manifest.json"
-        payload = json.loads(
-            (FIXTURES / "readiness-manifest.json").read_text(encoding="utf-8")
-        )
-        payload["declared_inputs"][0]["path"] = str(
-            FIXTURES / "provider-contract.json"
-        )
+        payload = json.loads((FIXTURES / "readiness-manifest.json").read_text(encoding="utf-8"))
+        payload["declared_inputs"][0]["path"] = str(FIXTURES / "provider-contract.json")
         source_path.write_text(json.dumps(payload), encoding="utf-8")
         arguments = [
             "--manifest",
@@ -730,9 +689,7 @@ def test_output_cannot_overwrite_evidence_sources_through_a_path_alias(
     elif protected_source == "declared_input":
         source_path = tmp_path / "provider-contract.json"
         source_path.write_bytes((FIXTURES / "provider-contract.json").read_bytes())
-        payload = json.loads(
-            (FIXTURES / "readiness-manifest.json").read_text(encoding="utf-8")
-        )
+        payload = json.loads((FIXTURES / "readiness-manifest.json").read_text(encoding="utf-8"))
         payload["declared_inputs"][0]["path"] = str(source_path)
         manifest_path = tmp_path / "manifest.json"
         manifest_path.write_text(json.dumps(payload), encoding="utf-8")
@@ -809,13 +766,9 @@ def test_merge_rejects_an_unlike_run_identity(tmp_path: Path) -> None:
     )
     assert first.returncode == 0, first.stderr
 
-    manifest = json.loads(
-        (FIXTURES / "readiness-manifest.json").read_text(encoding="utf-8")
-    )
+    manifest = json.loads((FIXTURES / "readiness-manifest.json").read_text(encoding="utf-8"))
     manifest["code_provenance"]["revision"] = "different-fixture-revision"
-    manifest["declared_inputs"][0]["path"] = str(
-        FIXTURES / "provider-contract.json"
-    )
+    manifest["declared_inputs"][0]["path"] = str(FIXTURES / "provider-contract.json")
     unlike_manifest = tmp_path / "unlike-manifest.json"
     unlike_manifest.write_text(json.dumps(manifest), encoding="utf-8")
     output = tmp_path / "merged-report.json"
@@ -926,8 +879,7 @@ def test_merge_rejects_missing_required_report_fields(
         (
             "claim_reasons",
             [],
-            "merge report claim_reasons do not match its fixture state and "
-            "prerequisites",
+            "merge report claim_reasons do not match its fixture state and prerequisites",
         ),
     ],
 )
@@ -1040,8 +992,7 @@ def test_merge_rejects_wrong_typed_envelope_fields_before_identity_validation(
         ),
         (
             "missing_declared_input",
-            "merge report evidence_index.entries missing required names: "
-            "'provider_contract'",
+            "merge report evidence_index.entries missing required names: 'provider_contract'",
         ),
         (
             "extra",
@@ -1080,9 +1031,9 @@ def test_merge_rejects_self_consistently_rehashed_mismatched_evidence_indexes(
     elif mutation == "extra":
         entries.append({"name": "extra", "sha256": "0" * 64})
     elif mutation == "wrong_declared_digest":
-        next(
-            entry for entry in entries if entry["name"] == "provider_contract"
-        )["sha256"] = "0" * 64
+        next(entry for entry in entries if entry["name"] == "provider_contract")["sha256"] = (
+            "0" * 64
+        )
     else:
         entries.append(dict(entries[0]))
     rehash_evidence_index(report)
@@ -1123,13 +1074,11 @@ def test_merge_rejects_self_consistently_rehashed_mismatched_evidence_indexes(
         ),
         (
             "missing_digest",
-            "merge report evidence_index.entries[0].sha256 must be a lowercase "
-            "SHA-256 digest",
+            "merge report evidence_index.entries[0].sha256 must be a lowercase SHA-256 digest",
         ),
         (
             "invalid_digest",
-            "merge report evidence_index.entries[0].sha256 must be a lowercase "
-            "SHA-256 digest",
+            "merge report evidence_index.entries[0].sha256 must be a lowercase SHA-256 digest",
         ),
     ],
 )
@@ -1202,10 +1151,7 @@ def test_merge_rejects_undeclared_evidence_entry_members(tmp_path: Path) -> None
     )
 
     assert result.returncode == 2
-    assert (
-        "merge report evidence_index.entries[0] has undeclared fields: 'path'"
-        in result.stderr
-    )
+    assert "merge report evidence_index.entries[0] has undeclared fields: 'path'" in result.stderr
     assert "Traceback" not in result.stderr
     assert not output.exists()
 
@@ -1221,9 +1167,7 @@ def test_merge_rejects_a_self_rehashed_false_manifest_digest(tmp_path: Path) -> 
     assert initial.returncode == 0, initial.stderr
     report = json.loads(report_path.read_text(encoding="utf-8"))
     manifest_entry = next(
-        entry
-        for entry in report["evidence_index"]["entries"]
-        if entry["name"] == "manifest"
+        entry for entry in report["evidence_index"]["entries"] if entry["name"] == "manifest"
     )
     manifest_entry["sha256"] = "0" * 64
     rehash_evidence_index(report)
@@ -1385,8 +1329,45 @@ def test_merge_rejects_tampered_identity_bearing_report_fields(
     )
 
     assert result.returncode == 2
-    assert (
-        "merge report run_identity does not match its identity-bearing fields"
-        in result.stderr
-    )
+    assert "merge report run_identity does not match its identity-bearing fields" in result.stderr
     assert not output.exists()
+
+
+def test_claim_publication_revalidates_immediately_before_replace(tmp_path: Path) -> None:
+    output = tmp_path / "report.json"
+    output.write_text('{"claim_eligible": false}\n', encoding="utf-8")
+
+    def changed() -> None:
+        raise EvidenceError("identity changed before publication")
+
+    with pytest.raises(EvidenceError, match="changed before publication"):
+        evidence_cli._write_report(
+            output,
+            {"claim_eligible": True},
+            revalidate=changed,
+            rollback_on_failure=True,
+        )
+
+    assert json.loads(output.read_text(encoding="utf-8"))["claim_eligible"] is False
+
+
+def test_post_replace_failure_restores_nonclaim_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output = tmp_path / "report.json"
+    output.write_text('{"claim_eligible": false}\n', encoding="utf-8")
+    monkeypatch.setattr(
+        evidence_cli,
+        "_fsync_directory",
+        lambda _path: (_ for _ in ()).throw(OSError("forced directory fsync failure")),
+    )
+
+    with pytest.raises(OSError, match="forced directory fsync failure"):
+        evidence_cli._write_report(
+            output,
+            {"claim_eligible": True},
+            revalidate=lambda: None,
+            rollback_on_failure=True,
+        )
+
+    assert json.loads(output.read_text(encoding="utf-8"))["claim_eligible"] is False

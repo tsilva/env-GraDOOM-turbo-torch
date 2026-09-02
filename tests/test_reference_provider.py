@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import numpy as np
@@ -11,6 +12,8 @@ from gradoom.evidence import reference_provider
 
 
 class _Distribution:
+    version = "1"
+
     def __init__(self, direct_url: dict[str, object] | None) -> None:
         self._direct_url = direct_url
 
@@ -289,3 +292,38 @@ def test_reference_diagnostic_reset_invalidates_staged_actor_identities() -> Non
     assert env.reset() == ("observation", "infos")
     with pytest.raises(RuntimeError, match="has not been staged"):
         env.diagnostic_actor_snapshot(0)
+
+
+def test_reference_distribution_identity_detects_modified_bytes_with_same_revision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package = tmp_path / "env_vizdoom_turbo"
+    package.mkdir()
+    module = package / "__init__.py"
+    module.write_text("VALUE = 1\n", encoding="utf-8")
+    metadata = tmp_path / "env_vizdoom_turbo-1.dist-info"
+    metadata.mkdir()
+    direct_url = metadata / "direct_url.json"
+    direct_url.write_text(json.dumps(_pinned_direct_url()), encoding="utf-8")
+
+    class BoundDistribution(_Distribution):
+        files = (
+            Path("env_vizdoom_turbo/__init__.py"),
+            Path("env_vizdoom_turbo-1.dist-info/direct_url.json"),
+        )
+
+        def locate_file(self, relative: object) -> Path:
+            return tmp_path / Path(str(relative))
+
+    distribution = BoundDistribution(_pinned_direct_url())
+    monkeypatch.setattr(
+        reference_provider.importlib_metadata,
+        "distribution",
+        lambda _name: distribution,
+    )
+    before = reference_provider.reference_distribution_identity()
+    module.write_text("VALUE = 2\n", encoding="utf-8")
+    after = reference_provider.reference_distribution_identity()
+
+    assert before["revision"] == after["revision"] == reference_provider.REFERENCE_REVISION
+    assert before["content_sha256"] != after["content_sha256"]
