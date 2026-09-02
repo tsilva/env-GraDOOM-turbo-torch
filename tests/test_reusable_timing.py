@@ -2531,3 +2531,37 @@ def test_sealed_execution_binding_preserves_documented_trainer_imports(tmp_path:
 
     assert result.returncode == 0, result.stderr
     assert "--config-only" in result.stdout
+
+
+def test_public_command_reads_bound_stdlib_source_through_open_code_apis(tmp_path: Path) -> None:
+    code_root = tmp_path / "code"
+    code_root.mkdir()
+    worker = code_root / "worker.py"
+    shutil.copyfile(FIXTURE_PROCESS, worker)
+    launcher = code_root / "launcher.py"
+    launcher.write_text(
+        "import _io\n"
+        "import hashlib\n"
+        "import io\n"
+        "for opener in (io.open_code, _io.open_code):\n"
+        "    with opener(hashlib.__file__) as stream:\n"
+        "        assert stream.read()\n"
+        "from worker import main\n"
+        "raise SystemExit(main())\n",
+        encoding="utf-8",
+    )
+    manifest = _manifest(
+        tmp_path,
+        outcomes={"10": [30.0, 0.0]},
+        trainer_script=launcher,
+        trainer_code_root=code_root,
+    )
+
+    result = _run_evidence(
+        "--manifest",
+        str(manifest),
+        "--output",
+        str(tmp_path / "report.json"),
+    )
+
+    assert result.returncode == 0, result.stderr
