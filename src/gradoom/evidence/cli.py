@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .benchmark import build_development_benchmark_report
+from .policy_corpus import build_policy_evaluation_report
 from .report import (
     EvidenceError,
     _load_manifest,
@@ -61,6 +62,11 @@ def _write_report(path: Path, report: dict[str, object]) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary_path, path)
+        directory_descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
     finally:
         temporary_path.unlink(missing_ok=True)
 
@@ -131,6 +137,26 @@ def _validate_output_path(
             raise EvidenceError(
                 f"output path aliases generated benchmark artifact {artifact['name']!r}"
             )
+
+    policy_evaluation = report.get("policy_evaluation")
+    if isinstance(policy_evaluation, dict):
+        corpus = policy_evaluation.get("corpus")
+        if isinstance(corpus, dict):
+            policies = corpus.get("policies")
+            if isinstance(policies, list):
+                for policy in policies:
+                    if not isinstance(policy, dict):
+                        continue
+                    raw_path = policy.get("resolved_artifact_path")
+                    if not isinstance(raw_path, str):
+                        continue
+                    artifact_path = _resolve_evidence_path(
+                        Path(raw_path), base_directory=manifest_directory
+                    )
+                    if _paths_alias(resolved_output, artifact_path):
+                        raise EvidenceError(
+                            f"output path aliases policy artifact {policy.get('id')!r}"
+                        )
 
     if merge_path is not None:
         resolved_merge = _resolve_evidence_path(
@@ -217,6 +243,13 @@ def main(argv: list[str] | None = None) -> int:
                     "development training benchmark continuation is not supported yet"
                 )
             report = build_development_benchmark_report(args.manifest)
+        elif workflow == "parity_certification":
+            report = build_policy_evaluation_report(
+                args.manifest,
+                merge_path=args.merge,
+                output_path=args.output,
+                progress_callback=lambda progress: _write_report(args.output, progress),
+            )
         else:
             raise EvidenceError(f"unsupported manifest workflow {workflow!r}")
         _validate_output_path(
@@ -225,7 +258,7 @@ def main(argv: list[str] | None = None) -> int:
             report=report,
             merge_path=args.merge,
         )
-        if args.merge is not None:
+        if args.merge is not None and workflow == "parity_readiness":
             evidence_index = report["evidence_index"]
             assert isinstance(evidence_index, dict)
             entries = evidence_index["entries"]
