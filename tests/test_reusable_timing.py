@@ -4,6 +4,7 @@ import base64
 import errno
 import hashlib
 import json
+import marshal
 import os
 import shutil
 import stat
@@ -2553,9 +2554,14 @@ def test_public_command_freshly_imports_bound_stdlib_source_and_extension(
     launcher.write_text(
         "import _hashlib\n"
         "import hashlib\n"
+        "from pathlib import Path\n"
         "assert type(hashlib.__spec__.loader).__name__ == 'SealedSourceLoader'\n"
         "assert getattr(_hashlib, '__file__', '/proc/self/fd/builtin').startswith("
         "'/proc/self/fd/')\n"
+        "crypto_maps = [line for line in Path('/proc/self/maps').read_text().splitlines() "
+        "if 'libcrypto' in line]\n"
+        "assert crypto_maps and all('/memfd:gradoom-sealed-trainer' in line "
+        "for line in crypto_maps), crypto_maps\n"
         "assert hashlib.sha256(b'bound').hexdigest() == "
         "'5e1cf42878df58fea7bfa45b715b7832d889092ad23e802e63912b1bfd205630'\n"
         "from worker import main\n"
@@ -2663,8 +2669,16 @@ def test_public_command_binds_legitimate_generated_source_into_attempt_evidence(
     attempt = report["attempts"][0]
     generated = attempt["generated_code"]
     assert any(
-        item["filename"] == "<sealed-generated>"
+        item["event"] == "compile"
+        and item["filename"] == "<sealed-generated>"
         and item["payload_sha256"] == hashlib.sha256(generated_source.encode()).hexdigest()
+        for item in generated
+    )
+    generated_code = compile(generated_source, "<sealed-generated>", "exec", dont_inherit=True)
+    assert any(
+        item["event"] == "exec"
+        and item["filename"] == "<sealed-generated>"
+        and item["payload_sha256"] == hashlib.sha256(marshal.dumps(generated_code)).hexdigest()
         for item in generated
     )
     assert attempt["execution_recipe_sha256"] == _canonical_sha256(
@@ -2673,6 +2687,70 @@ def test_public_command_binds_legitimate_generated_source_into_attempt_evidence(
             "generated_code": generated,
         },
         document="expected generated execution recipe",
+    )
+
+
+def test_public_command_binds_constructed_code_constants_before_function_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    external_value = tmp_path / "generated-value.txt"
+    external_value.write_text("7", encoding="utf-8")
+    dependency_root = tmp_path / "dependencies"
+    dependency_root.mkdir()
+    dependency = dependency_root / "constructed_dependency.py"
+    dependency_source = (
+        "import types\n"
+        "from pathlib import Path\n"
+        f"value = int(Path({str(external_value)!r}).read_text())\n"
+        "def template():\n"
+        "    return 0\n"
+        "code = template.__code__.replace(co_consts=(None, value))\n"
+        "generated = types.FunctionType(code, {})\n"
+        "assert generated() == value\n"
+        "assigned_code = template.__code__.replace(co_consts=(None, value + 1))\n"
+        "template.__code__ = assigned_code\n"
+        "assert template() == value + 1\n"
+    )
+    dependency.write_text(dependency_source, encoding="utf-8")
+    code_root = tmp_path / "code"
+    code_root.mkdir()
+    worker = code_root / "worker.py"
+    shutil.copyfile(FIXTURE_PROCESS, worker)
+    launcher = code_root / "launcher.py"
+    launcher.write_text(
+        "import constructed_dependency\nfrom worker import main\nraise SystemExit(main())\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(
+        "PYTHONPATH", str(dependency_root) + os.pathsep + os.environ.get("PYTHONPATH", "")
+    )
+    manifest = _manifest(
+        tmp_path,
+        outcomes={"10": [30.0, 0.0]},
+        trainer_script=launcher,
+        trainer_code_root=code_root,
+    )
+    output = tmp_path / "report.json"
+
+    result = _run_evidence("--manifest", str(manifest), "--output", str(output))
+
+    assert result.returncode == 0, result.stderr
+    namespace: dict[str, object] = {}
+    exec(compile(dependency_source, str(dependency), "exec", dont_inherit=True), namespace)
+    generated_code = namespace["code"]
+    assert isinstance(generated_code, type(compile("", "<test>", "exec")))
+    attempt = json.loads(output.read_text(encoding="utf-8"))["attempts"][0]
+    assert any(
+        item["event"] == "function.__new__"
+        and item["payload_sha256"] == hashlib.sha256(marshal.dumps(generated_code)).hexdigest()
+        for item in attempt["generated_code"]
+    )
+    assigned_code = namespace["assigned_code"]
+    assert isinstance(assigned_code, type(generated_code))
+    assert any(
+        item["event"] == "object.__setattr__.__code__"
+        and item["payload_sha256"] == hashlib.sha256(marshal.dumps(assigned_code)).hexdigest()
+        for item in attempt["generated_code"]
     )
 
 

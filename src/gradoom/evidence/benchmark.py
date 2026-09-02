@@ -101,6 +101,7 @@ import builtins
 import io
 import json
 import linecache
+import marshal
 import os
 import sys
 import tokenize
@@ -402,11 +403,58 @@ def reject_unsealed_execution(event, arguments):
         raise PermissionError("sealed trainer execution binding forbids dynamic code compilation")
     if event == "exec":
         code = arguments[0]
-        if code is entry_code or code.co_filename in sealed_source_names:
-            return
         pending = generated_compilations.get(code.co_filename)
         if pending and sealed_generated_code_caller(2):
             pending.pop(0)
+            caller = sys._getframe(1).f_code.co_filename
+            disclose_generated_code(
+                {
+                    "event": "exec",
+                    "caller": sealed_source_names[caller],
+                    "filename": code.co_filename,
+                    "payload_sha256": hashlib.sha256(marshal.dumps(code)).hexdigest(),
+                }
+            )
+            return
+        if code is entry_code or code.co_filename in sealed_source_names:
+            return
+        violations.append(event)
+        raise PermissionError("sealed trainer execution binding forbids dynamic code execution")
+    if event == "function.__new__":
+        code = arguments[0]
+        pending = generated_compilations.get(code.co_filename)
+        if pending and sealed_generated_code_caller(2):
+            pending.pop(0)
+            caller = sys._getframe(1).f_code.co_filename
+            disclose_generated_code(
+                {
+                    "event": "function.__new__",
+                    "caller": sealed_source_names[caller],
+                    "filename": code.co_filename,
+                    "payload_sha256": hashlib.sha256(marshal.dumps(code)).hexdigest(),
+                }
+            )
+            return
+        if code.co_filename in sealed_source_names:
+            return
+        violations.append(event)
+        raise PermissionError("sealed trainer execution binding forbids dynamic code execution")
+    if event == "object.__setattr__" and len(arguments) >= 3 and arguments[1] == "__code__":
+        code = arguments[2]
+        pending = generated_compilations.get(code.co_filename)
+        if pending and sealed_generated_code_caller(2):
+            pending.pop(0)
+            caller = sys._getframe(1).f_code.co_filename
+            disclose_generated_code(
+                {
+                    "event": "object.__setattr__.__code__",
+                    "caller": sealed_source_names[caller],
+                    "filename": code.co_filename,
+                    "payload_sha256": hashlib.sha256(marshal.dumps(code)).hexdigest(),
+                }
+            )
+            return
+        if code.co_filename in sealed_source_names:
             return
         violations.append(event)
         raise PermissionError("sealed trainer execution binding forbids dynamic code execution")
@@ -3187,7 +3235,14 @@ def _run_process(
             if (
                 not isinstance(record, dict)
                 or set(record) != {"event", "caller", "filename", "payload_sha256"}
-                or record.get("event") not in {"compile", "code.__new__"}
+                or record.get("event")
+                not in {
+                    "compile",
+                    "code.__new__",
+                    "exec",
+                    "function.__new__",
+                    "object.__setattr__.__code__",
+                }
                 or not all(isinstance(record.get(field), str) for field in record)
                 or len(record["payload_sha256"]) != 64
                 or any(
