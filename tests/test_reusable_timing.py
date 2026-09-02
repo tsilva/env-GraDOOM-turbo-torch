@@ -453,6 +453,7 @@ def test_reusable_setup_time_is_included_for_every_active_seed(tmp_path: Path) -
 def test_public_command_does_not_charge_one_seed_for_another_seeds_work(
     tmp_path: Path,
 ) -> None:
+    deliberate_delay_seconds = 5.0
     manifest = _manifest(
         tmp_path,
         outcomes={"10": [30.0, 0.0]},
@@ -461,7 +462,7 @@ def test_public_command_does_not_charge_one_seed_for_another_seeds_work(
             "--fixture-training-delay-seed",
             "123",
             "--fixture-training-delay-seconds",
-            "0.5",
+            str(deliberate_delay_seconds),
         ],
     )
     output = tmp_path / "report.json"
@@ -471,13 +472,14 @@ def test_public_command_does_not_charge_one_seed_for_another_seeds_work(
     assert result.returncode == 0, result.stderr
     attempts = json.loads(output.read_text(encoding="utf-8"))["attempts"]
     elapsed = {attempt["seed"]: attempt["reusable_elapsed_seconds"] for attempt in attempts}
-    assert elapsed[123] >= 0.5
-    assert elapsed[123] - elapsed[124] >= 0.4
+    assert elapsed[123] >= deliberate_delay_seconds
+    assert elapsed[123] - elapsed[124] >= deliberate_delay_seconds / 2
 
 
 def test_public_command_does_not_charge_recovery_for_another_seeds_work(
     tmp_path: Path,
 ) -> None:
+    deliberate_delay_seconds = 5.0
     manifest = _manifest(
         tmp_path,
         outcomes={"10": [30.0, 0.0]},
@@ -486,7 +488,7 @@ def test_public_command_does_not_charge_recovery_for_another_seeds_work(
             "--fixture-training-delay-seed",
             "123",
             "--fixture-training-delay-seconds",
-            "1.0",
+            str(deliberate_delay_seconds),
             "--fixture-interrupt-once-at-step",
             "10",
             "--fixture-interrupt-seed",
@@ -500,8 +502,10 @@ def test_public_command_does_not_charge_recovery_for_another_seeds_work(
     assert result.returncode == 0, result.stderr
     attempts = json.loads(output.read_text(encoding="utf-8"))["attempts"]
     assert [attempt["status"] for attempt in attempts] == ["succeeded", "interrupted"]
-    assert attempts[0]["reusable_elapsed_seconds"] >= 1.0
-    assert attempts[1]["recovery"]["accumulated_reusable_elapsed_seconds"] < 0.8
+    delayed_elapsed = attempts[0]["reusable_elapsed_seconds"]
+    recovery_elapsed = attempts[1]["recovery"]["accumulated_reusable_elapsed_seconds"]
+    assert delayed_elapsed >= deliberate_delay_seconds
+    assert delayed_elapsed - recovery_elapsed >= deliberate_delay_seconds / 2
 
 
 def test_terminal_elapsed_includes_durable_journal_and_authority_delay(
