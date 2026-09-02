@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .benchmark import build_development_benchmark_report
+from .diagnostic import build_fixed_time_diagnostic_report
 from .policy_corpus import build_policy_evaluation_report
 from .report import (
     EvidenceError,
@@ -243,6 +244,10 @@ def main(argv: list[str] | None = None) -> int:
                     "development training benchmark continuation is not supported yet"
                 )
             report = build_development_benchmark_report(args.manifest)
+        elif workflow == "fixed_time_training_diagnostic":
+            if args.merge is not None:
+                raise EvidenceError("fixed-time diagnostic continuation is not supported yet")
+            report = build_fixed_time_diagnostic_report(args.manifest)
         elif workflow == "parity_certification":
             report = build_policy_evaluation_report(
                 args.manifest,

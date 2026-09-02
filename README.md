@@ -107,6 +107,14 @@ per-policy kill threshold, and reports a deterministic paired 10,000-resample bo
 Only complete, clean, non-fixture evidence with a matched WAD profile and a passing fast invariant
 suite can emit a revision-bound parity certificate.
 
+The separate `fixed_time_training_diagnostic` path binds an existing benchmark report, then runs the
+same recipe and seeds to one predeclared reusable-time budget. It reports final mean
+`player_killcount` over the same 100 held-out stochastic episodes plus simulated tics/s and
+transitions/s, without changing benchmark passage. Its outer clock includes public-process startup
+and durable training evidence writes, and generated artifact digests are reconciled to unique
+evidence-index entries. Development evidence may leave this diagnostic explicitly unavailable;
+complete public performance evidence may not.
+
 Set `benchmark.cuda_residency_acceptance` in a development benchmark manifest to run the opt-in
 CUDA residency check around that same trainer. It records the checked workload and device/software
 identity and rejects host transition copies while leaving ordinary training uninstrumented. See the
