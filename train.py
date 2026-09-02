@@ -265,6 +265,21 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--timesteps", type=int, default=REFERENCE_RECIPE.timesteps)
+    parser.add_argument(
+        "--reusable-time-budget-seconds",
+        type=float,
+        default=None,
+        help=(
+            "Stop fixed-time training after the first complete rollout at or beyond this "
+            "reusable wall-clock budget, then durably write the final checkpoint."
+        ),
+    )
+    parser.add_argument(
+        "--reusable-time-deadline-monotonic",
+        type=float,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--seed", type=int, default=REFERENCE_RECIPE.seed)
     parser.add_argument("--num-envs", type=int, default=DEFAULT_NUM_ENVS)
     parser.add_argument("--n-steps", type=int, default=DEFAULT_N_STEPS)
@@ -638,6 +653,19 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("evaluation-num-envs cannot exceed evaluation-episodes")
     if not math.isfinite(args.learning_rate) or args.learning_rate <= 0.0:
         raise ValueError("learning-rate must be finite and positive")
+    if args.reusable_time_budget_seconds is not None and (
+        not math.isfinite(args.reusable_time_budget_seconds)
+        or args.reusable_time_budget_seconds <= 0.0
+    ):
+        raise ValueError("reusable-time-budget-seconds must be finite and positive")
+    if args.reusable_time_deadline_monotonic is not None and (
+        args.reusable_time_budget_seconds is None
+        or not math.isfinite(args.reusable_time_deadline_monotonic)
+        or args.reusable_time_deadline_monotonic <= 0.0
+    ):
+        raise ValueError(
+            "reusable-time-deadline-monotonic requires a finite positive reusable-time budget"
+        )
     if not math.isfinite(args.ent_coef) or args.ent_coef < 0.0:
         raise ValueError("ent-coef must be finite and non-negative")
     if not math.isfinite(args.death_penalty) or args.death_penalty < 0.0:
@@ -743,6 +771,8 @@ def _audit_config(args: argparse.Namespace) -> dict[str, Any]:
     effective = {
         **asdict(REFERENCE_RECIPE),
         "timesteps": int(args.timesteps),
+        "reusable_time_budget_seconds": args.reusable_time_budget_seconds,
+        "reusable_time_deadline_monotonic": args.reusable_time_deadline_monotonic,
         "seed": int(args.seed),
         "num_envs": int(args.num_envs),
         "n_steps": int(args.n_steps),
@@ -825,6 +855,8 @@ def _audit_config(args: argparse.Namespace) -> dict[str, Any]:
         ),
         "requested_timesteps": int(args.timesteps),
         "execution_timesteps": _execution_timesteps(args),
+        "reusable_time_budget_seconds": args.reusable_time_budget_seconds,
+        "reusable_time_deadline_monotonic": args.reusable_time_deadline_monotonic,
         "rollout_transitions": int(args.num_envs) * int(args.n_steps),
         "initialization": {
             "checkpoint": initialization_checkpoint,
@@ -2401,6 +2433,13 @@ def _save_checkpoint(
         },
         destination,
     )
+    with destination.open("rb") as stream:
+        os.fsync(stream.fileno())
+    directory_descriptor = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_descriptor)
+    finally:
+        os.close(directory_descriptor)
     return destination
 
 
@@ -3111,7 +3150,15 @@ def _train(
                 "cuda_rng_state": torch.cuda.get_rng_state_all(),
             }
 
-        while global_step < _execution_timesteps(args) and not interrupted:
+        reusable_time_budget = args.reusable_time_budget_seconds
+        reusable_time_deadline = args.reusable_time_deadline_monotonic
+        if reusable_time_budget is not None and reusable_time_deadline is None:
+            reusable_time_deadline = time.monotonic() + reusable_time_budget
+        while (
+            global_step < _execution_timesteps(args)
+            and not interrupted
+            and (reusable_time_deadline is None or time.monotonic() < reusable_time_deadline)
+        ):
             executed_rollouts += 1
             check_residency = residency_acceptance is not None and executed_rollouts > int(
                 args.steady_state_after_rollouts
@@ -3363,10 +3410,18 @@ def _train(
             )
         torch.cuda.synchronize(device)
         process_elapsed_seconds = time.perf_counter() - process_started
+        stop_reason = (
+            "interrupted"
+            if interrupted
+            else "reusable_time_budget"
+            if reusable_time_deadline is not None and time.monotonic() >= reusable_time_deadline
+            else "timestep_budget"
+        )
         emitter.emit(
             {
                 "type": "summary",
                 "status": "interrupted" if interrupted else "completed",
+                "stop_reason": stop_reason,
                 "train/global_step": global_step,
                 "requested_timesteps": int(args.timesteps),
                 "execution_timesteps": _execution_timesteps(args),
@@ -3375,6 +3430,13 @@ def _train(
                 "initialization_seconds": training_started - process_started,
                 "training_elapsed_seconds": training_elapsed_seconds,
                 "process_elapsed_seconds": process_elapsed_seconds,
+                "reusable_time_budget_seconds": reusable_time_budget,
+                "reusable_time_deadline_monotonic": args.reusable_time_deadline_monotonic,
+                "reusable_time_elapsed_seconds": (
+                    process_elapsed_seconds if reusable_time_budget is not None else None
+                ),
+                "training_transitions": global_step - resume_step,
+                "frame_skip": REFERENCE_RECIPE.frame_skip,
                 "training_transitions_per_second": (
                     (global_step - resume_step) / training_elapsed_seconds
                 ),
