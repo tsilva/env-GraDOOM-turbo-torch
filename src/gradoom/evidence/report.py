@@ -6,6 +6,7 @@ import math
 from pathlib import Path
 from typing import Any
 
+from .invariant_suite import InvariantSuiteError, run_invariant_suite
 from .wad_profile import validate_wad_profile
 
 
@@ -33,10 +34,12 @@ _READINESS_REPORT_FIELDS = (
     "code_provenance",
     "declared_inputs",
     "prerequisites",
+    "invariant_suite",
     "evidence_index",
 )
 
 _MAX_JSON_NESTING = 256
+_REQUIRED_READINESS_PREREQUISITES = ("real_pretrained_policy_corpus",)
 
 
 def _sha256_bytes(payload: bytes) -> str:
@@ -281,6 +284,7 @@ def _readiness_claim_reasons(
     fixture: bool,
     prerequisites: list[dict[str, Any]],
     wad_profile: dict[str, Any] | None = None,
+    invariant_suite: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     reasons: list[dict[str, Any]] = [
         {
@@ -322,6 +326,36 @@ def _readiness_claim_reasons(
         for item in prerequisites
         if not item["available"]
     )
+    declared_prerequisites = {item["id"] for item in prerequisites}
+    reasons.extend(
+        {
+            "code": "missing_required_prerequisite",
+            "prerequisite": identifier,
+            "message": f"Required readiness prerequisite {identifier!r} was not declared.",
+        }
+        for identifier in _REQUIRED_READINESS_PREREQUISITES
+        if identifier not in declared_prerequisites
+    )
+    if invariant_suite is not None:
+        reasons.extend(
+            {
+                "code": "invariant_failure",
+                "behavior": failure["behavior"],
+                "message": failure["message"],
+            }
+            for failure in invariant_suite["failures"]
+        )
+        reasons.extend(
+            {
+                "code": "invariant_suite_unavailable",
+                **{
+                    key: value
+                    for key, value in unavailable.items()
+                    if key in {"provider", "message"}
+                },
+            }
+            for unavailable in invariant_suite["unavailable_reasons"]
+        )
     return reasons
 
 
@@ -329,13 +363,21 @@ def _validate_readiness_envelope(
     report: dict[str, Any],
     prerequisites: list[dict[str, Any]],
     wad_profile: dict[str, Any] | None = None,
+    invariant_suite: dict[str, Any] | None = None,
 ) -> None:
     missing = [item for item in prerequisites if not item["available"]]
+    declared_prerequisites = {item["id"] for item in prerequisites}
+    omitted_required = set(_REQUIRED_READINESS_PREREQUISITES) - declared_prerequisites
     expected_status = (
         "failed"
-        if wad_profile is not None and wad_profile["status"] == "failed"
+        if (
+            (wad_profile is not None and wad_profile["status"] == "failed")
+            or (invariant_suite is not None and invariant_suite["status"] == "failed")
+        )
         else "unavailable"
         if missing
+        or omitted_required
+        or (invariant_suite is not None and invariant_suite["status"] == "unavailable")
         else "ready"
     )
     if report["status"] != expected_status:
@@ -347,7 +389,9 @@ def _validate_readiness_envelope(
     claim_reasons = report["claim_reasons"]
     if not isinstance(claim_reasons, list):
         raise EvidenceError("merge report claim_reasons must be an array")
-    expected_reasons = _readiness_claim_reasons(report["fixture"], prerequisites, wad_profile)
+    expected_reasons = _readiness_claim_reasons(
+        report["fixture"], prerequisites, wad_profile, invariant_suite
+    )
     canonical_reasons = sorted(
         json.dumps(reason, sort_keys=True, separators=(",", ":")) for reason in claim_reasons
     )
@@ -446,6 +490,7 @@ def _run_identity(
     *,
     document: str,
     wad_profile: dict[str, Any] | None = None,
+    invariant_suite: dict[str, Any] | None = None,
 ) -> str:
     identity = {
         "schema_version": manifest["schema_version"],
@@ -466,6 +511,11 @@ def _run_identity(
             if binding_identity is not None
             else {"authority": wad_profile["authority"]}
         )
+    if invariant_suite is not None and invariant_suite["configured"]:
+        identity["invariant_suite"] = {
+            "version": invariant_suite["version"],
+            "providers": invariant_suite["providers"],
+        }
     return _canonical_sha256(identity, document=document)
 
 
@@ -534,9 +584,24 @@ def build_readiness_report(manifest_path: Path) -> dict[str, Any]:
         formatted = ", ".join(repr(name) for name in colliding_names)
         raise EvidenceError(f"declared_inputs use reserved WAD profile evidence names: {formatted}")
     evidence_entries.extend(wad_evidence_entries)
+    try:
+        invariant_suite = run_invariant_suite(
+            manifest.get("invariant_suite"),
+            base_directory=manifest_path.parent,
+            declared_inputs=declared_inputs,
+            fixture=manifest["fixture"],
+            gradoom_revision=code_provenance["revision"],
+            wad_profile=wad_profile,
+        )
+    except InvariantSuiteError as error:
+        raise EvidenceError(str(error)) from error
 
     missing = [item for item in prerequisites if not item["available"]]
-    claim_reasons = _readiness_claim_reasons(manifest["fixture"], prerequisites, wad_profile)
+    declared_prerequisites = {item["id"] for item in prerequisites}
+    omitted_required = set(_REQUIRED_READINESS_PREREQUISITES) - declared_prerequisites
+    claim_reasons = _readiness_claim_reasons(
+        manifest["fixture"], prerequisites, wad_profile, invariant_suite
+    )
     evidence_index = {
         "algorithm": "sha256",
         "entries": evidence_entries,
@@ -549,9 +614,12 @@ def build_readiness_report(manifest_path: Path) -> dict[str, Any]:
         "fixture": manifest["fixture"],
         "status": (
             "failed"
-            if wad_profile is not None and wad_profile["status"] == "failed"
+            if (
+                (wad_profile is not None and wad_profile["status"] == "failed")
+                or invariant_suite["status"] == "failed"
+            )
             else "unavailable"
-            if missing
+            if missing or omitted_required or invariant_suite["status"] == "unavailable"
             else "ready"
         ),
         "claim_eligible": False,
@@ -563,10 +631,12 @@ def build_readiness_report(manifest_path: Path) -> dict[str, Any]:
             prerequisites,
             document="manifest",
             wad_profile=wad_profile,
+            invariant_suite=invariant_suite,
         ),
         "code_provenance": code_provenance,
         "declared_inputs": declared_inputs,
         "prerequisites": prerequisites,
+        "invariant_suite": invariant_suite,
         "evidence_index": evidence_index,
     }
     if wad_profile is not None:
@@ -581,6 +651,7 @@ def validate_merge_report(
     expected_manifest_sha256: str,
     manifest_directory: Path,
     expected_wad_profile: dict[str, Any] | None = None,
+    expected_invariant_suite: dict[str, Any] | None = None,
     expected_evidence_entries: list[dict[str, str]] | None = None,
 ) -> None:
     report = _parse_json_document(path.read_bytes(), document="merge report")
@@ -613,6 +684,11 @@ def validate_merge_report(
         raise EvidenceError(
             "merge report wad_profile does not match the current profile validation"
         )
+    invariant_suite = report["invariant_suite"]
+    if invariant_suite != expected_invariant_suite:
+        raise EvidenceError(
+            "merge report invariant_suite does not match the current invariant execution"
+        )
     stored_run_identity = _required_string(report["run_identity"], "merge report run_identity")
     recomputed_run_identity = _run_identity(
         report,
@@ -621,6 +697,7 @@ def validate_merge_report(
         prerequisites,
         document="merge report",
         wad_profile=wad_profile,
+        invariant_suite=invariant_suite,
     )
     if stored_run_identity != recomputed_run_identity:
         raise EvidenceError("merge report run_identity does not match its identity-bearing fields")
@@ -633,7 +710,7 @@ def validate_merge_report(
         raise EvidenceError("merge report workflow must be parity_readiness")
     if report["evidence_level"] != "development":
         raise EvidenceError("merge report evidence_level must be development")
-    _validate_readiness_envelope(report, prerequisites, wad_profile)
+    _validate_readiness_envelope(report, prerequisites, wad_profile, invariant_suite)
     _validate_evidence_index(
         report["evidence_index"],
         declared_inputs,

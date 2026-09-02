@@ -50,6 +50,10 @@ contains:
 - `wad_profile`: required for non-fixture runs and validated through the immutable
   `freedoom2-deathmatch-v1` binding before training. The trainer and evaluator must report the same
   IWAD and PWAD hashes. CPU-only fixture manifests may omit real WAD assets.
+- `cuda_residency_acceptance`: an optional boolean, defaulting to `false`. When true, the evidence
+  command owns the standalone trainer's `--cuda-residency-acceptance` flag and requires a passing
+  `gradoom-cuda-residency-v1` record from every training segment. Trainer arguments cannot override
+  this setting.
 
 For each seed, the command starts the reusable timer before attempt setup and invokes the existing
 `standalone-gradoom-deathmatch-ppo-v2` trainer contract at every checkpoint cadence. The first
@@ -88,6 +92,34 @@ Every development report includes `diagnostics.fixed_time`. When the separate di
 been run, that field has `status: unavailable`, an explicit reason, and `affects_passage: false`.
 The report also marks `public_performance_evidence.complete: false`; omission is allowed for cheap
 development iteration but cannot be silently promoted into a complete public evidence bundle.
+
+### CUDA residency acceptance
+
+CUDA residency acceptance instruments the real standalone trainer used by the development
+benchmark (and available to the primary benchmark through the same trainer contract). It begins
+only after `--steady-state-after-rollouts` and fails closed if no later rollout is checked. The
+record verifies one concrete CUDA device for observations, actions, rewards, reset selectors and
+state, rollout state, inference outputs, loss tensors, optimizer state, parameters, and gradients
+used for updates. One continuous rollout scope covers observation augmentation and staging,
+transitions, reward shaping, rollout writes, context/reset updates, value bootstrap, and rollout
+finalization; one continuous update scope covers PPO staging, losses, and parameter updates. Both
+reject host-to-accelerator and accelerator-to-host copies before they execute, including
+`.cpu().numpy()` round trips and NumPy-created update tensors.
+
+The retained record names the exact checked workload and transition count; GPU model, concrete
+device, compute capability, and memory; and Python, GraDOOM, Torch, CUDA, cuDNN, and NumPy versions.
+Its host-transition guard count and zero-transfer result are part of the validated evidence. A
+fixture process may exercise this report contract only as `fixture_contract`; fixture reports remain
+non-authoritative and claim-ineligible and cannot impersonate CUDA hardware evidence.
+
+Acceptance guards exclude bounded scalar telemetry, configuration and scheduling, process
+bootstrap, and checkpoint extraction/writing. Those operations remain permitted outside the
+steady-state data plane. When the option is disabled, the trainer creates no acceptance collector,
+uses two reusable no-op contexts per rollout instead of per-step or per-minibatch branches, emits no
+acceptance record, and performs no additional host transport.
+Hardware integration tests require an explicitly allocated CUDA device and
+`GRADOOM_RUN_CUDA_ACCEPTANCE=1`; otherwise they skip with a clear reason while deterministic
+contract and fixture-wiring tests continue to run.
 
 ## Fixed-time training diagnostic
 
@@ -160,13 +192,57 @@ The v1 readiness manifest is a JSON object with these fields:
   paths are resolved from the manifest directory and are verified before report creation.
 - `prerequisites`: uniquely identified readiness prerequisites with an `available` boolean. Every
   unavailable prerequisite must include a human-readable `reason`.
+- `invariant_suite` (optional until a provider runtime is available): version `1.0.0`, a `mode` of
+  `fixture` or `real`, the `runner_input` name of the hash-verified repository runner, and optional
+  statuses for the retained deep diagnostics. Manifests cannot declare provider commands. Fixture
+  mode requires `fixture: true`; its executable examples use `pass`, while the
+  `reward_mismatch`, `missing_player_killcount`, and `missing_termination` cases are retained
+  adversarial test inputs.
+- `invariant_suite.real_configuration` (required in real mode): a requested `device` (`cpu`,
+  `cuda`, or canonical ASCII `cuda:N`), a predeclared `timeout_seconds`, a
+  `reference_scenario_config_input` naming a hashed declared input, and `semantic_probes` for
+  `termination`, `truncation`, `player_killcount`, and
+  `player_killcount.enemy_on_enemy_exclusion`. Each probe declares exactly two uint32 `seeds`, a
+  non-empty cycle of two-lane pinned action-index rows under `actions`, and a positive
+  `max_steps` no greater than 100,000. The timeout must be at least 120 seconds and at least 0.05
+  seconds per total declared probe step, and cannot exceed 86,400 seconds. The action rows retain
+  their published action meanings; success comes only from an event observed in public step
+  results.
 - `wad_profile` (required when `certified_freedoom2_wad_profile` is declared available): the
   `freedoom2-deathmatch-v1` profile ID and exactly one `gradoom` and one `env-vizdoom-turbo`
   provider binding. Each binding declares `iwad_path`, `pwad_path`, and the complete policy-facing
   `configuration`. Relative WAD paths are resolved from the manifest directory.
 
+Real invariant execution additionally requires that `wad_profile` validation has matched. The
+command derives both providers' IWAD/PWAD paths, hashes, map, skill, scenario, action mode, frame
+skip, horizon, and preprocessing directly from that validated binding rather than accepting a
+second copy in `real_configuration`. The reference scenario config must sit beside, and therefore
+load, the exact validated reference `deathmatch.wad`; a substitute PWAD fails before provider work.
+
+The reference config is an exact allowlisted part of the shared scenario configuration. It must
+declare only the bound PWAD, skill, resolution, HUD and screen-flash settings, episode start and
+timeout, player mode, the complete pinned button set, and the native `HEALTH`, `KILLCOUNT`, and
+`PLAYER_KILLCOUNT` variables. Extra provider-only behavior settings, missing settings, duplicate
+settings, or different values fail before provider construction. `episode_return` remains a derived
+report signal selected through `info_filter`; it is never passed as a native game variable.
+
+Real kill probes use an additional diagnostic-only actor stage under the same bound IWAD, PWAD,
+map, skill, action table, and provider configuration. The player-kill stage contains exactly the
+controlled player and one enemy. The infighting stage contains exactly the controlled player and
+two enemies; a harmless west-facing shot during setup wakes the east-side actors without damaging
+them. GraDOOM records source and target actor IDs where engine damage becomes a death. The pinned
+reference provider enables native object information before initialization and proves the same
+death from stable object IDs and the distinct surviving actor in the isolated stage. A passing
+event must have exactly one death, retain the independently observed attacker, remove the target,
+and contain no additional actors. Counters, rewards, requested actions, provider labels, and pixel
+changes never supply actor identity. Missing object support, changed assets, replayed stages,
+self-attribution, multiple sources, or ambiguous populations produce a named failed invariant.
+This instrumentation is inactive during ordinary reset, step, policy evaluation, and benchmarks.
+
 The repository fixture is the executable example of this schema:
 [`tests/fixtures/evidence/readiness-manifest.json`](../tests/fixtures/evidence/readiness-manifest.json).
+The independently versioned two-provider invariant example is
+[`tests/fixtures/evidence/invariant-readiness-manifest.json`](../tests/fixtures/evidence/invariant-readiness-manifest.json).
 
 ## First WAD profile
 
@@ -228,19 +304,76 @@ defaults. The artifact is hashed before and after loading so a concurrently chan
 rejected. The adapter does not offer observation correction, action remapping, fine-tuning, or
 learned adaptation hooks.
 
+## Fast Turbo invariant suite
+
+Invariant suite `1.0.0` runs before readiness is decided. The manifest cannot supply provider
+commands. It names the repository-owned invariant runner as a declared input; the command verifies
+that input's path and hash, invokes only the installed runner module, and authenticates the response
+with a fresh challenge plus the runner-source digest. Arbitrary executables and static contract
+emitters therefore cannot satisfy the suite.
+
+The runner exercises each provider through public construction, reset, step, and masked-reset
+operations. The command requires the complete common constructor signature and defaults, full
+action meanings, exact observation, signal, and reward shapes and dtypes, lifecycle operations,
+termination, truncation, manual episode-reset semantics, and `player_killcount`. It additionally
+requires every GraDOOM reset-mask and action input plus reset and step output to be a Torch tensor on
+the declared device. A terminal event passes only after the terminal lanes reset and public stepping
+resumes. Masked reset is checked both at its immediate return and on the following transition against
+deterministic one-step and two-step controls, proving selected-lane reset and unselected-lane
+continuation in provider state. The player-attributed kill probes require staged actor/target
+attribution in addition to counters: the former must observe a player-to-enemy event and increment
+`player_killcount`, while the latter must observe an enemy-to-enemy event and increment only
+compatibility `killcount`. For real providers, the repository-owned oracle rehashes the validated
+IWAD and PWAD at the event boundary and consumes a freshly staged actor-population token exactly
+once; any public reset invalidates that stage. GraDOOM uses engine-recorded source and target actor
+IDs from the damage/death site. The reference provider instead uses stable native object IDs and the
+isolated before/after population to identify the distinct surviving attacker and removed target. The
+suite reconciles the exact staged and surviving populations and exactly one death with the public
+counter deltas: player-to-enemy increments `player_killcount`, while enemy-to-enemy leaves it
+unchanged and increments compatibility `killcount`. Requested actions, counters, rewards,
+observations, and pixels never supply actor identity. Provider- or manifest-supplied attribution,
+reset or stage replay, ambiguous populations, and counter-only evidence fail closed.
+
+Real execution loads GraDOOM and the immutable reference revision independently through the pinned
+reference adapter. An absent optional provider runtime is unavailable; changed assets, an invalid
+binding, a non-exact scenario config, or an unprovable executed GraDOOM Git checkout fail closed.
+The GraDOOM revision is derived from the clean checkout containing the executed module rather than
+copied from manifest provenance. Once the runtime is present, missing signals,
+malformed transitions, runtime errors, and unobserved lifecycle or kill events become named failed
+invariants rather than generic unavailability. Non-fixture execution also requires the GraDOOM
+provider revision to match `code_provenance.revision`. The fixture runner provides deterministic
+public-operation probes only when the manifest itself is `fixture: true`; fixture evidence can never
+support a real claim.
+
+Real runner timeout uses the accepted predeclared timeout rather than an unconditional process
+timeout. Exhaustion is retained as a named unavailable result and cannot produce readiness or a
+claim; incoherent timeout/probe budgets are rejected before execution.
+
+The report records every check under `invariant_suite.checks`. A mismatch sets both the suite and
+readiness status to `failed` and names the public `behavior`; missing, unconfigured, or unavailable
+suite execution leaves readiness `unavailable`. A complete invariant pass still reports
+certification unavailable when the required real pretrained policy corpus is unavailable or was not
+declared, with `claim_eligible: false`.
+
+Mechanics, trace, outcome-distribution, policy-observation, and rendering diagnostics remain
+separate reproducible tools. Their declared statuses are copied under
+`invariant_suite.diagnostics` with `affects_verdict: false`; they never change the invariant or
+readiness verdict.
+
 ## Report schema version 1
 
 The JSON report records its schema version, workflow, evidence level, fixture state, readiness
 status, claim eligibility and structured reasons, stable run identity, declared code provenance,
 declared inputs, prerequisites, optional WAD-profile validation, and evidence index. A fixture
-report is `unavailable` while real
-prerequisites are missing, has `claim_eligible: false`, and names every missing prerequisite in
-`claim_reasons`.
+report is `unavailable` while real prerequisites are missing, has `claim_eligible: false`, and
+names every missing prerequisite in `claim_reasons`. Every report records the invariant-suite
+version even when provider execution has not yet been configured.
 
 `run_identity` is the lowercase SHA-256 digest of canonical JSON containing the manifest schema,
 workflow, evidence level, fixture state, code provenance, input names and declared hashes,
 prerequisite identifiers, and—when supplied—the complete normalized WAD-profile binding. Input and
-prerequisite ordering does not affect it. Canonical JSON uses
+prerequisite ordering does not affect it. A configured invariant suite also binds its independent
+version and each provider's revision and canonical contract digest. Canonical JSON uses
 UTF-8, sorted object keys, no insignificant whitespace, and JSON separators `,` and `:`. File paths
 are not identity fields; the declared content hashes are.
 

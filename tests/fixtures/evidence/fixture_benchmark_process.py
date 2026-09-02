@@ -37,6 +37,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--evaluation-seed", type=int, default=123)
     parser.add_argument("--evaluation-stochastic", action=argparse.BooleanOptionalAction)
     parser.add_argument("--metrics-jsonl", type=Path, required=True)
+    parser.add_argument("--cuda-residency-acceptance", action="store_true")
     parser.add_argument("--fixture-outcomes", required=True)
     parser.add_argument("--fixture-fail-training-seed", type=int)
     parser.add_argument("--fixture-fail-evaluation-step", type=int)
@@ -54,6 +55,10 @@ def _parser() -> argparse.ArgumentParser:
         default="terminated",
     )
     parser.add_argument("--fixture-mutate-checkpoint-after-evaluation", action="store_true")
+    parser.add_argument("--fixture-omit-cuda-residency-record", action="store_true")
+    parser.add_argument("--fixture-cuda-residency-cpu-category")
+    parser.add_argument("--fixture-cuda-residency-detected-transfer", action="store_true")
+    parser.add_argument("--fixture-cuda-residency-hardware-device", default="cuda:0")
     return parser
 
 
@@ -110,26 +115,31 @@ def main() -> int:
             and not args.fixture_hardlink_checkpoint_to.exists()
         ):
             os.link(args.checkpoint, args.fixture_hardlink_checkpoint_to)
-        records: list[dict[str, object]] = [
-            {
-                "type": "config",
-                "contract": "standalone-gradoom-deathmatch-ppo-v2",
-                "operation": "train",
-                "requested_timesteps": args.timesteps,
-                "execution_timesteps": actual_step,
-                "initialization": {
-                    "mode": "random",
-                    "checkpoint": None,
-                    "checkpoint_sha256": None,
-                },
-                "state_initialization": {
-                    "policy_state": "resumed" if args.resume is not None else "fresh_random",
-                    "optimizer_state": "resumed" if args.resume is not None else "fresh",
-                },
-                "reusable_time_budget_seconds": args.reusable_time_budget_seconds,
-                "reusable_time_deadline_monotonic": args.reusable_time_deadline_monotonic,
+        config: dict[str, object] = {
+            "type": "config",
+            "contract": "standalone-gradoom-deathmatch-ppo-v2",
+            "operation": "train",
+            "requested_timesteps": args.timesteps,
+            "execution_timesteps": actual_step,
+            "initialization": {
+                "mode": "random",
+                "checkpoint": None,
+                "checkpoint_sha256": None,
+            },
+            "state_initialization": {
+                "policy_state": "resumed" if args.resume is not None else "fresh_random",
+                "optimizer_state": "resumed" if args.resume is not None else "fresh",
+            },
+            "reusable_time_budget_seconds": args.reusable_time_budget_seconds,
+            "reusable_time_deadline_monotonic": args.reusable_time_deadline_monotonic,
+        }
+        if args.cuda_residency_acceptance:
+            config["cuda_residency_acceptance"] = {
+                "contract": "gradoom-cuda-residency-v1",
+                "enabled": True,
+                "steady_state_after_rollouts": 1,
             }
-        ]
+        records: list[dict[str, object]] = [config]
         if args.resume is not None:
             records.append(
                 {
@@ -138,6 +148,64 @@ def main() -> int:
                     "checkpoint": str(args.resume),
                 }
             )
+        if args.cuda_residency_acceptance and not args.fixture_omit_cuda_residency_record:
+            categories = [
+                "observations",
+                "actions",
+                "rewards",
+                "resets",
+                "rollout_state",
+                "inference",
+                "losses",
+                "optimizer_state",
+                "parameters",
+                "updates",
+            ]
+            acceptance_record: dict[str, object] = {
+                "type": "cuda_residency_acceptance",
+                "contract": "gradoom-cuda-residency-v1",
+                "evidence_kind": "fixture_contract",
+                "status": "passed",
+                "checked_categories": categories,
+                "devices": {category: ["cuda:0"] for category in categories},
+                "host_transition_guard": {
+                    "status": "passed",
+                    "guarded_scopes": 4,
+                    "detected_transfers": (
+                        1 if args.fixture_cuda_residency_detected_transfer else 0
+                    ),
+                },
+                "checked_rollouts": 1,
+                "checked_steps": 10,
+                "workload": {
+                    "trainer_contract": "standalone-gradoom-deathmatch-ppo-v2",
+                    "num_envs": 1,
+                    "n_steps": 10,
+                    "checked_rollouts": 1,
+                    "checked_transitions": 10,
+                    "global_step_start": 0,
+                    "global_step_end": actual_step,
+                },
+                "hardware": {
+                    "gpu_model": "fixture-only",
+                    "device": args.fixture_cuda_residency_hardware_device,
+                    "compute_capability": "fixture",
+                    "total_memory_bytes": 0,
+                },
+                "software": {
+                    "python": "fixture",
+                    "gradoom": "fixture",
+                    "torch": "fixture",
+                    "cuda": "fixture",
+                    "cudnn": "fixture",
+                    "numpy": "fixture",
+                },
+            }
+            if args.fixture_cuda_residency_cpu_category:
+                devices = acceptance_record["devices"]
+                assert isinstance(devices, dict)
+                devices[args.fixture_cuda_residency_cpu_category] = ["cpu"]
+            records.append(acceptance_record)
         records.append(
             {
                 "type": "summary",
