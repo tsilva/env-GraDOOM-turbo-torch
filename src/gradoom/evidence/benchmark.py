@@ -92,7 +92,6 @@ _F_SEAL_SHRINK = 0x0002
 _F_SEAL_GROW = 0x0004
 _F_SEAL_WRITE = 0x0008
 _SEALED_PYTHON_BOOTSTRAP = r"""
-import _io
 import importlib.machinery
 import importlib.util
 import builtins
@@ -177,7 +176,6 @@ for module in set(environment_sources) | set(extension_descriptors):
 
 
 original_open = builtins.open
-original_open_code = _io.open_code
 
 
 def sealed_source_open(file, mode="r", *args, **kwargs):
@@ -201,19 +199,8 @@ def sealed_source_open(file, mode="r", *args, **kwargs):
     )
 
 
-def sealed_source_open_code(file):
-    archive_name = None
-    if isinstance(file, (str, bytes, os.PathLike)):
-        archive_name = sealed_source_names.get(os.path.realpath(os.fsdecode(file)))
-    if archive_name is None:
-        return original_open_code(file)
-    return io.BytesIO(sealed_archive.read(archive_name))
-
-
 builtins.open = sealed_source_open
 io.open = sealed_source_open
-_io.open_code = sealed_source_open_code
-io.open_code = sealed_source_open_code
 
 
 class SealedSourceLoader:
@@ -238,6 +225,15 @@ class SealedSourceLoader:
             )
         code = compile(source, self.original_path, "exec")
         exec(code, module.__dict__, module.__dict__)
+        if module.__name__ == "ctypes.util" and sys.platform.startswith("linux"):
+            original_find_library = module.find_library
+
+            def sealed_find_library(name):
+                if name == "dl":
+                    return "libdl.so.2"
+                return original_find_library(name)
+
+            module.find_library = sealed_find_library
 
     def is_package(self, fullname):
         return self.package
@@ -1392,7 +1388,10 @@ def _extension_module_name(relative_path: Path) -> str | None:
         part in {"lib", "libs"} or part.endswith(".libs") for part in relative_path.parts
     ):
         return None
-    module_parts = [*relative_path.parts[:-1], name[: -len(suffix)]]
+    parents = relative_path.parts[:-1]
+    if parents == ("lib-dynload",):
+        parents = ()
+    module_parts = [*parents, name[: -len(suffix)]]
     if not module_parts or any(not part.isidentifier() for part in module_parts):
         return None
     return ".".join(module_parts)

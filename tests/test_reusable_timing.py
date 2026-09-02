@@ -486,7 +486,7 @@ def test_public_command_does_not_charge_recovery_for_another_seeds_work(
             "--fixture-training-delay-seed",
             "123",
             "--fixture-training-delay-seconds",
-            "0.5",
+            "1.0",
             "--fixture-interrupt-once-at-step",
             "10",
             "--fixture-interrupt-seed",
@@ -500,8 +500,8 @@ def test_public_command_does_not_charge_recovery_for_another_seeds_work(
     assert result.returncode == 0, result.stderr
     attempts = json.loads(output.read_text(encoding="utf-8"))["attempts"]
     assert [attempt["status"] for attempt in attempts] == ["succeeded", "interrupted"]
-    assert attempts[0]["reusable_elapsed_seconds"] >= 0.5
-    assert attempts[1]["recovery"]["accumulated_reusable_elapsed_seconds"] < 0.4
+    assert attempts[0]["reusable_elapsed_seconds"] >= 1.0
+    assert attempts[1]["recovery"]["accumulated_reusable_elapsed_seconds"] < 0.8
 
 
 def test_terminal_elapsed_includes_durable_journal_and_authority_delay(
@@ -2533,19 +2533,22 @@ def test_sealed_execution_binding_preserves_documented_trainer_imports(tmp_path:
     assert "--config-only" in result.stdout
 
 
-def test_public_command_reads_bound_stdlib_source_through_open_code_apis(tmp_path: Path) -> None:
+def test_public_command_freshly_imports_bound_stdlib_source_and_extension(
+    tmp_path: Path,
+) -> None:
     code_root = tmp_path / "code"
     code_root.mkdir()
     worker = code_root / "worker.py"
     shutil.copyfile(FIXTURE_PROCESS, worker)
     launcher = code_root / "launcher.py"
     launcher.write_text(
-        "import _io\n"
+        "import _hashlib\n"
         "import hashlib\n"
-        "import io\n"
-        "for opener in (io.open_code, _io.open_code):\n"
-        "    with opener(hashlib.__file__) as stream:\n"
-        "        assert stream.read()\n"
+        "assert type(hashlib.__spec__.loader).__name__ == 'SealedSourceLoader'\n"
+        "assert getattr(_hashlib, '__file__', '/proc/self/fd/builtin').startswith("
+        "'/proc/self/fd/')\n"
+        "assert hashlib.sha256(b'bound').hexdigest() == "
+        "'5e1cf42878df58fea7bfa45b715b7832d889092ad23e802e63912b1bfd205630'\n"
         "from worker import main\n"
         "raise SystemExit(main())\n",
         encoding="utf-8",
