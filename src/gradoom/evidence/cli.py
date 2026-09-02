@@ -18,6 +18,7 @@ from .report import (
     build_readiness_report,
     validate_merge_report,
 )
+from .time_authority import ReusableTimeAuthority, TimeAuthorityError
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -251,9 +252,7 @@ def _validate_document_paths(
                 if resolved_output == resolved_code_root or resolved_output.is_relative_to(
                     resolved_code_root
                 ):
-                    raise EvidenceError(
-                        "benchmark report output must be outside trainer code_root"
-                    )
+                    raise EvidenceError("benchmark report output must be outside trainer code_root")
         bootstrap_artifacts = benchmark.get("bootstrap_artifacts")
         if isinstance(bootstrap_artifacts, list):
             for artifact in bootstrap_artifacts:
@@ -287,6 +286,20 @@ def _validate_document_paths(
 
 def main(argv: list[str] | None = None) -> int:
     invocation_started = time.perf_counter()
+    authority_invocation_event_id: str | None = None
+    authority_state = os.environ.get("GRADOOM_REUSABLE_TIME_AUTHORITY_STATE")
+    authority_witness = os.environ.get("GRADOOM_REUSABLE_TIME_AUTHORITY_WITNESS")
+    if authority_state and authority_witness:
+        try:
+            authority_invocation_event_id = ReusableTimeAuthority(
+                Path(authority_state), Path(authority_witness)
+            ).start_invocation()["event_id"]
+        except (OSError, TimeAuthorityError) as error:
+            print(
+                f"gradoom-evidence: error: reusable-time authority is unavailable: {error}",
+                file=sys.stderr,
+            )
+            return 2
     args = _parser().parse_args(argv)
     try:
         manifest, _payload = _load_manifest(args.manifest)
@@ -317,6 +330,7 @@ def main(argv: list[str] | None = None) -> int:
                 invocation_started=invocation_started,
                 clock=time.perf_counter,
                 report_writer=write_benchmark_report,
+                authority_invocation_event_id=authority_invocation_event_id,
             )
             report_already_written = True
         else:

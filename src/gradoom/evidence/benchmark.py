@@ -6,6 +6,7 @@ import binascii
 import ctypes
 import fcntl
 import hashlib
+import hmac
 import importlib.machinery
 import json
 import math
@@ -19,6 +20,7 @@ import subprocess
 import sys
 import sysconfig
 import tempfile
+import threading
 import time
 import zipfile
 from collections.abc import Callable
@@ -84,8 +86,7 @@ _MAX_SEALED_EXTENSION_FILE_BYTES = 512 * 1024 * 1024
 _MAX_SEALED_NATIVE_FILE_BYTES = 1024 * 1024 * 1024
 _MAX_SEALED_TOTAL_BYTES = 2 * 1024 * 1024 * 1024
 _SEALED_EXECUTION_EXIT = 125
-_SEALED_EXECUTION_CONTRACT = "kernel-sealed-python-environment-v2"
-_GENERATED_CODE_PREFIX = "__GRADOOM_SEALED_GENERATED_CODE_V1__="
+_SEALED_EXECUTION_CONTRACT = "kernel-sealed-python-environment-v3"
 _MFD_CLOEXEC = 0x0001
 _MFD_ALLOW_SEALING = 0x0002
 _F_ADD_SEALS = 1033
@@ -98,6 +99,8 @@ _SEALED_PYTHON_BOOTSTRAP = r"""
 import importlib.machinery
 import importlib.util
 import builtins
+import hashlib
+import hmac
 import io
 import json
 import linecache
@@ -113,16 +116,39 @@ import tokenize
     protected_roots_json,
     extension_descriptors_json,
     native_descriptors_json,
+    generated_request_descriptor,
+    generated_response_descriptor,
+    generated_secret_descriptor,
     *trainer_arguments,
 ) = sys.argv[1:]
 entry_path = os.path.join(code_root, entry_relative)
 protected_roots = json.loads(protected_roots_json)
 extension_descriptors = json.loads(extension_descriptors_json)
 native_descriptors = json.loads(native_descriptors_json)
+generated_request_descriptor = int(generated_request_descriptor)
+generated_response_descriptor = int(generated_response_descriptor)
+generated_secret_descriptor = int(generated_secret_descriptor)
+generated_channel_secret = b""
+while len(generated_channel_secret) < 32:
+    chunk = os.read(generated_secret_descriptor, 32 - len(generated_channel_secret))
+    if not chunk:
+        raise RuntimeError("generated-code authorization secret is incomplete")
+    generated_channel_secret += chunk
+os.close(generated_secret_descriptor)
 sealed_extension_originals = {
     os.path.realpath(value[1]) for value in extension_descriptors.values()
 }
 sealed_native_originals = {os.path.realpath(value[1]) for value in native_descriptors}
+sealed_native_by_name = {}
+for descriptor, original_path, loader_names in native_descriptors:
+    sealed_native_by_name[os.path.realpath(original_path)] = descriptor
+    sealed_native_by_name[os.path.basename(original_path)] = descriptor
+    for loader_name in loader_names:
+        sealed_native_by_name[loader_name] = descriptor
+sealed_native_descriptor_paths = {
+    "/proc/self/fd/" + str(descriptor) for descriptor, _path, _names in native_descriptors
+}
+ctypes_initializing = False
 violations = []
 
 
@@ -225,6 +251,7 @@ class SealedSourceLoader:
         return None
 
     def exec_module(self, module):
+        global ctypes_initializing
         source = sealed_archive.read(self.archive_name)
         if not self.archive_name.startswith("environment/0/"):
             encoding, _ = tokenize.detect_encoding(io.BytesIO(source).readline)
@@ -236,7 +263,14 @@ class SealedSourceLoader:
                 self.original_path,
             )
         code = compile(source, self.original_path, "exec")
-        exec(code, module.__dict__, module.__dict__)
+        initializes_ctypes = module.__name__ == "ctypes" and sys.platform.startswith("linux")
+        if initializes_ctypes:
+            ctypes_initializing = True
+        try:
+            exec(code, module.__dict__, module.__dict__)
+        finally:
+            if initializes_ctypes:
+                ctypes_initializing = False
         if module.__name__ == "ctypes.util" and sys.platform.startswith("linux"):
             original_find_library = module.find_library
 
@@ -246,6 +280,35 @@ class SealedSourceLoader:
                 return original_find_library(name)
 
             module.find_library = sealed_find_library
+        if module.__name__ == "ctypes" and sys.platform.startswith("linux"):
+            original_cdll = module.CDLL
+            original_pydll = module.PyDLL
+
+            def sealed_library_path(name):
+                if name is None:
+                    raise OSError("sealed trainer refused process-global native execution")
+                if not isinstance(name, (str, bytes, os.PathLike)):
+                    raise OSError("sealed trainer refused an unbound native library")
+                decoded = os.fsdecode(name)
+                descriptor = sealed_native_by_name.get(decoded)
+                if descriptor is None and os.path.isabs(decoded):
+                    descriptor = sealed_native_by_name.get(os.path.realpath(decoded))
+                if descriptor is None:
+                    descriptor = sealed_native_by_name.get(os.path.basename(decoded))
+                if descriptor is None:
+                    raise OSError("sealed trainer refused an unbound native library: " + decoded)
+                return "/proc/self/fd/" + str(descriptor)
+
+            def sealed_cdll(name, *args, **kwargs):
+                return original_cdll(sealed_library_path(name), *args, **kwargs)
+
+            def sealed_pydll(name, *args, **kwargs):
+                return original_pydll(sealed_library_path(name), *args, **kwargs)
+
+            module.CDLL = sealed_cdll
+            module.cdll = module.LibraryLoader(sealed_cdll)
+            module.PyDLL = sealed_pydll
+            module.pydll = module.LibraryLoader(sealed_pydll)
 
     def is_package(self, fullname):
         return self.package
@@ -288,7 +351,6 @@ class SealedEnvironmentFinder:
 
 
 sys.meta_path.insert(0, SealedEnvironmentFinder())
-import hashlib
 
 
 entry_encoding, _ = tokenize.detect_encoding(io.BytesIO(entry_source).readline)
@@ -303,16 +365,30 @@ entry_code = compile(entry_source, entry_path, "exec")
 generated_compilations = {}
 
 
-def disclose_generated_code(record):
-    sys.stderr.write(
-        "__GRADOOM_SEALED_GENERATED_CODE_V1__="
-        + json.dumps(record, sort_keys=True, separators=(",", ":"))
-        + "\n"
-    )
-    sys.stderr.flush()
+def authorize_generated_code(record):
+    payload = json.dumps(record, sort_keys=True, separators=(",", ":")).encode()
+    envelope = json.dumps(
+        {
+            "payload": record,
+            "authentication": hmac.new(
+                generated_channel_secret, payload, hashlib.sha256
+            ).hexdigest(),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    framed = len(envelope).to_bytes(4, "big") + envelope
+    while framed:
+        written = os.write(generated_request_descriptor, framed)
+        if written <= 0:
+            raise RuntimeError("generated-code authorization channel closed")
+        framed = framed[written:]
+    response = os.read(generated_response_descriptor, 1)
+    if response != b"1":
+        raise PermissionError("generated-code semantics were not authorized before execution")
 
 
-disclose_generated_code({"event": "binding-started"})
+authorize_generated_code({"event": "binding-started"})
 
 
 def sealed_generated_code_caller(depth):
@@ -372,9 +448,22 @@ def reject_unsealed_execution(event, arguments):
     ):
         violations.append(event)
         raise PermissionError("sealed trainer execution binding forbids protected-source mutation")
-    if event in {"os.exec", "os.posix_spawn"}:
+    if event in {"os.exec", "os.posix_spawn", "os.system", "subprocess.Popen"}:
         violations.append(event)
-        raise PermissionError("sealed trainer execution binding forbids process replacement")
+        raise PermissionError("sealed trainer execution binding forbids unbound process execution")
+    if event == "ctypes.dlopen":
+        name = arguments[0]
+        if name in sealed_native_descriptor_paths:
+            return
+        if name is None and ctypes_initializing:
+            try:
+                caller_archive = sealed_source_names[sys._getframe(1).f_code.co_filename]
+            except (AttributeError, KeyError, ValueError):
+                caller_archive = ""
+            if caller_archive.endswith("/ctypes/__init__.py"):
+                return
+        violations.append(event)
+        raise PermissionError("sealed trainer execution binding forbids unbound native execution")
     if event == "compile":
         source, filename = arguments
         archive_name = sealed_source_names.get(filename)
@@ -397,7 +486,7 @@ def reject_unsealed_execution(event, arguments):
                 "payload_sha256": hashlib.sha256(actual).hexdigest(),
             }
             generated_compilations.setdefault(filename, []).append(record)
-            disclose_generated_code(record)
+            authorize_generated_code(record)
             return
         violations.append(event)
         raise PermissionError("sealed trainer execution binding forbids dynamic code compilation")
@@ -407,7 +496,7 @@ def reject_unsealed_execution(event, arguments):
         if pending and sealed_generated_code_caller(2):
             pending.pop(0)
             caller = sys._getframe(1).f_code.co_filename
-            disclose_generated_code(
+            authorize_generated_code(
                 {
                     "event": "exec",
                     "caller": sealed_source_names[caller],
@@ -426,7 +515,7 @@ def reject_unsealed_execution(event, arguments):
         if pending and sealed_generated_code_caller(2):
             pending.pop(0)
             caller = sys._getframe(1).f_code.co_filename
-            disclose_generated_code(
+            authorize_generated_code(
                 {
                     "event": "function.__new__",
                     "caller": sealed_source_names[caller],
@@ -445,7 +534,7 @@ def reject_unsealed_execution(event, arguments):
         if pending and sealed_generated_code_caller(2):
             pending.pop(0)
             caller = sys._getframe(1).f_code.co_filename
-            disclose_generated_code(
+            authorize_generated_code(
                 {
                     "event": "object.__setattr__.__code__",
                     "caller": sealed_source_names[caller],
@@ -468,7 +557,7 @@ def reject_unsealed_execution(event, arguments):
             "payload_sha256": hashlib.sha256(bytes(arguments[0])).hexdigest(),
         }
         generated_compilations.setdefault(filename, []).append(record)
-        disclose_generated_code(record)
+        authorize_generated_code(record)
         return
     if event in {"marshal.loads", "code.__new__"}:
         violations.append(event)
@@ -933,9 +1022,11 @@ class _TrainerFileIdentityMarkers:
         self.environment_identities: list[dict[str, Any]] = []
         self.sealed_extensions: dict[str, BinaryIO] = {}
         self.sealed_extension_paths: dict[str, Path] = {}
+        self.sealed_executable: BinaryIO | None = None
+        self.sealed_interpreter: BinaryIO | None = None
+        self.interpreter_path: Path | None = None
         self.sealed_native_libraries: dict[Path, BinaryIO] = {}
         self.native_dependency_identities: list[dict[str, Any]] = []
-        self.generated_code_identities: list[dict[str, str]] = []
         self.native_library_directories: list[Path] = []
 
     def close(self) -> None:
@@ -957,6 +1048,12 @@ class _TrainerFileIdentityMarkers:
         extensions, self.sealed_extensions = self.sealed_extensions, {}
         for extension in extensions.values():
             extension.close()
+        executable, self.sealed_executable = self.sealed_executable, None
+        if executable is not None:
+            executable.close()
+        interpreter, self.sealed_interpreter = self.sealed_interpreter, None
+        if interpreter is not None:
+            interpreter.close()
         native_libraries, self.sealed_native_libraries = self.sealed_native_libraries, {}
         for library in native_libraries.values():
             library.close()
@@ -964,6 +1061,64 @@ class _TrainerFileIdentityMarkers:
     def __del__(self) -> None:
         with suppress(OSError):
             self.close()
+
+
+def _validate_generated_code_record(record: object) -> dict[str, str]:
+    if (
+        not isinstance(record, dict)
+        or set(record) != {"event", "caller", "filename", "payload_sha256"}
+        or record.get("event")
+        not in {
+            "compile",
+            "code.__new__",
+            "exec",
+            "function.__new__",
+            "object.__setattr__.__code__",
+        }
+        or not all(isinstance(record.get(field), str) for field in record)
+        or len(record["payload_sha256"]) != 64
+        or any(character not in "0123456789abcdef" for character in record["payload_sha256"])
+    ):
+        raise EvidenceError("generated-code execution authorization request is invalid")
+    return dict(record)
+
+
+class _GeneratedCodeBinding:
+    """Parent-owned, pre-execution generated-semantics continuation boundary."""
+
+    def __init__(self, prior: object, *, continuation: bool) -> None:
+        if not isinstance(prior, list):
+            raise EvidenceError("benchmark attempt generated-code identity is invalid")
+        self.identities: list[dict[str, str]] = []
+        for raw_record in prior:
+            record = _validate_generated_code_record(raw_record)
+            if record not in self.identities:
+                self.identities.append(record)
+        self._authorized = {tuple(sorted(record.items())) for record in self.identities}
+        self._continuation = continuation
+        self._lock = threading.Lock()
+
+    def authorize(
+        self,
+        record: object,
+        *,
+        persist: Callable[[], None] | None,
+    ) -> None:
+        validated = _validate_generated_code_record(record)
+        identity = tuple(sorted(validated.items()))
+        with self._lock:
+            if identity in self._authorized:
+                return
+            if self._continuation:
+                raise EvidenceError(
+                    "generated-code semantics changed across benchmark continuation"
+                )
+            self.identities.append(validated)
+            self._authorized.add(identity)
+            # The child stays blocked on the authorization channel until the live
+            # interruption journal containing this identity is durable.
+            if persist is not None:
+                persist()
 
 
 def _identity_marker_capacity() -> int:
@@ -1493,6 +1648,90 @@ def _extension_module_name(relative_path: Path) -> str | None:
     return ".".join(module_parts)
 
 
+def _environment_module_indexes(
+    roots: list[Path],
+) -> tuple[dict[str, tuple[Path, bool]], dict[str, Path]]:
+    sources: dict[str, tuple[Path, bool]] = {}
+    extensions: dict[str, Path] = {}
+    for root in roots:
+        for path in sorted(root.rglob("*.py")):
+            relative = path.relative_to(root)
+            if relative.name == "__init__.py":
+                module = ".".join(relative.parts[:-1])
+                is_package = True
+            else:
+                module = ".".join(relative.with_suffix("").parts)
+                is_package = False
+            if module:
+                sources.setdefault(module, (path, is_package))
+        for path in sorted(root.rglob("*.so")):
+            module = _extension_module_name(path.relative_to(root))
+            if module is not None:
+                extensions.setdefault(module, path)
+    return sources, extensions
+
+
+def _static_import_requests(path: Path, *, module: str, package: bool) -> set[str]:
+    try:
+        tree = ast.parse(path.read_bytes(), filename=str(path))
+    except (OSError, SyntaxError, UnicodeError):
+        return set()
+    requests: set[str] = set()
+    package_parts = module.split(".") if package else module.split(".")[:-1]
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            requests.update(alias.name for alias in node.names)
+            continue
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        if node.level:
+            trim = node.level - 1
+            base_parts = package_parts[: max(0, len(package_parts) - trim)]
+            if node.module:
+                base_parts.extend(node.module.split("."))
+            base = ".".join(base_parts)
+        else:
+            base = node.module or ""
+        if base:
+            requests.add(base)
+        for alias in node.names:
+            if alias.name != "*" and base:
+                requests.add(f"{base}.{alias.name}")
+    return requests
+
+
+def _reachable_environment_extensions(
+    code_root: Path, roots: list[Path]
+) -> tuple[dict[str, Path], set[Path]]:
+    sources, extensions = _environment_module_indexes(roots)
+    pending = list(_local_import_roots(code_root))
+    visited: set[str] = set()
+    reachable_extensions: dict[str, Path] = {}
+    reachable_sources: set[Path] = set()
+    while pending:
+        requested = pending.pop()
+        parts = requested.split(".")
+        # Importing a submodule executes each package initializer first.
+        candidates = [".".join(parts[:length]) for length in range(1, len(parts) + 1)]
+        for module in candidates:
+            if module in visited:
+                continue
+            visited.add(module)
+            extension = extensions.get(module)
+            if extension is not None:
+                reachable_extensions[module] = extension
+                continue
+            source = sources.get(module)
+            if source is None:
+                continue
+            source_path, is_package = source
+            reachable_sources.add(source_path)
+            pending.extend(
+                _static_import_requests(source_path, module=module, package=is_package) - visited
+            )
+    return reachable_extensions, reachable_sources
+
+
 def _seal_extension_payload(
     identity_markers: _TrainerFileIdentityMarkers,
     *,
@@ -1527,6 +1766,28 @@ def _seal_extension_payload(
             os.close(descriptor)
 
 
+def _sealed_native_stream(payload: bytes, *, description: str) -> BinaryIO:
+    descriptor = _new_sealable_memory_file()
+    try:
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            view = view[written:]
+        os.fsync(descriptor)
+        seals = _F_SEAL_SHRINK | _F_SEAL_GROW | _F_SEAL_WRITE | _F_SEAL_SEAL
+        fcntl.fcntl(descriptor, _F_ADD_SEALS, seals)
+        if fcntl.fcntl(descriptor, _F_GET_SEALS) & seals != seals:
+            raise EvidenceError(f"{description} could not be kernel-sealed")
+        stream = os.fdopen(descriptor, "rb")
+        descriptor = -1
+        return stream
+    except OSError as error:
+        raise EvidenceError(f"{description} could not be kernel-sealed") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
 def _ldd_dependencies(path: Path, library_directories: list[Path]) -> list[tuple[str, Path, bool]]:
     environment = {**os.environ, "LC_ALL": "C"}
     search_path = os.pathsep.join(map(str, library_directories))
@@ -1545,6 +1806,15 @@ def _ldd_dependencies(path: Path, library_directories: list[Path]) -> list[tuple
             errors="strict",
             env=environment,
         )
+        readelf = subprocess.run(
+            ["/usr/bin/readelf", "-l", "-d", str(path)],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="strict",
+            env=environment,
+        )
     except (OSError, UnicodeError) as error:
         raise EvidenceError(f"native dependency closure cannot be resolved: {path}") from error
     if result.returncode != 0 or "not found" in result.stdout or result.stderr.strip():
@@ -1554,7 +1824,6 @@ def _ldd_dependencies(path: Path, library_directories: list[Path]) -> list[tuple
         line = raw_line.strip()
         if not line or line.startswith("linux-vdso") or line == "statically linked":
             continue
-        loader = "=>" not in line
         if "=>" in line:
             name, raw_target = (part.strip() for part in line.split("=>", 1))
             target = raw_target.split(" (", 1)[0].strip()
@@ -1567,8 +1836,51 @@ def _ldd_dependencies(path: Path, library_directories: list[Path]) -> list[tuple
             resolved = Path(target).resolve(strict=True)
         except OSError as error:
             raise EvidenceError(f"native dependency closure cannot be resolved: {path}") from error
-        dependencies.append((name, resolved, loader))
-    return dependencies
+        dependencies.append((name, resolved, False))
+    if readelf.returncode != 0 or readelf.stderr.strip():
+        raise EvidenceError(f"native executable identity cannot be inspected: {path}")
+    interpreter: Path | None = None
+    needed: list[str] = []
+    for raw_line in readelf.stdout.splitlines():
+        line = raw_line.strip()
+        marker = "Requesting program interpreter:"
+        if marker in line:
+            raw_interpreter = line.split(marker, 1)[1].strip().rstrip("]")
+            try:
+                interpreter = Path(raw_interpreter).resolve(strict=True)
+            except OSError as error:
+                raise EvidenceError(
+                    f"native executable interpreter cannot be resolved: {path}"
+                ) from error
+        if "(NEEDED)" in line and "Shared library:" in line:
+            needed.append(line.split("Shared library:", 1)[1].strip().strip("[]"))
+    by_name = {name: resolved for name, resolved, _loader in dependencies}
+    by_name.update({resolved.name: resolved for _name, resolved, _loader in dependencies})
+    for name in needed:
+        if Path(name).is_absolute():
+            try:
+                resolved = Path(name).resolve(strict=True)
+            except OSError as error:
+                raise EvidenceError(
+                    f"absolute DT_NEEDED dependency cannot be resolved: {name}"
+                ) from error
+            by_name[name] = resolved
+        elif name not in by_name:
+            raise EvidenceError(
+                f"native dependency closure cannot resolve DT_NEEDED {name!r}: {path}"
+            )
+    normalized: dict[Path, tuple[str, Path, bool]] = {}
+    for name, resolved, _loader in dependencies:
+        normalized[resolved] = (name, resolved, interpreter is not None and resolved == interpreter)
+    for name in needed:
+        resolved = by_name[name]
+        if Path(name).is_absolute():
+            normalized[resolved] = (name, resolved, False)
+        else:
+            normalized.setdefault(resolved, (name, resolved, False))
+    if interpreter is not None:
+        normalized[interpreter] = (interpreter.name, interpreter, True)
+    return list(normalized.values())
 
 
 def _seal_native_dependencies(
@@ -1576,9 +1888,18 @@ def _seal_native_dependencies(
     *,
     extension_paths: list[Path],
     library_directories: list[Path],
+    direct_library_paths: list[Path] | None = None,
 ) -> None:
     resolution: dict[Path, dict[str, Any]] = {}
     dependency_counts: dict[Path, int] = {}
+    for direct_path in direct_library_paths or []:
+        resolution[direct_path] = {
+            "role": "native-dynamic-library",
+            "path": str(direct_path),
+            "loader_names": {direct_path.name},
+            "required_by": {"reachable-python-source"},
+            "load_strategy": "sealed-preload",
+        }
     for extension_path in extension_paths:
         dependencies = _ldd_dependencies(extension_path, library_directories)
         dependency_counts.update(
@@ -1589,6 +1910,10 @@ def _seal_native_dependencies(
             }
         )
         for name, resolved, loader in dependencies:
+            if not loader and Path(name).is_absolute():
+                raise EvidenceError(
+                    f"absolute DT_NEEDED dependency cannot be redirected to sealed bytes: {name}"
+                )
             item = resolution.setdefault(
                 resolved,
                 {
@@ -1596,7 +1921,7 @@ def _seal_native_dependencies(
                     "path": str(resolved),
                     "loader_names": set(),
                     "required_by": set(),
-                    "load_strategy": "process-interpreter" if loader else "sealed-preload",
+                    "load_strategy": "sealed-interpreter" if loader else "sealed-preload",
                 },
             )
             item["loader_names"].add(name)
@@ -1611,25 +1936,15 @@ def _seal_native_dependencies(
         item["size"] = len(payload)
         item["loader_names"] = sorted(item["loader_names"])
         item["required_by"] = sorted(item["required_by"])
-        if item["load_strategy"] == "sealed-preload":
-            descriptor = _new_sealable_memory_file()
-            try:
-                view = memoryview(payload)
-                while view:
-                    written = os.write(descriptor, view)
-                    view = view[written:]
-                os.fsync(descriptor)
-                seals = _F_SEAL_SHRINK | _F_SEAL_GROW | _F_SEAL_WRITE | _F_SEAL_SEAL
-                fcntl.fcntl(descriptor, _F_ADD_SEALS, seals)
-                if fcntl.fcntl(descriptor, _F_GET_SEALS) & seals != seals:
-                    raise EvidenceError("native shared library could not be kernel-sealed")
-                identity_markers.sealed_native_libraries[path] = os.fdopen(descriptor, "rb")
-                descriptor = -1
-            except OSError as error:
-                raise EvidenceError("native shared library could not be kernel-sealed") from error
-            finally:
-                if descriptor >= 0:
-                    os.close(descriptor)
+        stream = _sealed_native_stream(payload, description="native shared library")
+        if item["load_strategy"] == "sealed-interpreter":
+            if identity_markers.sealed_interpreter is not None:
+                stream.close()
+                raise EvidenceError("native dependency closure has multiple ELF interpreters")
+            identity_markers.sealed_interpreter = stream
+            identity_markers.interpreter_path = path
+        else:
+            identity_markers.sealed_native_libraries[path] = stream
     identity_markers.native_dependency_identities = [
         resolution[path] for path in sorted(resolution, key=str)
     ]
@@ -1648,10 +1963,28 @@ def _bind_python_environment(
     executable_path: Path,
 ) -> None:
     roots = _python_environment_roots(code_root)
+    reachable_extensions, reachable_sources = _reachable_environment_extensions(code_root, roots)
     identities: list[dict[str, Any]] = []
     extensions_seen: set[str] = set()
     extension_paths: list[Path] = []
     native_library_directories: set[Path] = set()
+    reachable_source_text = b"\n".join(
+        _stable_environment_payload(path, identity_markers) for path in sorted(reachable_sources)
+    )
+    executable_payload = _stable_environment_payload(
+        executable_path,
+        identity_markers,
+        per_file_limit=_MAX_SEALED_NATIVE_FILE_BYTES,
+    )
+    _reserve_sealed_payload(
+        identity_markers,
+        str(executable_path),
+        executable_payload,
+        per_file_limit=_MAX_SEALED_NATIVE_FILE_BYTES,
+    )
+    identity_markers.sealed_executable = _sealed_native_stream(
+        executable_payload, description="Python executable"
+    )
     for root_index, root in enumerate(roots):
         prefix = f"environment/{root_index}"
         for path in sorted(root.rglob("*.py")):
@@ -1671,10 +2004,11 @@ def _bind_python_environment(
         for library_path in root.rglob("*.so*"):
             if library_path.is_file():
                 native_library_directories.add(library_path.parent)
-        for path in sorted(root.rglob("*.so")):
+        for module, path in sorted(reachable_extensions.items()):
+            if not path.is_relative_to(root):
+                continue
             relative_path = path.relative_to(root)
-            module = _extension_module_name(relative_path)
-            if module is None or module in extensions_seen:
+            if module in extensions_seen:
                 continue
             payload = _stable_environment_payload(
                 path,
@@ -1698,11 +2032,22 @@ def _bind_python_environment(
                     "size": len(payload),
                 }
             )
+    explicit_native_paths: list[Path] = []
+    for root in roots:
+        for path in sorted(root.rglob("*.so*")):
+            if not path.is_file():
+                continue
+            stem = path.name.split(".so", 1)[0].encode()
+            if stem and stem in reachable_source_text and path not in extension_paths:
+                explicit_native_paths.append(path)
     _seal_native_dependencies(
         identity_markers,
-        extension_paths=[executable_path, *extension_paths],
+        extension_paths=[executable_path, *extension_paths, *explicit_native_paths],
         library_directories=sorted(native_library_directories),
+        direct_library_paths=explicit_native_paths,
     )
+    if identity_markers.sealed_interpreter is None:
+        raise EvidenceError("Python executable has no sealed ELF interpreter")
     loader_search_identity = {
         "role": "native-loader-search",
         "LD_LIBRARY_PATH": os.environ.get("LD_LIBRARY_PATH"),
@@ -3093,8 +3438,11 @@ def _run_process(
     *,
     cwd: Path,
     execution_binding: _TrainerFileIdentityMarkers,
+    generated_binding: _GeneratedCodeBinding | None = None,
     heartbeat: Callable[[], None] | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    if generated_binding is None:
+        generated_binding = _GeneratedCodeBinding([], continuation=False)
     archive = execution_binding.sealed_archive
     if archive is None or archive.closed:
         raise EvidenceError("sealed trainer execution binding is unavailable")
@@ -3105,6 +3453,17 @@ def _run_process(
     executable_argv0 = execution_binding.executable_argv0
     if code_root is None or entry_relative is None or executable_argv0 is None:
         raise EvidenceError("sealed trainer execution binding has incomplete source metadata")
+    sealed_executable = execution_binding.sealed_executable
+    sealed_interpreter = execution_binding.sealed_interpreter
+    interpreter_path = execution_binding.interpreter_path
+    if (
+        sealed_executable is None
+        or sealed_executable.closed
+        or sealed_interpreter is None
+        or sealed_interpreter.closed
+        or interpreter_path is None
+    ):
+        raise EvidenceError("sealed trainer execution binding has incomplete native identity")
     archive_descriptor = archive.fileno()
     extension_descriptors = {
         module: [stream.fileno(), str(execution_binding.sealed_extension_paths[module])]
@@ -3143,8 +3502,17 @@ def _run_process(
         *map(str, execution_binding.environment_roots),
         *([] if native_search_directory is None else [str(native_search_directory)]),
     ]
+    generated_request_read, generated_request_write = os.pipe()
+    generated_response_read, generated_response_write = os.pipe()
+    generated_secret_read, generated_secret_write = os.pipe()
+    generated_channel_secret = os.urandom(32)
+    os.write(generated_secret_write, generated_channel_secret)
+    os.close(generated_secret_write)
+    executable_descriptor = sealed_executable.fileno()
+    interpreter_descriptor = sealed_interpreter.fileno()
     launched_command = [
-        executable_argv0,
+        str(interpreter_path),
+        f"/proc/self/fd/{executable_descriptor}",
         "-P",
         "-S",
         "-s",
@@ -3156,6 +3524,9 @@ def _run_process(
         json.dumps(protected_roots, separators=(",", ":")),
         json.dumps(extension_descriptors, separators=(",", ":")),
         json.dumps(native_descriptors, separators=(",", ":")),
+        str(generated_request_write),
+        str(generated_response_read),
+        str(generated_secret_read),
         *command[2:],
     ]
     archive_environment_roots = [
@@ -3163,7 +3534,9 @@ def _run_process(
         for index in range(len(execution_binding.environment_roots))
     ]
     environment = {
-        **os.environ,
+        **{
+            key: value for key, value in os.environ.items() if not key.startswith(("LD_", "PYTHON"))
+        },
         "PYTHONDONTWRITEBYTECODE": "1",
         "PYTHONPATH": os.pathsep.join(archive_environment_roots),
     }
@@ -3173,11 +3546,16 @@ def _run_process(
         archive_descriptor,
         *(value[0] for value in extension_descriptors.values()),
         *(value[0] for value in native_descriptors),
+        executable_descriptor,
+        interpreter_descriptor,
+        generated_request_write,
+        generated_response_read,
+        generated_secret_read,
     )
     try:
         process = subprocess.Popen(
             launched_command,
-            executable=command[0],
+            executable=f"/proc/self/fd/{interpreter_descriptor}",
             cwd=cwd,
             env=environment,
             pass_fds=inherited_descriptors,
@@ -3188,6 +3566,15 @@ def _run_process(
             errors="replace",
         )
     except OSError as error:
+        for descriptor in (
+            generated_request_read,
+            generated_request_write,
+            generated_response_read,
+            generated_response_write,
+            generated_secret_read,
+        ):
+            with suppress(OSError):
+                os.close(descriptor)
         if native_search_directory is not None:
             native_search_directory.chmod(0o755)
             shutil.rmtree(native_search_directory)
@@ -3197,6 +3584,77 @@ def _run_process(
             stdout="",
             stderr=f"cannot execute benchmark process {command[0]!r}: {error}",
         )
+    os.close(generated_request_write)
+    os.close(generated_response_read)
+    os.close(generated_secret_read)
+    authorization_errors: list[BaseException] = []
+    binding_started = threading.Event()
+
+    def read_exact(descriptor: int, size: int) -> bytes:
+        payload = b""
+        while len(payload) < size:
+            chunk = os.read(descriptor, size - len(payload))
+            if not chunk:
+                break
+            payload += chunk
+        return payload
+
+    def authorize_generated_requests() -> None:
+        try:
+            while True:
+                raw_size = read_exact(generated_request_read, 4)
+                if not raw_size:
+                    return
+                if len(raw_size) != 4:
+                    raise EvidenceError("generated-code authorization frame is truncated")
+                size = int.from_bytes(raw_size, "big")
+                if size <= 0 or size > 1024 * 1024:
+                    raise EvidenceError("generated-code authorization frame has invalid size")
+                raw_envelope = read_exact(generated_request_read, size)
+                if len(raw_envelope) != size:
+                    raise EvidenceError("generated-code authorization frame is truncated")
+                try:
+                    envelope = json.loads(raw_envelope)
+                except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                    raise EvidenceError("generated-code authorization frame is invalid") from error
+                if not isinstance(envelope, dict) or set(envelope) != {
+                    "payload",
+                    "authentication",
+                }:
+                    raise EvidenceError("generated-code authorization frame is invalid")
+                payload = envelope["payload"]
+                authentication = envelope["authentication"]
+                canonical_payload = json.dumps(
+                    payload, sort_keys=True, separators=(",", ":")
+                ).encode()
+                expected = hmac.new(
+                    generated_channel_secret, canonical_payload, hashlib.sha256
+                ).hexdigest()
+                if not isinstance(authentication, str) or not hmac.compare_digest(
+                    authentication, expected
+                ):
+                    raise EvidenceError("generated-code authorization frame authentication failed")
+                if payload == {"event": "binding-started"}:
+                    binding_started.set()
+                else:
+                    generated_binding.authorize(payload, persist=heartbeat)
+                os.write(generated_response_write, b"1")
+        except BaseException as error:
+            authorization_errors.append(error)
+            with suppress(OSError):
+                os.write(generated_response_write, b"0")
+        finally:
+            with suppress(OSError):
+                os.close(generated_request_read)
+            with suppress(OSError):
+                os.close(generated_response_write)
+
+    authorization_thread = threading.Thread(
+        target=authorize_generated_requests,
+        name="gradoom-generated-code-authority",
+        daemon=True,
+    )
+    authorization_thread.start()
     previous_handlers: dict[int, Any] = {}
     forwarded_signal: int | None = None
 
@@ -3216,51 +3674,24 @@ def _run_process(
         stdout, stderr = process.communicate()
         if heartbeat is not None:
             heartbeat()
-        generated_code_identities: list[dict[str, str]] = []
-        retained_stderr: list[str] = []
-        binding_started = False
-        for line in stderr.splitlines(keepends=True):
-            if not line.startswith(_GENERATED_CODE_PREFIX):
-                retained_stderr.append(line)
-                continue
-            try:
-                record = json.loads(line[len(_GENERATED_CODE_PREFIX) :])
-            except json.JSONDecodeError as error:
-                raise EvidenceError(
-                    "generated-code execution binding transcript is invalid"
-                ) from error
-            if record == {"event": "binding-started"}:
-                binding_started = True
-                continue
-            if (
-                not isinstance(record, dict)
-                or set(record) != {"event", "caller", "filename", "payload_sha256"}
-                or record.get("event")
-                not in {
-                    "compile",
-                    "code.__new__",
-                    "exec",
-                    "function.__new__",
-                    "object.__setattr__.__code__",
-                }
-                or not all(isinstance(record.get(field), str) for field in record)
-                or len(record["payload_sha256"]) != 64
-                or any(
-                    character not in "0123456789abcdef" for character in record["payload_sha256"]
-                )
-            ):
-                raise EvidenceError("generated-code execution binding transcript is invalid")
-            generated_code_identities.append(record)
-        if not binding_started:
-            raise EvidenceError("generated-code execution binding transcript is missing")
-        execution_binding.generated_code_identities.extend(generated_code_identities)
+        authorization_thread.join(timeout=5.0)
+        if authorization_thread.is_alive():
+            raise EvidenceError("generated-code authorization channel did not close")
+        if authorization_errors:
+            raise EvidenceError(str(authorization_errors[0])) from authorization_errors[0]
+        if not binding_started.is_set():
+            raise EvidenceError("generated-code authorization handshake is missing")
         completed = subprocess.CompletedProcess(
             command,
             process.returncode,
             stdout=stdout,
-            stderr="".join(retained_stderr),
+            stderr=stderr,
         )
     finally:
+        with suppress(OSError):
+            os.close(generated_request_read)
+        with suppress(OSError):
+            os.close(generated_response_write)
         for signum, handler in previous_handlers.items():
             signal.signal(signum, handler)
         if native_search_directory is not None:
@@ -3533,6 +3964,7 @@ def _execute_evaluation(
     manifest_directory: Path,
     wad_profile: dict[str, Any] | None,
     execution_binding: _TrainerFileIdentityMarkers,
+    generated_binding: _GeneratedCodeBinding,
     heartbeat: Callable[[], None] | None,
 ) -> tuple[str, dict[str, Any] | None, dict[str, Any] | None, str | None]:
     evaluation_command = [
@@ -3553,6 +3985,7 @@ def _execute_evaluation(
         evaluation_command,
         cwd=manifest_directory,
         execution_binding=execution_binding,
+        generated_binding=generated_binding,
         heartbeat=heartbeat,
     )
     if evaluation_process.returncode == 130:
@@ -3650,6 +4083,10 @@ def _load_live_interrupted_attempt(
             or journal.get("continuation_identity") != expected_identity
         ):
             raise EvidenceError(f"seed {seed} live attempt journal has unlike identity")
+        generated_code = journal.get("generated_code")
+        if not isinstance(generated_code, list):
+            raise EvidenceError(f"seed {seed} live attempt journal has no generated-code binding")
+        generated_code = [_validate_generated_code_record(record) for record in generated_code]
         phase = journal.get("phase", "training")
         if phase not in {"training", "evaluation"}:
             raise EvidenceError(f"seed {seed} live attempt journal has an invalid phase")
@@ -3757,6 +4194,7 @@ def _load_live_interrupted_attempt(
             },
             "recovery_history": journal["recovery_history"],
             "recovery_journal": None,
+            "generated_code": generated_code,
             "generated_artifacts": generated_artifacts,
         }
     return None
@@ -3781,7 +4219,6 @@ def _run_attempt(
 ) -> dict[str, Any]:
     if started is None:
         started = clock()
-    generated_code_start = len(execution_binding.generated_code_identities)
     attempt_directory = run_directory / f"seed-{seed}"
     attempt_identity = _canonical_sha256(
         {"run_identity": run_identity, "seed": seed},
@@ -3810,6 +4247,10 @@ def _run_attempt(
         raise EvidenceError(f"seed {seed} continuation has unlike attempt identity")
     elif existing_attempt.get("status") != "interrupted":
         return existing_attempt
+    generated_binding = _GeneratedCodeBinding(
+        (existing_attempt or {}).get("generated_code", []),
+        continuation=existing_attempt is not None,
+    )
     seed_file = attempt_directory / "evaluation-seeds.json"
     if seed_file.exists():
         seed_file_sha256 = _fsync_file(seed_file, field="evaluation seed file")
@@ -3923,6 +4364,7 @@ def _run_attempt(
                 "outcomes": outcomes,
                 "failures": failures,
                 "recovery_history": recovery_history,
+                "generated_code": generated_binding.identities,
                 "reusable_elapsed_seconds": prior_elapsed + clock() - started,
                 "reusable_elapsed_seconds_at_launch": reusable_elapsed_at_launch,
                 "started_unix_ns": live_started_unix_ns,
@@ -4013,6 +4455,7 @@ def _run_attempt(
             manifest_directory=manifest_directory,
             wad_profile=wad_profile,
             execution_binding=execution_binding,
+            generated_binding=generated_binding,
             heartbeat=heartbeat,
         )
         evaluation_live_sha256 = _fsync_file(
@@ -4121,6 +4564,7 @@ def _run_attempt(
                 "outcomes": outcomes,
                 "failures": failures,
                 "recovery_history": recovery_history,
+                "generated_code": generated_binding.identities,
                 "reusable_elapsed_seconds": prior_elapsed + clock() - started,
                 "reusable_elapsed_seconds_at_launch": reusable_elapsed_at_launch,
                 "started_unix_ns": live_started_unix_ns,
@@ -4143,6 +4587,7 @@ def _run_attempt(
             training_command,
             cwd=manifest_directory,
             execution_binding=execution_binding,
+            generated_binding=generated_binding,
             heartbeat=persist_live_attempt,
         )
         live_journal_sha256 = _fsync_file(
@@ -4283,6 +4728,7 @@ def _run_attempt(
             manifest_directory=manifest_directory,
             wad_profile=wad_profile,
             execution_binding=execution_binding,
+            generated_binding=generated_binding,
             heartbeat=heartbeat,
         )
         evaluation_live_sha256 = _fsync_file(
@@ -4379,10 +4825,7 @@ def _run_attempt(
         generated_artifacts.append(
             {"name": recovery_evidence_name, "path": str(recovery_journal_path)}
         )
-    generated_code = [
-        *(existing_attempt or {}).get("generated_code", []),
-        *execution_binding.generated_code_identities[generated_code_start:],
-    ]
+    generated_code = list(generated_binding.identities)
     execution_recipe_sha256 = _canonical_sha256(
         {
             "continuation_identity": protocol["continuation_identity"],
@@ -4502,9 +4945,21 @@ def _build_development_benchmark_report(
     invocation_started: float | None = None,
     clock: Callable[[], float] = time.perf_counter,
     report_writer: Callable[[dict[str, Any]], None] | None = None,
+    authority_invocation_event_id: str | None = None,
 ) -> dict[str, Any]:
     if invocation_started is None:
         invocation_started = clock()
+    if (
+        authority_invocation_event_id is None
+        and os.environ.get(_AUTHORITY_STATE_ENV)
+        and os.environ.get(_AUTHORITY_WITNESS_ENV)
+    ):
+        try:
+            authority_invocation_event_id = _formal_time_authority().start_invocation()["event_id"]
+        except TimeAuthorityError as error:
+            raise EvidenceError(
+                f"reusable-time authority refused invocation timing: {error}"
+            ) from error
     manifest, manifest_payload = _load_manifest(manifest_path)
     validated = _validate_benchmark(manifest)
     declared_inputs = _validate_declared_inputs(
@@ -4772,6 +5227,28 @@ def _build_development_benchmark_report(
     anchors_by_seed = {
         anchor["payload"]["seed"]: anchor for anchor in validated["elapsed_time_anchors"]
     }
+    authority_setup_event_id: str | None = None
+    if not manifest["fixture"]:
+        if authority_invocation_event_id is None:
+            raise EvidenceError("formal benchmark invocation has no authority-owned setup timer")
+        active_attempt_identities = [
+            {
+                "seed": seed,
+                "started_unix_ns": anchors_by_seed[seed]["payload"]["started_unix_ns"],
+            }
+            for seed in validated["training_seeds"]
+            if existing_by_seed.get(seed) is None
+            or existing_by_seed[seed].get("status") == "interrupted"
+        ]
+        try:
+            authority_setup_event_id = _formal_time_authority().seal_invocation_setup(
+                authority_invocation_event_id,
+                active_attempt_identities,
+            )["event_id"]
+        except TimeAuthorityError as error:
+            raise EvidenceError(
+                f"reusable-time authority refused recurring setup seal: {error}"
+            ) from error
     for seed in validated["training_seeds"]:
         existing_attempt = existing_by_seed.get(seed)
         active_attempt = existing_attempt is None or existing_attempt.get("status") == "interrupted"
@@ -4784,7 +5261,9 @@ def _build_development_benchmark_report(
         ):
             try:
                 _formal_time_authority().start_timing_segment(
-                    seed, elapsed_anchor["payload"]["started_unix_ns"]
+                    seed,
+                    elapsed_anchor["payload"]["started_unix_ns"],
+                    authority_setup_event_id,
                 )
             except TimeAuthorityError as error:
                 raise EvidenceError(
@@ -4803,7 +5282,9 @@ def _build_development_benchmark_report(
             existing_attempt=existing_attempt,
             prior_generated_artifacts=actual_generated_artifacts,
             started=attempt_started,
-            recurring_setup_elapsed=(recurring_setup_elapsed if active_attempt else 0.0),
+            recurring_setup_elapsed=(
+                recurring_setup_elapsed if active_attempt and manifest["fixture"] else 0.0
+            ),
             clock=clock,
         )
         recovered_terminal_timing = attempt.pop("_recovered_terminal_timing", None)
@@ -4975,6 +5456,7 @@ def build_development_benchmark_report(
     invocation_started: float | None = None,
     clock: Callable[[], float] = time.perf_counter,
     report_writer: Callable[[dict[str, Any]], None] | None = None,
+    authority_invocation_event_id: str | None = None,
 ) -> dict[str, Any]:
     identity_marker_registry: list[_TrainerFileIdentityMarkers] = []
     try:
@@ -4985,6 +5467,7 @@ def build_development_benchmark_report(
             invocation_started=invocation_started,
             clock=clock,
             report_writer=report_writer,
+            authority_invocation_event_id=authority_invocation_event_id,
         )
     finally:
         for identity_markers in identity_marker_registry:

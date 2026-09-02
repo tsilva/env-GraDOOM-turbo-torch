@@ -439,6 +439,83 @@ class ReusableTimeAuthority:
             "signature": _signature(self.private_key, payload),
         }
 
+    @staticmethod
+    def _current_boot_id() -> str:
+        try:
+            boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+        except OSError as error:
+            raise TimeAuthorityError(
+                "authority-owned elapsed time requires a stable monotonic boot identity"
+            ) from error
+        if not boot_id:
+            raise TimeAuthorityError(
+                "authority-owned elapsed time requires a stable monotonic boot identity"
+            )
+        return boot_id
+
+    def start_invocation(self) -> dict[str, Any]:
+        """Start the shared recurring setup interval before manifest processing."""
+        return self._append(
+            "invocation_started",
+            {
+                "invocation_id": os.urandom(16).hex(),
+                "segment_started_monotonic_ns": time.monotonic_ns(),
+                "boot_id": self._current_boot_id(),
+            },
+        )
+
+    def seal_invocation_setup(
+        self,
+        invocation_event_id: str,
+        attempts: list[dict[str, int]],
+    ) -> dict[str, Any]:
+        if not isinstance(invocation_event_id, str) or not isinstance(attempts, list):
+            raise TimeAuthorityError("invocation setup seal request is invalid")
+        matches = [
+            item["payload"]
+            for item in self.ledger
+            if item["payload"].get("event_type") == "invocation_started"
+            and item["payload"].get("event_id") == invocation_event_id
+        ]
+        if len(matches) != 1:
+            raise TimeAuthorityError("invocation setup anchor is not registered")
+        if any(
+            item["payload"].get("event_type") == "invocation_setup_sealed"
+            and item["payload"].get("invocation_event_id") == invocation_event_id
+            for item in self.ledger
+        ):
+            raise TimeAuthorityError("invocation setup anchor was already sealed")
+        normalized: list[dict[str, int]] = []
+        for attempt in attempts:
+            if (
+                not isinstance(attempt, dict)
+                or set(attempt) != {"seed", "started_unix_ns"}
+                or type(attempt["seed"]) is not int
+                or type(attempt["started_unix_ns"]) is not int
+            ):
+                raise TimeAuthorityError("invocation setup attempt identity is invalid")
+            self._start_event(attempt["seed"], attempt["started_unix_ns"])
+            normalized.append(dict(attempt))
+        started = matches[0]
+        if started.get("boot_id") != self._current_boot_id():
+            raise TimeAuthorityError("authority timing cannot continue across a system restart")
+        elapsed = (
+            max(
+                0,
+                time.monotonic_ns() - started["segment_started_monotonic_ns"],
+            )
+            / 1_000_000_000
+        )
+        return self._append(
+            "invocation_setup_sealed",
+            {
+                "invocation_event_id": invocation_event_id,
+                "attempts": normalized,
+                "setup_elapsed_seconds": elapsed,
+                "boot_id": started["boot_id"],
+            },
+        )
+
     def _start_event(self, seed: int, started_unix_ns: int) -> dict[str, Any]:
         expected = _sha256(
             _canonical_bytes(
@@ -460,7 +537,12 @@ class ReusableTimeAuthority:
             raise TimeAuthorityError("attempt anchor is not registered in the persistent ledger")
         return matches[0]
 
-    def start_timing_segment(self, seed: int, started_unix_ns: int) -> dict[str, Any]:
+    def start_timing_segment(
+        self,
+        seed: int,
+        started_unix_ns: int,
+        invocation_setup_event_id: str | None = None,
+    ) -> dict[str, Any]:
         """Open one authority-clocked, seed-local interval for a registered attempt."""
         if type(seed) is not int or type(started_unix_ns) is not int:
             raise TimeAuthorityError("attempt timing identity is invalid")
@@ -484,10 +566,24 @@ class ReusableTimeAuthority:
             if len(active) != 1:
                 raise TimeAuthorityError("attempt has ambiguous active timing segments")
             return active[0]
-        try:
-            boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
-        except OSError:
-            boot_id = None
+        setup_elapsed = 0.0
+        if invocation_setup_event_id is not None:
+            setups = [
+                item["payload"]
+                for item in self.ledger
+                if item["payload"].get("event_type") == "invocation_setup_sealed"
+                and item["payload"].get("event_id") == invocation_setup_event_id
+            ]
+            if (
+                len(setups) != 1
+                or {
+                    "seed": seed,
+                    "started_unix_ns": started_unix_ns,
+                }
+                not in setups[0]["attempts"]
+            ):
+                raise TimeAuthorityError("timing segment has an invalid invocation setup seal")
+            setup_elapsed = float(setups[0]["setup_elapsed_seconds"])
         return self._append(
             "timing_segment_started",
             {
@@ -495,7 +591,9 @@ class ReusableTimeAuthority:
                 "started_unix_ns": started_unix_ns,
                 "segment_started_unix_ns": time.time_ns(),
                 "segment_started_monotonic_ns": time.monotonic_ns(),
-                "boot_id": boot_id,
+                "boot_id": self._current_boot_id(),
+                "invocation_setup_event_id": invocation_setup_event_id,
+                "invocation_setup_elapsed_seconds": setup_elapsed,
             },
         )
 
@@ -519,20 +617,17 @@ class ReusableTimeAuthority:
             raise TimeAuthorityError("journal seal requires one active authority timing segment")
         return active[0]
 
-    @staticmethod
-    def _segment_elapsed_seconds(segment: dict[str, Any]) -> float:
-        wall_elapsed = max(0, time.time_ns() - segment["segment_started_unix_ns"])
-        monotonic_elapsed = 0
-        try:
-            boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
-        except OSError:
-            boot_id = None
-        if boot_id == segment.get("boot_id"):
-            monotonic_elapsed = max(
+    @classmethod
+    def _segment_elapsed_seconds(cls, segment: dict[str, Any]) -> float:
+        if segment.get("boot_id") != cls._current_boot_id():
+            raise TimeAuthorityError("authority timing cannot continue across a system restart")
+        return (
+            max(
                 0,
                 time.monotonic_ns() - segment["segment_started_monotonic_ns"],
             )
-        return max(wall_elapsed, monotonic_elapsed) / 1_000_000_000
+            / 1_000_000_000
+        )
 
     def sign_journal_head(self, request: dict[str, Any]) -> dict[str, Any]:
         required = {
@@ -583,7 +678,8 @@ class ReusableTimeAuthority:
             raise TimeAuthorityError("initial journal generation is invalid")
         segment = self._active_timing_segment(request["seed"], request["started_unix_ns"])
         authority_elapsed = float(request["prior_reusable_elapsed_seconds"]) + (
-            self._segment_elapsed_seconds(segment)
+            float(segment.get("invocation_setup_elapsed_seconds", 0.0))
+            + self._segment_elapsed_seconds(segment)
         )
         elapsed = max(
             float(request["prior_reusable_elapsed_seconds"]),
@@ -911,6 +1007,8 @@ def _parser() -> argparse.ArgumentParser:
             "init",
             "identity",
             "start-attempt",
+            "start-invocation",
+            "seal-invocation-setup",
             "start-timing-segment",
             "sign-journal-head",
             "verify-latest-journal-head",
@@ -948,10 +1046,19 @@ def main(argv: list[str] | None = None) -> int:
                 result = authority.identity
             elif args.operation == "start-attempt":
                 result = authority.start_attempt(_stdin_object().get("seed"))
+            elif args.operation == "start-invocation":
+                result = authority.start_invocation()
+            elif args.operation == "seal-invocation-setup":
+                request = _stdin_object()
+                result = authority.seal_invocation_setup(
+                    request.get("invocation_event_id"), request.get("attempts")
+                )
             elif args.operation == "start-timing-segment":
                 request = _stdin_object()
                 result = authority.start_timing_segment(
-                    request.get("seed"), request.get("started_unix_ns")
+                    request.get("seed"),
+                    request.get("started_unix_ns"),
+                    request.get("invocation_setup_event_id"),
                 )
             elif args.operation == "sign-journal-head":
                 result = authority.sign_journal_head(_stdin_object())

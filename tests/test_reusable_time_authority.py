@@ -11,7 +11,7 @@ import pytest
 
 from gradoom.evidence.benchmark import _validate_elapsed_time_anchors
 from gradoom.evidence.report import EvidenceError
-from gradoom.evidence.time_authority import ReusableTimeAuthority
+from gradoom.evidence.time_authority import ReusableTimeAuthority, TimeAuthorityError
 
 
 def _authority(
@@ -200,6 +200,75 @@ def test_repository_authority_owns_seed_local_elapsed_without_charging_anchor_ag
 
     elapsed = sealed["payload"]["reusable_elapsed_seconds"]
     assert 0.04 <= elapsed < 0.2
+
+
+def test_repository_authority_owns_recurring_setup_before_seed_segment(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "authority"
+    authority = ReusableTimeAuthority.initialize(state)
+    anchor = authority.start_attempt(125)
+    invocation = authority.start_invocation()
+    time.sleep(0.05)
+    setup = authority.seal_invocation_setup(
+        invocation["event_id"],
+        [
+            {
+                "seed": 125,
+                "started_unix_ns": anchor["payload"]["started_unix_ns"],
+            }
+        ],
+    )
+    authority.start_timing_segment(
+        125,
+        anchor["payload"]["started_unix_ns"],
+        setup["event_id"],
+    )
+    time.sleep(0.05)
+
+    sealed = authority.sign_journal_head(
+        {
+            "schema_version": 1,
+            "authority": anchor["payload"]["authority"],
+            "seed": 125,
+            "started_unix_ns": anchor["payload"]["started_unix_ns"],
+            "generation": 0,
+            "previous_journal_sha256": None,
+            "journal_sha256": "5" * 64,
+            "status": "succeeded",
+            "prior_reusable_elapsed_seconds": 0.0,
+            "minimum_reusable_elapsed_seconds": 0.0,
+        }
+    )
+
+    assert sealed["payload"]["reusable_elapsed_seconds"] >= 0.09
+
+
+def test_repository_authority_fails_closed_across_boot_identity_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = tmp_path / "authority"
+    authority = ReusableTimeAuthority.initialize(state)
+    anchor = authority.start_attempt(126)
+    monkeypatch.setattr(ReusableTimeAuthority, "_current_boot_id", staticmethod(lambda: "boot-a"))
+    authority.start_timing_segment(126, anchor["payload"]["started_unix_ns"])
+    monkeypatch.setattr(ReusableTimeAuthority, "_current_boot_id", staticmethod(lambda: "boot-b"))
+
+    with pytest.raises(TimeAuthorityError, match="cannot continue across a system restart"):
+        authority.sign_journal_head(
+            {
+                "schema_version": 1,
+                "authority": anchor["payload"]["authority"],
+                "seed": 126,
+                "started_unix_ns": anchor["payload"]["started_unix_ns"],
+                "generation": 0,
+                "previous_journal_sha256": None,
+                "journal_sha256": "6" * 64,
+                "status": "interrupted",
+                "prior_reusable_elapsed_seconds": 0.0,
+                "minimum_reusable_elapsed_seconds": 0.0,
+            }
+        )
 
 
 def test_repository_authority_rejects_coherent_state_directory_rollback(
