@@ -6,6 +6,12 @@ inputs before the real WAD profile, reference provider, and pretrained policy co
 It reports those prerequisites as unavailable; it does not issue a parity certificate or make a
 performance claim.
 
+The `parity_certification` workflow now validates and executes a sealed pretrained-policy corpus.
+It records complete two-provider episode evidence but deliberately stops before the per-policy
+threshold, bootstrap diagnostic, and certificate verdict. Until that subsequent verdict workflow
+is complete, every corpus report has `claim_eligible: false`; deterministic fixture corpora are
+also permanently identified by the `fixture_evidence` reason.
+
 The command also provides the `development_training_benchmark` workflow. It is the inexpensive
 integration benchmark: it drives the standalone GPU-resident trainer from a fresh policy and
 optimizer, evaluates predeclared checkpoints on GraDOOM, and records its complete result using the
@@ -23,6 +29,74 @@ gradoom-evidence \
 The command exits with status 2 and a concise error when the manifest is malformed, its schema
 version is unsupported, a declared file does not match its SHA-256 digest, or a merge report is
 incompatible. It writes the report only after all validation succeeds.
+
+## Sealed pretrained-policy corpus
+
+A `parity_certification` manifest uses formal evidence and declares a `policy_evaluation` object.
+That object names three hash-verified `declared_inputs`: a corpus manifest, an episode-seed
+manifest, and one common policy-runner executable. It also binds protocol version `2` and exactly
+one revision for each provider, `gradoom` and `env-vizdoom-turbo`. An optional positive
+`timeout_seconds` applies independently to each provider-policy batch. Provider-specific runner
+commands or policy arguments are not accepted.
+
+The separate corpus manifest is selected and hashed before execution. It records schema and corpus
+versions, `sealed: true`, the shared preprocessing SHA-256 identity, and a non-empty policy array.
+Each policy records a unique ID, its `gradoom` or `env-vizdoom-turbo` training origin, immutable
+artifact path and SHA-256, model/runtime contract, `stochastic_actions: true`, `adapted: false`, and
+an empty `provider_specific_modifications` array. The v1 contract accepts Torch standalone GraDOOM
+PPO artifacts using one of the audited `nature`, `nature-pyramid`, `nature-waist`, `nature-flat`,
+`nature-thin`, `nature-half`, or `nature-quarter` architectures and requires at least one frozen
+policy from each training origin. Every v1 manifest, corpus, policy, provider, seed set, and
+model/runtime object has an exact field set; undeclared fields and provider override channels are
+rejected. Missing or changed artifacts, duplicate IDs or locations, unsupported contracts,
+deterministic-only policies, adaptation, provider compensation, and any artifact or declared-input
+mutation during execution fail closed.
+
+Protocol v2 reads and hashes every declared file before evaluation, then executes the runner and
+each policy artifact through Linux sealed anonymous file descriptors. The runner receives only the
+read-only sealed policy path, and the same sealed runner bytes are used for every batch. Replacing
+and restoring an original path during execution therefore cannot change the bytes actually used;
+an attempted write to an execution descriptor fails. Original paths are still checked between
+batches so a persistent post-seal mutation fails before more progress is committed.
+
+The seed manifest contains a versioned seed-set ID and exactly 256 unique, ordered, non-negative
+64-bit episode seeds. The evidence command passes that same complete ordered array to the same
+hash-pinned runner for every provider-policy pair. Runner success, process failure, timeout,
+malformed output, or an omitted seed all produce one retained outcome for every declared unit; a
+failed unit is never silently retried or replaced. Every record includes its provider, policy,
+seed index, seed, stable unit identity, `player_killcount`, termination state, episode length, and
+an explicit execution failure or null.
+
+Successful and failed outcomes share one exact validator. A success permits only a finite,
+non-negative 64-bit-range `player_killcount`, a non-negative 64-bit integer episode length, and
+`terminated` or `truncated` termination. All evidence JSON integers are limited to the signed
+64-bit range, and the runner timeout has an explicit positive upper bound. A failure permits only
+non-whitespace code/message fields and null outcome metrics. Missing, extra, unhashable, or
+out-of-range fields fail validation. The same rules are reapplied to resumed evidence, including
+evidence whose internal hashes were recomputed after tampering. Runner stdout and stderr are
+file-size bounded to 8 MiB per batch; reaching that boundary becomes retained execution failure
+evidence rather than unbounded host-memory growth.
+
+The report's `policy_evaluation` object binds the corpus and seed manifest hashes, normalized corpus,
+provider revisions, exact seed list, expected outcome count, complete outcomes, and failure count.
+The evaluation and every policy artifact are separately hashed in the evidence index. The stable
+run identity also binds code provenance, evidence level, fixture state, every declared input hash,
+runner protocol and timeout, provider revisions, and corpus and seed identities.
+
+Pass `--merge` with an earlier matching corpus report to reuse already completed unit identities.
+Completed failures are evidence and are reused exactly like successes. A changed corpus, seed set,
+runner, provider revision, code provenance, protocol, timeout, evidence level, or fixture state is
+an unlike evaluation and is rejected instead of combined. Resume also revalidates the complete
+top-level report schema, provenance, declared inputs, claim state, evidence index, and normalized
+corpus instead of trusting a stored identity string.
+
+After each complete provider-policy batch, the command atomically replaces the requested output
+with an `evaluation_in_progress` report, fsyncs both file and containing directory, and only then
+starts the next batch. The last batch durably writes `evaluation_complete`. After interruption,
+pass that progress report through `--merge` and use a distinct output path. Resume accepts only the
+exact leading prefix of the fixed provider-policy-seed order, revalidates every outcome, and never
+reruns a retained success or failure. Gaps, reordering, mismatched identities, corrupt hashes, or a
+complete status with missing units fail closed.
 
 ## Development training benchmark
 
@@ -190,11 +264,13 @@ hardlink.
 
 Evaluation uses the same trainer executable with `--evaluate-checkpoint`,
 `--evaluation-episodes 100`, `--evaluation-seeds-file`, and stochastic actions. Every evaluator must
-return all 100 episode records in the predeclared order. Passage is computed solely from their mean
-`player_killcount` and requires at least `30.0`; separately reported `compatibility_killcount` is a
-diagnostic and cannot change the verdict. The passing checkpoint, metrics, all preceding checkpoint
-outcomes, all episode outcomes, and every process or evidence failure are retained and hashed in the
-report evidence index.
+return all 100 episode records in the predeclared order. Each record must have a positive episode
+length and exactly one true terminal flag (`terminated` or `truncated`); zero-length, unterminated,
+and contradictory records are evidence failures and cannot count toward the cohort. Passage is
+computed solely from the completed episodes' mean `player_killcount` and requires at least `30.0`;
+separately reported `compatibility_killcount` is a diagnostic and cannot change the verdict. The
+passing checkpoint, metrics, all preceding checkpoint outcomes, all episode outcomes, and every
+process or evidence failure are retained and hashed in the report evidence index.
 
 The report has `authoritative: false` and `claim_eligible: false` unconditionally. Its per-seed
 attempt states are `succeeded`, `exhausted`, `crashed`, `interrupted`, `evaluation_failed`, or
@@ -273,6 +349,11 @@ uint32 game seeds. Its emitted config binds the complete ordered seed list, file
 action setting, `player_killcount` gate signal, and separate compatibility signal into the retained
 evaluation evidence.
 
+Every development report includes `diagnostics.fixed_time`. When the separate diagnostic has not
+been run, that field has `status: unavailable`, an explicit reason, and `affects_passage: false`.
+The report also marks `public_performance_evidence.complete: false`; omission is allowed for cheap
+development iteration but cannot be silently promoted into a complete public evidence bundle.
+
 ### CUDA residency acceptance
 
 CUDA residency acceptance instruments the real standalone trainer used by the development
@@ -300,6 +381,64 @@ acceptance record, and performs no additional host transport.
 Hardware integration tests require an explicitly allocated CUDA device and
 `GRADOOM_RUN_CUDA_ACCEPTANCE=1`; otherwise they skip with a clear reason while deterministic
 contract and fixture-wiring tests continue to run.
+
+## Fixed-time training diagnostic
+
+The `fixed_time_training_diagnostic` workflow compares final policy quality at one common reusable
+wall-clock budget without extending or changing the matched benchmark's time-to-threshold run. Its
+manifest uses the common envelope fields and a `diagnostic` object containing:
+
+- `reusable_time_budget_seconds`: one finite positive budget used by every predeclared seed;
+- `training_seeds`, `evaluation_episode_seeds`, and `evaluation_action_seed`: the same ordered seed
+  declarations as the matched benchmark; the held-out grid contains exactly 100 unique uint32 game
+  seeds;
+- `recipe`: the exact standalone trainer `command` and fixed `arguments` used by the benchmark;
+- `timing_rules`: the fixed reusable-run boundary: an outer monotonic wall clock starts before
+  attempt setup and public subprocess launch and stops after trainer exit and durable training
+  evidence writes. Seed-manifest creation, interpreter/module startup, recurring initialization,
+  per-process or uncached compilation, warm-up, training, checkpoint writing, and training-metrics
+  writing are included, with device synchronization around measured GPU work. Only the final
+  held-out evaluation is outside the fixed training budget;
+- `matching_benchmark_report`: the path and SHA-256 of the existing development or primary report;
+- `artifacts_directory`: the immutable run-identity directory for seed grids, final checkpoints,
+  training metrics, and evaluation metrics; and
+- `wad_profile`: required for non-fixture runs and required to have the same binding identity as the
+  matched benchmark.
+
+Before starting training, the command verifies the matched report's digest, evidence index, run
+identity, evidence level, fixture status, code provenance, recipe, training seeds, evaluation seeds,
+action seed, WAD-profile binding, and the complete order-insensitive set of declared input names and
+SHA-256 digests. The diagnostic manifest itself and its matched-benchmark report are envelope
+documents rather than declared workload inputs, so those two diagnostic-owned evidence entries are
+the only exclusions from the declared-input set comparison; recipe, WAD, seed, command, and timing
+identity remain independently bound. A declared-input mismatch produces a retained failed diagnostic
+with `matching_benchmark.matched: false` before creating diagnostic artifacts. The
+trainer starts every diagnostic seed from fresh policy and optimizer state and receives the outer
+absolute monotonic deadline. It starts no rollout after that deadline; a deadline consumed by
+startup therefore produces zero training transitions, while an in-flight rollout may finish before
+the final checkpoint and training evidence are durably written. The command then evaluates that
+checkpoint through the same stochastic 100-episode GraDOOM evaluator used by the benchmark.
+
+Completed attempts retain exactly 100 genuinely completed episode records and report
+`final_mean_player_killcount`. Throughput is computed as transitions per second and simulated tics
+per second using the actual outer public-command elapsed time, never a trainer-reported inner timer;
+the report retains transition count, frame skip, simulated tic count, elapsed time, timer source,
+and the complete workload boundary. Compatibility `killcount` may be retained as a diagnostic but
+is not final policy quality.
+
+Declared input names must not collide with manifest, matched-report, or generated-artifact evidence
+names. After every attempt, the command rehashes each generated seed manifest, checkpoint, training
+metrics file, and evaluation metrics file and reconciles it with one uniquely named evidence-index
+entry. The report retains both digests and a matched/mismatched status; a missing, ambiguous, or
+changed binding is retained as an `artifact_evidence` failure and makes the attempt
+`evidence_failed`.
+
+All fixed-time results live under `diagnostics.fixed_time`, are non-authoritative on their own, have
+`affects_passage: false`, and repeat the matched benchmark passage status as `unchanged: true`.
+Process and evidence failures remain explicit failed attempts. A complete public performance bundle
+requires a completed, matching non-fixture diagnostic and a separately claim-eligible benchmark;
+development and fixture reports remain incomplete regardless of diagnostic quality or throughput.
+`--merge` is not supported for this workflow version.
 
 ## Manifest schema version 1
 
@@ -484,9 +623,9 @@ readiness verdict.
 
 ## Report schema version 1
 
-The JSON report records its schema version, workflow, evidence level, fixture state, readiness
+The JSON report records its schema version, workflow, evidence level, fixture state, workflow
 status, claim eligibility and structured reasons, stable run identity, declared code provenance,
-declared inputs, prerequisites, optional WAD-profile validation, and evidence index. A fixture
+declared inputs, workflow results, and evidence index. A readiness fixture
 report is `unavailable` while real prerequisites are missing, has `claim_eligible: false`, and
 names every missing prerequisite in `claim_reasons`. Every report records the invariant-suite
 version even when provider execution has not yet been configured.
@@ -500,10 +639,11 @@ UTF-8, sorted object keys, no insignificant whitespace, and JSON separators `,` 
 are not identity fields; the declared content hashes are.
 
 The `evidence_index.entries` array contains the raw manifest-file digest, every verified declared
-input digest, and, when used, the bundled WAD-profile manifest plus every readable provider WAD
-digest. `evidence_index.sha256` hashes the canonical JSON representation of that complete entries
-array using the same rules. This makes index mutation detectable without attempting the impossible
-operation of including the report's own digest inside itself.
+input digest, and workflow-specific evidence. WAD readiness adds the bundled profile manifest and
+every readable provider WAD digest; corpus evaluation adds every policy artifact and the complete
+policy-evaluation digest. `evidence_index.sha256` hashes the canonical JSON representation of that
+complete entries array using the same rules. This makes index mutation detectable without
+attempting the impossible operation of including the report's own digest inside itself.
 
 ## Safe continuation
 
@@ -517,3 +657,7 @@ For `development_training_benchmark`, continuation additionally re-hashes every 
 artifact and validates every per-seed attempt journal. Only an `interrupted` attempt with a matching
 recovery checkpoint and journal may execute more trainer work. Terminal successes and failures remain
 attached to their original predeclared seed without replacement.
+
+Corpus continuation additionally validates the stored policy-evaluation digest and every stable
+provider-policy-seed unit identity. It reuses only matching completed outcomes and retains failed
+units without replacement.

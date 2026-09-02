@@ -74,6 +74,8 @@ _CONTROLLED_ARGUMENTS = {
     "--no-evaluation-stochastic",
     "--no-cuda-residency-acceptance",
     "--resume",
+    "--reusable-time-deadline-monotonic",
+    "--reusable-time-budget-seconds",
     "--seed",
     "--timesteps",
 }
@@ -827,7 +829,14 @@ def _validated_python_tree(path: Path) -> ast.AST:
             kind == "os"
             and isinstance(parent, ast.Attribute)
             and parent.value is node
-            and parent.attr in {"_exit", "link"}
+            and parent.attr in {"O_DIRECTORY", "O_RDONLY"}
+        ):
+            return True
+        if (
+            kind == "os"
+            and isinstance(parent, ast.Attribute)
+            and parent.value is node
+            and parent.attr in {"_exit", "close", "fsync", "link", "open"}
         ):
             grandparent = parents.get(parent)
             return isinstance(grandparent, ast.Call) and grandparent.func is parent
@@ -3407,6 +3416,19 @@ def _validate_evaluation_records(
             raise EvidenceError("evaluation episode indices do not match their declared order")
         if raw_episode.get("game_seed") != episode_seeds[index]:
             raise EvidenceError("evaluation episode seeds do not match the predeclared seed grid")
+        length = raw_episode.get("length")
+        if type(length) is not int or length <= 0:
+            raise EvidenceError(f"evaluation episodes[{index}].length must be a positive integer")
+        terminated = raw_episode.get("terminated")
+        truncated = raw_episode.get("truncated")
+        if type(terminated) is not bool or type(truncated) is not bool:
+            raise EvidenceError(f"evaluation episodes[{index}] completion flags must be booleans")
+        if not terminated and not truncated:
+            raise EvidenceError(f"evaluation episodes[{index}] must declare terminal completion")
+        if terminated and truncated:
+            raise EvidenceError(
+                f"evaluation episodes[{index}] cannot be both terminated and truncated"
+            )
         player_value = raw_episode.get("player_killcount")
         if type(player_value) not in (int, float) or not math.isfinite(float(player_value)):
             raise EvidenceError(f"evaluation episodes[{index}].player_killcount must be finite")
@@ -5367,6 +5389,17 @@ def _build_development_benchmark_report(
         "wad_profile": wad_profile,
         "attempts": attempts,
         "failures": failures,
+        "diagnostics": {
+            "fixed_time": {
+                "status": "unavailable",
+                "reason": "No matching fixed-time diagnostic was supplied.",
+                "affects_passage": False,
+            }
+        },
+        "public_performance_evidence": {
+            "complete": False,
+            "reason": "matching_fixed_time_diagnostic_unavailable",
+        },
         "generated_artifacts": generated_artifacts,
         "evidence_index": {
             "algorithm": "sha256",
