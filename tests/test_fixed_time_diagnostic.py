@@ -9,6 +9,9 @@ from pathlib import Path
 
 import pytest
 
+from gradoom.evidence import diagnostic as diagnostic_module
+from gradoom.evidence.cli import main as evidence_main
+
 FIXTURE_PROCESS = Path(__file__).parent / "fixtures" / "evidence" / "fixture_benchmark_process.py"
 EVALUATION_SEEDS = list(range(10_000, 10_100))
 TIMING_RULES = {
@@ -138,6 +141,16 @@ def _declared_input(name: str, path: Path) -> dict[str, str]:
     }
 
 
+def _canonical_sha256(value: object) -> str:
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
 def test_matching_fixed_time_diagnostic_reports_quality_and_throughput_without_passage(
     tmp_path: Path,
 ) -> None:
@@ -225,6 +238,76 @@ def test_matching_fixed_time_diagnostic_reports_quality_and_throughput_without_p
         "reason": "matching_benchmark_is_not_claim_eligible",
     }
     assert benchmark["status"] == "passed"
+
+
+def test_development_claim_eligibility_mutation_cannot_complete_public_bundle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = _trainer({"10": [31.0, 0.0]})
+    benchmark_path, benchmark = _benchmark_report(tmp_path, trainer)
+    benchmark["fixture"] = False
+    benchmark["benchmark_protocol"]["fixture"] = False
+    benchmark["benchmark_protocol"]["wad_profile_binding_sha256"] = "b" * 64
+    benchmark["run_identity"] = _canonical_sha256(
+        {
+            "schema_version": benchmark["schema_version"],
+            "workflow": benchmark["workflow"],
+            "evidence_level": benchmark["evidence_level"],
+            "fixture": benchmark["fixture"],
+            "code_provenance": benchmark["code_provenance"],
+            "declared_inputs": benchmark["declared_inputs"],
+            "benchmark_protocol": benchmark["benchmark_protocol"],
+        }
+    )
+    benchmark["claim_eligible"] = False
+    benchmark_path.write_text(json.dumps(benchmark), encoding="utf-8")
+
+    baseline = benchmark_path.read_bytes()
+    benchmark["claim_eligible"] = True
+    benchmark_path.write_text(json.dumps(benchmark), encoding="utf-8")
+    assert json.loads(baseline) | {"claim_eligible": True} == benchmark
+
+    manifest_path = _diagnostic_manifest(
+        tmp_path,
+        benchmark_report=benchmark_path,
+        trainer=trainer,
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["fixture"] = False
+    manifest["wad_profile"] = {"profile_id": "test-profile"}
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    wad_profile = {
+        "status": "matched",
+        "binding_sha256": "b" * 64,
+        "binding_identity": {
+            "providers": [
+                {
+                    "id": "gradoom",
+                    "iwad_sha256": None,
+                    "pwad_sha256": None,
+                }
+            ]
+        },
+        "providers": [],
+    }
+    monkeypatch.setattr(
+        diagnostic_module,
+        "validate_wad_profile",
+        lambda declaration, *, base_directory: (wad_profile, []),
+    )
+    output = tmp_path / "diagnostic-report.json"
+
+    returncode = evidence_main(["--manifest", str(manifest_path), "--output", str(output)])
+
+    assert returncode == 0
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert report["status"] == "completed"
+    assert report["diagnostics"]["fixed_time"]["matching_benchmark"]["matched"] is True
+    assert report["public_performance_evidence"] == {
+        "complete": False,
+        "reason": "matching_benchmark_is_not_claim_eligible",
+    }
 
 
 @pytest.mark.parametrize("mismatch", ["training_seeds", "recipe"])

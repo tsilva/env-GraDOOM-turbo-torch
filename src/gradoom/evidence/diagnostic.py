@@ -36,6 +36,16 @@ from .wad_profile import validate_wad_profile
 
 _WORKFLOW = "fixed_time_training_diagnostic"
 _MAX_TRAINING_STEPS = (1 << 63) - 1
+_BENCHMARK_EVIDENCE_POLICIES = {
+    "development_training_benchmark": {
+        "evidence_level": "development",
+        "claim_eligible": False,
+    },
+    "primary_training_benchmark": {
+        "evidence_level": "formal",
+        "claim_eligible": True,
+    },
+}
 _TIMING_RULES = {
     "clock": "monotonic_wall_clock",
     "start": "before_attempt_setup_and_public_subprocess_start",
@@ -91,11 +101,11 @@ def _load_matching_benchmark(
     if not isinstance(report, dict):
         raise EvidenceError("matching benchmark report must be a JSON object")
     _validate_schema_version(report.get("schema_version"), document="matching benchmark report")
-    if report.get("workflow") not in {
-        "development_training_benchmark",
-        "primary_training_benchmark",
-    }:
+    benchmark_policy = _BENCHMARK_EVIDENCE_POLICIES.get(report.get("workflow"))
+    if benchmark_policy is None:
         raise EvidenceError("matching benchmark report is not a training benchmark")
+    if report.get("evidence_level") != benchmark_policy["evidence_level"]:
+        raise EvidenceError("matching benchmark report evidence level does not match its workflow")
     if not isinstance(report.get("run_identity"), str):
         raise EvidenceError("matching benchmark report run_identity is missing")
     evidence_index = _required_mapping(
@@ -612,7 +622,10 @@ def _assemble_diagnostic_report(
     ]
     matched = not matching_failures
     completed = matched and all(attempt["status"] == "completed" for attempt in attempts)
-    benchmark_claim_eligible = benchmark.get("claim_eligible") is True
+    benchmark_policy = _BENCHMARK_EVIDENCE_POLICIES[benchmark["workflow"]]
+    benchmark_claim_eligible = (
+        benchmark_policy["claim_eligible"] and benchmark.get("status") == "passed"
+    )
     return {
         "schema_version": 1,
         "workflow": _WORKFLOW,
