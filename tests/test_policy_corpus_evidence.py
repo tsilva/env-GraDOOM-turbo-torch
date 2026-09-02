@@ -5,9 +5,12 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
+
+from gradoom.evidence import policy_corpus
 
 RUNNER = Path(__file__).parent / "fixtures" / "evidence" / "fixture_policy_runner.py"
 INCOMPLETE_RUNNER = RUNNER.with_name("fixture_incomplete_policy_runner.py")
@@ -20,6 +23,25 @@ TRANSIENT_RUNNER = RUNNER.with_name("fixture_transient_restore_runner.py")
 INTERRUPT_RUNNER = RUNNER.with_name("fixture_interrupt_once_runner.py")
 NOISY_RUNNER = RUNNER.with_name("fixture_noisy_policy_runner.py")
 OVERSIZED_NUMERIC_RUNNER = RUNNER.with_name("fixture_oversized_numeric_policy_runner.py")
+LIMITED_FILE_SIZE_HARNESS = """
+import json
+import resource
+import sys
+from pathlib import Path
+
+from gradoom.evidence.policy_corpus import build_policy_evaluation_report
+
+limit = int(sys.argv[2])
+resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit))
+report = build_policy_evaluation_report(Path(sys.argv[1]))
+outcomes = report["policy_evaluation"]["outcomes"]
+print(json.dumps({
+    "status": report["status"],
+    "outcome_count": len(outcomes),
+    "failure_count": report["policy_evaluation"]["failure_count"],
+    "failure_codes": sorted({item["execution_failure"]["code"] for item in outcomes}),
+}))
+"""
 
 
 def _sha256(path: Path) -> str:
@@ -274,6 +296,24 @@ def test_model_contract_version_requires_an_exact_json_integer(
     assert "unsupported model/runtime contract" in result.stderr
 
 
+@pytest.mark.parametrize("architecture", [[], {}])
+def test_model_contract_architecture_requires_a_json_string_without_a_traceback(
+    tmp_path: Path, architecture: object
+) -> None:
+    manifest_path, corpus_path, manifest = _documents(tmp_path)
+    corpus = json.loads(corpus_path.read_text(encoding="utf-8"))
+    corpus["policies"][0]["model_runtime_contract"]["architecture"] = architecture
+    _write_json(corpus_path, corpus)
+    manifest["declared_inputs"][0]["sha256"] = _sha256(corpus_path)  # type: ignore[index]
+    _write_json(manifest_path, manifest)
+
+    result = _run("--manifest", str(manifest_path), "--output", str(tmp_path / "report.json"))
+
+    assert result.returncode == 2
+    assert "unsupported model/runtime contract" in result.stderr
+    assert "Traceback" not in result.stderr
+
+
 def test_policy_evaluation_protocol_requires_an_exact_json_integer(tmp_path: Path) -> None:
     manifest_path, _corpus_path, manifest = _documents(tmp_path)
     manifest["policy_evaluation"]["protocol_version"] = 2.0  # type: ignore[index]
@@ -490,6 +530,47 @@ def test_oversized_manifest_timeout_fails_without_a_traceback(
     assert "Traceback" not in result.stderr
 
 
+def test_runner_respects_a_stricter_inherited_file_size_hard_limit(tmp_path: Path) -> None:
+    manifest_path, _corpus_path, manifest = _documents(tmp_path)
+    _replace_runner(manifest_path, manifest, FLOAT_PROTOCOL_RUNNER)
+
+    result = subprocess.run(
+        [sys.executable, "-c", LIMITED_FILE_SIZE_HARNESS, str(manifest_path), "1024"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {
+        "status": "evaluation_complete",
+        "outcome_count": 2 * 2 * 256,
+        "failure_count": 2 * 2 * 256,
+        "failure_codes": ["invalid_runner_response"],
+    }
+    assert "Traceback" not in result.stderr
+
+
+def test_runner_setup_failure_is_retained_for_every_required_seed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest_path, _corpus_path, _manifest = _documents(tmp_path)
+
+    def fail_runner_setup() -> None:
+        raise RuntimeError("forced runner setup failure")
+
+    monkeypatch.setattr(policy_corpus, "_limit_runner_output_files", fail_runner_setup)
+
+    report = policy_corpus.build_policy_evaluation_report(manifest_path)
+
+    outcomes = report["policy_evaluation"]["outcomes"]
+    assert report["status"] == "evaluation_complete"
+    assert len(outcomes) == 2 * 2 * 256
+    assert report["policy_evaluation"]["failure_count"] == 2 * 2 * 256
+    assert {item["execution_failure"]["code"] for item in outcomes} == {"runner_failure"}
+
+
 def test_execution_copy_rejects_policy_mutation(tmp_path: Path) -> None:
     manifest_path, _corpus_path, manifest = _documents(tmp_path)
     _replace_runner(manifest_path, manifest, MUTATING_RUNNER)
@@ -633,6 +714,72 @@ def test_merge_rejects_self_consistently_rehashed_json_type_substitutions(
 
     assert result.returncode == 2
     assert "merge report" in result.stderr
+
+
+@pytest.mark.parametrize("status", [[], {}])
+def test_merge_status_requires_a_json_string_without_a_traceback(
+    tmp_path: Path, status: object
+) -> None:
+    manifest_path, _corpus_path, _manifest = _documents(tmp_path)
+    initial = tmp_path / "initial.json"
+    assert _run("--manifest", str(manifest_path), "--output", str(initial)).returncode == 0
+    report = json.loads(initial.read_text(encoding="utf-8"))
+    report["status"] = status
+    _rehash_policy_report(report)
+    _write_json(initial, report)
+
+    result = _run(
+        "--manifest",
+        str(manifest_path),
+        "--output",
+        str(tmp_path / "resumed.json"),
+        "--merge",
+        str(initial),
+    )
+
+    assert result.returncode == 2
+    assert "invalid policy evaluation status" in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("message", "rehash", "diagnostic"),
+    [
+        ("tampered\0failure", True, "contains U+0000"),
+        ("tampered\ud800failure", False, "contains invalid Unicode"),
+    ],
+)
+def test_merge_rejects_failure_messages_with_disallowed_string_content(
+    tmp_path: Path, message: str, rehash: bool, diagnostic: str
+) -> None:
+    manifest_path, _corpus_path, manifest = _documents(tmp_path)
+    manifest["policy_evaluation"]["fixture_failure_seed"] = 17  # type: ignore[index]
+    _write_json(manifest_path, manifest)
+    initial = tmp_path / "initial.json"
+    assert _run("--manifest", str(manifest_path), "--output", str(initial)).returncode == 0
+    report = json.loads(initial.read_text(encoding="utf-8"))
+    failed = next(
+        item
+        for item in report["policy_evaluation"]["outcomes"]
+        if item["execution_failure"] is not None
+    )
+    failed["execution_failure"]["message"] = message
+    if rehash:
+        _rehash_policy_report(report)
+    _write_json(initial, report)
+
+    result = _run(
+        "--manifest",
+        str(manifest_path),
+        "--output",
+        str(tmp_path / "resumed.json"),
+        "--merge",
+        str(initial),
+    )
+
+    assert result.returncode == 2
+    assert diagnostic in result.stderr
+    assert "Traceback" not in result.stderr
 
 
 def test_merge_rejects_tampered_policy_evidence(tmp_path: Path) -> None:

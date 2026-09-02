@@ -162,7 +162,13 @@ def _sealed_memfd(payload: bytes, *, name: str, stack: contextlib.ExitStack) -> 
 
 
 def _limit_runner_output_files() -> None:
-    resource.setrlimit(resource.RLIMIT_FSIZE, (_RUNNER_CAPTURE_LIMIT, _RUNNER_CAPTURE_LIMIT))
+    _soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_FSIZE)
+    limit = (
+        _RUNNER_CAPTURE_LIMIT
+        if hard_limit == resource.RLIM_INFINITY
+        else min(_RUNNER_CAPTURE_LIMIT, hard_limit)
+    )
+    resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit))
 
 
 def _bounded_text(value: str, *, limit: int, suffix: str) -> str:
@@ -257,6 +263,7 @@ def _validate_contract(value: object, *, field: str) -> dict[str, Any]:
         or value.get("contract_version") != 1
         or value.get("artifact_format") != CHECKPOINT_FORMAT
         or value.get("runtime") != "torch"
+        or type(value.get("architecture")) is not str
         or value.get("architecture") not in _SUPPORTED_POLICY_ARCHITECTURES
     ):
         raise EvidenceError(f"{field} uses an unsupported model/runtime contract")
@@ -657,7 +664,7 @@ def _execute_batch(
                 pass_fds=(runner_descriptor, artifact_descriptor),
                 preexec_fn=_limit_runner_output_files,
             )
-        except (OSError, subprocess.TimeoutExpired) as error:
+        except (OSError, subprocess.SubprocessError) as error:
             code = (
                 "runner_timeout"
                 if isinstance(error, subprocess.TimeoutExpired)
@@ -707,6 +714,7 @@ def _load_reusable_outcomes(
     report = _parse_json_document(merge_path.read_bytes(), document="merge report")
     if not isinstance(report, dict):
         raise EvidenceError("merge report must be an object")
+    _validate_string_content(report, document="merge report")
     _exact_fields(report, _POLICY_REPORT_FIELDS, document="merge report")
     report_identity = _validate_sha256(report.get("run_identity"), "merge report run_identity")
     if report_identity != evaluation_identity:
@@ -715,7 +723,10 @@ def _load_reusable_outcomes(
         if not _same_json_value(report.get(field), expected):
             raise EvidenceError(f"merge report {field} does not match current evidence")
     status = report.get("status")
-    if status not in {"evaluation_in_progress", "evaluation_complete"}:
+    if type(status) is not str or status not in {
+        "evaluation_in_progress",
+        "evaluation_complete",
+    }:
         raise EvidenceError("merge report has an invalid policy evaluation status")
     evaluation = report.get("policy_evaluation")
     if not isinstance(evaluation, dict):
