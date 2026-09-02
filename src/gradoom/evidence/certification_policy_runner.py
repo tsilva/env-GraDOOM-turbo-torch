@@ -7,8 +7,8 @@ import importlib.util
 import json
 import math
 import random
-import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -18,8 +18,15 @@ import torch
 
 from gradoom import GraDoomVecEnv
 from gradoom.evidence.checkpoint_policy import load_policy_checkpoint
-from gradoom.evidence.policy_execution import policy_execution_identity
-from gradoom.evidence.reference_provider import load_reference_provider
+from gradoom.evidence.policy_execution import (
+    canonical_policy_execution_identity,
+    validate_loaded_policy_contract,
+)
+from gradoom.evidence.reference_provider import (
+    installed_distribution_identity,
+    load_reference_provider,
+    reference_distribution_identity,
+)
 
 
 def _sha256(path: Path) -> str:
@@ -38,14 +45,44 @@ def _load_train() -> tuple[ModuleType, Path]:
     return module, repository
 
 
-def _installed_revision(repository: Path) -> str:
-    return subprocess.run(
-        ["git", "-C", str(repository), "rev-parse", "HEAD"],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=10,
-    ).stdout.strip()
+def _source_identity(repository: Path, expected: dict[str, Any]) -> dict[str, Any]:
+    entries = expected.get("files")
+    if not isinstance(entries, list):
+        raise ValueError("GraDOOM source binding is incomplete")
+    actual = [
+        {"path": entry["path"], "sha256": _sha256(repository / entry["path"])} for entry in entries
+    ]
+    encoded = json.dumps(actual, separators=(",", ":"), sort_keys=True).encode()
+    return {
+        "repository": expected.get("repository"),
+        "revision": expected.get("revision"),
+        "source_count": len(actual),
+        "source_sha256": hashlib.sha256(encoded).hexdigest(),
+        "repository_root": str(repository),
+        "files": actual,
+    }
+
+
+def _validate_runtime_distributions(value: object) -> None:
+    runtime_distributions = value
+    runtime_names = (
+        {identity.get("name") for identity in runtime_distributions if isinstance(identity, dict)}
+        if isinstance(runtime_distributions, list)
+        else set()
+    )
+    if (
+        not isinstance(runtime_distributions, list)
+        or not {"torch", "numpy", "gymnasium"}.issubset(runtime_names)
+        or len(runtime_names) != len(runtime_distributions)
+    ):
+        raise ValueError("authenticated runner dependency bindings are incomplete")
+    for expected_distribution in runtime_distributions:
+        if (
+            not isinstance(expected_distribution, dict)
+            or installed_distribution_identity(str(expected_distribution.get("name")))
+            != expected_distribution
+        ):
+            raise ValueError("authenticated runner dependency bytes do not match their binding")
 
 
 def _validated_context(request: dict[str, Any], repository: Path) -> dict[str, Any]:
@@ -89,11 +126,50 @@ def _validated_context(request: dict[str, Any], repository: Path) -> dict[str, A
         "configuration"
     ):
         raise ValueError("providers are not bound to one configuration")
-    if (
-        request["provider_id"] == "gradoom"
-        and _installed_revision(repository) != request["provider_revision"]
+    expected_sources = context.get("gradoom_sources")
+    if request["provider_id"] == "gradoom" and (
+        not isinstance(expected_sources, dict)
+        or expected_sources.get("revision") != request["provider_revision"]
     ):
         raise ValueError("executed GraDOOM revision does not match the request")
+    if (
+        not isinstance(expected_sources, dict)
+        or _source_identity(repository, expected_sources) != expected_sources
+    ):
+        raise ValueError("executed GraDOOM source bytes do not match their binding")
+    if reference_distribution_identity() != context.get("reference_distribution"):
+        raise ValueError("installed reference-provider bytes do not match their binding")
+    _validate_runtime_distributions(context.get("runtime_distributions"))
+    python = context.get("python")
+    executable = Path(sys.executable)
+    if (
+        not isinstance(python, dict)
+        or executable != Path(str(python.get("executable", "")))
+        or _sha256(executable) != python.get("sha256")
+    ):
+        raise ValueError("executed Python interpreter does not match its binding")
+    python_home = python.get("home")
+    if not isinstance(python_home, dict) or Path(sys.prefix) != Path(
+        str(python_home.get("root", ""))
+    ):
+        raise ValueError("executed Python standard library does not match its binding")
+    actual_python_files = [
+        {
+            "path": entry["path"],
+            "sha256": _sha256(Path(sys.prefix) / entry["path"]),
+            "executable": entry.get("executable") is True,
+        }
+        for entry in python_home.get("files", [])
+    ]
+    if len(actual_python_files) != python_home.get("file_count") or hashlib.sha256(
+        json.dumps(actual_python_files, separators=(",", ":"), sort_keys=True).encode()
+    ).hexdigest() != python_home.get("content_sha256"):
+        raise ValueError("executed Python standard-library bytes do not match their binding")
+    scenario_config = Path(str(context.get("reference_scenario_config_path", "")))
+    if not scenario_config.is_file() or _sha256(scenario_config) != context.get(
+        "reference_scenario_config_sha256"
+    ):
+        raise ValueError("reference scenario configuration changed")
     return context
 
 
@@ -177,6 +253,29 @@ def _history(infos: dict[str, Any], train: ModuleType, device: torch.device) -> 
     return values[..., None].expand(-1, -1, train.FRAME_STACK).clone()
 
 
+def _validate_loaded_checkpoint(request: dict[str, Any], loaded: Any) -> None:
+    validate_loaded_policy_contract(
+        request["policy"]["model_runtime_contract"],
+        loaded.contract.as_dict(),
+    )
+    actual_identity = canonical_policy_execution_identity(
+        artifact_sha256=loaded.artifact_sha256,
+        artifact_contract=request["policy"]["model_runtime_contract"],
+        stochastic_actions=True,
+    )
+    if actual_identity != request["policy"]["execution_identity"]:
+        raise ValueError("loaded policy execution identity does not match the request")
+
+
+def _dispatch_loaded_checkpoint(
+    request: dict[str, Any], loaded: Any, evaluator: Callable[[], Any]
+) -> Any:
+    """Expose the real post-validation dispatch boundary as a CPU-testable seam."""
+
+    _validate_loaded_checkpoint(request, loaded)
+    return evaluator()
+
+
 def _evaluate(request: dict[str, Any]) -> list[dict[str, Any]]:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for authenticated policy evaluation")
@@ -187,13 +286,7 @@ def _evaluate(request: dict[str, Any]) -> list[dict[str, Any]]:
         raise ValueError("authenticated policy evaluation requires a CUDA device")
     artifact = Path(request["policy"]["resolved_artifact_path"])
     loaded = load_policy_checkpoint(artifact, map_location=device)
-    actual_identity = policy_execution_identity(
-        artifact_sha256=loaded.artifact_sha256,
-        model_runtime_contract=loaded.contract.as_dict(),
-        stochastic_actions=True,
-    )
-    if actual_identity != request["policy"]["execution_identity"]:
-        raise ValueError("loaded policy execution identity does not match the request")
+    _dispatch_loaded_checkpoint(request, loaded, lambda: None)
     _policy, calls, precision = train._bind_checkpoint_policy(loaded, device)
     context_encoder = train.CombatContextEncoder(train.MODEL_HISTORY_SIGNALS, device)
     env, reference = _make_env(request["provider_id"], context=context, train=train, device=device)

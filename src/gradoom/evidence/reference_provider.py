@@ -5,6 +5,7 @@ import importlib
 import importlib.metadata as importlib_metadata
 import json
 import secrets
+import stat
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -52,6 +53,75 @@ def _installed_revision() -> str:
             f"found {revision!r}"
         )
     return revision
+
+
+def reference_distribution_identity() -> dict[str, Any]:
+    """Hash the installed reference Python/native payload, not only VCS metadata."""
+
+    revision = _installed_revision()
+    return {
+        **installed_distribution_identity(REFERENCE_DISTRIBUTION),
+        "revision": revision,
+    }
+
+
+def installed_distribution_identity(distribution_name: str) -> dict[str, Any]:
+    """Bind every importable byte owned by an installed distribution."""
+
+    try:
+        distribution = importlib_metadata.distribution(distribution_name)
+    except importlib_metadata.PackageNotFoundError as error:
+        raise ReferenceProviderError(
+            f"required runtime distribution {distribution_name!r} is not installed"
+        ) from error
+    files = distribution.files
+    if files is None:
+        raise ReferenceProviderError(
+            f"runtime distribution {distribution_name!r} does not expose installed files"
+        )
+    root = Path(distribution.locate_file("")).resolve()
+    entries: list[dict[str, Any]] = []
+    for relative in sorted(files, key=str):
+        relative_string = str(relative)
+        if "__pycache__" in relative.parts or relative_string.endswith((".pyc", ".pyo")):
+            continue
+        installed_path = Path(distribution.locate_file(relative)).absolute()
+        path = installed_path.resolve()
+        try:
+            path.relative_to(root)
+            normalized = installed_path.relative_to(root)
+        except ValueError:
+            # Console scripts outside site-packages are not importable runtime bytes.
+            continue
+        if not path.is_file():
+            continue
+        try:
+            payload = path.read_bytes()
+        except OSError as error:
+            raise ReferenceProviderError(
+                f"runtime distribution file is unavailable: {distribution_name}:{relative_string}"
+            ) from error
+        entries.append(
+            {
+                "path": str(normalized),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "executable": bool(stat.S_IMODE(path.stat().st_mode) & 0o111),
+            }
+        )
+    if not entries:
+        raise ReferenceProviderError(
+            f"runtime distribution {distribution_name!r} has no bindable installed files"
+        )
+    entries.sort(key=lambda entry: entry["path"])
+    encoded = json.dumps(entries, separators=(",", ":"), sort_keys=True).encode()
+    return {
+        "name": distribution_name,
+        "version": distribution.version,
+        "file_count": len(entries),
+        "content_sha256": hashlib.sha256(encoded).hexdigest(),
+        "installation_root": str(root),
+        "files": entries,
+    }
 
 
 @dataclass(frozen=True)
@@ -281,5 +351,7 @@ __all__ = [
     "REFERENCE_REVISION",
     "ReferenceProvider",
     "ReferenceProviderError",
+    "installed_distribution_identity",
     "load_reference_provider",
+    "reference_distribution_identity",
 ]

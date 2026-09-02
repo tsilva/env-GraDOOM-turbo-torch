@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -252,6 +253,20 @@ def test_complete_real_context_issues_a_fully_bound_certificate(
         lambda *args, **kwargs: {"kind": "repository_owned", "runner_sha256": "3" * 64},
     )
     monkeypatch.setattr(policy_corpus, "_real_runner_context", lambda *args, **kwargs: {})
+    monkeypatch.setattr(
+        policy_corpus,
+        "_seal_real_runner_inputs",
+        lambda *args, **kwargs: (
+            {
+                "python": {
+                    "executable": sys.executable,
+                    "home": {"root": sys.base_prefix},
+                    "import_paths": [],
+                }
+            },
+            (),
+        ),
+    )
     monkeypatch.setattr(policy_corpus, "_validate_repository_clean", lambda *args: None)
 
     report = policy_corpus.build_policy_evaluation_report(manifest_path)
@@ -1362,6 +1377,20 @@ def test_final_validation_failure_never_publishes_claim_bearing_progress(
         lambda *args, **kwargs: {"kind": "repository_owned", "runner_sha256": "3" * 64},
     )
     monkeypatch.setattr(policy_corpus, "_real_runner_context", lambda *args, **kwargs: {})
+    monkeypatch.setattr(
+        policy_corpus,
+        "_seal_real_runner_inputs",
+        lambda *args, **kwargs: (
+            {
+                "python": {
+                    "executable": sys.executable,
+                    "home": {"root": sys.base_prefix},
+                    "import_paths": [],
+                }
+            },
+            (),
+        ),
+    )
     if late_change == "repository":
         monkeypatch.setattr(
             policy_corpus,
@@ -1388,3 +1417,162 @@ def test_final_validation_failure_never_publishes_claim_bearing_progress(
     assert all(report["status"] == "evaluation_in_progress" for report in progress)
     assert all(report["claim_eligible"] is False for report in progress)
     assert all(report["parity_certificate"] is None for report in progress)
+
+
+def test_real_runner_uses_immutable_wad_scenario_and_source_snapshots(tmp_path: Path) -> None:
+    source_root = tmp_path / "source"
+    source_file = source_root / "src/gradoom/example.py"
+    source_file.parent.mkdir(parents=True)
+    source_file.write_bytes(b"trusted source\n")
+    reference_root = tmp_path / "site"
+    reference_file = reference_root / "env_vizdoom_turbo/__init__.py"
+    reference_file.parent.mkdir(parents=True)
+    reference_file.write_bytes(b"trusted reference\n")
+    iwad = tmp_path / "freedoom2.wad"
+    pwad = tmp_path / "deathmatch.wad"
+    scenario = tmp_path / "scenario.cfg"
+    python_home = tmp_path / "python-home"
+    python_runtime_file = python_home / "lib/python/runtime.py"
+    python_runtime_file.parent.mkdir(parents=True)
+    python_runtime_file.write_bytes(b"trusted runtime\n")
+    iwad.write_bytes(b"trusted iwad")
+    pwad.write_bytes(b"trusted pwad")
+    scenario.write_bytes(b"doom_scenario_path = deathmatch.wad\n")
+
+    source_entry = {"path": "src/gradoom/example.py", "sha256": _sha256(source_file)}
+    reference_entry = {
+        "path": "env_vizdoom_turbo/__init__.py",
+        "sha256": _sha256(reference_file),
+    }
+    context = {
+        "gradoom_sources": {
+            "repository": "tsilva/env-GraDOOM-turbo-torch",
+            "revision": "a" * 40,
+            "source_count": 1,
+            "source_sha256": _canonical_sha256([source_entry]),
+            "repository_root": str(source_root),
+            "files": [source_entry],
+        },
+        "reference_distribution": {
+            "revision": "b" * 40,
+            "file_count": 1,
+            "content_sha256": _canonical_sha256([reference_entry]),
+            "installation_root": str(reference_root),
+            "files": [reference_entry],
+        },
+        "python": {
+            "executable": sys.executable,
+            "sha256": _sha256(Path(sys.executable)),
+            "home": {
+                "version": sys.version,
+                "file_count": 1,
+                "content_sha256": _canonical_sha256(
+                    [
+                        {
+                            "path": "lib/python/runtime.py",
+                            "sha256": _sha256(python_runtime_file),
+                            "executable": False,
+                        }
+                    ]
+                ),
+                "root": str(python_home),
+                "files": [
+                    {
+                        "path": "lib/python/runtime.py",
+                        "sha256": _sha256(python_runtime_file),
+                        "executable": False,
+                    }
+                ],
+            },
+            "import_paths": [str(source_root / "src")],
+        },
+        "providers": {
+            provider: {
+                "configuration": {"map": "MAP01"},
+                "iwad": {"path": str(iwad), "sha256": _sha256(iwad)},
+                "pwad": {"path": str(pwad), "sha256": _sha256(pwad)},
+            }
+            for provider in ("gradoom", "env-vizdoom-turbo")
+        },
+        "reference_scenario_config_path": str(scenario),
+        "reference_scenario_config_sha256": _sha256(scenario),
+    }
+
+    with contextlib.ExitStack() as stack:
+        sealed, _descriptors = policy_corpus._seal_real_runner_inputs(context, stack=stack)
+        assert sealed is not None
+        iwad.write_bytes(b"substituted iwad")
+        pwad.write_bytes(b"substituted pwad")
+        scenario.write_bytes(b"substituted config")
+        source_file.write_bytes(b"substituted source")
+        reference_file.write_bytes(b"substituted reference")
+
+        assert Path(sealed["providers"]["gradoom"]["iwad"]["path"]).read_bytes() == b"trusted iwad"
+        assert Path(sealed["providers"]["gradoom"]["pwad"]["path"]).read_bytes() == b"trusted pwad"
+        assert (
+            Path(sealed["reference_scenario_config_path"])
+            .read_bytes()
+            .startswith(b"doom_scenario_path")
+        )
+        snapshot_root = Path(sealed["gradoom_sources"]["repository_root"])
+        assert (snapshot_root / source_entry["path"]).read_bytes() == b"trusted source\n"
+        snapshot_site = Path(sealed["reference_distribution"]["installation_root"])
+        assert (snapshot_site / reference_entry["path"]).read_bytes() == b"trusted reference\n"
+
+
+def test_nonfixture_runner_rejects_import_injection_and_uses_isolated_python(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    binding = {
+        "fixture": False,
+        "runner_context": {
+            "python": {
+                "executable": sys.executable,
+                "home": {"root": "/trusted/python-home"},
+                "import_paths": ["/trusted/repository/src", "/trusted/site-packages"],
+            }
+        },
+    }
+
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        captured["command"] = command
+        captured["env"] = kwargs["env"]
+        request = json.loads(kwargs["input"])  # type: ignore[arg-type]
+        response = {
+            "protocol_version": 2,
+            "execution_binding": request["execution_binding"],
+            "outcomes": [],
+        }
+        stdout = kwargs["stdout"]
+        stdout.write(json.dumps(response).encode())  # type: ignore[union-attr]
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setenv("PYTHONPATH", "/malicious/shadow")
+    monkeypatch.setenv("PYTHONSTARTUP", "/malicious/startup.py")
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.delenv("NVIDIA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setattr(policy_corpus.subprocess, "run", fake_run)
+    policy_corpus._execute_batch(
+        10,
+        11,
+        provider={"id": "gradoom", "revision": "a" * 40},
+        policy={
+            "id": "policy",
+            "training_provider": "gradoom",
+            "artifact_sha256": "b" * 64,
+            "model_runtime_contract": {},
+            "stochastic_actions": True,
+            "execution_identity": {},
+        },
+        seeds=[],
+        fixture_failure_seed=None,
+        timeout_seconds=1,
+        execution_binding=binding,
+    )
+
+    command = captured["command"]
+    assert isinstance(command, list)
+    assert command[1:3] == ["-P", "-S"]
+    assert captured["env"] == {"PYTHONHOME": "/trusted/python-home"}
+    assert "/malicious/shadow" not in command

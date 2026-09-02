@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import sys
@@ -36,7 +37,21 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _write_report(path: Path, report: dict[str, object]) -> None:
+def _fsync_directory(path: Path) -> None:
+    directory_descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_descriptor)
+    finally:
+        os.close(directory_descriptor)
+
+
+def _write_report(
+    path: Path,
+    report: dict[str, object],
+    *,
+    revalidate: Any | None = None,
+    rollback_on_failure: bool = False,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         payload = (
@@ -57,19 +72,51 @@ def _write_report(path: Path, report: dict[str, object]) -> None:
         text=True,
     )
     temporary_path = Path(temporary_name)
+    backup_path: Path | None = None
+    replaced = False
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
             stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())
+        if revalidate is not None:
+            revalidate()
+        if rollback_on_failure and path.exists():
+            backup_descriptor, backup_name = tempfile.mkstemp(
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                suffix=".rollback",
+            )
+            os.close(backup_descriptor)
+            backup_path = Path(backup_name)
+            backup_path.unlink()
+            os.replace(path, backup_path)
         os.replace(temporary_path, path)
-        directory_descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(directory_descriptor)
-        finally:
-            os.close(directory_descriptor)
+        replaced = True
+        if revalidate is not None:
+            revalidate()
+        _fsync_directory(path.parent)
+        if backup_path is not None:
+            backup_path.unlink()
+            backup_path = None
+            # The claim-bearing replacement was already validated and made durable.
+            # Failure to durably remove the private rollback copy is non-fatal.
+            with contextlib.suppress(OSError):
+                _fsync_directory(path.parent)
+    except BaseException:
+        if rollback_on_failure and replaced:
+            path.unlink(missing_ok=True)
+        if rollback_on_failure and backup_path is not None:
+            os.replace(backup_path, path)
+            backup_path = None
+        if rollback_on_failure:
+            with contextlib.suppress(OSError):
+                _fsync_directory(path.parent)
+        raise
     finally:
         temporary_path.unlink(missing_ok=True)
+        if backup_path is not None:
+            backup_path.unlink(missing_ok=True)
 
 
 def _validate_output_path(
@@ -236,6 +283,7 @@ def main(argv: list[str] | None = None) -> int:
             merge_path=args.merge,
         )
         workflow = manifest.get("workflow")
+        final_report_published = False
         if workflow == "parity_readiness":
             report = build_readiness_report(args.manifest)
         elif workflow == "development_training_benchmark":
@@ -249,20 +297,38 @@ def main(argv: list[str] | None = None) -> int:
                 raise EvidenceError("fixed-time diagnostic continuation is not supported yet")
             report = build_fixed_time_diagnostic_report(args.manifest)
         elif workflow == "parity_certification":
+
+            def publish_policy_report(final_report: dict[str, Any], revalidate: Any) -> None:
+                _validate_output_path(
+                    args.output,
+                    manifest_path=args.manifest,
+                    report=final_report,
+                    merge_path=args.merge,
+                )
+                _write_report(
+                    args.output,
+                    final_report,
+                    revalidate=revalidate,
+                    rollback_on_failure=True,
+                )
+
             report = build_policy_evaluation_report(
                 args.manifest,
                 merge_path=args.merge,
                 output_path=args.output,
                 progress_callback=lambda progress: _write_report(args.output, progress),
+                final_callback=publish_policy_report,
             )
+            final_report_published = True
         else:
             raise EvidenceError(f"unsupported manifest workflow {workflow!r}")
-        _validate_output_path(
-            args.output,
-            manifest_path=args.manifest,
-            report=report,
-            merge_path=args.merge,
-        )
+        if not final_report_published:
+            _validate_output_path(
+                args.output,
+                manifest_path=args.manifest,
+                report=report,
+                merge_path=args.merge,
+            )
         if args.merge is not None and workflow == "parity_readiness":
             evidence_index = report["evidence_index"]
             assert isinstance(evidence_index, dict)
@@ -295,7 +361,8 @@ def main(argv: list[str] | None = None) -> int:
                     }
                 ],
             )
-        _write_report(args.output, report)
+        if not final_report_published:
+            _write_report(args.output, report)
     except (EvidenceError, OSError) as error:
         print(f"gradoom-evidence: error: {error}", file=sys.stderr)
         return 2

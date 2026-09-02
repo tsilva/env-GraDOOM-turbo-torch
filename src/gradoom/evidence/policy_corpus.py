@@ -3,12 +3,14 @@ from __future__ import annotations
 import contextlib
 import ctypes
 import fcntl
+import importlib.metadata as importlib_metadata
 import json
 import math
 import os
 import resource
 import subprocess
 import sys
+import sysconfig
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
@@ -21,7 +23,12 @@ from .parity_verdict import (
     issue_parity_certificate,
     parity_claim_reasons,
 )
-from .policy_execution import POLICY_PREPROCESSING_SHA256, policy_execution_identity
+from .policy_execution import POLICY_PREPROCESSING_SHA256, canonical_policy_execution_identity
+from .reference_provider import (
+    ReferenceProviderError,
+    installed_distribution_identity,
+    reference_distribution_identity,
+)
 from .report import (
     EvidenceError,
     _canonical_sha256,
@@ -147,15 +154,43 @@ _FIELD_DIAGNOSTIC_LIMIT = 128
 _FIELD_DIAGNOSTIC_COUNT = 8
 _MAX_OUTCOME_NUMBER = 2**63 - 1
 _MAX_TIMEOUT_SECONDS = 2**31 - 1
+_ISOLATED_RUNNER_BOOTSTRAP = (
+    "import runpy,sys;"
+    "sys.path[:0]=sys.argv[1].split(sys.argv[2]);"
+    "runpy.run_path(sys.argv[3],run_name='__main__')"
+)
 _MFD_ALLOW_SEALING = 0x0002
 _F_ADD_SEALS = 1033
 _F_SEAL_SEAL = 0x0001
 _F_SEAL_SHRINK = 0x0002
 _F_SEAL_GROW = 0x0004
 _F_SEAL_WRITE = 0x0008
+_RUNTIME_DISTRIBUTIONS = (
+    "torch",
+    "numpy",
+    "gymnasium",
+    "cloudpickle",
+    "farama-notifications",
+    "filelock",
+    "fsspec",
+    "jinja2",
+    "markupsafe",
+    "mpmath",
+    "networkx",
+    "setuptools",
+    "sympy",
+    "typing-extensions",
+    "triton",
+)
 
 
-def _sealed_memfd(payload: bytes, *, name: str, stack: contextlib.ExitStack) -> int:
+def _sealed_memfd(
+    payload: bytes,
+    *,
+    name: str,
+    stack: contextlib.ExitStack,
+    executable: bool = False,
+) -> int:
     libc = ctypes.CDLL(None, use_errno=True)
     memfd_create = getattr(libc, "memfd_create", None)
     if memfd_create is None:
@@ -174,6 +209,8 @@ def _sealed_memfd(payload: bytes, *, name: str, stack: contextlib.ExitStack) -> 
     while view:
         written = os.write(descriptor, view)
         view = view[written:]
+    if executable:
+        os.fchmod(descriptor, 0o555)
     os.lseek(descriptor, 0, os.SEEK_SET)
     seals = _F_SEAL_SEAL | _F_SEAL_SHRINK | _F_SEAL_GROW | _F_SEAL_WRITE
     try:
@@ -181,6 +218,15 @@ def _sealed_memfd(payload: bytes, *, name: str, stack: contextlib.ExitStack) -> 
     except OSError as error:
         raise EvidenceError("sealed policy execution could not seal an anonymous file") from error
     return descriptor
+
+
+def _restore_snapshot_permissions(*roots: Path) -> None:
+    for root in roots:
+        for path in root.rglob("*"):
+            with contextlib.suppress(OSError):
+                path.chmod(0o755 if path.is_dir() else 0o644)
+        with contextlib.suppress(OSError):
+            root.chmod(0o755)
 
 
 def _limit_runner_output_files() -> None:
@@ -299,6 +345,73 @@ def _validate_repository_clean(code_provenance: dict[str, Any]) -> None:
         raise EvidenceError("GraDOOM repository changed or became dirty during policy evaluation")
 
 
+def _repository_execution_identity(code_provenance: dict[str, Any]) -> dict[str, Any]:
+    _validate_repository_clean(code_provenance)
+    repository = Path(__file__).resolve().parents[3]
+    try:
+        tracked = subprocess.run(
+            ["git", "-C", str(repository), "ls-files", "-z", "src/gradoom", "train.py"],
+            check=True,
+            capture_output=True,
+            timeout=10,
+        ).stdout.split(b"\0")
+    except (OSError, subprocess.SubprocessError) as error:
+        raise EvidenceError("cannot bind the GraDOOM execution source closure") from error
+    entries = []
+    for raw_relative in tracked:
+        if not raw_relative:
+            continue
+        relative = os.fsdecode(raw_relative)
+        path = repository / relative
+        try:
+            digest = _sha256_bytes(path.read_bytes())
+        except OSError as error:
+            raise EvidenceError(f"cannot bind executed source {relative!r}") from error
+        entries.append({"path": relative, "sha256": digest})
+    return {
+        "repository": code_provenance["repository"],
+        "revision": code_provenance["revision"],
+        "source_count": len(entries),
+        "source_sha256": _canonical_sha256(entries, document="GraDOOM execution sources"),
+        "repository_root": str(repository),
+        "files": entries,
+    }
+
+
+def _python_home_identity() -> dict[str, Any]:
+    root = Path(sys.base_prefix).resolve()
+    standard_library = Path(sysconfig.get_path("stdlib")).resolve()
+    try:
+        standard_library.relative_to(root)
+    except ValueError as error:
+        raise EvidenceError("Python standard library is outside its runtime prefix") from error
+    entries: list[dict[str, Any]] = []
+    for path in sorted(standard_library.rglob("*")):
+        if not path.is_file() or "__pycache__" in path.parts or path.suffix in {".pyc", ".pyo"}:
+            continue
+        relative = path.relative_to(root)
+        try:
+            payload = path.read_bytes()
+        except OSError as error:
+            raise EvidenceError(f"cannot bind Python runtime file {relative!s}") from error
+        entries.append(
+            {
+                "path": str(relative),
+                "sha256": _sha256_bytes(payload),
+                "executable": os.access(path, os.X_OK),
+            }
+        )
+    if not entries:
+        raise EvidenceError("Python runtime has no bindable standard-library files")
+    return {
+        "version": sys.version,
+        "file_count": len(entries),
+        "content_sha256": _canonical_sha256(entries, document="Python runtime files"),
+        "root": str(root),
+        "files": entries,
+    }
+
+
 def _validate_real_runner_authority(
     runner_path: Path,
     runner_payload: bytes,
@@ -369,11 +482,153 @@ def _real_runner_context(
         providers[provider_id] = normalized
     if set(providers) != set(PROVIDER_IDS):
         raise EvidenceError("real policy execution must bind both providers")
+    try:
+        reference_identity = reference_distribution_identity()
+        accelerator_distributions = {
+            str(distribution.metadata["Name"])
+            for distribution in importlib_metadata.distributions()
+            if str(distribution.metadata["Name"])
+            .lower()
+            .replace("_", "-")
+            .startswith(("cuda-", "nvidia-"))
+        }
+        runtime_identities = [
+            installed_distribution_identity(name)
+            for name in sorted({*_RUNTIME_DISTRIBUTIONS, *accelerator_distributions})
+        ]
+    except ReferenceProviderError as error:
+        raise EvidenceError(str(error)) from error
+    executable = Path(sys.executable).resolve()
     return {
         "device": real_configuration.get("device"),
         "reference_scenario_config_path": str(verified[config_input][0]),
+        "reference_scenario_config_sha256": _sha256_bytes(verified[config_input][1]),
         "providers": providers,
+        "gradoom_sources": _repository_execution_identity(manifest["code_provenance"]),
+        "reference_distribution": reference_identity,
+        "runtime_distributions": runtime_identities,
+        "python": {
+            "executable": str(executable),
+            "sha256": _sha256_bytes(executable.read_bytes()),
+            "home": _python_home_identity(),
+            "import_paths": [str(Path(__file__).resolve().parents[2])],
+        },
     }
+
+
+def _seal_real_runner_inputs(
+    context: dict[str, Any] | None,
+    *,
+    stack: contextlib.ExitStack,
+) -> tuple[dict[str, Any] | None, tuple[int, ...]]:
+    if context is None:
+        return None, ()
+    sealed = json.loads(json.dumps(context, allow_nan=False))
+    runtime_root = Path(stack.enter_context(tempfile.TemporaryDirectory()))
+    source_binding = sealed["gradoom_sources"]
+    source_root = Path(source_binding["repository_root"])
+    source_snapshot = runtime_root / "repository"
+    for entry in source_binding["files"]:
+        source = source_root / entry["path"]
+        payload = source.read_bytes()
+        if _sha256_bytes(payload) != entry["sha256"]:
+            raise EvidenceError(f"executed source {entry['path']!r} changed before sealing")
+        destination = source_snapshot / entry["path"]
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(payload)
+    source_binding["repository_root"] = str(source_snapshot)
+    reference_snapshot = runtime_root / "reference-site"
+    distribution_bindings = [
+        sealed["reference_distribution"],
+        *sealed.get("runtime_distributions", []),
+    ]
+    for distribution_binding in distribution_bindings:
+        distribution_root = Path(distribution_binding["installation_root"])
+        for entry in distribution_binding["files"]:
+            relative = Path(entry["path"])
+            source = (distribution_root / relative).resolve()
+            payload = source.read_bytes()
+            if _sha256_bytes(payload) != entry["sha256"]:
+                raise EvidenceError(
+                    f"runtime-distribution file {entry['path']!r} changed before sealing"
+                )
+            destination = (reference_snapshot / relative).resolve()
+            if reference_snapshot.resolve() not in destination.parents:
+                raise EvidenceError("runtime distribution contains an unsafe path")
+            if destination.exists():
+                if destination.read_bytes() != payload:
+                    raise EvidenceError("runtime distributions contain conflicting files")
+                continue
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(payload)
+            if entry.get("executable") is True:
+                destination.chmod(0o755)
+        distribution_binding["installation_root"] = str(reference_snapshot)
+    python_binding = sealed["python"]
+    python_home_binding = python_binding["home"]
+    original_python_home = Path(python_home_binding["root"])
+    python_home_snapshot = runtime_root / "python-home"
+    for entry in python_home_binding["files"]:
+        source = original_python_home / entry["path"]
+        payload = source.read_bytes()
+        if _sha256_bytes(payload) != entry["sha256"]:
+            raise EvidenceError(f"Python runtime file {entry['path']!r} changed before sealing")
+        destination = python_home_snapshot / entry["path"]
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(payload)
+        if entry.get("executable") is True:
+            destination.chmod(0o755)
+    python_home_binding["root"] = str(python_home_snapshot)
+    snapshots = (source_snapshot, reference_snapshot, python_home_snapshot)
+    for snapshot in snapshots:
+        for path in sorted(snapshot.rglob("*"), key=lambda item: len(item.parts), reverse=True):
+            if path.is_file():
+                path.chmod(0o555 if os.access(path, os.X_OK) else 0o444)
+            elif path.is_dir():
+                path.chmod(0o555)
+        snapshot.chmod(0o555)
+    stack.callback(_restore_snapshot_permissions, *snapshots)
+    sealed["python"]["import_paths"] = [
+        str(source_snapshot / "src"),
+        str(reference_snapshot),
+    ]
+    descriptors: list[int] = []
+    python_payload = Path(python_binding["executable"]).read_bytes()
+    if _sha256_bytes(python_payload) != python_binding["sha256"]:
+        raise EvidenceError("Python interpreter changed before immutable execution copy")
+    python_descriptor = _sealed_memfd(
+        python_payload,
+        name="gradoom-python",
+        stack=stack,
+        executable=True,
+    )
+    descriptors.append(python_descriptor)
+    python_binding["executable"] = f"/proc/self/fd/{python_descriptor}"
+    for provider in sealed["providers"].values():
+        for asset in ("iwad", "pwad"):
+            binding = provider[asset]
+            payload = Path(binding["path"]).read_bytes()
+            if _sha256_bytes(payload) != binding["sha256"]:
+                raise EvidenceError(f"{asset.upper()} changed before immutable execution copy")
+            descriptor = _sealed_memfd(payload, name=f"gradoom-{asset}", stack=stack)
+            descriptors.append(descriptor)
+            binding["path"] = f"/proc/self/fd/{descriptor}"
+    scenario_path = Path(sealed["reference_scenario_config_path"])
+    scenario_payload = scenario_path.read_bytes()
+    if _sha256_bytes(scenario_payload) != sealed["reference_scenario_config_sha256"]:
+        raise EvidenceError("reference scenario configuration changed before execution")
+    scenario_descriptor = _sealed_memfd(
+        scenario_payload, name="gradoom-reference-config", stack=stack
+    )
+    descriptors.append(scenario_descriptor)
+    reference_directory = Path(stack.enter_context(tempfile.TemporaryDirectory()))
+    config_path = reference_directory / "scenario.cfg"
+    pwad_path = reference_directory / "deathmatch.wad"
+    config_path.symlink_to(f"/proc/self/fd/{scenario_descriptor}")
+    reference_pwad = sealed["providers"]["env-vizdoom-turbo"]["pwad"]["path"]
+    pwad_path.symlink_to(reference_pwad)
+    sealed["reference_scenario_config_path"] = str(config_path)
+    return sealed, tuple(descriptors)
 
 
 def _read_verified_input(
@@ -521,9 +776,9 @@ def _load_corpus(
                 "stochastic_actions": True,
                 "adapted": False,
                 "provider_specific_modifications": [],
-                "execution_identity": policy_execution_identity(
+                "execution_identity": canonical_policy_execution_identity(
                     artifact_sha256=expected_sha256,
-                    model_runtime_contract=contract,
+                    artifact_contract=contract,
                     stochastic_actions=True,
                 ),
             }
@@ -828,6 +1083,7 @@ def _execute_batch(
     fixture_failure_seed: int | None,
     timeout_seconds: float,
     execution_binding: dict[str, Any],
+    execution_descriptors: tuple[int, ...] = (),
 ) -> dict[int, dict[str, Any]]:
     request: dict[str, Any] = {
         "protocol_version": POLICY_RUNNER_PROTOCOL_VERSION,
@@ -849,15 +1105,40 @@ def _execute_batch(
         request["fixture_failure_seed"] = fixture_failure_seed
     with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
         try:
+            fixture = execution_binding["fixture"] is True
+            if fixture:
+                command = [sys.executable, f"/proc/self/fd/{runner_descriptor}"]
+                environment = None
+            else:
+                runner_context = execution_binding["runner_context"]
+                python = runner_context["python"]
+                separator = os.pathsep
+                command = [
+                    python["executable"],
+                    "-P",
+                    "-S",
+                    "-c",
+                    _ISOLATED_RUNNER_BOOTSTRAP,
+                    separator.join(python["import_paths"]),
+                    separator,
+                    f"/proc/self/fd/{runner_descriptor}",
+                ]
+                environment = {
+                    key: os.environ[key]
+                    for key in ("CUDA_VISIBLE_DEVICES", "NVIDIA_VISIBLE_DEVICES")
+                    if key in os.environ
+                }
+                environment["PYTHONHOME"] = python["home"]["root"]
             result = subprocess.run(
-                [sys.executable, f"/proc/self/fd/{runner_descriptor}"],
+                command,
                 input=json.dumps(request, allow_nan=False).encode(),
                 check=False,
                 stdout=stdout,
                 stderr=stderr,
                 timeout=timeout_seconds,
-                pass_fds=(runner_descriptor, artifact_descriptor),
+                pass_fds=(runner_descriptor, artifact_descriptor, *execution_descriptors),
                 preexec_fn=_limit_runner_output_files,
+                env=environment,
             )
         except (OSError, subprocess.SubprocessError) as error:
             code = (
@@ -1106,6 +1387,7 @@ def build_policy_evaluation_report(
     merge_path: Path | None = None,
     output_path: Path | None = None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    final_callback: Callable[[dict[str, Any], Callable[[], None]], None] | None = None,
 ) -> dict[str, Any]:
     manifest, manifest_payload = _load_manifest(manifest_path)
     _exact_fields(
@@ -1373,16 +1655,6 @@ def build_policy_evaluation_report(
             invariant_suite=invariant_suite,
             complete=complete,
         )
-        if (
-            complete
-            and not manifest["fixture"]
-            and verdict.get("would_issue") is True
-            and code_provenance.get("dirty") is False
-            and isinstance(wad_profile, dict)
-            and wad_profile.get("status") == "matched"
-            and invariant_suite.get("status") == "passed"
-        ):
-            _validate_repository_clean(code_provenance)
         certificate = issue_parity_certificate(
             evaluation,
             verdict=verdict,
@@ -1454,6 +1726,10 @@ def build_policy_evaluation_report(
             )
             for policy in policies
         }
+        sealed_runner_context, execution_descriptors = _seal_real_runner_inputs(
+            runner_context,
+            stack=stack,
+        )
         for provider in providers:
             for policy in policies:
                 pending_seeds = []
@@ -1484,8 +1760,9 @@ def build_policy_evaluation_report(
                             "policy_execution_identity": policy["execution_identity"],
                             "wad_profile": _wad_profile_identity(wad_profile),
                             "invariant_suite": _invariant_suite_identity(invariant_suite),
-                            "runner_context": runner_context,
+                            "runner_context": sealed_runner_context,
                         },
+                        execution_descriptors=execution_descriptors,
                     )
                     if pending_seeds
                     else {}
@@ -1522,13 +1799,22 @@ def build_policy_evaluation_report(
                             complete=False,
                         )
                     )
-    _validate_sources_unchanged(
-        declared_inputs=declared_inputs,
-        verified=verified,
-        policies=policies,
-    )
-    validate_profile_unchanged()
-    return build_report(outcomes, complete=True)
+    final_report = build_report(outcomes, complete=True)
+
+    def validate_final_state() -> None:
+        _validate_sources_unchanged(
+            declared_inputs=declared_inputs,
+            verified=verified,
+            policies=policies,
+        )
+        validate_profile_unchanged()
+        if final_report["claim_eligible"] is True:
+            _validate_repository_clean(code_provenance)
+
+    validate_final_state()
+    if final_callback is not None:
+        final_callback(final_report, validate_final_state)
+    return final_report
 
 
 __all__ = ["POLICY_RUNNER_PROTOCOL_VERSION", "build_policy_evaluation_report"]
