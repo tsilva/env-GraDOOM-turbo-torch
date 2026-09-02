@@ -151,6 +151,77 @@ def _canonical_sha256(value: object) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _bind_benchmark_identity(benchmark: dict[str, object]) -> None:
+    benchmark["run_identity"] = _canonical_sha256(
+        {
+            "schema_version": benchmark["schema_version"],
+            "workflow": benchmark["workflow"],
+            "evidence_level": benchmark["evidence_level"],
+            "fixture": benchmark["fixture"],
+            "code_provenance": benchmark["code_provenance"],
+            "declared_inputs": benchmark["declared_inputs"],
+            "benchmark_protocol": benchmark["benchmark_protocol"],
+        }
+    )
+
+
+def _non_fixture_benchmark_report(
+    tmp_path: Path,
+    trainer: dict[str, object],
+) -> tuple[Path, dict[str, object]]:
+    benchmark_path, benchmark = _benchmark_report(tmp_path, trainer)
+    benchmark["fixture"] = False
+    protocol = benchmark["benchmark_protocol"]
+    assert isinstance(protocol, dict)
+    protocol["fixture"] = False
+    protocol["wad_profile_binding_sha256"] = "b" * 64
+    _bind_benchmark_identity(benchmark)
+    benchmark_path.write_text(json.dumps(benchmark), encoding="utf-8")
+    return benchmark_path, benchmark
+
+
+def _non_fixture_diagnostic_manifest(
+    tmp_path: Path,
+    *,
+    benchmark_report: Path,
+    trainer: dict[str, object],
+    evidence_level: str = "development",
+) -> Path:
+    manifest_path = _diagnostic_manifest(
+        tmp_path,
+        benchmark_report=benchmark_report,
+        trainer=trainer,
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["evidence_level"] = evidence_level
+    manifest["fixture"] = False
+    manifest["wad_profile"] = {"profile_id": "test-profile"}
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    return manifest_path
+
+
+def _use_matched_wad_profile(monkeypatch: pytest.MonkeyPatch) -> None:
+    wad_profile = {
+        "status": "matched",
+        "binding_sha256": "b" * 64,
+        "binding_identity": {
+            "providers": [
+                {
+                    "id": "gradoom",
+                    "iwad_sha256": None,
+                    "pwad_sha256": None,
+                }
+            ]
+        },
+        "providers": [],
+    }
+    monkeypatch.setattr(
+        diagnostic_module,
+        "validate_wad_profile",
+        lambda declaration, *, base_directory: (wad_profile, []),
+    )
+
+
 def test_matching_fixed_time_diagnostic_reports_quality_and_throughput_without_passage(
     tmp_path: Path,
 ) -> None:
@@ -245,21 +316,7 @@ def test_development_claim_eligibility_mutation_cannot_complete_public_bundle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     trainer = _trainer({"10": [31.0, 0.0]})
-    benchmark_path, benchmark = _benchmark_report(tmp_path, trainer)
-    benchmark["fixture"] = False
-    benchmark["benchmark_protocol"]["fixture"] = False
-    benchmark["benchmark_protocol"]["wad_profile_binding_sha256"] = "b" * 64
-    benchmark["run_identity"] = _canonical_sha256(
-        {
-            "schema_version": benchmark["schema_version"],
-            "workflow": benchmark["workflow"],
-            "evidence_level": benchmark["evidence_level"],
-            "fixture": benchmark["fixture"],
-            "code_provenance": benchmark["code_provenance"],
-            "declared_inputs": benchmark["declared_inputs"],
-            "benchmark_protocol": benchmark["benchmark_protocol"],
-        }
-    )
+    benchmark_path, benchmark = _non_fixture_benchmark_report(tmp_path, trainer)
     benchmark["claim_eligible"] = False
     benchmark_path.write_text(json.dumps(benchmark), encoding="utf-8")
 
@@ -268,34 +325,12 @@ def test_development_claim_eligibility_mutation_cannot_complete_public_bundle(
     benchmark_path.write_text(json.dumps(benchmark), encoding="utf-8")
     assert json.loads(baseline) | {"claim_eligible": True} == benchmark
 
-    manifest_path = _diagnostic_manifest(
+    manifest_path = _non_fixture_diagnostic_manifest(
         tmp_path,
         benchmark_report=benchmark_path,
         trainer=trainer,
     )
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest["fixture"] = False
-    manifest["wad_profile"] = {"profile_id": "test-profile"}
-    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-    wad_profile = {
-        "status": "matched",
-        "binding_sha256": "b" * 64,
-        "binding_identity": {
-            "providers": [
-                {
-                    "id": "gradoom",
-                    "iwad_sha256": None,
-                    "pwad_sha256": None,
-                }
-            ]
-        },
-        "providers": [],
-    }
-    monkeypatch.setattr(
-        diagnostic_module,
-        "validate_wad_profile",
-        lambda declaration, *, base_directory: (wad_profile, []),
-    )
+    _use_matched_wad_profile(monkeypatch)
     output = tmp_path / "diagnostic-report.json"
 
     returncode = evidence_main(["--manifest", str(manifest_path), "--output", str(output)])
@@ -308,6 +343,112 @@ def test_development_claim_eligibility_mutation_cannot_complete_public_bundle(
         "complete": False,
         "reason": "matching_benchmark_is_not_claim_eligible",
     }
+
+
+def test_relabelled_development_report_cannot_complete_public_bundle(
+    tmp_path: Path,
+) -> None:
+    trainer = _trainer({"10": [31.0, 0.0]})
+    benchmark_path, benchmark = _non_fixture_benchmark_report(tmp_path, trainer)
+    baseline = dict(benchmark)
+    benchmark["workflow"] = "primary_training_benchmark"
+    benchmark["evidence_level"] = "formal"
+    _bind_benchmark_identity(benchmark)
+    benchmark_path.write_text(json.dumps(benchmark), encoding="utf-8")
+    assert {key for key in benchmark if benchmark[key] != baseline[key]} == {
+        "workflow",
+        "evidence_level",
+        "run_identity",
+    }
+    manifest = _non_fixture_diagnostic_manifest(
+        tmp_path,
+        benchmark_report=benchmark_path,
+        trainer=trainer,
+        evidence_level="formal",
+    )
+    output = tmp_path / "diagnostic-report.json"
+
+    result = _run_evidence("--manifest", str(manifest), "--output", str(output))
+
+    assert result.returncode == 2
+    assert "requires workflow-specific eligibility validation" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert not output.exists()
+
+
+def test_failed_to_passed_status_mutation_cannot_complete_public_bundle(
+    tmp_path: Path,
+) -> None:
+    trainer = _trainer({"10": [31.0, 0.0]})
+    benchmark_path, benchmark = _non_fixture_benchmark_report(tmp_path, trainer)
+    benchmark["workflow"] = "primary_training_benchmark"
+    benchmark["evidence_level"] = "formal"
+    benchmark["status"] = "failed"
+    _bind_benchmark_identity(benchmark)
+    benchmark_path.write_text(json.dumps(benchmark), encoding="utf-8")
+
+    baseline = benchmark_path.read_bytes()
+    benchmark["status"] = "passed"
+    benchmark_path.write_text(json.dumps(benchmark), encoding="utf-8")
+    assert json.loads(baseline) | {"status": "passed"} == benchmark
+    manifest = _non_fixture_diagnostic_manifest(
+        tmp_path,
+        benchmark_report=benchmark_path,
+        trainer=trainer,
+        evidence_level="formal",
+    )
+    output = tmp_path / "diagnostic-report.json"
+
+    result = _run_evidence("--manifest", str(manifest), "--output", str(output))
+
+    assert result.returncode == 2
+    assert "requires workflow-specific eligibility validation" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert not output.exists()
+
+
+def test_fixed_time_diagnostic_rejects_unhashable_benchmark_workflow_cleanly(
+    tmp_path: Path,
+) -> None:
+    trainer = _trainer({"10": [31.0, 0.0]})
+    benchmark_path, benchmark = _benchmark_report(tmp_path, trainer)
+    benchmark["workflow"] = []
+    benchmark_path.write_text(json.dumps(benchmark), encoding="utf-8")
+    manifest = _diagnostic_manifest(
+        tmp_path,
+        benchmark_report=benchmark_path,
+        trainer=trainer,
+    )
+    output = tmp_path / "diagnostic-report.json"
+
+    result = _run_evidence("--manifest", str(manifest), "--output", str(output))
+
+    assert result.returncode == 2
+    assert "matching benchmark report workflow must be a string" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert not output.exists()
+
+
+def test_fixed_time_diagnostic_rejects_malformed_benchmark_status_cleanly(
+    tmp_path: Path,
+) -> None:
+    trainer = _trainer({"10": [31.0, 0.0]})
+    benchmark_path, benchmark = _benchmark_report(tmp_path, trainer)
+    benchmark["status"] = []
+    benchmark_path.write_text(json.dumps(benchmark), encoding="utf-8")
+    manifest = _diagnostic_manifest(
+        tmp_path,
+        benchmark_report=benchmark_path,
+        trainer=trainer,
+    )
+    output = tmp_path / "diagnostic-report.json"
+
+    result = _run_evidence("--manifest", str(manifest), "--output", str(output))
+
+    assert result.returncode == 2
+    assert "matching benchmark report status must be 'passed' or 'failed'" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert not output.exists()
 
 
 @pytest.mark.parametrize("mismatch", ["training_seeds", "recipe"])
