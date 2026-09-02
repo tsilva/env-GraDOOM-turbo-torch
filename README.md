@@ -92,7 +92,7 @@ uv run gradoom-evidence \
 ```
 
 `gradoom-evidence` is the single public command for versioned parity and training evidence.
-Its initial `parity_readiness` path validates every declared input hash and emits a
+Its `parity_readiness` path validates every declared input hash and emits a
 machine-readable, non-claim-eligible report that names unavailable real prerequisites. See the
 [evidence contract](./docs/evidence.md) for the versioned manifest, report, hashing, and safe merge
 rules.
@@ -101,6 +101,11 @@ The `development_training_benchmark` path runs predeclared cold-start attempts t
 standalone trainer and exact 100-episode stochastic GraDOOM evaluation path. Its reports are always
 non-authoritative and claim-ineligible, including passes made before a current parity certificate
 exists.
+
+The `parity_certification` path evaluates the sealed two-origin policy corpus, applies the exact
+per-policy kill threshold, and reports a deterministic paired 10,000-resample bootstrap diagnostic.
+Only complete, clean, non-fixture evidence with a matched WAD profile and a passing fast invariant
+suite can emit a revision-bound parity certificate.
 
 Set `benchmark.cuda_residency_acceptance` in a development benchmark manifest to run the opt-in
 CUDA residency check around that same trainer. It records the checked workload and device/software
