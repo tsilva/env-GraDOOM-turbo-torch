@@ -572,6 +572,57 @@ def test_runner_setup_failure_is_retained_for_every_required_seed(
     assert {item["execution_failure"]["code"] for item in outcomes} == {"runner_failure"}
 
 
+@pytest.mark.parametrize("exception_message", ["", " \t\n"])
+def test_blank_runner_setup_failures_are_reusable_without_reexecution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    exception_message: str,
+) -> None:
+    manifest_path, _corpus_path, manifest = _documents(tmp_path)
+    _replace_runner(manifest_path, manifest, INTERRUPT_RUNNER)
+    setup_attempts = 0
+
+    def fail_runner_setup(*args: object, **kwargs: object) -> None:
+        nonlocal setup_attempts
+        setup_attempts += 1
+        raise subprocess.SubprocessError(exception_message)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(policy_corpus.subprocess, "run", fail_runner_setup)
+        report = policy_corpus.build_policy_evaluation_report(manifest_path)
+
+    outcomes = report["policy_evaluation"]["outcomes"]
+    messages = {item["execution_failure"]["message"] for item in outcomes}
+    assert setup_attempts == 4
+    assert report["status"] == "evaluation_complete"
+    assert len(outcomes) == 2 * 2 * 256
+    assert report["policy_evaluation"]["failure_count"] == 2 * 2 * 256
+    assert {item["execution_failure"]["code"] for item in outcomes} == {"runner_failure"}
+    assert messages == {"No failure message was provided."}
+    assert all(len(message.encode()) <= 4096 for message in messages)
+
+    retained = tmp_path / "retained.json"
+    _write_json(retained, report)
+    invocation_log = tmp_path / "invocations.log"
+    resumed = _run(
+        "--manifest",
+        str(manifest_path),
+        "--output",
+        str(tmp_path / "resumed.json"),
+        "--merge",
+        str(retained),
+        env={
+            "GRADOOM_INTERRUPT_MARKER": str(tmp_path / "interrupt.marker"),
+            "GRADOOM_INVOCATION_LOG": str(invocation_log),
+        },
+    )
+
+    assert resumed.returncode == 0, resumed.stderr
+    completed = json.loads((tmp_path / "resumed.json").read_text(encoding="utf-8"))
+    assert completed["policy_evaluation"]["outcomes"] == outcomes
+    assert not invocation_log.exists()
+
+
 def test_execution_copy_rejects_policy_mutation(tmp_path: Path) -> None:
     manifest_path, _corpus_path, manifest = _documents(tmp_path)
     _replace_runner(manifest_path, manifest, MUTATING_RUNNER)

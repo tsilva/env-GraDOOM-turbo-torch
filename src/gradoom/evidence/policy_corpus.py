@@ -446,6 +446,8 @@ def _failure_outcome(seed: int, *, code: str, message: str) -> dict[str, Any]:
         limit=_FAILURE_MESSAGE_LIMIT,
         suffix="\n[failure message truncated]",
     )
+    if not bounded_message.strip():
+        bounded_message = "No failure message was provided."
     return {
         "seed": seed,
         "player_killcount": None,
