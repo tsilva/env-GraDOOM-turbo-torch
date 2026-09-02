@@ -92,6 +92,7 @@ _F_SEAL_SHRINK = 0x0002
 _F_SEAL_GROW = 0x0004
 _F_SEAL_WRITE = 0x0008
 _SEALED_PYTHON_BOOTSTRAP = r"""
+import _io
 import importlib.machinery
 import importlib.util
 import builtins
@@ -176,6 +177,7 @@ for module in set(environment_sources) | set(extension_descriptors):
 
 
 original_open = builtins.open
+original_open_code = _io.open_code
 
 
 def sealed_source_open(file, mode="r", *args, **kwargs):
@@ -199,8 +201,19 @@ def sealed_source_open(file, mode="r", *args, **kwargs):
     )
 
 
+def sealed_source_open_code(file):
+    archive_name = None
+    if isinstance(file, (str, bytes, os.PathLike)):
+        archive_name = sealed_source_names.get(os.path.realpath(os.fsdecode(file)))
+    if archive_name is None:
+        return original_open_code(file)
+    return io.BytesIO(sealed_archive.read(archive_name))
+
+
 builtins.open = sealed_source_open
 io.open = sealed_source_open
+_io.open_code = sealed_source_open_code
+io.open_code = sealed_source_open_code
 
 
 class SealedSourceLoader:
