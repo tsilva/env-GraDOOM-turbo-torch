@@ -210,6 +210,15 @@ def test_development_benchmark_defaults_to_one_cold_seed_and_stops_at_first_pass
     assert report["authoritative"] is False
     assert report["claim_eligible"] is False
     assert report["status"] == "passed"
+    assert report["diagnostics"]["fixed_time"] == {
+        "affects_passage": False,
+        "reason": "No matching fixed-time diagnostic was supplied.",
+        "status": "unavailable",
+    }
+    assert report["public_performance_evidence"] == {
+        "complete": False,
+        "reason": "matching_fixed_time_diagnostic_unavailable",
+    }
     assert report["benchmark_protocol"]["training_seeds"] == [123]
     assert report["benchmark_protocol"]["failure_budget_steps"] == 30
     assert report["benchmark_protocol"]["quality_gate"] == {
