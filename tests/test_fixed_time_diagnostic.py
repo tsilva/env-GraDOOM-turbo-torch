@@ -1,19 +1,24 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from gradoom.evidence import diagnostic as diagnostic_module
 from gradoom.evidence.cli import main as evidence_main
 
 FIXTURE_PROCESS = Path(__file__).parent / "fixtures" / "evidence" / "fixture_benchmark_process.py"
 EVALUATION_SEEDS = list(range(10_000, 10_100))
+ANCHOR_PRIVATE_KEY = Ed25519PrivateKey.from_private_bytes(b"\x19" * 32)
 TIMING_RULES = {
     "clock": "monotonic_wall_clock",
     "start": "before_attempt_setup_and_public_subprocess_start",
@@ -62,6 +67,28 @@ def _benchmark_report(
     training_seeds: list[int] | None = None,
     declared_inputs: list[dict[str, str]] | None = None,
 ) -> tuple[Path, dict[str, object]]:
+    effective_training_seeds = training_seeds or [123]
+    elapsed_time_anchors = []
+    for seed in effective_training_seeds:
+        payload = {
+            "schema_version": 1,
+            "authority": "gradoom-fixture-independent-anchor-v1",
+            "seed": seed,
+            "started_unix_ns": time.time_ns(),
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        elapsed_time_anchors.append(
+            {
+                "payload": payload,
+                "public_key": base64.b64encode(
+                    ANCHOR_PRIVATE_KEY.public_key().public_bytes(
+                        serialization.Encoding.Raw,
+                        serialization.PublicFormat.Raw,
+                    )
+                ).decode(),
+                "signature": base64.b64encode(ANCHOR_PRIVATE_KEY.sign(encoded)).decode(),
+            }
+        )
     manifest = {
         "schema_version": 1,
         "workflow": "development_training_benchmark",
@@ -74,10 +101,11 @@ def _benchmark_report(
         },
         "declared_inputs": declared_inputs or [],
         "benchmark": {
-            "training_seeds": training_seeds or [123],
+            "training_seeds": effective_training_seeds,
             "failure_budget_steps": 10,
             "checkpoint_steps": [10],
             "evaluation_episode_seeds": EVALUATION_SEEDS,
+            "elapsed_time_anchors": elapsed_time_anchors,
             "trainer": trainer,
             "artifacts_directory": "benchmark-artifacts",
             "parity_certificate": {

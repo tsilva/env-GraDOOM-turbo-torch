@@ -1,16 +1,21 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 FIXTURE_PROCESS = Path(__file__).parent / "fixtures" / "evidence" / "fixture_benchmark_process.py"
 EVALUATION_SEEDS = list(range(10_000, 10_100))
+ANCHOR_PRIVATE_KEY = Ed25519PrivateKey.from_private_bytes(b"\x19" * 32)
 
 
 def _run_evidence(*args: str) -> subprocess.CompletedProcess[str]:
@@ -52,6 +57,29 @@ def _manifest(
     }
     if training_seeds is not None:
         benchmark["training_seeds"] = training_seeds
+    effective_seeds = training_seeds or [123]
+    anchors = []
+    for seed in effective_seeds:
+        payload = {
+            "schema_version": 1,
+            "authority": "gradoom-fixture-independent-anchor-v1",
+            "seed": seed,
+            "started_unix_ns": time.time_ns(),
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        anchors.append(
+            {
+                "payload": payload,
+                "public_key": base64.b64encode(
+                    ANCHOR_PRIVATE_KEY.public_key().public_bytes(
+                        serialization.Encoding.Raw,
+                        serialization.PublicFormat.Raw,
+                    )
+                ).decode(),
+                "signature": base64.b64encode(ANCHOR_PRIVATE_KEY.sign(encoded)).decode(),
+            }
+        )
+    benchmark["elapsed_time_anchors"] = anchors
     manifest = {
         "schema_version": 1,
         "workflow": "development_training_benchmark",
@@ -201,13 +229,28 @@ def test_development_benchmark_defaults_to_one_cold_seed_and_stops_at_first_pass
     }
     assert report["benchmark_protocol"]["evaluation_episode_seeds"] == EVALUATION_SEEDS
     assert report["benchmark_protocol"]["evaluation_action_seed"] == 123
+    assert report["benchmark_protocol"]["time_authority"] == {
+        "authority": "gradoom-fixture-independent-anchor-v1",
+        "public_key": "MfMyLUkj02xBwQm9sAmRkxh77ZmUIJbkkmokx379DS8=",
+        "monotonic_witness": None,
+        "claim_eligible": False,
+    }
     assert report["benchmark_protocol"]["timer_includes"] == [
+        "command_parsing",
+        "manifest_and_configuration_validation",
+        "identity_and_input_hashing",
+        "artifact_directory_setup",
+        "continuation_and_recovery_verification",
         "recurring_initialization",
         "per_process_or_uncached_compilation",
+        "graph_capture",
         "warmup",
         "training",
         "checkpoint_evaluation",
         "durable_checkpoint_write",
+        "terminal_evidence_verification",
+        "report_validation_serialization_replacement_and_fsync",
+        "durable_authority_elapsed_seal",
     ]
     assert report["attempts"][0]["status"] == "succeeded"
     assert [candidate["checkpoint_step"] for candidate in report["attempts"][0]["outcomes"]] == [
@@ -281,12 +324,9 @@ def test_development_benchmark_retains_process_launch_failures(tmp_path: Path) -
 
     result = _run_evidence("--manifest", str(manifest_path), "--output", str(output))
 
-    assert result.returncode == 0, result.stderr
-    report = json.loads(output.read_text(encoding="utf-8"))
-    assert report["attempts"][0]["status"] == "crashed"
-    assert report["failures"][0]["phase"] == "training"
-    assert report["failures"][0]["returncode"] == 127
-    assert "cannot execute benchmark process" in report["failures"][0]["stderr"]
+    assert result.returncode == 2
+    assert "executed-code closure cannot be proven" in result.stderr
+    assert not output.exists()
 
 
 def test_development_benchmark_rejects_legacy_kills_without_player_killcount(

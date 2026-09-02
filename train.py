@@ -38,6 +38,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+import gradoom
 from gradoom._kernels import bounded_observation_augment, frozen_nature_conv1
 from gradoom.evidence.checkpoint_policy import (
     LoadedPolicyCheckpoint,
@@ -522,6 +523,8 @@ def _parser() -> argparse.ArgumentParser:
         type=Path,
         help="Resume policy, optimizer, counters, and RNG state from a trusted checkpoint.",
     )
+    parser.add_argument("--evidence-run-identity", help=argparse.SUPPRESS)
+    parser.add_argument("--evidence-attempt-identity", help=argparse.SUPPRESS)
     parser.add_argument(
         "--initialize-from",
         type=Path,
@@ -690,6 +693,16 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("steady-state-after-rollouts must be non-negative")
     if args.checkpoint_every_rollouts < 0:
         raise ValueError("checkpoint-every-rollouts must be non-negative")
+    evidence_identities = (args.evidence_run_identity, args.evidence_attempt_identity)
+    if (evidence_identities[0] is None) != (evidence_identities[1] is None):
+        raise ValueError("evidence run and attempt identities must be supplied together")
+    for identity in (value for value in evidence_identities if value is not None):
+        if len(identity) != 64 or any(
+            character not in "0123456789abcdef" for character in identity
+        ):
+            raise ValueError(
+                "evidence run and attempt identities must be lowercase SHA-256 digests"
+            )
     if int(args.observation_blur_kernel) <= 0 or int(args.observation_blur_kernel) % 2 == 0:
         raise ValueError("observation-blur-kernel must be a positive odd integer")
     if (
@@ -872,6 +885,10 @@ def _audit_config(args: argparse.Namespace) -> dict[str, Any]:
                 else "fresh_random"
             ),
             "optimizer_state": "resumed" if args.resume is not None else "fresh",
+        },
+        "evidence_binding": {
+            "run_identity": args.evidence_run_identity,
+            "attempt_identity": args.evidence_attempt_identity,
         },
         "evaluation": {
             "checkpoint": (
@@ -1740,6 +1757,34 @@ class RolloutBuffer:
     def reset(self) -> None:
         self.position = 0
 
+    def residency_tensors(self) -> tuple[torch.Tensor, ...]:
+        tensors = (
+            self.context,
+            self.final_observations,
+            self.final_histories,
+            self.actions,
+            self.teacher_actions,
+            self.teacher_valid,
+            self.rewards,
+            self.episode_starts,
+            self.values,
+            self.log_probs,
+            self.advantages,
+            self.returns,
+            self.truncated,
+            self.completed,
+            self.completed_returns,
+            self.completed_kills,
+            self.completed_lengths,
+            self.completed_success,
+        )
+        optional = tuple(
+            tensor
+            for tensor in (self.observations, self.observation_features)
+            if tensor is not None
+        )
+        return (*optional, *tensors)
+
     def stage(
         self,
         observations: torch.Tensor,
@@ -2409,6 +2454,200 @@ def _restore_episode_indices(
     return preserved
 
 
+_CONTINUOUS_PROGRESS_FIELDS = {
+    "completed_episodes",
+    "executed_rollouts",
+    "episode_index",
+    "rolling_returns",
+    "rolling_kills",
+    "rolling_lengths",
+    "rolling_success",
+    "environment_state",
+    "observations",
+    "context",
+    "episode_starts",
+    "dones",
+    "episode_returns",
+    "episode_lengths",
+    "lane_identity",
+    "reward_shaper_state",
+}
+
+
+def _capture_live_component_state(component: object | None) -> dict[str, Any]:
+    if component is None:
+        return {"format": "gradoom-live-component-v1", "tensors": {}}
+    return {
+        "format": "gradoom-live-component-v1",
+        "tensors": {
+            name: value.detach().cpu().clone()
+            for name, value in vars(component).items()
+            if isinstance(value, torch.Tensor)
+        },
+    }
+
+
+def _restore_live_component_state(component: object | None, state: Mapping[str, Any]) -> None:
+    if state.get("format") != "gradoom-live-component-v1":
+        raise ValueError("checkpoint reward-shaper state has an unsupported format")
+    saved = state.get("tensors")
+    if not isinstance(saved, Mapping):
+        raise ValueError("checkpoint reward-shaper tensor state is incomplete")
+    current = (
+        {}
+        if component is None
+        else {
+            name: value
+            for name, value in vars(component).items()
+            if isinstance(value, torch.Tensor)
+        }
+    )
+    if set(saved) != set(current):
+        raise ValueError("checkpoint reward-shaper tensor inventory mismatch")
+    for name, destination in current.items():
+        source = saved[name]
+        if not isinstance(source, torch.Tensor):
+            raise ValueError(f"checkpoint reward-shaper state {name!r} is not a tensor")
+        if source.shape != destination.shape or source.dtype != destination.dtype:
+            raise ValueError(f"checkpoint reward-shaper state {name!r} has a shape mismatch")
+        destination.copy_(source.to(device=destination.device))
+
+
+def _checkpoint_restored_state(
+    checkpoint: Mapping[str, Any],
+    *,
+    num_envs: int,
+) -> dict[str, bool]:
+    training_state = checkpoint.get("training_state")
+    if not isinstance(training_state, Mapping):
+        training_state = {}
+    rng_complete = all(
+        key in training_state
+        for key in (
+            "python_rng_state",
+            "numpy_rng_state",
+            "torch_rng_state",
+            "cuda_rng_state",
+        )
+    )
+    environment_state = training_state.get("environment_state")
+    environment_complete = (
+        isinstance(environment_state, Mapping)
+        and environment_state.get("format") == "gradoom-live-snapshot-v1"
+        and environment_state.get("lane_count") == int(num_envs)
+    )
+    lane_fields = (
+        "episode_index",
+        "observations",
+        "context",
+        "episode_starts",
+        "dones",
+        "episode_returns",
+        "episode_lengths",
+        "lane_identity",
+    )
+    lanes_complete = all(
+        isinstance(training_state.get(field), torch.Tensor)
+        and training_state[field].ndim >= 1
+        and training_state[field].shape[0] == int(num_envs)
+        for field in lane_fields
+    )
+    config = checkpoint.get("config")
+    effective_recipe = config.get("effective_recipe") if isinstance(config, Mapping) else None
+    precision = effective_recipe.get("precision") if isinstance(effective_recipe, Mapping) else None
+    anchor_coefficient = (
+        effective_recipe.get("encoder_anchor_coef")
+        if isinstance(effective_recipe, Mapping)
+        else None
+    )
+    scaler_complete = isinstance(training_state.get("precision_scaler_state"), Mapping) or (
+        precision == "fp32"
+    )
+    anchors_complete = isinstance(training_state.get("encoder_anchor_targets"), list) or (
+        type(anchor_coefficient) in (int, float) and float(anchor_coefficient) == 0.0
+    )
+    progress_complete = (
+        set(training_state) >= _CONTINUOUS_PROGRESS_FIELDS
+        and environment_complete
+        and lanes_complete
+        and isinstance(training_state.get("reward_shaper_state"), Mapping)
+        and training_state["reward_shaper_state"].get("format") == "gradoom-live-component-v1"
+        and scaler_complete
+        and anchors_complete
+    )
+    return {
+        "policy": "policy_state_dict" in checkpoint,
+        "optimizer": "optimizer_state_dict" in checkpoint,
+        "rng": rng_complete,
+        "progress": progress_complete,
+    }
+
+
+def _has_compatible_live_state(training_state: Mapping[str, Any], *, num_envs: int) -> bool:
+    environment_state = training_state.get("environment_state")
+    lane_fields = (
+        "observations",
+        "context",
+        "episode_starts",
+        "dones",
+        "episode_returns",
+        "episode_lengths",
+        "lane_identity",
+    )
+    return (
+        isinstance(environment_state, Mapping)
+        and environment_state.get("format") == "gradoom-live-snapshot-v1"
+        and environment_state.get("lane_count") == int(num_envs)
+        and all(
+            isinstance(training_state.get(field), torch.Tensor)
+            and training_state[field].ndim >= 1
+            and training_state[field].shape[0] == int(num_envs)
+            for field in lane_fields
+        )
+    )
+
+
+def _encoder_anchors_from_state(
+    policy: NatureActorCritic,
+    saved_targets: object,
+    *,
+    coefficient: float,
+) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
+    parameters = tuple(policy.observation_encoder.parameters())
+    if coefficient <= 0.0:
+        if saved_targets not in (None, []):
+            raise ValueError("checkpoint unexpectedly contains encoder-anchor targets")
+        return ()
+    if saved_targets is None:
+        return tuple((parameter, parameter.detach().clone()) for parameter in parameters)
+    if not isinstance(saved_targets, list) or len(saved_targets) != len(parameters):
+        raise ValueError("checkpoint encoder-anchor target inventory mismatch")
+    anchors = []
+    for index, (parameter, target) in enumerate(zip(parameters, saved_targets, strict=True)):
+        if not isinstance(target, torch.Tensor):
+            raise ValueError(f"checkpoint encoder-anchor target {index} is not a tensor")
+        if target.shape != parameter.shape or target.dtype != parameter.dtype:
+            raise ValueError(f"checkpoint encoder-anchor target {index} has a shape mismatch")
+        anchors.append((parameter, target.to(device=parameter.device).clone()))
+    return tuple(anchors)
+
+
+def _validate_evidence_recovery_checkpoint(
+    checkpoint: Mapping[str, Any],
+    *,
+    num_envs: int,
+) -> None:
+    if _checkpoint_restored_state(checkpoint, num_envs=num_envs) != {
+        "policy": True,
+        "optimizer": True,
+        "rng": True,
+        "progress": True,
+    }:
+        raise ValueError(
+            "evidence recovery checkpoint cannot restore continuous environment and lane progress"
+        )
+
+
 def _save_checkpoint(
     path: Path,
     *,
@@ -2558,7 +2797,7 @@ def _cuda_acceptance_environment(
     }
     software = {
         "python": platform.python_version(),
-        "gradoom": __import__("gradoom").__version__,
+        "gradoom": gradoom.__version__,
         "torch": torch.__version__,
         "cuda": torch.version.cuda,
         "cudnn": str(torch.backends.cudnn.version()),
@@ -2883,6 +3122,24 @@ def _train(
     torch.manual_seed(int(args.seed))
     torch.cuda.manual_seed_all(int(args.seed))
     device = torch.device("cuda")
+    preloaded_resume: Mapping[str, Any] | None = None
+    if args.resume is not None:
+        loaded = torch.load(args.resume, map_location=device, weights_only=False)
+        if not isinstance(loaded, Mapping) or loaded.get("format") != "standalone-gradoom-ppo-v1":
+            raise ValueError(f"unsupported resume checkpoint: {args.resume}")
+        if args.evidence_run_identity is not None:
+            loaded_config = loaded.get("config")
+            expected_evidence_binding = {
+                "run_identity": args.evidence_run_identity,
+                "attempt_identity": args.evidence_attempt_identity,
+            }
+            if (
+                not isinstance(loaded_config, Mapping)
+                or loaded_config.get("evidence_binding") != expected_evidence_binding
+            ):
+                raise ValueError("resume checkpoint has unlike evidence run or attempt identity")
+            _validate_evidence_recovery_checkpoint(loaded, num_envs=int(args.num_envs))
+        preloaded_resume = loaded
     env = _make_env(args, device)
     interrupted = False
     previous_handlers: dict[int, Any] = {}
@@ -2960,12 +3217,8 @@ def _train(
                 }
             )
         if args.resume is not None:
-            loaded = torch.load(args.resume, map_location=device, weights_only=False)
-            if (
-                not isinstance(loaded, Mapping)
-                or loaded.get("format") != "standalone-gradoom-ppo-v1"
-            ):
-                raise ValueError(f"unsupported resume checkpoint: {args.resume}")
+            assert preloaded_resume is not None
+            loaded = preloaded_resume
             policy.load_state_dict(loaded["policy_state_dict"])
             _load_optimizer_state(
                 optimizer,
@@ -2973,16 +3226,26 @@ def _train(
                 learning_rate=float(args.learning_rate),
             )
             resume_payload = loaded
-        encoder_anchors = (
-            tuple(
-                (parameter, parameter.detach().clone())
-                for parameter in policy.observation_encoder.parameters()
-            )
-            if float(args.encoder_anchor_coef) > 0.0
-            else ()
-        )
         calls = PolicyCalls(policy, compile_policy=bool(args.compile_policy))
         precision = Precision(str(args.precision), device)
+        saved_training_state = (
+            resume_payload.get("training_state", {}) if resume_payload is not None else {}
+        )
+        if not isinstance(saved_training_state, Mapping):
+            raise ValueError("checkpoint training_state must be a mapping")
+        if resume_payload is not None:
+            scaler_state = saved_training_state.get("precision_scaler_state")
+            if isinstance(scaler_state, Mapping):
+                precision.scaler.load_state_dict(dict(scaler_state))
+            elif str(args.precision) != "fp32":
+                raise ValueError("checkpoint precision scaler state is missing")
+        encoder_anchors = _encoder_anchors_from_state(
+            policy,
+            saved_training_state.get("encoder_anchor_targets")
+            if resume_payload is not None
+            else None,
+            coefficient=float(args.encoder_anchor_coef),
+        )
         buffer = RolloutBuffer(
             int(args.n_steps),
             int(args.num_envs),
@@ -3038,11 +3301,6 @@ def _train(
         )
         disabled_teacher_actions = torch.zeros(int(args.num_envs), dtype=torch.int64, device=device)
         disabled_teacher_valid = torch.zeros(int(args.num_envs), dtype=torch.bool, device=device)
-        saved_training_state = (
-            resume_payload.get("training_state", {}) if resume_payload is not None else {}
-        )
-        if not isinstance(saved_training_state, Mapping):
-            raise ValueError("checkpoint training_state must be a mapping")
         rolling_returns: deque[float] = deque(
             (float(value) for value in saved_training_state.get("rolling_returns", ())),
             maxlen=ROLLING_EPISODES,
@@ -3094,16 +3352,38 @@ def _train(
                         "new_lanes_start_at_episode": 0,
                     }
                 )
-            episode_seeds.ensure(_max_episode_index(episode_index))
-            observations, _signals = env.reset_device(
-                reset_mask,
-                episode_seeds.lookup(episode_index),
+            environment_state = saved_training_state.get("environment_state")
+            live_state_available = _has_compatible_live_state(
+                saved_training_state,
+                num_envs=int(args.num_envs),
             )
-            context = context_encoder.encode(env.device_info_histories())
-            episode_starts.fill_(True)
-            dones.zero_()
-            episode_returns.zero_()
-            episode_lengths.zero_()
+            if live_state_available:
+                lane_identity = saved_training_state["lane_identity"]
+                expected_lanes = torch.arange(int(args.num_envs), dtype=torch.int64)
+                if not torch.equal(lane_identity.detach().cpu().to(torch.int64), expected_lanes):
+                    raise ValueError("checkpoint lane identity does not match the live environment")
+                env.restore_live_snapshot(environment_state)
+                observations.copy_(saved_training_state["observations"].to(device=device))
+                context.copy_(saved_training_state["context"].to(device=device))
+                episode_starts.copy_(saved_training_state["episode_starts"].to(device=device))
+                dones.copy_(saved_training_state["dones"].to(device=device))
+                episode_returns.copy_(saved_training_state["episode_returns"].to(device=device))
+                episode_lengths.copy_(saved_training_state["episode_lengths"].to(device=device))
+                reward_state = saved_training_state.get("reward_shaper_state")
+                if not isinstance(reward_state, Mapping):
+                    raise ValueError("checkpoint reward-shaper state is missing")
+                _restore_live_component_state(reward_shaper, reward_state)
+            else:
+                episode_seeds.ensure(_max_episode_index(episode_index))
+                observations, _signals = env.reset_device(
+                    reset_mask,
+                    episode_seeds.lookup(episode_index),
+                )
+                context = context_encoder.encode(env.device_info_histories())
+                episode_starts.fill_(True)
+                dones.zero_()
+                episode_returns.zero_()
+                episode_lengths.zero_()
             python_rng_state = saved_training_state.get("python_rng_state")
             numpy_rng_state = saved_training_state.get("numpy_rng_state")
             torch_rng_state = saved_training_state.get("torch_rng_state")
@@ -3124,6 +3404,14 @@ def _train(
                     "event": "resumed",
                     "checkpoint": str(args.resume),
                     "train/global_step": global_step,
+                    "restored_state": _checkpoint_restored_state(
+                        resume_payload,
+                        num_envs=int(args.num_envs),
+                    ),
+                    "evidence_binding": {
+                        "run_identity": args.evidence_run_identity,
+                        "attempt_identity": args.evidence_attempt_identity,
+                    },
                 }
             )
         last_metrics: dict[str, Any] = {}
@@ -3140,6 +3428,7 @@ def _train(
                 "completed_episodes": completed_episodes,
                 "executed_rollouts": executed_rollouts,
                 "episode_index": episode_index.detach().cpu(),
+                "lane_identity": torch.arange(int(args.num_envs), dtype=torch.int64),
                 "rolling_returns": list(rolling_returns),
                 "rolling_kills": list(rolling_kills),
                 "rolling_lengths": list(rolling_lengths),
@@ -3148,6 +3437,18 @@ def _train(
                 "numpy_rng_state": np.random.get_state(),
                 "torch_rng_state": torch.get_rng_state(),
                 "cuda_rng_state": torch.cuda.get_rng_state_all(),
+                "environment_state": env.capture_live_snapshot(),
+                "observations": observations.detach().cpu().clone(),
+                "context": context.detach().cpu().clone(),
+                "episode_starts": episode_starts.detach().cpu().clone(),
+                "dones": dones.detach().cpu().clone(),
+                "episode_returns": episode_returns.detach().cpu().clone(),
+                "episode_lengths": episode_lengths.detach().cpu().clone(),
+                "reward_shaper_state": _capture_live_component_state(reward_shaper),
+                "precision_scaler_state": precision.scaler.state_dict(),
+                "encoder_anchor_targets": [
+                    target.detach().cpu().clone() for _parameter, target in encoder_anchors
+                ],
             }
 
         reusable_time_budget = args.reusable_time_budget_seconds
@@ -3169,7 +3470,7 @@ def _train(
                     residency_global_step_start = global_step
                 active_residency.observe("observations", observations)
                 active_residency.observe("resets", reset_mask, episode_index, episode_starts, dones)
-                active_residency.observe("rollout_state", buffer.__dict__)
+                active_residency.observe("rollout_state", buffer.residency_tensors())
                 active_residency.observe("parameters", tuple(policy.parameters()))
             episode_seeds.ensure(_max_episode_index(episode_index) + int(args.n_steps) + 1)
             torch.cuda.synchronize(device)
@@ -3262,7 +3563,7 @@ def _train(
                     )
                     if active_residency is not None:
                         active_residency.observe("rewards", policy_rewards)
-                        active_residency.observe("rollout_state", buffer.__dict__)
+                        active_residency.observe("rollout_state", buffer.residency_tensors())
                     observations = transition.observations
                     context = context_encoder.encode(transition.info_histories)
                     torch.logical_or(

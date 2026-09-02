@@ -7,17 +7,22 @@ import argparse
 import hashlib
 import json
 import os
-import sys
+import signal
 import time
 from pathlib import Path
 
 
 def _apply_startup_delay() -> None:
+    arguments = [
+        argument.decode()
+        for argument in Path("/proc/self/cmdline").read_bytes().split(b"\0")
+        if argument
+    ]
     try:
-        index = sys.argv.index("--fixture-startup-delay-seconds")
+        index = arguments.index("--fixture-startup-delay-seconds")
     except ValueError:
         return
-    time.sleep(float(sys.argv[index + 1]))
+    time.sleep(float(arguments[index + 1]))
 
 
 _apply_startup_delay()
@@ -40,10 +45,27 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--cuda-residency-acceptance", action="store_true")
     parser.add_argument("--fixture-outcomes", required=True)
     parser.add_argument("--fixture-fail-training-seed", type=int)
+    parser.add_argument("--fixture-fail-training-once-marker", type=Path)
+    parser.add_argument("--fixture-fail-after-resume-once-marker", type=Path)
     parser.add_argument("--fixture-fail-evaluation-step", type=int)
     parser.add_argument("--fixture-omit-player-killcount", action="store_true")
     parser.add_argument("--fixture-training-step-offset", type=int, default=0)
+    parser.add_argument("--fixture-training-delay-seed", type=int)
+    parser.add_argument("--fixture-training-delay-seconds", type=float, default=0.0)
     parser.add_argument("--fixture-hardlink-checkpoint-to", type=Path)
+    parser.add_argument("--fixture-mutate-bootstrap", type=Path)
+    parser.add_argument("--fixture-mutate-trainer-code", type=Path)
+    parser.add_argument("--fixture-remove-trainer-code", type=Path)
+    parser.add_argument("--fixture-replace-trainer-code", type=Path)
+    parser.add_argument("--fixture-interrupt-once-at-step", type=int)
+    parser.add_argument("--fixture-interrupt-seed", type=int)
+    parser.add_argument("--fixture-hard-crash-once-at-step", type=int)
+    parser.add_argument("--fixture-hold-after-recovery-checkpoint-marker", type=Path)
+    parser.add_argument("--fixture-recovery-child-exited-marker", type=Path)
+    parser.add_argument("--fixture-hold-evaluation-once-marker", type=Path)
+    parser.add_argument("--fixture-evaluation-child-exited-marker", type=Path)
+    parser.add_argument("--evidence-run-identity")
+    parser.add_argument("--evidence-attempt-identity")
     parser.add_argument("--fixture-diagnostic-quality", type=float, default=0.0)
     parser.add_argument("--fixture-diagnostic-transitions", type=int, default=1000)
     parser.add_argument("--fixture-diagnostic-elapsed-seconds", type=float, default=1.0)
@@ -74,26 +96,71 @@ def _emit(path: Path, *records: dict[str, object]) -> None:
     )
 
 
+def _mutate_bootstrap(path: Path | None) -> None:
+    if path is None:
+        return
+    path.chmod(0o600)
+    with path.open("ab") as stream:
+        stream.write(b"mutated during benchmark\n")
+
+
 def main() -> int:
     args, _unknown = _parser().parse_known_args()
+
+    def stop_after_checkpoint(_signum: int, _frame: object) -> None:
+        if args.fixture_recovery_child_exited_marker is not None:
+            args.fixture_recovery_child_exited_marker.write_text(
+                "child-exited-after-forwarded-signal\n", encoding="utf-8"
+            )
+        raise SystemExit(130)
+
+    signal.signal(signal.SIGINT, stop_after_checkpoint)
+    signal.signal(signal.SIGTERM, stop_after_checkpoint)
     outcomes = json.loads(args.fixture_outcomes)
     if args.evaluate_checkpoint is None:
+        if args.fixture_training_delay_seed == args.seed:
+            time.sleep(args.fixture_training_delay_seconds)
+        if (
+            args.resume is not None
+            and args.fixture_fail_after_resume_once_marker is not None
+            and not args.fixture_fail_after_resume_once_marker.exists()
+        ):
+            args.fixture_fail_after_resume_once_marker.write_text("failed\n", encoding="utf-8")
+            return 23
+        if (
+            args.fixture_fail_training_once_marker is not None
+            and not args.fixture_fail_training_once_marker.exists()
+        ):
+            args.fixture_fail_training_once_marker.write_text("failed\n", encoding="utf-8")
+            return 17
         if args.fixture_fail_training_seed == args.seed:
             return 17
         assert args.checkpoint is not None
         assert args.timesteps is not None
+        resumed_checkpoint = None
+        if args.resume is not None:
+            resumed_checkpoint = json.loads(args.resume.read_text(encoding="utf-8"))
+            assert resumed_checkpoint["evidence_run_identity"] == args.evidence_run_identity
+            assert resumed_checkpoint["evidence_attempt_identity"] == args.evidence_attempt_identity
+        cooperative_interruption = args.fixture_interrupt_once_at_step == args.timesteps and (
+            args.fixture_interrupt_seed is None or args.fixture_interrupt_seed == args.seed
+        )
+        hard_crash = args.fixture_hard_crash_once_at_step == args.timesteps
+        should_interrupt = (cooperative_interruption or hard_crash) and not (
+            resumed_checkpoint or {}
+        ).get("interrupted", False)
         diagnostic = args.reusable_time_budget_seconds is not None
         before_deadline = (
             args.reusable_time_deadline_monotonic is None
             or time.monotonic() < args.reusable_time_deadline_monotonic
         )
-        actual_step = (
-            args.fixture_diagnostic_transitions
-            if diagnostic and before_deadline
-            else 0
-            if diagnostic
-            else args.timesteps + args.fixture_training_step_offset
-        )
+        if diagnostic:
+            actual_step = args.fixture_diagnostic_transitions if before_deadline else 0
+        elif should_interrupt:
+            actual_step = max(1, args.timesteps // 2)
+        else:
+            actual_step = args.timesteps + args.fixture_training_step_offset
+        execution_timesteps = args.timesteps if should_interrupt else actual_step
         if diagnostic and args.reusable_time_deadline_monotonic is not None:
             time.sleep(max(0.0, args.reusable_time_deadline_monotonic - time.monotonic()))
         args.checkpoint.parent.mkdir(parents=True, exist_ok=True)
@@ -104,7 +171,25 @@ def main() -> int:
                     "seed": args.seed,
                     "step": actual_step,
                     "resumed": args.resume is not None,
+                    "interrupted": should_interrupt,
                     "fixed_time": diagnostic,
+                    "policy_state": "fixture-policy-state",
+                    "optimizer_state": "fixture-optimizer-state",
+                    "rng_state": "fixture-rng-state",
+                    "progress": {
+                        "global_step": actual_step,
+                        "rollouts": actual_step,
+                        "environment_state": {"format": "fixture-live-snapshot-v1", "lanes": 1},
+                        "observations": [[actual_step]],
+                        "context": [[actual_step]],
+                        "episode_starts": [False],
+                        "dones": [False],
+                        "episode_returns": [float(actual_step)],
+                        "episode_lengths": [actual_step],
+                        "episode_index": [0],
+                    },
+                    "evidence_run_identity": args.evidence_run_identity,
+                    "evidence_attempt_identity": args.evidence_attempt_identity,
                 },
                 sort_keys=True,
             ),
@@ -120,7 +205,7 @@ def main() -> int:
             "contract": "standalone-gradoom-deathmatch-ppo-v2",
             "operation": "train",
             "requested_timesteps": args.timesteps,
-            "execution_timesteps": actual_step,
+            "execution_timesteps": execution_timesteps,
             "initialization": {
                 "mode": "random",
                 "checkpoint": None,
@@ -129,6 +214,10 @@ def main() -> int:
             "state_initialization": {
                 "policy_state": "resumed" if args.resume is not None else "fresh_random",
                 "optimizer_state": "resumed" if args.resume is not None else "fresh",
+            },
+            "evidence_binding": {
+                "run_identity": args.evidence_run_identity,
+                "attempt_identity": args.evidence_attempt_identity,
             },
             "reusable_time_budget_seconds": args.reusable_time_budget_seconds,
             "reusable_time_deadline_monotonic": args.reusable_time_deadline_monotonic,
@@ -146,6 +235,31 @@ def main() -> int:
                     "type": "event",
                     "event": "resumed",
                     "checkpoint": str(args.resume),
+                    "train/global_step": int(resumed_checkpoint["step"]),
+                    "restored_state": {
+                        "policy": "policy_state" in resumed_checkpoint,
+                        "optimizer": "optimizer_state" in resumed_checkpoint,
+                        "rng": "rng_state" in resumed_checkpoint,
+                        "progress": all(
+                            key in resumed_checkpoint.get("progress", {})
+                            for key in (
+                                "global_step",
+                                "rollouts",
+                                "environment_state",
+                                "observations",
+                                "context",
+                                "episode_starts",
+                                "dones",
+                                "episode_returns",
+                                "episode_lengths",
+                                "episode_index",
+                            )
+                        ),
+                    },
+                    "evidence_binding": {
+                        "run_identity": args.evidence_run_identity,
+                        "attempt_identity": args.evidence_attempt_identity,
+                    },
                 }
             )
         if args.cuda_residency_acceptance and not args.fixture_omit_cuda_residency_record:
@@ -209,10 +323,10 @@ def main() -> int:
         records.append(
             {
                 "type": "summary",
-                "status": "completed",
+                "status": "interrupted" if should_interrupt else "completed",
                 "train/global_step": actual_step,
                 "requested_timesteps": args.timesteps,
-                "execution_timesteps": actual_step,
+                "execution_timesteps": execution_timesteps,
                 "checkpoint": str(args.checkpoint),
                 "training_transitions_per_second": 1000.0,
                 "training_transitions": actual_step,
@@ -226,8 +340,50 @@ def main() -> int:
             }
         )
         _emit(args.metrics_jsonl, *records)
-        return 0
+        _mutate_bootstrap(args.fixture_mutate_bootstrap)
+        if args.fixture_mutate_trainer_code is not None:
+            with args.fixture_mutate_trainer_code.open("a", encoding="utf-8") as stream:
+                stream.write("\n# mutated during cohort\n")
+        if args.fixture_remove_trainer_code is not None:
+            args.fixture_remove_trainer_code.unlink()
+        if args.fixture_replace_trainer_code is not None:
+            # Keep the old file object alive until its replacement exists so this probe
+            # cannot be defeated by immediate inode reuse on the runner filesystem.
+            with args.fixture_replace_trainer_code.open("rb") as original:
+                replacement_payload = original.read()
+                args.fixture_replace_trainer_code.unlink()
+                args.fixture_replace_trainer_code.write_bytes(replacement_payload)
+        if should_interrupt and args.fixture_hold_after_recovery_checkpoint_marker is not None:
+            args.fixture_hold_after_recovery_checkpoint_marker.write_text(
+                "checkpoint-ready\n", encoding="utf-8"
+            )
+            time.sleep(0.75)
+            if args.fixture_recovery_child_exited_marker is not None:
+                args.fixture_recovery_child_exited_marker.write_text(
+                    "child-exited\n", encoding="utf-8"
+                )
+        if should_interrupt and hard_crash:
+            os._exit(17)
+        return 130 if should_interrupt else 0
 
+    if (
+        args.fixture_hold_evaluation_once_marker is not None
+        and not args.fixture_hold_evaluation_once_marker.exists()
+    ):
+        args.fixture_hold_evaluation_once_marker.write_text(
+            "evaluation-started\n", encoding="utf-8"
+        )
+
+        def stop_evaluation(_signum: int, _frame: object) -> None:
+            if args.fixture_evaluation_child_exited_marker is not None:
+                args.fixture_evaluation_child_exited_marker.write_text(
+                    "evaluation-child-exited\n", encoding="utf-8"
+                )
+            raise SystemExit(130)
+
+        signal.signal(signal.SIGINT, stop_evaluation)
+        signal.signal(signal.SIGTERM, stop_evaluation)
+        time.sleep(30.0)
     checkpoint = json.loads(args.evaluate_checkpoint.read_text(encoding="utf-8"))
     step = int(checkpoint["step"])
     if args.fixture_fail_evaluation_step == step:

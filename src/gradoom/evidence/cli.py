@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,7 @@ from .report import (
     build_readiness_report,
     validate_merge_report,
 )
+from .time_authority import ReusableTimeAuthority, TimeAuthorityError
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -139,6 +141,27 @@ def _validate_output_path(
                 f"output path aliases generated benchmark artifact {artifact['name']!r}"
             )
 
+    bootstrap_exclusions = report.get("bootstrap_exclusions", [])
+    assert isinstance(bootstrap_exclusions, list)
+    for artifact in bootstrap_exclusions:
+        assert isinstance(artifact, dict)
+        resolved_artifact = _resolve_evidence_path(
+            Path(artifact["path"]),
+            base_directory=manifest_directory,
+        )
+        if _paths_alias(resolved_output, resolved_artifact):
+            raise EvidenceError(f"output path aliases bootstrap artifact {artifact['name']!r}")
+        receipt = artifact.get("creation_receipt")
+        if isinstance(receipt, dict) and isinstance(receipt.get("path"), str):
+            resolved_receipt = _resolve_evidence_path(
+                Path(receipt["path"]),
+                base_directory=manifest_directory,
+            )
+            if _paths_alias(resolved_output, resolved_receipt):
+                raise EvidenceError(
+                    f"output path aliases bootstrap artifact {artifact['name']!r} creation receipt"
+                )
+
     policy_evaluation = report.get("policy_evaluation")
     if isinstance(policy_evaluation, dict):
         corpus = policy_evaluation.get("corpus")
@@ -185,6 +208,22 @@ def _validate_document_paths(
         resolved_merge = _resolve_evidence_path(merge_path, base_directory=working_directory)
         if _paths_alias(resolved_output, resolved_merge):
             raise EvidenceError("output path aliases the merge report")
+    if manifest.get("fixture") is False:
+        authority_state = os.environ.get("GRADOOM_REUSABLE_TIME_AUTHORITY_STATE")
+        authority_witness = os.environ.get("GRADOOM_REUSABLE_TIME_AUTHORITY_WITNESS")
+        for authority_path, label in (
+            (authority_state, "reusable-time authority state"),
+            (authority_witness, "reusable-time authority witness"),
+        ):
+            if not authority_path:
+                continue
+            resolved_authority_path = _resolve_evidence_path(
+                Path(authority_path), base_directory=working_directory
+            )
+            if resolved_output == resolved_authority_path or resolved_output.is_relative_to(
+                resolved_authority_path
+            ):
+                raise EvidenceError(f"output path aliases {label}")
     manifest_directory = _resolve_evidence_path(
         manifest_path.parent,
         base_directory=working_directory,
@@ -223,9 +262,66 @@ def _validate_document_paths(
                     if _paths_alias(resolved_output, resolved_asset):
                         asset_id = f"{provider.get('id')}.{asset_name}"
                         raise EvidenceError(f"output path aliases WAD profile asset {asset_id!r}")
+    benchmark = manifest.get("benchmark")
+    if isinstance(benchmark, dict):
+        trainer = benchmark.get("trainer")
+        if isinstance(trainer, dict):
+            raw_code_root = trainer.get("code_root")
+            if isinstance(raw_code_root, str) and raw_code_root.strip():
+                resolved_code_root = _resolve_evidence_path(
+                    Path(raw_code_root), base_directory=manifest_directory
+                )
+                if resolved_output == resolved_code_root or resolved_output.is_relative_to(
+                    resolved_code_root
+                ):
+                    raise EvidenceError("benchmark report output must be outside trainer code_root")
+        bootstrap_artifacts = benchmark.get("bootstrap_artifacts")
+        if isinstance(bootstrap_artifacts, list):
+            for artifact in bootstrap_artifacts:
+                if not isinstance(artifact, dict):
+                    continue
+                raw_path = artifact.get("path")
+                if not isinstance(raw_path, str) or not raw_path.strip():
+                    continue
+                resolved_artifact = _resolve_evidence_path(
+                    Path(raw_path),
+                    base_directory=manifest_directory,
+                )
+                if _paths_alias(resolved_output, resolved_artifact):
+                    raise EvidenceError(
+                        f"output path aliases bootstrap artifact {artifact.get('name')!r}"
+                    )
+                receipt = artifact.get("creation_receipt")
+                if isinstance(receipt, dict):
+                    receipt_path = receipt.get("path")
+                    if isinstance(receipt_path, str) and receipt_path.strip():
+                        resolved_receipt = _resolve_evidence_path(
+                            Path(receipt_path),
+                            base_directory=manifest_directory,
+                        )
+                        if _paths_alias(resolved_output, resolved_receipt):
+                            raise EvidenceError(
+                                "output path aliases bootstrap artifact "
+                                f"{artifact.get('name')!r} creation receipt"
+                            )
 
 
 def main(argv: list[str] | None = None) -> int:
+    invocation_started = time.perf_counter()
+    authority_invocation_event_id: str | None = None
+    authority_state = os.environ.get("GRADOOM_REUSABLE_TIME_AUTHORITY_STATE")
+    authority_witness = os.environ.get("GRADOOM_REUSABLE_TIME_AUTHORITY_WITNESS")
+    if authority_state and authority_witness:
+        try:
+            authority_invocation_event_id = ReusableTimeAuthority(
+                Path(authority_state), Path(authority_witness)
+            ).start_invocation()["event_id"]
+        except (OSError, TimeAuthorityError) as error:
+            print(
+                f"gradoom-evidence: error: reusable-time authority is unavailable: {error}",
+                file=sys.stderr,
+            )
+            return 2
     args = _parser().parse_args(argv)
     try:
         manifest, _payload = _load_manifest(args.manifest)
@@ -236,14 +332,29 @@ def main(argv: list[str] | None = None) -> int:
             merge_path=args.merge,
         )
         workflow = manifest.get("workflow")
+        report_already_written = False
         if workflow == "parity_readiness":
             report = build_readiness_report(args.manifest)
         elif workflow == "development_training_benchmark":
-            if args.merge is not None:
-                raise EvidenceError(
-                    "development training benchmark continuation is not supported yet"
+
+            def write_benchmark_report(candidate: dict[str, Any]) -> None:
+                _validate_output_path(
+                    args.output,
+                    manifest_path=args.manifest,
+                    report=candidate,
+                    merge_path=args.merge,
                 )
-            report = build_development_benchmark_report(args.manifest)
+                _write_report(args.output, candidate)
+
+            report = build_development_benchmark_report(
+                args.manifest,
+                merge_path=args.merge,
+                invocation_started=invocation_started,
+                clock=time.perf_counter,
+                report_writer=write_benchmark_report,
+                authority_invocation_event_id=authority_invocation_event_id,
+            )
+            report_already_written = True
         elif workflow == "fixed_time_training_diagnostic":
             if args.merge is not None:
                 raise EvidenceError("fixed-time diagnostic continuation is not supported yet")
@@ -257,12 +368,13 @@ def main(argv: list[str] | None = None) -> int:
             )
         else:
             raise EvidenceError(f"unsupported manifest workflow {workflow!r}")
-        _validate_output_path(
-            args.output,
-            manifest_path=args.manifest,
-            report=report,
-            merge_path=args.merge,
-        )
+        if not report_already_written:
+            _validate_output_path(
+                args.output,
+                manifest_path=args.manifest,
+                report=report,
+                merge_path=args.merge,
+            )
         if args.merge is not None and workflow == "parity_readiness":
             evidence_index = report["evidence_index"]
             assert isinstance(evidence_index, dict)
@@ -295,7 +407,8 @@ def main(argv: list[str] | None = None) -> int:
                     }
                 ],
             )
-        _write_report(args.output, report)
+        if not report_already_written:
+            _write_report(args.output, report)
     except (EvidenceError, OSError) as error:
         print(f"gradoom-evidence: error: {error}", file=sys.stderr)
         return 2

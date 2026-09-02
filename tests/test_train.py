@@ -960,6 +960,189 @@ def test_resume_optimizer_state_honors_explicit_learning_rate() -> None:
     assert resumed.state[resumed_parameter]["step"] == source.state[source_parameter]["step"]
 
 
+def test_evidence_resume_rejects_checkpoint_without_live_lane_progress() -> None:
+    checkpoint = {
+        "policy_state_dict": {},
+        "optimizer_state_dict": {},
+        "training_state": {
+            "completed_episodes": 4,
+            "executed_rollouts": 2,
+            "episode_index": torch.tensor([2, 3]),
+            "rolling_returns": [],
+            "rolling_kills": [],
+            "rolling_lengths": [],
+            "rolling_success": [],
+            "python_rng_state": object(),
+            "numpy_rng_state": object(),
+            "torch_rng_state": torch.zeros(1, dtype=torch.uint8),
+            "cuda_rng_state": [torch.zeros(1, dtype=torch.uint8)],
+        },
+    }
+
+    assert train._checkpoint_restored_state(checkpoint, num_envs=2) == {
+        "policy": True,
+        "optimizer": True,
+        "rng": True,
+        "progress": False,
+    }
+    with pytest.raises(
+        ValueError,
+        match=(
+            "evidence recovery checkpoint cannot restore continuous environment and lane progress"
+        ),
+    ):
+        train._validate_evidence_recovery_checkpoint(checkpoint, num_envs=2)
+
+
+def test_evidence_resume_accepts_full_live_lane_progress() -> None:
+    lanes = 2
+    checkpoint = {
+        "policy_state_dict": {},
+        "optimizer_state_dict": {},
+        "training_state": {
+            "completed_episodes": 4,
+            "executed_rollouts": 2,
+            "episode_index": torch.tensor([2, 3]),
+            "lane_identity": torch.arange(lanes),
+            "rolling_returns": [1.0],
+            "rolling_kills": [2.0],
+            "rolling_lengths": [3.0],
+            "rolling_success": [1.0],
+            "environment_state": {
+                "format": "gradoom-live-snapshot-v1",
+                "lane_count": lanes,
+            },
+            "observations": torch.zeros((lanes, 4, 84, 84), dtype=torch.uint8),
+            "context": torch.zeros((lanes, train.CONTEXT_FEATURES)),
+            "episode_starts": torch.tensor([False, True]),
+            "dones": torch.tensor([False, True]),
+            "episode_returns": torch.tensor([4.0, 0.0]),
+            "episode_lengths": torch.tensor([7, 0], dtype=torch.int32),
+            "reward_shaper_state": {
+                "format": "gradoom-live-component-v1",
+                "tensors": {},
+            },
+            "precision_scaler_state": {},
+            "encoder_anchor_targets": [],
+            "python_rng_state": object(),
+            "numpy_rng_state": object(),
+            "torch_rng_state": torch.zeros(1, dtype=torch.uint8),
+            "cuda_rng_state": [torch.zeros(1, dtype=torch.uint8)],
+        },
+    }
+
+    assert train._checkpoint_restored_state(checkpoint, num_envs=lanes) == {
+        "policy": True,
+        "optimizer": True,
+        "rng": True,
+        "progress": True,
+    }
+    train._validate_evidence_recovery_checkpoint(checkpoint, num_envs=lanes)
+
+
+def test_evidence_resume_requires_scaler_and_encoder_anchor_targets() -> None:
+    lanes = 2
+    training_state = {
+        "completed_episodes": 0,
+        "executed_rollouts": 1,
+        "episode_index": torch.zeros(lanes, dtype=torch.int64),
+        "lane_identity": torch.arange(lanes),
+        "rolling_returns": [],
+        "rolling_kills": [],
+        "rolling_lengths": [],
+        "rolling_success": [],
+        "environment_state": {"format": "gradoom-live-snapshot-v1", "lane_count": lanes},
+        "observations": torch.zeros((lanes, 4, 84, 84), dtype=torch.uint8),
+        "context": torch.zeros((lanes, train.CONTEXT_FEATURES)),
+        "episode_starts": torch.ones(lanes, dtype=torch.bool),
+        "dones": torch.zeros(lanes, dtype=torch.bool),
+        "episode_returns": torch.zeros(lanes),
+        "episode_lengths": torch.zeros(lanes, dtype=torch.int32),
+        "reward_shaper_state": {"format": "gradoom-live-component-v1", "tensors": {}},
+        "python_rng_state": object(),
+        "numpy_rng_state": object(),
+        "torch_rng_state": torch.zeros(1, dtype=torch.uint8),
+        "cuda_rng_state": [torch.zeros(1, dtype=torch.uint8)],
+    }
+    checkpoint = {
+        "policy_state_dict": {},
+        "optimizer_state_dict": {},
+        "training_state": training_state,
+    }
+
+    assert train._checkpoint_restored_state(checkpoint, num_envs=lanes)["progress"] is False
+    training_state["precision_scaler_state"] = {}
+    training_state["encoder_anchor_targets"] = []
+    assert train._checkpoint_restored_state(checkpoint, num_envs=lanes)["progress"] is True
+
+
+def test_legacy_fp32_live_checkpoint_does_not_require_scaler_state() -> None:
+    lanes = 2
+    checkpoint = {
+        "policy_state_dict": {},
+        "optimizer_state_dict": {},
+        "config": {"effective_recipe": {"precision": "fp32", "encoder_anchor_coef": 0.0}},
+        "training_state": {
+            "completed_episodes": 0,
+            "executed_rollouts": 1,
+            "episode_index": torch.zeros(lanes, dtype=torch.int64),
+            "lane_identity": torch.arange(lanes),
+            "rolling_returns": [],
+            "rolling_kills": [],
+            "rolling_lengths": [],
+            "rolling_success": [],
+            "environment_state": {
+                "format": "gradoom-live-snapshot-v1",
+                "lane_count": lanes,
+            },
+            "observations": torch.zeros((lanes, 4, 84, 84), dtype=torch.uint8),
+            "context": torch.zeros((lanes, train.CONTEXT_FEATURES)),
+            "episode_starts": torch.ones(lanes, dtype=torch.bool),
+            "dones": torch.zeros(lanes, dtype=torch.bool),
+            "episode_returns": torch.zeros(lanes),
+            "episode_lengths": torch.zeros(lanes, dtype=torch.int32),
+            "reward_shaper_state": {"format": "gradoom-live-component-v1", "tensors": {}},
+            "python_rng_state": object(),
+            "numpy_rng_state": object(),
+            "torch_rng_state": torch.zeros(1, dtype=torch.uint8),
+            "cuda_rng_state": [torch.zeros(1, dtype=torch.uint8)],
+        },
+    }
+
+    assert train._checkpoint_restored_state(checkpoint, num_envs=lanes)["progress"] is True
+
+
+def test_live_restore_requires_matching_environment_lane_count() -> None:
+    state = {
+        "environment_state": {"format": "gradoom-live-snapshot-v1", "lane_count": 4},
+        "observations": torch.zeros((4, 1)),
+        "context": torch.zeros((4, 1)),
+        "episode_starts": torch.zeros(4, dtype=torch.bool),
+        "dones": torch.zeros(4, dtype=torch.bool),
+        "episode_returns": torch.zeros(4),
+        "episode_lengths": torch.zeros(4, dtype=torch.int32),
+        "lane_identity": torch.arange(4),
+    }
+
+    assert train._has_compatible_live_state(state, num_envs=2) is False
+    assert train._has_compatible_live_state(state, num_envs=4) is True
+
+
+def test_encoder_anchor_recovery_preserves_original_targets() -> None:
+    policy = train.NatureActorCritic("nature", "contiguous", 1)
+    original = [parameter.detach().clone() for parameter in policy.observation_encoder.parameters()]
+    with torch.no_grad():
+        for parameter in policy.observation_encoder.parameters():
+            parameter.add_(1.0)
+
+    anchors = train._encoder_anchors_from_state(policy, original, coefficient=0.001)
+
+    assert len(anchors) == len(original)
+    for (parameter, restored), expected in zip(anchors, original, strict=True):
+        assert torch.equal(restored, expected)
+        assert not torch.equal(restored, parameter)
+
+
 def test_native_death_reward_is_explicitly_audited() -> None:
     args = _args("--config-only", "--reward-shape", "native-death-v1", "--death-penalty", "3")
 

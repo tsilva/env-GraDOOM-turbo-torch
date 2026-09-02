@@ -10,9 +10,11 @@ from .benchmark import (
     _EVALUATION_EPISODES,
     _TRAINER_CONTRACT,
     _UINT32_MAX,
+    _bind_trainer_files,
     _fsync_file,
     _read_jsonl,
     _required_mapping,
+    _reverify_trainer_files,
     _run_process,
     _seed_list,
     _validate_evaluation_records,
@@ -229,7 +231,6 @@ def _validate_diagnostic(
             evaluation_action_seed,
             benchmark_protocol.get("evaluation_action_seed"),
         ),
-        "recipe": (recipe, benchmark_protocol.get("trainer")),
     }
     for name, (actual, expected) in comparisons.items():
         if actual != expected:
@@ -329,6 +330,7 @@ def _run_diagnostic_attempt(
     manifest_directory: Path,
     evidence_entries: list[dict[str, str]],
     wad_profile: dict[str, Any] | None,
+    execution_binding: Any,
 ) -> dict[str, Any]:
     attempt_started = time.monotonic()
     reusable_time_deadline = attempt_started + protocol["reusable_time_budget_seconds"]
@@ -355,7 +357,11 @@ def _run_diagnostic_attempt(
         "--metrics-jsonl",
         str(training_metrics),
     ]
-    training_process = _run_process(training_command, cwd=manifest_directory)
+    training_process = _run_process(
+        training_command,
+        cwd=manifest_directory,
+        execution_binding=execution_binding,
+    )
     if training_process.returncode != 0:
         failure = _training_failure(seed=seed, process=training_process)
         return {
@@ -417,7 +423,11 @@ def _run_diagnostic_attempt(
         "--metrics-jsonl",
         str(evaluation_metrics),
     ]
-    evaluation_process = _run_process(evaluation_command, cwd=manifest_directory)
+    evaluation_process = _run_process(
+        evaluation_command,
+        cwd=manifest_directory,
+        execution_binding=execution_binding,
+    )
     if evaluation_process.returncode != 0:
         failure = {
             "seed": seed,
@@ -741,6 +751,26 @@ def build_fixed_time_diagnostic_report(manifest_path: Path) -> dict[str, Any]:
     diagnostic_binding = None if wad_profile is None else wad_profile["binding_sha256"]
     if diagnostic_binding != benchmark_binding:
         raise EvidenceError("fixed-time diagnostic WAD profile does not match benchmark")
+    artifacts_root = _resolve_evidence_path(
+        Path(validated["artifacts_directory"]),
+        base_directory=manifest_path.parent,
+    )
+    bound_recipe = _bind_trainer_files(
+        validated["recipe"],
+        base_directory=manifest_path.parent,
+        artifacts_root=artifacts_root,
+    )
+    public_bound_recipe = {
+        key: value for key, value in bound_recipe.items() if key != "_identity_markers"
+    }
+    benchmark_recipe = _required_mapping(
+        benchmark["benchmark_protocol"].get("trainer"),
+        "matching benchmark report trainer",
+    )
+    if public_bound_recipe != benchmark_recipe:
+        bound_recipe["_identity_markers"].close()
+        raise EvidenceError("fixed-time diagnostic recipe do not match benchmark")
+    validated["recipe"] = public_bound_recipe
     protocol = {
         "reusable_time_budget_seconds": validated["reusable_time_budget_seconds"],
         "training_seeds": validated["training_seeds"],
@@ -776,6 +806,7 @@ def build_fixed_time_diagnostic_report(manifest_path: Path) -> dict[str, Any]:
     )
     if declared_input_failure is not None:
         _validate_unique_evidence_entries(evidence_entries)
+        bound_recipe["_identity_markers"].close()
         return _assemble_diagnostic_report(
             manifest=manifest,
             validated=validated,
@@ -791,10 +822,6 @@ def build_fixed_time_diagnostic_report(manifest_path: Path) -> dict[str, Any]:
             evidence_entries=evidence_entries,
             matching_failures=[declared_input_failure],
         )
-    artifacts_root = _resolve_evidence_path(
-        Path(validated["artifacts_directory"]),
-        base_directory=manifest_path.parent,
-    )
     run_directory = artifacts_root / run_identity
     generated_specs = _generated_artifact_specs(
         run_directory,
@@ -804,6 +831,7 @@ def build_fixed_time_diagnostic_report(manifest_path: Path) -> dict[str, Any]:
     try:
         run_directory.mkdir(parents=True, exist_ok=False)
     except FileExistsError as error:
+        bound_recipe["_identity_markers"].close()
         raise EvidenceError(
             f"diagnostic artifact directory already exists; refusing to overwrite: {run_directory}"
         ) from error
@@ -815,9 +843,11 @@ def build_fixed_time_diagnostic_report(manifest_path: Path) -> dict[str, Any]:
             manifest_directory=manifest_path.parent,
             evidence_entries=evidence_entries,
             wad_profile=wad_profile,
+            execution_binding=bound_recipe["_identity_markers"],
         )
         for seed in validated["training_seeds"]
     ]
+    _reverify_trainer_files(bound_recipe)
     generated_artifacts = _reconcile_generated_artifacts(
         attempts=attempts,
         specs=generated_specs,

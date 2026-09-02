@@ -13,9 +13,8 @@ from typing import Any
 from gradoom.actions import DEATHMATCH_ACTION_MEANINGS
 
 from . import invariant_runner
+from .invariant_contract import INVARIANT_SUITE_VERSION
 from .reference_provider import REFERENCE_REVISION
-
-INVARIANT_SUITE_VERSION = "1.0.0"
 
 _PROVIDER_IDS = ("gradoom", "env-vizdoom-turbo")
 _SIGNALS = ("health", "killcount", "player_killcount", "episode_return")
