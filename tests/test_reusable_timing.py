@@ -602,9 +602,12 @@ def test_signed_attempt_is_durable_before_public_report_and_recovers_without_ree
     )
     assert len(sealed_attempts) == 1
     sealed_attempt = json.loads(sealed_attempts[0].read_text(encoding="utf-8"))
-    assert sealed_attempt["attempt"]["attempt_journal"]["authority_attestation"]["payload"][
-        "journal_sha256"
-    ] == sealed_attempt["attempt"]["attempt_journal"]["sha256"]
+    assert (
+        sealed_attempt["attempt"]["attempt_journal"]["authority_attestation"]["payload"][
+            "journal_sha256"
+        ]
+        == sealed_attempt["attempt"]["attempt_journal"]["sha256"]
+    )
 
     report = build_development_benchmark_report(manifest)
 
@@ -671,9 +674,7 @@ def test_durable_attempt_seal_rejects_unlike_provenance_before_reexecution(
                 RuntimeError("simulated crash before public report persistence")
             ),
         )
-    seal_path = next(
-        (tmp_path / "benchmark-artifacts").glob("*/seed-123/attempt-seal-0.json")
-    )
+    seal_path = next((tmp_path / "benchmark-artifacts").glob("*/seed-123/attempt-seal-0.json"))
     seal = json.loads(seal_path.read_text(encoding="utf-8"))
     seal["continuation_identity"]["recipe_sha256"] = "0" * 64
     seal_path.write_text(json.dumps(seal), encoding="utf-8")
@@ -2377,7 +2378,8 @@ def test_public_command_rejects_hidden_source_executed_through_builtins(
     result = _run_evidence(
         "--manifest",
         str(manifest),
-        "--output", str(tmp_path / "report.json"),
+        "--output",
+        str(tmp_path / "report.json"),
     )
 
     assert result.returncode == 2
@@ -2413,7 +2415,8 @@ def test_public_command_rejects_computed_exec_inside_conventional_ignored_direct
     result = _run_evidence(
         "--manifest",
         str(manifest),
-        "--output", str(tmp_path / "report.json"),
+        "--output",
+        str(tmp_path / "report.json"),
     )
 
     assert result.returncode == 2
@@ -2456,7 +2459,8 @@ def test_public_command_rejects_suffixless_payload_decoded_before_computed_exec(
     result = _run_evidence(
         "--manifest",
         str(manifest),
-        "--output", str(tmp_path / f"report-{payload_encoding}.json"),
+        "--output",
+        str(tmp_path / f"report-{payload_encoding}.json"),
     )
 
     assert result.returncode == 2
@@ -2487,7 +2491,8 @@ def test_public_command_rejects_hidden_trainer_launched_through_operator_and_pos
     result = _run_evidence(
         "--manifest",
         str(manifest),
-        "--output", str(tmp_path / "report.json"),
+        "--output",
+        str(tmp_path / "report.json"),
     )
 
     assert result.returncode == 2
@@ -2572,3 +2577,162 @@ def test_public_command_freshly_imports_bound_stdlib_source_and_extension(
     )
 
     assert result.returncode == 0, result.stderr
+
+
+def test_public_command_rejects_mutable_generated_source_spoofing_bound_filename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    external_source = tmp_path / "mutable-generated.txt"
+    marker = tmp_path / "unbound-generated-executed"
+    external_source.write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('executed')\n",
+        encoding="utf-8",
+    )
+    dependency_root = tmp_path / "dependencies"
+    dependency_root.mkdir()
+    (dependency_root / "generated_dependency.py").write_text(
+        "from pathlib import Path\n"
+        f"source = Path({str(external_source)!r}).read_text(encoding='utf-8')\n"
+        "code = compile(source, __file__, 'exec')\n"
+        "exec(code, {'__name__': '__main__'})\n",
+        encoding="utf-8",
+    )
+    code_root = tmp_path / "code"
+    code_root.mkdir()
+    worker = code_root / "worker.py"
+    shutil.copyfile(FIXTURE_PROCESS, worker)
+    launcher = code_root / "launcher.py"
+    launcher.write_text(
+        "import generated_dependency\nfrom worker import main\nraise SystemExit(main())\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(
+        "PYTHONPATH", str(dependency_root) + os.pathsep + os.environ.get("PYTHONPATH", "")
+    )
+    manifest = _manifest(
+        tmp_path,
+        outcomes={"10": [30.0, 0.0]},
+        trainer_script=launcher,
+        trainer_code_root=code_root,
+    )
+
+    result = _run_evidence("--manifest", str(manifest), "--output", str(tmp_path / "report.json"))
+
+    assert result.returncode == 2
+    assert "sealed trainer execution binding rejected unsealed execution" in result.stderr
+    assert not marker.exists()
+
+
+def test_public_command_binds_legitimate_generated_source_into_attempt_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    generated_source = "BOUND_VALUE = 7\n"
+    dependency_root = tmp_path / "dependencies"
+    dependency_root.mkdir()
+    (dependency_root / "generated_dependency.py").write_text(
+        f"code = compile({generated_source!r}, '<sealed-generated>', 'exec')\n"
+        "namespace = {}\n"
+        "exec(code, namespace)\n"
+        "assert namespace['BOUND_VALUE'] == 7\n",
+        encoding="utf-8",
+    )
+    code_root = tmp_path / "code"
+    code_root.mkdir()
+    worker = code_root / "worker.py"
+    shutil.copyfile(FIXTURE_PROCESS, worker)
+    launcher = code_root / "launcher.py"
+    launcher.write_text(
+        "import generated_dependency\nfrom worker import main\nraise SystemExit(main())\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(
+        "PYTHONPATH", str(dependency_root) + os.pathsep + os.environ.get("PYTHONPATH", "")
+    )
+    manifest = _manifest(
+        tmp_path,
+        outcomes={"10": [30.0, 0.0]},
+        trainer_script=launcher,
+        trainer_code_root=code_root,
+    )
+    output = tmp_path / "report.json"
+
+    result = _run_evidence("--manifest", str(manifest), "--output", str(output))
+
+    assert result.returncode == 0, result.stderr
+    report = json.loads(output.read_text(encoding="utf-8"))
+    attempt = report["attempts"][0]
+    generated = attempt["generated_code"]
+    assert any(
+        item["filename"] == "<sealed-generated>"
+        and item["payload_sha256"] == hashlib.sha256(generated_source.encode()).hexdigest()
+        for item in generated
+    )
+    assert attempt["execution_recipe_sha256"] == _canonical_sha256(
+        {
+            "continuation_identity": report["benchmark_protocol"]["continuation_identity"],
+            "generated_code": generated,
+        },
+        document="expected generated execution recipe",
+    )
+
+
+def test_native_dependency_bytes_and_loader_resolution_are_sealed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    extension = tmp_path / "fixture-extension.so"
+    extension.write_bytes(b"fixture extension")
+    dependency = tmp_path / "libfixture.so.1"
+    original = b"immutable dependency bytes"
+    dependency.write_bytes(original)
+
+    def dependencies(path: Path, _directories: list[Path]):
+        if path == extension:
+            return [("libfixture.so.1", dependency, False)]
+        if path == dependency:
+            return []
+        raise AssertionError(path)
+
+    monkeypatch.setattr(benchmark_module, "_ldd_dependencies", dependencies)
+    markers = benchmark_module._TrainerFileIdentityMarkers()
+    try:
+        benchmark_module._seal_native_dependencies(
+            markers,
+            extension_paths=[extension],
+            library_directories=[tmp_path],
+        )
+        dependency.write_bytes(b"mutated after binding")
+        sealed = markers.sealed_native_libraries[dependency]
+        sealed.seek(0)
+        assert sealed.read() == original
+        identity = markers.native_dependency_identities[0]
+        assert identity["loader_names"] == ["libfixture.so.1"]
+        assert identity["sha256"] == hashlib.sha256(original).hexdigest()
+        assert identity["load_strategy"] == "sealed-preload"
+    finally:
+        markers.close()
+
+    replacement_markers = benchmark_module._TrainerFileIdentityMarkers()
+    try:
+        benchmark_module._seal_native_dependencies(
+            replacement_markers,
+            extension_paths=[extension],
+            library_directories=[tmp_path],
+        )
+        assert (
+            replacement_markers.native_dependency_identities[0]["sha256"]
+            != hashlib.sha256(original).hexdigest()
+        )
+    finally:
+        replacement_markers.close()
+
+    dependency.unlink()
+    missing_markers = benchmark_module._TrainerFileIdentityMarkers()
+    try:
+        with pytest.raises(EvidenceError, match="Python execution environment changed"):
+            benchmark_module._seal_native_dependencies(
+                missing_markers,
+                extension_paths=[extension],
+                library_directories=[tmp_path],
+            )
+    finally:
+        missing_markers.close()

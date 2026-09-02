@@ -18,6 +18,7 @@ import statistics
 import subprocess
 import sys
 import sysconfig
+import tempfile
 import time
 import zipfile
 from collections.abc import Callable
@@ -80,9 +81,11 @@ _OPEN_DESCRIPTOR_RESERVE = 64
 _MAX_SEALED_SOURCE_FILES = 16_384
 _MAX_SEALED_SOURCE_FILE_BYTES = 16 * 1024 * 1024
 _MAX_SEALED_EXTENSION_FILE_BYTES = 512 * 1024 * 1024
-_MAX_SEALED_TOTAL_BYTES = 768 * 1024 * 1024
+_MAX_SEALED_NATIVE_FILE_BYTES = 1024 * 1024 * 1024
+_MAX_SEALED_TOTAL_BYTES = 2 * 1024 * 1024 * 1024
 _SEALED_EXECUTION_EXIT = 125
-_SEALED_EXECUTION_CONTRACT = "kernel-sealed-python-zip-v1"
+_SEALED_EXECUTION_CONTRACT = "kernel-sealed-python-environment-v2"
+_GENERATED_CODE_PREFIX = "__GRADOOM_SEALED_GENERATED_CODE_V1__="
 _MFD_CLOEXEC = 0x0001
 _MFD_ALLOW_SEALING = 0x0002
 _F_ADD_SEALS = 1033
@@ -108,14 +111,17 @@ import tokenize
     entry_relative,
     protected_roots_json,
     extension_descriptors_json,
+    native_descriptors_json,
     *trainer_arguments,
 ) = sys.argv[1:]
 entry_path = os.path.join(code_root, entry_relative)
 protected_roots = json.loads(protected_roots_json)
 extension_descriptors = json.loads(extension_descriptors_json)
+native_descriptors = json.loads(native_descriptors_json)
 sealed_extension_originals = {
     os.path.realpath(value[1]) for value in extension_descriptors.values()
 }
+sealed_native_originals = {os.path.realpath(value[1]) for value in native_descriptors}
 violations = []
 
 
@@ -126,8 +132,13 @@ def inside_protected_root(value):
     if not isinstance(value, (str, bytes, os.PathLike)):
         return False
     try:
-        candidate = os.path.realpath(os.fsdecode(value))
-        return any(os.path.commonpath((root, candidate)) == root for root in protected_roots)
+        candidate = os.path.abspath(os.fsdecode(value))
+        resolved = os.path.realpath(candidate)
+        return any(
+            os.path.commonpath((root, candidate)) == root
+            or os.path.commonpath((root, resolved)) == root
+            for root in protected_roots
+        )
     except (OSError, ValueError):
         return False
 
@@ -276,6 +287,9 @@ class SealedEnvironmentFinder:
 
 
 sys.meta_path.insert(0, SealedEnvironmentFinder())
+import hashlib
+
+
 entry_encoding, _ = tokenize.detect_encoding(io.BytesIO(entry_source).readline)
 entry_text = entry_source.decode(entry_encoding)
 linecache.cache[entry_path] = (
@@ -285,23 +299,27 @@ linecache.cache[entry_path] = (
     entry_path,
 )
 entry_code = compile(entry_source, entry_path, "exec")
+generated_compilations = {}
 
 
-def trusted_generated_code_caller():
+def disclose_generated_code(record):
+    sys.stderr.write(
+        "__GRADOOM_SEALED_GENERATED_CODE_V1__="
+        + json.dumps(record, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    )
+    sys.stderr.flush()
+
+
+disclose_generated_code({"event": "binding-started"})
+
+
+def sealed_generated_code_caller(depth):
     try:
-        filename = sys._getframe(2).f_code.co_filename
+        filename = sys._getframe(depth).f_code.co_filename
     except (AttributeError, ValueError):
         return False
-    if filename not in sealed_source_names:
-        return False
-    if filename.startswith(archive_path + "/environment/"):
-        return True
-    try:
-        return any(
-            os.path.commonpath((root, filename)) == root for root in protected_roots[1:]
-        )
-    except ValueError:
-        return False
+    return filename in sealed_source_names
 
 
 def reject_unsealed_execution(event, arguments):
@@ -327,6 +345,7 @@ def reject_unsealed_execution(event, arguments):
                 os.path.commonpath((code_root, os.path.realpath(os.fsdecode(path)))) == code_root
                 or os.fsdecode(path).endswith((".py", ".pyc", ".pyo"))
                 or os.path.realpath(os.fsdecode(path)) in sealed_extension_originals
+                or os.path.realpath(os.fsdecode(path)) in sealed_native_originals
             )
         )
         if not writing and not relative_path and protected_source_read:
@@ -363,7 +382,21 @@ def reject_unsealed_execution(event, arguments):
             actual = source.encode() if isinstance(source, str) else bytes(source)
             if actual == expected:
                 return
-        if trusted_generated_code_caller():
+            violations.append(event)
+            raise PermissionError(
+                "sealed trainer execution binding forbids replacing bound source during compilation"
+            )
+        if sealed_generated_code_caller(2):
+            actual = source.encode() if isinstance(source, str) else bytes(source)
+            caller = sys._getframe(1).f_code.co_filename
+            record = {
+                "event": "compile",
+                "caller": sealed_source_names[caller],
+                "filename": filename,
+                "payload_sha256": hashlib.sha256(actual).hexdigest(),
+            }
+            generated_compilations.setdefault(filename, []).append(record)
+            disclose_generated_code(record)
             return
         violations.append(event)
         raise PermissionError("sealed trainer execution binding forbids dynamic code compilation")
@@ -371,13 +404,25 @@ def reject_unsealed_execution(event, arguments):
         code = arguments[0]
         if code is entry_code or code.co_filename in sealed_source_names:
             return
-        if trusted_generated_code_caller():
+        pending = generated_compilations.get(code.co_filename)
+        if pending and sealed_generated_code_caller(2):
+            pending.pop(0)
             return
         violations.append(event)
         raise PermissionError("sealed trainer execution binding forbids dynamic code execution")
+    if event == "code.__new__" and sealed_generated_code_caller(2):
+        filename = arguments[1]
+        caller = sys._getframe(1).f_code.co_filename
+        record = {
+            "event": "code.__new__",
+            "caller": sealed_source_names[caller],
+            "filename": filename,
+            "payload_sha256": hashlib.sha256(bytes(arguments[0])).hexdigest(),
+        }
+        generated_compilations.setdefault(filename, []).append(record)
+        disclose_generated_code(record)
+        return
     if event in {"marshal.loads", "code.__new__"}:
-        if trusted_generated_code_caller():
-            return
         violations.append(event)
         raise PermissionError("sealed trainer execution binding forbids opaque code construction")
 
@@ -467,6 +512,11 @@ def _attempt_journal_payload(
             attempt.get("failures"),
             document="benchmark attempt failures",
         ),
+        "generated_code_sha256": _canonical_sha256(
+            attempt.get("generated_code"),
+            document="benchmark attempt generated code",
+        ),
+        "execution_recipe_sha256": attempt.get("execution_recipe_sha256"),
         "recovery_sha256": _canonical_sha256(
             {
                 "recovery": normalized_recovery,
@@ -764,9 +814,7 @@ def _inventory_code_root_paths(code_root: Path) -> list[Path]:
             f"benchmark trainer code_root cannot be inventoried: {code_root}"
         ) from error
     if stat.S_ISLNK(root_metadata.st_mode):
-        raise EvidenceError(
-            f"benchmark trainer code_root contains a symlink alias: {code_root}"
-        )
+        raise EvidenceError(f"benchmark trainer code_root contains a symlink alias: {code_root}")
     if not stat.S_ISDIR(root_metadata.st_mode):
         raise EvidenceError(f"benchmark trainer code_root is not a directory: {code_root}")
 
@@ -837,6 +885,9 @@ class _TrainerFileIdentityMarkers:
         self.environment_identities: list[dict[str, Any]] = []
         self.sealed_extensions: dict[str, BinaryIO] = {}
         self.sealed_extension_paths: dict[str, Path] = {}
+        self.sealed_native_libraries: dict[Path, BinaryIO] = {}
+        self.native_dependency_identities: list[dict[str, Any]] = []
+        self.generated_code_identities: list[dict[str, str]] = []
         self.native_library_directories: list[Path] = []
 
     def close(self) -> None:
@@ -858,6 +909,9 @@ class _TrainerFileIdentityMarkers:
         extensions, self.sealed_extensions = self.sealed_extensions, {}
         for extension in extensions.values():
             extension.close()
+        native_libraries, self.sealed_native_libraries = self.sealed_native_libraries, {}
+        for library in native_libraries.values():
+            library.close()
 
     def __del__(self) -> None:
         with suppress(OSError):
@@ -906,8 +960,7 @@ def _snapshot_regular_code_file(
         ):
             raise EvidenceError("sealed execution environment exceeds the source-file count limit")
         if identity_markers is not None and (
-            identity_markers.sealed_total_bytes + before.st_size
-            > _MAX_SEALED_TOTAL_BYTES
+            identity_markers.sealed_total_bytes + before.st_size > _MAX_SEALED_TOTAL_BYTES
         ):
             raise EvidenceError("sealed execution environment exceeds the total sealed byte limit")
         flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
@@ -946,6 +999,7 @@ def _snapshot_regular_code_file(
             value.st_mtime_ns,
             value.st_ctime_ns,
         )
+
     if not (
         stable_identity(before)
         == stable_identity(opened)
@@ -974,9 +1028,7 @@ def _snapshot_regular_code_file(
     else:
         assert stream is not None
         identity_markers.streams[relative_path] = stream
-        _append_trainer_execution_payload(
-            identity_markers, f"code/{relative_path}", payload
-        )
+        _append_trainer_execution_payload(identity_markers, f"code/{relative_path}", payload)
     return snapshot
 
 
@@ -1012,9 +1064,7 @@ def _reserve_sealed_payload(
         )
     if identity_markers.sealed_file_count >= _MAX_SEALED_SOURCE_FILES:
         raise EvidenceError("sealed execution environment exceeds the source-file count limit")
-    if (
-        identity_markers.sealed_total_bytes + len(payload) > _MAX_SEALED_TOTAL_BYTES
-    ):
+    if identity_markers.sealed_total_bytes + len(payload) > _MAX_SEALED_TOTAL_BYTES:
         raise EvidenceError("sealed execution environment exceeds the total sealed byte limit")
     identity_markers.sealed_file_count += 1
     identity_markers.sealed_total_bytes += len(payload)
@@ -1267,10 +1317,7 @@ def _stable_environment_payload(
             )
         if identity_markers.sealed_file_count >= _MAX_SEALED_SOURCE_FILES:
             raise EvidenceError("sealed execution environment exceeds the source-file count limit")
-        if (
-            identity_markers.sealed_total_bytes + before.st_size
-            > _MAX_SEALED_TOTAL_BYTES
-        ):
+        if identity_markers.sealed_total_bytes + before.st_size > _MAX_SEALED_TOTAL_BYTES:
             raise EvidenceError("sealed execution environment exceeds the total sealed byte limit")
         descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
         try:
@@ -1361,9 +1408,10 @@ def _python_environment_roots(code_root: Path) -> list[Path]:
             continue
         parts = module.split(".")
         for root in candidates:
-            if root.joinpath(*parts).with_suffix(".py").is_file() or root.joinpath(
-                *parts, "__init__.py"
-            ).is_file():
+            if (
+                root.joinpath(*parts).with_suffix(".py").is_file()
+                or root.joinpath(*parts, "__init__.py").is_file()
+            ):
                 selected.add(root)
                 break
     ordered = [root for root in candidates if root in selected]
@@ -1431,14 +1479,130 @@ def _seal_extension_payload(
             os.close(descriptor)
 
 
+def _ldd_dependencies(path: Path, library_directories: list[Path]) -> list[tuple[str, Path, bool]]:
+    environment = {**os.environ, "LC_ALL": "C"}
+    search_path = os.pathsep.join(map(str, library_directories))
+    if search_path:
+        inherited = environment.get("LD_LIBRARY_PATH")
+        environment["LD_LIBRARY_PATH"] = (
+            search_path if not inherited else search_path + os.pathsep + inherited
+        )
+    try:
+        result = subprocess.run(
+            ["/usr/bin/ldd", str(path)],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="strict",
+            env=environment,
+        )
+    except (OSError, UnicodeError) as error:
+        raise EvidenceError(f"native dependency closure cannot be resolved: {path}") from error
+    if result.returncode != 0 or "not found" in result.stdout or result.stderr.strip():
+        raise EvidenceError(f"native dependency closure cannot be resolved: {path}")
+    dependencies: list[tuple[str, Path, bool]] = []
+    for raw_line in result.stdout.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("linux-vdso") or line == "statically linked":
+            continue
+        loader = "=>" not in line
+        if "=>" in line:
+            name, raw_target = (part.strip() for part in line.split("=>", 1))
+            target = raw_target.split(" (", 1)[0].strip()
+        else:
+            target = line.split(" (", 1)[0].strip()
+            name = Path(target).name
+        if not target.startswith("/"):
+            raise EvidenceError(f"native dependency closure cannot be resolved: {path}")
+        try:
+            resolved = Path(target).resolve(strict=True)
+        except OSError as error:
+            raise EvidenceError(f"native dependency closure cannot be resolved: {path}") from error
+        dependencies.append((name, resolved, loader))
+    return dependencies
+
+
+def _seal_native_dependencies(
+    identity_markers: _TrainerFileIdentityMarkers,
+    *,
+    extension_paths: list[Path],
+    library_directories: list[Path],
+) -> None:
+    resolution: dict[Path, dict[str, Any]] = {}
+    dependency_counts: dict[Path, int] = {}
+    for extension_path in extension_paths:
+        dependencies = _ldd_dependencies(extension_path, library_directories)
+        dependency_counts.update(
+            {
+                resolved: len(_ldd_dependencies(resolved, library_directories))
+                for _name, resolved, loader in dependencies
+                if not loader and resolved not in dependency_counts
+            }
+        )
+        for name, resolved, loader in dependencies:
+            item = resolution.setdefault(
+                resolved,
+                {
+                    "role": "native-loader" if loader else "native-shared-library",
+                    "path": str(resolved),
+                    "loader_names": set(),
+                    "required_by": set(),
+                    "load_strategy": "process-interpreter" if loader else "sealed-preload",
+                },
+            )
+            item["loader_names"].add(name)
+            item["required_by"].add(str(extension_path))
+    for path, item in sorted(resolution.items(), key=lambda pair: str(pair[0])):
+        payload = _stable_environment_payload(
+            path,
+            identity_markers,
+            per_file_limit=_MAX_SEALED_NATIVE_FILE_BYTES,
+        )
+        item["sha256"] = _sha256_bytes(payload)
+        item["size"] = len(payload)
+        item["loader_names"] = sorted(item["loader_names"])
+        item["required_by"] = sorted(item["required_by"])
+        if item["load_strategy"] == "sealed-preload":
+            descriptor = _new_sealable_memory_file()
+            try:
+                view = memoryview(payload)
+                while view:
+                    written = os.write(descriptor, view)
+                    view = view[written:]
+                os.fsync(descriptor)
+                seals = _F_SEAL_SHRINK | _F_SEAL_GROW | _F_SEAL_WRITE | _F_SEAL_SEAL
+                fcntl.fcntl(descriptor, _F_ADD_SEALS, seals)
+                if fcntl.fcntl(descriptor, _F_GET_SEALS) & seals != seals:
+                    raise EvidenceError("native shared library could not be kernel-sealed")
+                identity_markers.sealed_native_libraries[path] = os.fdopen(descriptor, "rb")
+                descriptor = -1
+            except OSError as error:
+                raise EvidenceError("native shared library could not be kernel-sealed") from error
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
+    identity_markers.native_dependency_identities = [
+        resolution[path] for path in sorted(resolution, key=str)
+    ]
+    identity_markers.sealed_native_libraries = dict(
+        sorted(
+            identity_markers.sealed_native_libraries.items(),
+            key=lambda pair: (dependency_counts.get(pair[0], 0), str(pair[0])),
+        )
+    )
+
+
 def _bind_python_environment(
     identity_markers: _TrainerFileIdentityMarkers,
     *,
     code_root: Path,
+    executable_path: Path,
 ) -> None:
     roots = _python_environment_roots(code_root)
     identities: list[dict[str, Any]] = []
     extensions_seen: set[str] = set()
+    extension_paths: list[Path] = []
     native_library_directories: set[Path] = set()
     for root_index, root in enumerate(roots):
         prefix = f"environment/{root_index}"
@@ -1476,6 +1640,7 @@ def _bind_python_environment(
                 payload=payload,
             )
             extensions_seen.add(module)
+            extension_paths.append(path)
             identities.append(
                 {
                     "role": "extension-module",
@@ -1485,8 +1650,22 @@ def _bind_python_environment(
                     "size": len(payload),
                 }
             )
+    _seal_native_dependencies(
+        identity_markers,
+        extension_paths=[executable_path, *extension_paths],
+        library_directories=sorted(native_library_directories),
+    )
+    loader_search_identity = {
+        "role": "native-loader-search",
+        "LD_LIBRARY_PATH": os.environ.get("LD_LIBRARY_PATH"),
+        "directories": [str(path) for path in sorted(native_library_directories)],
+    }
     identity_markers.environment_roots = roots
-    identity_markers.environment_identities = identities
+    identity_markers.environment_identities = [
+        *identities,
+        loader_search_identity,
+        *identity_markers.native_dependency_identities,
+    ]
     identity_markers.native_library_directories = sorted(native_library_directories)
 
 
@@ -1571,7 +1750,11 @@ def _bind_trainer_files(
                     identity_markers=identity_markers,
                 )
             )
-            _bind_python_environment(identity_markers, code_root=code_root)
+            _bind_python_environment(
+                identity_markers,
+                code_root=code_root,
+                executable_path=executable_path,
+            )
             _seal_trainer_execution_archive(identity_markers)
         except BaseException:
             identity_markers.close()
@@ -1592,6 +1775,7 @@ def _bind_trainer_files(
                 "files": _MAX_SEALED_SOURCE_FILES,
                 "per_file_bytes": _MAX_SEALED_SOURCE_FILE_BYTES,
                 "extension_per_file_bytes": _MAX_SEALED_EXTENSION_FILE_BYTES,
+                "native_per_file_bytes": _MAX_SEALED_NATIVE_FILE_BYTES,
                 "total_bytes": _MAX_SEALED_TOTAL_BYTES,
             },
         }
@@ -1646,8 +1830,7 @@ def _reverify_trainer_files(trainer: dict[str, Any]) -> None:
             if current["sha256"] != expected["sha256"]:
                 raise EvidenceError(f"bound trainer file changed during the cohort: {path}")
             if any(
-                current[field] != expected[field]
-                for field in ("device", "inode", "mode", "size")
+                current[field] != expected[field] for field in ("device", "inode", "mode", "size")
             ):
                 raise EvidenceError(
                     f"bound trainer file identity changed during the cohort: {path}"
@@ -1832,7 +2015,11 @@ def _sign_generation_attestation(
             "minimum_reusable_elapsed_seconds": minimum_elapsed,
         }
         try:
-            attestation = _formal_time_authority().sign_journal_head(request)
+            authority_client = _formal_time_authority()
+            authority_client.start_timing_segment(
+                anchor["payload"]["seed"], anchor["payload"]["started_unix_ns"]
+            )
+            attestation = authority_client.sign_journal_head(request)
         except TimeAuthorityError as error:
             raise EvidenceError(f"reusable-time authority refused journal seal: {error}") from error
         sealed_payload = attestation.get("payload")
@@ -2691,9 +2878,7 @@ def _validate_cuda_residency_record(record: dict[str, Any], *, fixture: bool) ->
         raise EvidenceError("CUDA residency acceptance record did not pass the required contract")
     expected_kind = "fixture_contract" if fixture else "cuda_hardware"
     if record.get("evidence_kind") != expected_kind:
-        raise EvidenceError(
-            f"CUDA residency acceptance evidence_kind must be {expected_kind!r}"
-        )
+        raise EvidenceError(f"CUDA residency acceptance evidence_kind must be {expected_kind!r}")
     if record.get("checked_categories") != list(CUDA_RESIDENCY_CATEGORIES):
         raise EvidenceError("CUDA residency acceptance did not check every required category")
     devices = record.get("devices")
@@ -2706,9 +2891,7 @@ def _validate_cuda_residency_record(record: dict[str, Any], *, fixture: bool) ->
             raise EvidenceError(f"CUDA residency acceptance {category} devices must be non-empty")
         for value in values:
             if not isinstance(value, str) or not value.startswith("cuda:"):
-                raise EvidenceError(
-                    f"CUDA residency acceptance {category} used a non-CUDA device"
-                )
+                raise EvidenceError(f"CUDA residency acceptance {category} used a non-CUDA device")
             concrete_devices.add(value)
     if len(concrete_devices) != 1:
         raise EvidenceError("CUDA residency acceptance used inconsistent CUDA devices")
@@ -2725,10 +2908,7 @@ def _validate_cuda_residency_record(record: dict[str, Any], *, fixture: bool) ->
         if type(record.get(field)) is not int or record[field] <= 0:
             raise EvidenceError(f"CUDA residency acceptance {field} must be positive")
     workload = record.get("workload")
-    if (
-        not isinstance(workload, dict)
-        or workload.get("trainer_contract") != _TRAINER_CONTRACT
-    ):
+    if not isinstance(workload, dict) or workload.get("trainer_contract") != _TRAINER_CONTRACT:
         raise EvidenceError("CUDA residency acceptance workload did not use the benchmark trainer")
     if (
         workload.get("checked_rollouts") != record["checked_rollouts"]
@@ -2756,8 +2936,7 @@ def _validate_cuda_residency_record(record: dict[str, Any], *, fixture: bool) ->
         raise EvidenceError("CUDA residency acceptance software is required")
     required_software = {"python", "gradoom", "torch", "cuda", "cudnn", "numpy"}
     if set(software) != required_software or any(
-        not isinstance(software[field], str) or not software[field]
-        for field in required_software
+        not isinstance(software[field], str) or not software[field] for field in required_software
     ):
         raise EvidenceError("CUDA residency acceptance software versions are incomplete")
 
@@ -2883,7 +3062,39 @@ def _run_process(
         module: [stream.fileno(), str(execution_binding.sealed_extension_paths[module])]
         for module, stream in execution_binding.sealed_extensions.items()
     }
-    protected_roots = [str(code_root), *map(str, execution_binding.environment_roots)]
+    native_names_by_path = {
+        item["path"]: item["loader_names"]
+        for item in execution_binding.native_dependency_identities
+        if item["load_strategy"] == "sealed-preload"
+    }
+    native_descriptors = [
+        [stream.fileno(), str(path), native_names_by_path[str(path)]]
+        for path, stream in execution_binding.sealed_native_libraries.items()
+    ]
+    native_search_directory: Path | None = None
+    if native_descriptors:
+        native_search_directory = Path(tempfile.mkdtemp(prefix="gradoom-sealed-native-"))
+        aliases: dict[str, int] = {}
+        try:
+            for descriptor, original_path, loader_names in native_descriptors:
+                for name in sorted({Path(original_path).name, *loader_names}):
+                    previous = aliases.setdefault(name, descriptor)
+                    if previous != descriptor:
+                        raise EvidenceError(
+                            f"native dependency resolution is ambiguous for loader name {name!r}"
+                        )
+                    alias = native_search_directory / name
+                    if not alias.exists():
+                        alias.symlink_to(f"/proc/self/fd/{descriptor}")
+            native_search_directory.chmod(0o555)
+        except BaseException:
+            shutil.rmtree(native_search_directory)
+            raise
+    protected_roots = [
+        str(code_root),
+        *map(str, execution_binding.environment_roots),
+        *([] if native_search_directory is None else [str(native_search_directory)]),
+    ]
     launched_command = [
         executable_argv0,
         "-P",
@@ -2896,6 +3107,7 @@ def _run_process(
         str(entry_relative),
         json.dumps(protected_roots, separators=(",", ":")),
         json.dumps(extension_descriptors, separators=(",", ":")),
+        json.dumps(native_descriptors, separators=(",", ":")),
         *command[2:],
     ]
     archive_environment_roots = [
@@ -2907,19 +3119,12 @@ def _run_process(
         "PYTHONDONTWRITEBYTECODE": "1",
         "PYTHONPATH": os.pathsep.join(archive_environment_roots),
     }
-    native_library_path = os.pathsep.join(
-        map(str, execution_binding.native_library_directories)
-    )
-    if native_library_path:
-        existing_library_path = environment.get("LD_LIBRARY_PATH")
-        environment["LD_LIBRARY_PATH"] = (
-            native_library_path
-            if not existing_library_path
-            else native_library_path + os.pathsep + existing_library_path
-        )
+    if native_search_directory is not None:
+        environment["LD_LIBRARY_PATH"] = str(native_search_directory)
     inherited_descriptors = (
         archive_descriptor,
         *(value[0] for value in extension_descriptors.values()),
+        *(value[0] for value in native_descriptors),
     )
     try:
         process = subprocess.Popen(
@@ -2935,6 +3140,9 @@ def _run_process(
             errors="replace",
         )
     except OSError as error:
+        if native_search_directory is not None:
+            native_search_directory.chmod(0o755)
+            shutil.rmtree(native_search_directory)
         return subprocess.CompletedProcess(
             command,
             127,
@@ -2960,15 +3168,49 @@ def _run_process(
         stdout, stderr = process.communicate()
         if heartbeat is not None:
             heartbeat()
+        generated_code_identities: list[dict[str, str]] = []
+        retained_stderr: list[str] = []
+        binding_started = False
+        for line in stderr.splitlines(keepends=True):
+            if not line.startswith(_GENERATED_CODE_PREFIX):
+                retained_stderr.append(line)
+                continue
+            try:
+                record = json.loads(line[len(_GENERATED_CODE_PREFIX) :])
+            except json.JSONDecodeError as error:
+                raise EvidenceError(
+                    "generated-code execution binding transcript is invalid"
+                ) from error
+            if record == {"event": "binding-started"}:
+                binding_started = True
+                continue
+            if (
+                not isinstance(record, dict)
+                or set(record) != {"event", "caller", "filename", "payload_sha256"}
+                or record.get("event") not in {"compile", "code.__new__"}
+                or not all(isinstance(record.get(field), str) for field in record)
+                or len(record["payload_sha256"]) != 64
+                or any(
+                    character not in "0123456789abcdef" for character in record["payload_sha256"]
+                )
+            ):
+                raise EvidenceError("generated-code execution binding transcript is invalid")
+            generated_code_identities.append(record)
+        if not binding_started:
+            raise EvidenceError("generated-code execution binding transcript is missing")
+        execution_binding.generated_code_identities.extend(generated_code_identities)
         completed = subprocess.CompletedProcess(
             command,
             process.returncode,
             stdout=stdout,
-            stderr=stderr,
+            stderr="".join(retained_stderr),
         )
     finally:
         for signum, handler in previous_handlers.items():
             signal.signal(signum, handler)
+        if native_search_directory is not None:
+            native_search_directory.chmod(0o755)
+            shutil.rmtree(native_search_directory)
     if forwarded_signal is not None:
         signal.signal(forwarded_signal, signal.SIG_DFL)
         os.kill(os.getpid(), forwarded_signal)
@@ -3123,9 +3365,7 @@ def _load_durable_attempt_seals(
             anchor=anchor,
             journal_sha256=journal_sha256,
         )
-        expected_attestation["reusable_elapsed_seconds"] = attempt.get(
-            "reusable_elapsed_seconds"
-        )
+        expected_attestation["reusable_elapsed_seconds"] = attempt.get("reusable_elapsed_seconds")
         verified_attestation = _verify_generation_attestation(
             journal.get("authority_attestation"),
             anchor=anchor,
@@ -3169,9 +3409,7 @@ def _load_durable_attempt_seals(
             path = generated_paths.get(name)
             if not isinstance(name, str) or path is None:
                 raise EvidenceError("durable benchmark attempt seal has unbound evidence")
-            artifact_path = _resolve_evidence_path(
-                Path(path), base_directory=manifest_directory
-            )
+            artifact_path = _resolve_evidence_path(Path(path), base_directory=manifest_directory)
             if _fsync_file(artifact_path, field=f"sealed attempt evidence {name!r}") != entry.get(
                 "sha256"
             ):
@@ -3488,6 +3726,7 @@ def _run_attempt(
 ) -> dict[str, Any]:
     if started is None:
         started = clock()
+    generated_code_start = len(execution_binding.generated_code_identities)
     attempt_directory = run_directory / f"seed-{seed}"
     attempt_identity = _canonical_sha256(
         {"run_identity": run_identity, "seed": seed},
@@ -3579,8 +3818,7 @@ def _run_attempt(
     generated_artifacts.extend((existing_attempt or {}).get("generated_artifacts", []))
     generated_artifacts = list(
         {
-            (artifact["name"], artifact["path"]): artifact
-            for artifact in generated_artifacts
+            (artifact["name"], artifact["path"]): artifact for artifact in generated_artifacts
         }.values()
     )
     evaluation_seed_artifact = {
@@ -4086,6 +4324,17 @@ def _run_attempt(
         generated_artifacts.append(
             {"name": recovery_evidence_name, "path": str(recovery_journal_path)}
         )
+    generated_code = [
+        *(existing_attempt or {}).get("generated_code", []),
+        *execution_binding.generated_code_identities[generated_code_start:],
+    ]
+    execution_recipe_sha256 = _canonical_sha256(
+        {
+            "continuation_identity": protocol["continuation_identity"],
+            "generated_code": generated_code,
+        },
+        document="benchmark attempt execution recipe",
+    )
     attempt = {
         "seed": seed,
         "attempt_identity": attempt_identity,
@@ -4100,6 +4349,8 @@ def _run_attempt(
         "checkpoint_sha256": final_checkpoint_sha256,
         "outcomes": outcomes,
         "failures": failures,
+        "generated_code": generated_code,
+        "execution_recipe_sha256": execution_recipe_sha256,
         "recovery": recovery,
         "recovery_history": recovery_history,
         "recovery_journal": recovery_journal,
@@ -4329,9 +4580,7 @@ def _build_development_benchmark_report(
             "stop": "after_final_durable_report_contains_a_conservative_authority_elapsed_seal",
         },
         "trainer": {
-            key: value
-            for key, value in validated["trainer"].items()
-            if key != "_identity_markers"
+            key: value for key, value in validated["trainer"].items() if key != "_identity_markers"
         },
         "fixture": manifest["fixture"],
         "cuda_residency_acceptance": {
@@ -4459,9 +4708,7 @@ def _build_development_benchmark_report(
     prior_attempts = (
         continuation.get("attempts", []) if continuation is not None else durable_attempts
     )
-    existing_by_seed = {
-        attempt["seed"]: attempt for attempt in prior_attempts
-    }
+    existing_by_seed = {attempt["seed"]: attempt for attempt in prior_attempts}
     attempts = []
     actual_generated_artifacts: list[dict[str, str]] = list(
         (continuation or {}).get("generated_artifacts", durable_generated_artifacts)
@@ -4473,6 +4720,21 @@ def _build_development_benchmark_report(
     for seed in validated["training_seeds"]:
         existing_attempt = existing_by_seed.get(seed)
         active_attempt = existing_attempt is None or existing_attempt.get("status") == "interrupted"
+        attempt_started = clock() if active_attempt else None
+        elapsed_anchor = anchors_by_seed.get(seed)
+        if (
+            active_attempt
+            and elapsed_anchor is not None
+            and elapsed_anchor["payload"]["authority"] != _FIXTURE_ELAPSED_ANCHOR_AUTHORITY
+        ):
+            try:
+                _formal_time_authority().start_timing_segment(
+                    seed, elapsed_anchor["payload"]["started_unix_ns"]
+                )
+            except TimeAuthorityError as error:
+                raise EvidenceError(
+                    f"reusable-time authority refused timing activation: {error}"
+                ) from error
         attempt = _run_attempt(
             seed=seed,
             protocol=protocol,
@@ -4482,10 +4744,10 @@ def _build_development_benchmark_report(
             evidence_entries=evidence_entries,
             wad_profile=wad_profile,
             execution_binding=validated["trainer"]["_identity_markers"],
-            elapsed_time_anchor=anchors_by_seed.get(seed),
+            elapsed_time_anchor=elapsed_anchor,
             existing_attempt=existing_attempt,
             prior_generated_artifacts=actual_generated_artifacts,
-            started=(clock() if active_attempt else None),
+            started=attempt_started,
             recurring_setup_elapsed=(recurring_setup_elapsed if active_attempt else 0.0),
             clock=clock,
         )
