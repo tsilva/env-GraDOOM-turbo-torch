@@ -451,6 +451,32 @@ def test_fixed_time_diagnostic_rejects_malformed_benchmark_status_cleanly(
     assert not output.exists()
 
 
+@pytest.mark.parametrize("malformed_evidence_level", [[], {}])
+def test_fixed_time_diagnostic_rejects_unhashable_evidence_level_cleanly(
+    tmp_path: Path,
+    malformed_evidence_level: object,
+) -> None:
+    trainer = _trainer({"10": [31.0, 0.0]})
+    benchmark_path, _benchmark = _benchmark_report(tmp_path, trainer)
+    manifest_path = _diagnostic_manifest(
+        tmp_path,
+        benchmark_report=benchmark_path,
+        trainer=trainer,
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["evidence_level"] = malformed_evidence_level
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    output = tmp_path / "diagnostic-report.json"
+
+    result = _run_evidence("--manifest", str(manifest_path), "--output", str(output))
+
+    assert result.returncode == 2
+    assert "fixed-time diagnostic requires development or formal evidence" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert result.stdout == ""
+    assert not output.exists()
+
+
 @pytest.mark.parametrize("mismatch", ["training_seeds", "recipe"])
 def test_fixed_time_diagnostic_rejects_evidence_that_does_not_match_benchmark(
     tmp_path: Path,

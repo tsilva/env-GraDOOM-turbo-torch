@@ -171,7 +171,8 @@ def _validate_diagnostic(
     _validate_schema_version(manifest.get("schema_version"), document="manifest")
     if manifest.get("workflow") != _WORKFLOW:
         raise EvidenceError(f"this command path requires workflow {_WORKFLOW}")
-    if manifest.get("evidence_level") not in {"development", "formal"}:
+    evidence_level = manifest.get("evidence_level")
+    if not isinstance(evidence_level, str) or evidence_level not in {"development", "formal"}:
         raise EvidenceError("fixed-time diagnostic requires development or formal evidence")
     if type(manifest.get("fixture")) is not bool:
         raise EvidenceError("fixture is required and must be a boolean")
