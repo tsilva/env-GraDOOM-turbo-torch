@@ -224,6 +224,39 @@ def test_invalid_corpus_is_rejected_before_execution(
     assert message in result.stderr
 
 
+def test_byte_identical_policy_artifacts_are_rejected_before_execution(
+    tmp_path: Path,
+) -> None:
+    manifest_path, corpus_path, manifest = _documents(tmp_path)
+    _replace_runner(manifest_path, manifest, INTERRUPT_RUNNER)
+    corpus = json.loads(corpus_path.read_text(encoding="utf-8"))
+    first_artifact = tmp_path / corpus["policies"][0]["artifact_path"]
+    second_artifact = tmp_path / corpus["policies"][1]["artifact_path"]
+    second_artifact.write_bytes(first_artifact.read_bytes())
+    corpus["policies"][1]["artifact_sha256"] = _sha256(second_artifact)
+    _write_json(corpus_path, corpus)
+    manifest["declared_inputs"][0]["sha256"] = _sha256(corpus_path)  # type: ignore[index]
+    _write_json(manifest_path, manifest)
+    output = tmp_path / "report.json"
+    invocation_log = tmp_path / "invocations.log"
+
+    result = _run(
+        "--manifest",
+        str(manifest_path),
+        "--output",
+        str(output),
+        env={
+            "GRADOOM_INTERRUPT_MARKER": str(tmp_path / "interrupt.marker"),
+            "GRADOOM_INVOCATION_LOG": str(invocation_log),
+        },
+    )
+
+    assert result.returncode == 2
+    assert "artifact_sha256 is duplicated" in result.stderr
+    assert not output.exists()
+    assert not invocation_log.exists()
+
+
 @pytest.mark.parametrize("contract_version", [True, 1.0])
 def test_model_contract_version_requires_an_exact_json_integer(
     tmp_path: Path, contract_version: object

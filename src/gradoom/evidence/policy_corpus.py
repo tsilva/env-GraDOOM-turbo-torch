@@ -290,6 +290,7 @@ def _load_corpus(
     policies: list[dict[str, Any]] = []
     identifiers: set[str] = set()
     artifact_paths: list[Path] = []
+    artifact_sha256s: set[str] = set()
     origins: set[str] = set()
     artifact_payloads: dict[str, bytes] = {}
     for index, raw_policy in enumerate(raw_policies):
@@ -325,6 +326,9 @@ def _load_corpus(
                 f"policy {policy_id!r} artifact SHA-256 mismatch: "
                 f"expected {expected_sha256}, got {actual_sha256}"
             )
+        if actual_sha256 in artifact_sha256s:
+            raise EvidenceError(f"{field}.artifact_sha256 is duplicated")
+        artifact_sha256s.add(actual_sha256)
         artifact_payloads[policy_id] = artifact_payload
         contract = _validate_contract(
             raw_policy.get("model_runtime_contract"),
