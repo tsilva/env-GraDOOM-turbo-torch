@@ -2694,22 +2694,27 @@ def test_public_command_binds_constructed_code_constants_before_function_executi
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     external_value = tmp_path / "generated-value.txt"
-    external_value.write_text("7", encoding="utf-8")
+    external_value.write_text("seven", encoding="utf-8")
     dependency_root = tmp_path / "dependencies"
     dependency_root.mkdir()
     dependency = dependency_root / "constructed_dependency.py"
     dependency_source = (
         "import types\n"
         "from pathlib import Path\n"
-        f"value = int(Path({str(external_value)!r}).read_text())\n"
+        f"value = Path({str(external_value)!r}).read_text()\n"
         "def template():\n"
-        "    return 0\n"
-        "code = template.__code__.replace(co_consts=(None, value))\n"
+        "    return 'placeholder'\n"
+        "def with_value(original, value):\n"
+        "    return original.replace(co_consts=tuple(\n"
+        "        value if item == 'placeholder' else item\n"
+        "        for item in original.co_consts\n"
+        "    ))\n"
+        "code = with_value(template.__code__, value)\n"
         "generated = types.FunctionType(code, {})\n"
         "assert generated() == value\n"
-        "assigned_code = template.__code__.replace(co_consts=(None, value + 1))\n"
+        "assigned_code = with_value(template.__code__, value + '!')\n"
         "template.__code__ = assigned_code\n"
-        "assert template() == value + 1\n"
+        "assert template() == value + '!'\n"
     )
     dependency.write_text(dependency_source, encoding="utf-8")
     code_root = tmp_path / "code"
@@ -2814,3 +2819,240 @@ def test_native_dependency_bytes_and_loader_resolution_are_sealed(
             )
     finally:
         missing_markers.close()
+
+
+def test_generated_semantics_are_locked_before_continuation_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    external_value = tmp_path / "generated-value.txt"
+    external_value.write_text("7", encoding="utf-8")
+    dependency_root = tmp_path / "dependencies"
+    dependency_root.mkdir()
+    (dependency_root / "generated_dependency.py").write_text(
+        "from pathlib import Path\n"
+        f"value = int(Path({str(external_value)!r}).read_text())\n"
+        "code = compile(f'BOUND_VALUE = {value}\\n', '<continued-generated>', 'exec')\n"
+        "namespace = {}\n"
+        "exec(code, namespace)\n",
+        encoding="utf-8",
+    )
+    code_root = tmp_path / "code"
+    code_root.mkdir()
+    shutil.copyfile(FIXTURE_PROCESS, code_root / "worker.py")
+    launcher = code_root / "launcher.py"
+    launcher.write_text(
+        "import generated_dependency\nfrom worker import main\nraise SystemExit(main())\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(
+        "PYTHONPATH", str(dependency_root) + os.pathsep + os.environ.get("PYTHONPATH", "")
+    )
+    manifest = _manifest(
+        tmp_path,
+        outcomes={"10": [30.0, 0.0]},
+        trainer_script=launcher,
+        trainer_code_root=code_root,
+        extra_arguments=["--fixture-interrupt-once-at-step", "10"],
+    )
+    interrupted = tmp_path / "interrupted.json"
+    first = _run_evidence("--manifest", str(manifest), "--output", str(interrupted))
+    assert first.returncode == 0, first.stderr
+    first_report = json.loads(interrupted.read_text(encoding="utf-8"))
+    assert first_report["attempts"][0]["status"] == "interrupted"
+    expected_generated = first_report["attempts"][0]["generated_code"]
+    assert expected_generated
+    live_journals = list(
+        Path(first_report["attempts"][0]["recovery"]["checkpoint"]).parent.glob(
+            "attempt-live-*.json"
+        )
+    )
+    assert live_journals
+    assert json.loads(live_journals[-1].read_text(encoding="utf-8"))["generated_code"] == (
+        expected_generated
+    )
+
+    external_value.write_text("8", encoding="utf-8")
+    changed = _run_evidence(
+        "--manifest",
+        str(manifest),
+        "--output",
+        str(tmp_path / "changed.json"),
+        "--merge",
+        str(interrupted),
+    )
+
+    assert changed.returncode == 2
+    assert "generated-code semantics changed across benchmark continuation" in changed.stderr
+
+
+def test_generated_semantics_continuation_allows_identical_repeated_use() -> None:
+    record = {
+        "event": "exec",
+        "caller": "environment/0/dependency.py",
+        "filename": "<generated>",
+        "payload_sha256": "a" * 64,
+    }
+    binding = benchmark_module._GeneratedCodeBinding([record], continuation=True)
+
+    binding.authorize(record, persist=lambda: pytest.fail("repeat should need no persistence"))
+    binding.authorize(record, persist=lambda: pytest.fail("repeat should need no persistence"))
+
+    assert binding.identities == [record]
+
+
+def test_generated_semantics_channel_survives_stderr_suppression_and_forgery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dependency_root = tmp_path / "dependencies"
+    dependency_root.mkdir()
+    (dependency_root / "generated_dependency.py").write_text(
+        "import os, sys\n"
+        'print(\'__GRADOOM_SEALED_GENERATED_CODE_V1__={"event":"binding-started"}\', '
+        "file=sys.stderr)\n"
+        "sys.stderr = open(os.devnull, 'w')\n"
+        "code = compile('BOUND_VALUE = 7\\n', '<protected-channel>', 'exec')\n"
+        "namespace = {}\n"
+        "exec(code, namespace)\n",
+        encoding="utf-8",
+    )
+    code_root = tmp_path / "code"
+    code_root.mkdir()
+    shutil.copyfile(FIXTURE_PROCESS, code_root / "worker.py")
+    launcher = code_root / "launcher.py"
+    launcher.write_text(
+        "import generated_dependency\nfrom worker import main\nraise SystemExit(main())\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(
+        "PYTHONPATH", str(dependency_root) + os.pathsep + os.environ.get("PYTHONPATH", "")
+    )
+    manifest = _manifest(
+        tmp_path,
+        outcomes={"10": [30.0, 0.0]},
+        trainer_script=launcher,
+        trainer_code_root=code_root,
+    )
+    output = tmp_path / "report.json"
+
+    result = _run_evidence("--manifest", str(manifest), "--output", str(output))
+
+    assert result.returncode == 0, result.stderr
+    generated = json.loads(output.read_text(encoding="utf-8"))["attempts"][0]["generated_code"]
+    assert any(item["filename"] == "<protected-channel>" for item in generated)
+
+
+def test_sealed_dependency_cannot_execute_external_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dependency_root = tmp_path / "dependencies"
+    dependency_root.mkdir()
+    (dependency_root / "process_dependency.py").write_text(
+        "import subprocess\nsubprocess.run(['/bin/true'], check=True)\n",
+        encoding="utf-8",
+    )
+    code_root = tmp_path / "code"
+    code_root.mkdir()
+    shutil.copyfile(FIXTURE_PROCESS, code_root / "worker.py")
+    launcher = code_root / "launcher.py"
+    launcher.write_text(
+        "import process_dependency\nfrom worker import main\nraise SystemExit(main())\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(
+        "PYTHONPATH", str(dependency_root) + os.pathsep + os.environ.get("PYTHONPATH", "")
+    )
+    manifest = _manifest(
+        tmp_path,
+        outcomes={"10": [30.0, 0.0]},
+        trainer_script=launcher,
+        trainer_code_root=code_root,
+    )
+
+    result = _run_evidence("--manifest", str(manifest), "--output", str(tmp_path / "report.json"))
+
+    assert result.returncode == 2
+    assert "sealed trainer execution binding rejected unsealed execution" in result.stderr
+
+
+def test_sealed_dependency_cannot_open_process_global_native_symbols(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dependency_root = tmp_path / "dependencies"
+    dependency_root.mkdir()
+    (dependency_root / "native_dependency.py").write_text(
+        "import ctypes\nctypes._dlopen(None)\n",
+        encoding="utf-8",
+    )
+    code_root = tmp_path / "code"
+    code_root.mkdir()
+    shutil.copyfile(FIXTURE_PROCESS, code_root / "worker.py")
+    launcher = code_root / "launcher.py"
+    launcher.write_text(
+        "import native_dependency\nfrom worker import main\nraise SystemExit(main())\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(
+        "PYTHONPATH", str(dependency_root) + os.pathsep + os.environ.get("PYTHONPATH", "")
+    )
+    manifest = _manifest(
+        tmp_path,
+        outcomes={"10": [30.0, 0.0]},
+        trainer_script=launcher,
+        trainer_code_root=code_root,
+    )
+
+    result = _run_evidence("--manifest", str(manifest), "--output", str(tmp_path / "report.json"))
+
+    assert result.returncode == 2
+    assert "sealed trainer execution binding rejected unsealed execution" in result.stderr
+
+
+def test_absolute_dt_needed_dependency_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    extension = tmp_path / "fixture-extension.so"
+    dependency = tmp_path / "libabsolute.so"
+    extension.write_bytes(b"fixture")
+    dependency.write_bytes(b"dependency")
+    monkeypatch.setattr(
+        benchmark_module,
+        "_ldd_dependencies",
+        lambda _path, _directories: [(str(dependency), dependency, False)],
+    )
+    markers = benchmark_module._TrainerFileIdentityMarkers()
+    try:
+        with pytest.raises(EvidenceError, match="absolute DT_NEEDED"):
+            benchmark_module._seal_native_dependencies(
+                markers,
+                extension_paths=[extension],
+                library_directories=[tmp_path],
+            )
+    finally:
+        markers.close()
+
+
+def test_python_executable_and_elf_interpreter_are_kernel_sealed(
+    tmp_path: Path,
+) -> None:
+    bound = benchmark_module._bind_trainer_files(
+        {
+            "command": [sys.executable, str(FIXTURE_PROCESS)],
+            "arguments": [],
+            "code_root": str(FIXTURE_PROCESS.parent),
+        },
+        base_directory=tmp_path,
+        artifacts_root=tmp_path / "artifacts",
+    )
+    markers = bound["_identity_markers"]
+    try:
+        assert markers.sealed_executable is not None
+        assert markers.sealed_interpreter is not None
+        assert markers.interpreter_path is not None
+        assert any(
+            identity["path"] == str(markers.interpreter_path)
+            and identity["load_strategy"] == "sealed-interpreter"
+            for identity in markers.native_dependency_identities
+        )
+        assert "_tkinter" not in markers.sealed_extensions
+    finally:
+        markers.close()
