@@ -26,3 +26,11 @@
   distribution names.
 - Add the independently versioned fast Turbo invariant suite to parity readiness,
   including named public-behavior failures and GraDOOM Torch device checks.
+- Add sealed two-origin pretrained-policy corpus validation and exhaustive,
+  restart-safe 256-seed execution in both providers through the public evidence
+  command, with deterministic nonclaiming subprocess fixtures.
+- Seal the policy runner and policy bytes used by corpus execution, revalidate
+  resumed outcomes canonically, and durably checkpoint each completed batch.
+- Close corpus-resume and schema gaps by rejecting partial batches, unsupported
+  model contracts, undeclared override fields, tampered provenance, and unsafe
+  JSON numeric values through the public evidence command.
