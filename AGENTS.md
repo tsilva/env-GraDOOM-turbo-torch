@@ -23,3 +23,8 @@ Use the canonical `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-hu
 ### Domain docs
 
 Use a single-context layout with `CONTEXT.md` at the repository root and system-wide ADRs under `docs/adr/`. See `docs/agents/domain.md`.
+
+## Release builds
+
+Use the repository `$build-release` skill. Normal validation and publication
+builds run only in GitHub Actions; local preparation handles metadata and Git.
