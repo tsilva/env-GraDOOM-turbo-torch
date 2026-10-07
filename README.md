@@ -149,3 +149,7 @@ changed commits with the pinned Infisical CLI; rewritten pushes and new branches
 scan all history reachable from the new head. Missing pull-request revisions,
 scanner errors, and findings fail the check. Reports publish locations without
 credentials or matched source content.
+
+The reusable benchmark security suite seals executables and native dependencies on
+Linux. CI permits up to 60 minutes per Python job so Python 3.14 completes the
+full suite without dropping the sealing or recovery checks.
