@@ -37,6 +37,9 @@ def test_lock_uses_patched_floors_and_registry_only_sources() -> None:
         0,
     )
 
+    assert tuple(int(part) for part in versions["gitpython"].split(".")) >= (3, 1, 62)
+    assert tuple(int(part) for part in versions["urllib3"].split(".")) >= (2, 8, 0)
+
     for package in lock["package"]:
         source = package.get("source", {})
         assert "git" not in source, package["name"]

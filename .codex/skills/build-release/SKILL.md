@@ -5,6 +5,13 @@ description: Automatically version, build, audit, publish, monitor, and verify a
 
 # Build Release
 
+Read and apply the shared `$release-workflow` skill at
+`/Users/tsilva/.codex/skills/release-workflow/SKILL.md` before execution.
+It owns common preflight, publication safeguards, `$push` integration,
+workflow monitoring, verification, and reporting. The rules below are this
+project's adapter; they retain its invocation default and required gates.
+If the shared skill is unavailable, stop and report the missing dependency.
+
 Use the repository-owned release path and preserve the distinction between a
 local candidate and an external publication. A local candidate is reversible;
 pushing a release tag or publishing to PyPI is not.
@@ -12,8 +19,8 @@ pushing a release tag or publishing to PyPI is not.
 Treat an unqualified `$build-release` invocation as authorization to complete
 the publication flow. Do not stop after building a local candidate: commit the
 release metadata, tag and atomically push the release, monitor the exact
-workflow, and verify the exact version on PyPI and GitHub. Use the local-only
-candidate flow only when the user explicitly asks for a candidate, dry run,
+workflow, and verify the exact version on PyPI and GitHub. Use the Actions validation
+flow only when the user explicitly asks for a candidate, dry run,
 validation-only run, or no publication.
 
 The repository publication path is `.github/workflows/release.yml`. A pushed
@@ -35,73 +42,29 @@ the user explicitly requests its exact version. `env-gradoom-turbo-torch` has no
 upstream-derived `.postN` release scheme, so advance a `.postN` version to the
 next final patch. Honor any exact user-selected final version as well.
 
-## Build an explicitly requested local candidate
+## Validate in Actions without publication
 
-1. Read `AGENTS.md` and use `$specs-author` as required there.
-
-2. Confirm the worktree state and synchronized metadata without mutating either:
-
-```bash
-git status --short --branch
-python3 .codex/skills/build-release/scripts/release_build.py check-version
-```
-
-Dirty files do not prevent an explicitly requested local candidate, but report
-that it is not eligible for publication and preserve every existing change.
-
-3. Select the release version. On a clean worktree, write the automatically
-selected final version when it differs from the checked-in version:
+Read `AGENTS.md` and apply `$specs-author`. Normal builds and release gates run
+only in GitHub Actions. Fetch the configured upstream on main and resolve the
+full pushed commit SHA, then dispatch:
 
 ```bash
-python3 .codex/skills/build-release/scripts/release_build.py \
-  prepare-version --write
+gh workflow run release.yml --ref main -f ref=<full-pushed-main-sha>
 ```
 
-For an exact version explicitly requested by the user, add `--to <version>`.
-This is the only path that permits a prerelease. The helper checks local tags
-and PyPI, skips occupied automatic versions, and transactionally updates
-`pyproject.toml`, `src/gradoom/__init__.py`, and the root
-`env-gradoom-turbo-torch` entry in `uv.lock`. If the worktree was dirty, run
-without `--write`; proceed only when the reported pending version requires no
-bump. Never layer an automatic version edit onto existing user changes.
-
-4. Run the locked source gates after version preparation:
+The runner checks the locked environment, three matching versions, source lint
+and tests, exact wheel/sdist contents, and isolated wheel import. Monitor the
+exact SHA, download `release-v<version>`, and audit the existing artifacts:
 
 ```bash
-uv sync --frozen --group dev
-.venv/bin/ruff check .
-.venv/bin/pytest
+python3 .codex/skills/build-release/scripts/release_build.py audit \
+  --version <version> --dist-dir <download-directory>/primary
 ```
 
-Do not build a candidate when a source gate fails.
-
-5. Confirm that the selected exact version is still unused on PyPI:
-
-```bash
-python3 .codex/skills/build-release/scripts/release_build.py \
-  check-pypi --version <version>
-```
-
-For packaging diagnosis of an already-published version, skip only this check
-and say why. Never overwrite or republish an existing PyPI version.
-
-6. Build into a fresh version-scoped directory:
-
-```bash
-.venv/bin/python .codex/skills/build-release/scripts/release_build.py build \
-  --version <version> --out-dir dist/release-v<version>
-```
-
-The helper uses `uv build --no-sources`, requires exactly one universal wheel
-and one source distribution, audits their metadata and contents, imports the
-wheel in an isolated working directory using the locked environment, and prints
-SHA-256 digests. It refuses to reuse an output directory so stale artifacts
-cannot enter the candidate.
-
-7. Report the two artifact paths, their SHA-256 digests, the selected version,
-whether metadata was bumped, and every completed gate. Preserve failed
-artifacts and exact error output for diagnosis. A candidate with an uncommitted
-automatic bump is not eligible for publication.
+Compare downloaded hashes with the runner log. This dispatch never changes a
+version, tags, publishes, or updates GradLab. Dirty local files are excluded
+from the pushed source and must not be described as tested. The existing helper
+`build` command remains available only for explicitly requested local diagnosis.
 
 ## Publish or cut a release
 
@@ -112,15 +75,18 @@ Require all of the following before any tag or publication action:
 - an automatically selected or explicitly requested version matching all three
   metadata locations;
 - an unused version on PyPI;
-- a passing local candidate build from the exact commit; and
+- matching metadata and a passing lock consistency check; and
 - a checked-in trusted-publishing workflow whose tag, artifact, audit, PyPI,
   and GitHub Release contract can be verified from repository source.
 
-Start clean, run `prepare-version --write`, and complete the source and candidate
-gates. If version preparation changed metadata, commit exactly
+Start clean, fetch the configured upstream and release tags, require a
+synchronized main branch, and run the metadata-only helper `prepare-version
+--write`, `check-version`, and `check-pypi`. Run `uv lock --check --config-file
+uv.toml` and `git diff --check`. Do not synchronize a local environment, run
+source tests, or build local artifacts. If version preparation changed metadata, commit exactly
 `pyproject.toml`, `src/gradoom/__init__.py`, and `uv.lock` as
-`Release v<version>`. Verify the committed tree is identical to the source used
-for the passing candidate. Create an annotated tag only after every requirement
+`Release v<version>`. Verify the three committed versions agree. Actions validates and builds the
+exact tagged commit before publication. Create an annotated tag only after every requirement
 passes, then atomically push the current branch and tag:
 
 ```bash
@@ -128,44 +94,40 @@ git tag -a v<version> -m "Release v<version>"
 git push --atomic origin HEAD v<version>
 ```
 
-Do not create or switch branches, synthesize release notes, or move an existing
-release tag. If the workflow is absent or no longer matches this contract, stop
-before tagging and repair the repository-owned release path first.
-
-Never print, commit, or pass PyPI credentials on a command line. Trusted
-publishing is the only acceptable normal PyPI publication path.
+Release notes follow the shared workflow policy and are generated by the
+GitHub Release job. Verify the checked-in workflow contract before tagging;
+use shared stop conditions if it is absent or has changed.
 
 ## Verify a published release
 
-When publication infrastructure exists and a release is launched, monitor its
-exact tag commit through the matching workflow. A workflow success is not the
-final success signal: poll PyPI until files exist for the exact version, then
-confirm the GitHub Release and artifact set.
+Follow the shared monitoring and verification procedure for the `release.yml`
+tag-push run at the full `v<version>` commit SHA. A `workflow_dispatch` run
+validates artifacts but never publishes. Verify PyPI project `env-gradoom-turbo-torch` and
+the GitHub Release for the same tag.
 
-Use:
+Require exactly one universal wheel and one source distribution on PyPI and
+the matching GitHub Release.
 
-```bash
-release_sha="$(git rev-list -n 1 v<version>)"
-gh run list --workflow release.yml --commit "$release_sha" --limit 5 \
-  --json databaseId,status,conclusion,event,headBranch,headSha,displayTitle,url
-gh run watch <run-id> --exit-status
-```
+## Update GradLab after successful publication
 
-If the workflow fails, inspect only failed logs with
-`gh run view <run-id> --log-failed`. Do not manually replay the upload.
+After the release succeeds and the exact PyPI version and required GitHub
+Release artifacts pass external verification, update GradLab to consume the
+latest successfully published `env-gradoom-turbo-torch` version. Complete
+this step as part of the full publication flow; local builds, dry runs, and
+inspection-only requests do not trigger it.
 
-Confirm the exact PyPI version at:
+Read `/Users/tsilva/repos/tsilva/gradlab/AGENTS.md` and its required
+specifications before editing. Synchronize GradLab's current branch with its
+configured upstream and preserve existing work. Update every matching exact
+pin in `pyproject.toml`, including platform-specific project dependencies and
+the `train-runtime` dependency group. Use the just-verified release version;
+if GradLab already consumes a newer verified publication, do not downgrade it.
+Regenerate `uv.lock` with `uv lock --upgrade-package env-gradoom-turbo-torch`,
+preserving unrelated pins, supply-chain constraints, and existing per-package
+release-age exceptions. Review the dependency diff, validate lock consistency,
+and run GradLab's relevant provider compatibility checks.
 
-```text
-https://pypi.org/project/env-gradoom-turbo-torch/<version>/
-```
-
-## Final response
-
-For a local candidate, lead with the artifact directory and report both files,
-digests, version, and gates. For a published release, lead with the exact PyPI
-version URL and report the tag, workflow URL and conclusion, GitHub Release URL,
-and every distribution filename. Never report an unqualified release invocation
-as complete until PyPI returns files for the exact version and the GitHub
-Release exists. On failure, report the exact failed command or gate and the next
-safe recovery action.
+Report the GradLab version/pin and lockfile update separately from release
+success. If synchronization, resolution, or validation fails, preserve the
+published release and report the downstream update as incomplete with its
+blocker; do not repeat publication.
