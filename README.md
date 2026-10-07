@@ -1,7 +1,9 @@
 <p align="center">
   <img src="https://raw.githubusercontent.com/tsilva/env-GraDOOM-turbo-torch/main/logo.png" alt="env-GraDOOM-turbo-torch" width="560" />
   <br />
+  <!-- repo-tagline:start -->
   <strong>🔥 Train Stronger Doom Policies, Faster 🔥</strong>
+  <!-- repo-tagline:end -->
 </p>
 
 `env-GraDOOM-turbo-torch` is a Python library and integrated training system for expert reinforcement-learning researchers who want to train strong Doom deathmatch policies from fresh initialization on NVIDIA GPUs. A certified result counts only when the unchanged stochastic policy transfers to `env-ViZDoom-turbo`; certification ranks policy quality by systematic player-attributed kills, with reusable-run wall-clock time and raw simulated Doom tics breaking close ties.
@@ -112,3 +114,12 @@ uv run python tools/evaluate_vizdoom_checkpoint.py \
 The project's original source code is [MIT-licensed](./LICENSE). Bundled ZDoom BulletChip
 resources retain their separate [GPL-3.0-only license](./LICENSES/GPL-3.0-only.txt); see
 the [third-party notices](./THIRD_PARTY_NOTICES.md) for exact provenance and redistribution terms.
+
+## CI security gates
+
+The locked development graph requires patched GitPython and urllib3 versions
+while retaining the seven-day package release window. GitHub Actions scans
+changed commits with the pinned Infisical CLI; rewritten pushes and new branches
+scan all history reachable from the new head. Missing pull-request revisions,
+scanner errors, and findings fail the check. Reports publish locations without
+credentials or matched source content.
