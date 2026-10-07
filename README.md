@@ -1,7 +1,9 @@
 <p align="center">
   <img src="https://raw.githubusercontent.com/tsilva/env-GraDOOM-turbo-torch/main/logo.png" alt="env-GraDOOM-turbo-torch" width="560" />
   <br />
+  <!-- repo-tagline:start -->
   <strong>🔥 Train Stronger Doom Policies, Faster 🔥</strong>
+  <!-- repo-tagline:end -->
 </p>
 
 `env-GraDOOM-turbo-torch` is a Python library and integrated training system for expert reinforcement-learning researchers who want to train strong Doom deathmatch policies from fresh initialization on NVIDIA GPUs. A certified result counts only when the unchanged stochastic policy transfers to `env-ViZDoom-turbo`; certification ranks policy quality by systematic player-attributed kills, with reusable-run wall-clock time and raw simulated Doom tics breaking close ties.
