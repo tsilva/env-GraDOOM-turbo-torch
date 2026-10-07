@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import errno
+import fcntl
 import hashlib
 import json
 import marshal
@@ -3053,6 +3054,17 @@ def test_python_executable_and_elf_interpreter_are_kernel_sealed(
             and identity["load_strategy"] == "sealed-interpreter"
             for identity in markers.native_dependency_identities
         )
-        assert "_tkinter" not in markers.sealed_extensions
+        # Optional native modules vary across Python distributions; every bound
+        # executable, interpreter, and extension must have the kernel seals.
+        required_seals = (
+            fcntl.F_SEAL_SEAL | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW | fcntl.F_SEAL_WRITE
+        )
+        for stream in (
+            markers.sealed_executable,
+            markers.sealed_interpreter,
+            *markers.sealed_extensions.values(),
+        ):
+            actual_seals = fcntl.fcntl(stream.fileno(), fcntl.F_GET_SEALS)
+            assert actual_seals & required_seals == required_seals
     finally:
         markers.close()
