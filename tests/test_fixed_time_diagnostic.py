@@ -18,6 +18,8 @@ from gradoom.evidence.cli import main as evidence_main
 
 FIXTURE_PROCESS = Path(__file__).parent / "fixtures" / "evidence" / "fixture_benchmark_process.py"
 EVALUATION_SEEDS = list(range(10_000, 10_100))
+# Workload-reporting fixtures need room for cold interpreter and module startup.
+WORKLOAD_TIME_BUDGET_SECONDS = 5.0
 ANCHOR_PRIVATE_KEY = Ed25519PrivateKey.from_private_bytes(b"\x19" * 32)
 TIMING_RULES = {
     "clock": "monotonic_wall_clock",
@@ -255,6 +257,8 @@ def test_matching_fixed_time_diagnostic_reports_quality_and_throughput_without_p
 ) -> None:
     trainer = _trainer(
         {"10": [31.0, 0.0]},
+        "--fixture-startup-delay-seconds",
+        "0.75",
         "--fixture-diagnostic-quality",
         "27.5",
         "--fixture-diagnostic-transitions",
@@ -273,6 +277,7 @@ def test_matching_fixed_time_diagnostic_reports_quality_and_throughput_without_p
         benchmark_report=benchmark_path,
         trainer=trainer,
         training_seeds=training_seeds,
+        reusable_time_budget_seconds=WORKLOAD_TIME_BUDGET_SECONDS,
     )
     output = tmp_path / "diagnostic-report.json"
 
@@ -283,7 +288,10 @@ def test_matching_fixed_time_diagnostic_reports_quality_and_throughput_without_p
     assert report["workflow"] == "fixed_time_training_diagnostic"
     assert report["status"] == "completed"
     assert report["claim_eligible"] is False
-    assert report["diagnostic_protocol"]["reusable_time_budget_seconds"] == 0.5
+    assert (
+        report["diagnostic_protocol"]["reusable_time_budget_seconds"]
+        == WORKLOAD_TIME_BUDGET_SECONDS
+    )
     assert report["diagnostic_protocol"]["training_seeds"] == training_seeds
     assert report["diagnostic_protocol"]["evaluation_episode_seeds"] == EVALUATION_SEEDS
     assert report["diagnostic_protocol"]["timing_rules"] == TIMING_RULES
@@ -298,7 +306,7 @@ def test_matching_fixed_time_diagnostic_reports_quality_and_throughput_without_p
     }
     assert [attempt["seed"] for attempt in fixed_time["attempts"]] == training_seeds
     assert all(
-        attempt["throughput"]["timer"]["elapsed_seconds"] >= 0.5
+        attempt["throughput"]["timer"]["elapsed_seconds"] >= WORKLOAD_TIME_BUDGET_SECONDS
         for attempt in fixed_time["attempts"]
     )
     attempt = fixed_time["attempts"][0]
@@ -721,6 +729,8 @@ def test_fixed_time_diagnostic_retains_failed_evaluation_without_changing_passag
 ) -> None:
     trainer = _trainer(
         {"10": [31.0, 0.0]},
+        "--fixture-startup-delay-seconds",
+        "0.75",
         "--fixture-diagnostic-transitions",
         "6000",
         "--fixture-diagnostic-elapsed-seconds",
@@ -733,6 +743,7 @@ def test_fixed_time_diagnostic_retains_failed_evaluation_without_changing_passag
         tmp_path,
         benchmark_report=benchmark_path,
         trainer=trainer,
+        reusable_time_budget_seconds=WORKLOAD_TIME_BUDGET_SECONDS,
     )
     output = tmp_path / "diagnostic-report.json"
 
