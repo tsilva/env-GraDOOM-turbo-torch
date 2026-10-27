@@ -1,0 +1,4 @@
+interface:
+  display_name: "Build Release"
+  short_description: "Publish env-gradoom-turbo-torch releases"
+  default_prompt: "Use $gradoom-torch_build-release to publish the next env-gradoom-turbo-torch version and verify it on PyPI."

@@ -24,7 +24,14 @@ Use the canonical `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-hu
 
 Use a single-context layout with `CONTEXT.md` at the repository root and system-wide ADRs under `docs/adr/`. See `docs/agents/domain.md`.
 
+## Shared release procedure
+
+The project `gradoom-torch_build-release` skill composes `$release-workflow` from
+`/Users/tsilva/.codex/skills/private-skills/release-workflow/SKILL.md`.
+Read both for release work; keep project commands, version policy, artifact
+requirements, and approval gates in the project adapter.
+
 ## Release builds
 
-Use the repository `$build-release` skill. Normal validation and publication
+Use the repository `$gradoom-torch_build-release` skill. Normal validation and publication
 builds run only in GitHub Actions; local preparation handles metadata and Git.

@@ -1,12 +1,12 @@
 ---
-name: build-release
-description: Automatically version, build, audit, publish, monitor, and verify an env-gradoom-turbo-torch Python release through PyPI availability. Use when the user asks to build release artifacts, cut/tag/publish a release, requests a specific env-gradoom-turbo-torch version, invokes $build-release, diagnoses release packaging, or asks whether a version is live on PyPI.
+name: gradoom-torch_build-release
+description: Automatically version, build, audit, publish, monitor, and verify an env-gradoom-turbo-torch Python release through PyPI availability. Use when the user asks to build release artifacts, cut/tag/publish a release, requests a specific env-gradoom-turbo-torch version, invokes $gradoom-torch_build-release, diagnoses release packaging, or asks whether a version is live on PyPI.
 ---
 
 # Build Release
 
 Read and apply the shared `$release-workflow` skill at
-`/Users/tsilva/.codex/skills/release-workflow/SKILL.md` before execution.
+`/Users/tsilva/.codex/skills/private-skills/release-workflow/SKILL.md` before execution.
 It owns common preflight, publication safeguards, `$push` integration,
 workflow monitoring, verification, and reporting. The rules below are this
 project's adapter; they retain its invocation default and required gates.
@@ -16,7 +16,7 @@ Use the repository-owned release path and preserve the distinction between a
 local candidate and an external publication. A local candidate is reversible;
 pushing a release tag or publishing to PyPI is not.
 
-Treat an unqualified `$build-release` invocation as authorization to complete
+Treat an unqualified `$gradoom-torch_build-release` invocation as authorization to complete
 the publication flow. Do not stop after building a local candidate: commit the
 release metadata, tag and atomically push the release, monitor the exact
 workflow, and verify the exact version on PyPI and GitHub. Use the Actions validation
@@ -57,7 +57,7 @@ and tests, exact wheel/sdist contents, and isolated wheel import. Monitor the
 exact SHA, download `release-v<version>`, and audit the existing artifacts:
 
 ```bash
-python3 .codex/skills/build-release/scripts/release_build.py audit \
+python3 .codex/skills/gradoom-torch_build-release/scripts/release_build.py audit \
   --version <version> --dist-dir <download-directory>/primary
 ```
 

@@ -79,14 +79,14 @@ jobs:
               exit 1
             fi
           fi
-          .venv/bin/python .codex/skills/build-release/scripts/release_build.py \
+          .venv/bin/python .codex/skills/gradoom-torch_build-release/scripts/release_build.py \
             check-version --version "$version"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Check PyPI version is unused
         if: github.event_name == 'push' && github.ref_type == 'tag'
         run: >-
-          .venv/bin/python .codex/skills/build-release/scripts/release_build.py
+          .venv/bin/python .codex/skills/gradoom-torch_build-release/scripts/release_build.py
           check-pypi --version "${{ steps.version.outputs.version }}"
 
       - name: Run source checks
@@ -96,7 +96,7 @@ jobs:
 
       - name: Build and audit distributions
         run: >-
-          .venv/bin/python .codex/skills/build-release/scripts/release_build.py
+          .venv/bin/python .codex/skills/gradoom-torch_build-release/scripts/release_build.py
           build --version "${{ steps.version.outputs.version }}"
           --out-dir dist/primary
 
@@ -148,7 +148,7 @@ jobs:
       - name: Generate release notes from committed changes
         shell: bash
         run: |
-          python3 .codex/skills/build-release/scripts/release_notes.py \
+          python3 .codex/skills/gradoom-torch_build-release/scripts/release_notes.py \
             --version "${GITHUB_REF_NAME#v}" --tag-prefix "v" \
             --ref "$GITHUB_SHA" > "$RUNNER_TEMP/release-notes.md"
       - name: Download audited distributions
