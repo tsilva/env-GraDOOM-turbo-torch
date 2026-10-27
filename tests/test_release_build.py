@@ -7,7 +7,14 @@ from types import ModuleType
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-RELEASE_BUILD = REPO_ROOT / ".codex" / "skills" / "gradoom-torch_build-release" / "scripts" / "release_build.py"
+RELEASE_BUILD = (
+    REPO_ROOT
+    / ".codex"
+    / "skills"
+    / "gradoom-torch_build-release"
+    / "scripts"
+    / "release_build.py"
+)
 
 
 @pytest.fixture(scope="module")
