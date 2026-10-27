@@ -14,7 +14,7 @@ At the start of substantive repository work, use `$specs-author` to read the ent
 
 Issues and specs are tracked in GitHub Issues for `tsilva/env-GraDOOM-turbo-torch`. See `docs/agents/issue-tracker.md`.
 
-For explicit AFK implementation of an approved root issue and its child issue graph, use `$codex-issue-orchestrate`. Start with `--dry-run`; the skill uses isolated worktrees, reviewed child PRs into a specification integration branch, and a final PR for human review.
+For explicit AFK implementation of an approved root issue and its child issue graph, use `$implement-issue-tree`. Start with `--dry-run`; the skill uses isolated worktrees, risk-based review gates, a specification integration branch, and a final PR for human review.
 
 ### Triage labels
 
