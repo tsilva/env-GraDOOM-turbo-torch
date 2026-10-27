@@ -22,7 +22,7 @@ dependencies = [
 Homepage = "https://github.com/tsilva/env-GraDOOM-turbo-torch"
 Repository = "https://github.com/tsilva/env-GraDOOM-turbo-torch.git"
 Issues = "https://github.com/tsilva/env-GraDOOM-turbo-torch/issues"
-Changelog = "https://github.com/tsilva/env-GraDOOM-turbo-torch/blob/main/CHANGES.md"
+Changelog = "https://github.com/tsilva/env-GraDOOM-turbo-torch/releases"
 
 [dependency-groups]
 dev = [
