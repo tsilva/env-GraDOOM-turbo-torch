@@ -49,3 +49,16 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+# Constraints are project metadata; uv does not read them from uv.toml.
+[tool.uv]
+constraint-dependencies = [
+  "gitpython>=3.2.1",
+  "certifi>=2026.10.19",
+  "filelock>=4.2.1",
+  "msgpack>=1.2.3",
+  "setuptools>=84.1.0",
+  "urllib3>=2.8.0",
+  "guardrails-ai!=0.10.1",
+  "mistralai!=2.4.6",
+]

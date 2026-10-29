@@ -12,6 +12,10 @@ Its batched simulation, rendering, rewards, resets, rollouts, policy inference, 
 
 ## Install
 
+Dependency resolution keeps the seven-day release-age setting in `uv.toml` and
+the security constraints in `[tool.uv]` in `pyproject.toml`. Keep both files with
+the committed `uv.lock` when updating dependencies.
+
 `env-GraDOOM-turbo-torch` requires Python 3.11 or newer and [uv](https://docs.astral.sh/uv/).
 
 ```bash

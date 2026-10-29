@@ -12,6 +12,18 @@ resolution-markers = [
 exclude-newer = "0001-01-01T00:00:00Z" # This has no effect and is included for backwards compatibility when using relative exclude-newer values.
 exclude-newer-span = "P7D"
 
+[manifest]
+constraints = [
+    { name = "certifi", specifier = ">=2026.10.19" },
+    { name = "filelock", specifier = ">=4.2.1" },
+    { name = "gitpython", specifier = ">=3.2.1" },
+    { name = "guardrails-ai", specifier = "!=0.10.1" },
+    { name = "mistralai", specifier = "!=2.4.6" },
+    { name = "msgpack", specifier = ">=1.2.3" },
+    { name = "setuptools", specifier = ">=84.1.0" },
+    { name = "urllib3", specifier = ">=2.8.0" },
+]
+
 [[package]]
 name = "annotated-types"
 version = "0.8.0"
