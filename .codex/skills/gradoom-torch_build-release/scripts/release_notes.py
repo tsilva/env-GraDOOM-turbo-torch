@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate release-note drafts from Git without a checked-in changelog.
 
-Canonical helper: release-workflow/scripts/release_notes.py. Portable copies
+Canonical helper: private-skills_release-workflow/scripts/release_notes.py. Portable copies
 may be bundled by projects whose CI needs commit-based notes before publishing.
 """
 

@@ -5,9 +5,9 @@ description: Automatically version, build, audit, publish, monitor, and verify a
 
 # Build Release
 
-Read and apply the shared `$release-workflow` skill at
-`/Users/tsilva/.codex/skills/private-skills/release-workflow/SKILL.md` before execution.
-It owns common preflight, publication safeguards, `$push` integration,
+Read and apply the shared `$private-skills_release-workflow` skill at
+`/Users/tsilva/.codex/skills/private-skills/private-skills_release-workflow/SKILL.md` before execution.
+It owns common preflight, publication safeguards, `$private-skills_push` integration,
 workflow monitoring, verification, and reporting. The rules below are this
 project's adapter; they retain its invocation default and required gates.
 If the shared skill is unavailable, stop and report the missing dependency.
@@ -44,7 +44,7 @@ next final patch. Honor any exact user-selected final version as well.
 
 ## Validate in Actions without publication
 
-Read `AGENTS.md` and apply `$specs-author`. Normal builds and release gates run
+Read `AGENTS.md` and apply `$private-skills_specs-author`. Normal builds and release gates run
 only in GitHub Actions. Fetch the configured upstream on main and resolve the
 full pushed commit SHA, then dispatch:
 
